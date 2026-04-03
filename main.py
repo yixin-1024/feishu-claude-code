@@ -26,7 +26,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 
 import bot_config as config
 from feishu_client import FeishuClient
-from session_store import SessionStore
+from session_store import SessionStore, generate_summary, _write_custom_title
 from commands import parse_command, handle_command
 from claude_runner import run_claude
 from run_control import ActiveRun, ActiveRunRegistry, stop_run
@@ -583,7 +583,8 @@ async def _handle_resume_session(user_id: str, chat_id: str, session_id: str, ca
     print(f"[resume] 已恢复 session: {sid[:8]}", flush=True)
     if card_msg_id:
         try:
-            text = f"✅ 已恢复会话 `{sid[:8]}...`，继续对话吧。"
+            name = store.get_summary(user_id, sid) or f"#{sid[:8]}"
+            text = f"✅ 已恢复会话「{name}」，继续对话吧。"
             if old_title:
                 text += f"\n上个会话：「{old_title}」"
             await feishu.update_card(card_msg_id, text)
@@ -652,6 +653,7 @@ def on_message_receive(data: P2ImMessageReceiveV1) -> None:
     _last_event = time.time()
     if _ws_loop is None:
         _ws_loop = asyncio.get_event_loop()
+        asyncio.ensure_future(_bg_summary_loop())  # 首次捕获循环时启动摘要定时任务
     asyncio.ensure_future(handle_message_async(data))
 
 
@@ -722,6 +724,43 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass  # 静默 HTTP 日志
+
+
+# ── 后台定时摘要生成 ─────────────────────────────────────────
+
+async def _bg_summary_loop():
+    """每 10 分钟扫描未摘要的会话，后台生成摘要"""
+    await asyncio.sleep(30)  # 启动后等 30 秒再开始
+    while True:
+        try:
+            unsummarized = store.get_all_unsummarized()
+            if unsummarized:
+                print(f"[摘要] 发现 {len(unsummarized)} 个未摘要会话，开始生成", flush=True)
+                count = 0
+                for user_id, sid in unsummarized[:10]:  # 每轮最多 10 个
+                    try:
+                        summary = await asyncio.to_thread(generate_summary, sid)
+                        if summary:
+                            store._data.setdefault(user_id, {}).setdefault("summaries", {})[sid] = summary
+                            await asyncio.to_thread(_write_custom_title, sid, summary)
+                            count += 1
+                    except Exception:
+                        pass
+                if count:
+                    await store._save_async()
+                    print(f"[摘要] 本轮生成 {count} 个摘要", flush=True)
+        except Exception as e:
+            print(f"[摘要] 定时任务异常: {e}", flush=True)
+        await asyncio.sleep(600)  # 10 分钟
+
+
+def _start_summary_loop():
+    """在 WS 事件循环就绪后启动摘要定时任务"""
+    global _ws_loop
+    if _ws_loop is None:
+        # 延迟到第一条消息时启动
+        return
+    asyncio.run_coroutine_threadsafe(_bg_summary_loop(), _ws_loop)
 
 
 def _start_callback_server(port):

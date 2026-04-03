@@ -581,7 +581,9 @@ async def handle_command(
         session_id, old_title = await store.resume_session(user_id, chat_id, args)
         if not session_id:
             return f"❌ 未找到 session：`{args}`，用 `/resume` 查看列表。"
-        reply = f"✅ 已恢复 session `{session_id[:8]}...`，继续对话吧。"
+        # 用摘要作为会话名，没有就用 ID 前缀
+        name = store.get_summary(user_id, session_id) or f"#{session_id[:8]}"
+        reply = f"✅ 已恢复会话「{name}」，继续对话吧。"
         if old_title:
             reply += f"\n上个会话：「{old_title}」"
         return reply

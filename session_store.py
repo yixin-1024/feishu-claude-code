@@ -200,10 +200,10 @@ def generate_summary(session_id: str, token: Optional[str] = None) -> str:
 
     body = json.dumps({
         "model": "claude-sonnet-4-6",
-        "max_tokens": 80,
+        "max_tokens": 40,
         "messages": [{"role": "user", "content": (
-            "请用一句话（15-25个字）总结以下对话的主题。"
-            "只返回摘要文本，不要加引号或其他格式。\n\n"
+            "用10-20个中文字总结这段对话的主题。"
+            "直接返回摘要，不加引号不加标点。\n\n"
             + context[:2000]
         )}],
     }).encode()
@@ -408,6 +408,23 @@ class SessionStore:
     def get_summary(self, user_id: str, session_id: str) -> str:
         """获取缓存的摘要"""
         return self._user(user_id).get("summaries", {}).get(session_id, "")
+
+    def get_all_unsummarized(self) -> list[tuple[str, str]]:
+        """返回所有缺摘要的 (user_id, session_id) 列表"""
+        results = []
+        for user_id, user_data in self._data.items():
+            summaries = user_data.get("summaries", {})
+            for chat_key, chat_data in user_data.items():
+                if not isinstance(chat_data, dict) or "history" not in chat_data:
+                    continue
+                cur_sid = chat_data.get("current", {}).get("session_id")
+                if cur_sid and not summaries.get(cur_sid):
+                    results.append((user_id, cur_sid))
+                for h in chat_data.get("history", []):
+                    sid = h.get("session_id", "")
+                    if sid and not summaries.get(sid):
+                        results.append((user_id, sid))
+        return results
 
     async def batch_set_summaries(self, user_id: str, summaries: dict):
         """批量缓存摘要并保存"""
