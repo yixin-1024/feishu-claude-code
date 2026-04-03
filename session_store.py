@@ -199,7 +199,7 @@ def generate_summary(session_id: str, token: Optional[str] = None) -> str:
         return ""
 
     body = json.dumps({
-        "model": "claude-sonnet-4-6",
+        "model": "claude-haiku-4-5-20251001",
         "max_tokens": 40,
         "messages": [{"role": "user", "content": (
             "用10-20个中文字总结这段对话的主题。"
@@ -222,13 +222,15 @@ def generate_summary(session_id: str, token: Optional[str] = None) -> str:
 
     try:
         ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
             result = json.loads(resp.read())
             blocks = result.get("content", [])
             if blocks and blocks[0].get("type") == "text":
                 return blocks[0]["text"].strip()
-    except Exception:
-        pass
+    except urllib.error.HTTPError as e:
+        print(f"[摘要API] {session_id[:8]} HTTP {e.code}: {e.read().decode()[:100]}", flush=True)
+    except Exception as e:
+        print(f"[摘要API] {session_id[:8]} {type(e).__name__}: {e}", flush=True)
     return ""
 
 
