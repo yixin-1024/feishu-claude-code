@@ -103,6 +103,37 @@ async def _handle_stop_command(sender_open_id: str) -> str:
     return "已发送停止请求"
 
 
+# ── 命令菜单（锁外即时响应）──────────────────────────────────
+
+_COMMAND_MENU = [
+    {"text": "🆕 新会话",      "value": {"action": "run_cmd", "cmd": "/new", "cid": ""}},
+    {"text": "📋 新会话(规划)", "value": {"action": "run_cmd", "cmd": "/new plan", "cid": ""}},
+    {"text": "📂 恢复会话",    "value": {"action": "run_cmd", "cmd": "/resume", "cid": ""}},
+    {"text": "📊 状态",        "value": {"action": "run_cmd", "cmd": "/status", "cid": ""}},
+    {"text": "🔄 切模型",      "value": {"action": "run_cmd", "cmd": "/model", "cid": ""}},
+    {"text": "⚙️ 切模式",      "value": {"action": "run_cmd", "cmd": "/mode", "cid": ""}},
+    {"text": "📈 用量",        "value": {"action": "run_cmd", "cmd": "/usage", "cid": ""}},
+    {"text": "⏹ 停止",        "value": {"action": "run_cmd", "cmd": "/stop", "cid": ""}},
+    {"text": "❓ 帮助",        "value": {"action": "run_cmd", "cmd": "/help", "cid": ""}},
+]
+
+
+async def _show_command_menu(user_id: str, chat_id: str, is_group: bool, msg_id: str):
+    """显示命令菜单（按钮卡片），不走队列锁"""
+    buttons = [
+        {**btn, "value": {**btn["value"], "cid": chat_id}}
+        for btn in _COMMAND_MENU
+    ]
+    try:
+        if is_group:
+            card_id = await feishu.reply_card(msg_id, content="⚡ **快捷命令**", loading=False)
+        else:
+            card_id = await feishu.send_card_to_user(user_id, content="⚡ **快捷命令**", loading=False)
+        await feishu.update_card_with_buttons(card_id, "⚡ **快捷命令**", buttons)
+    except Exception as e:
+        print(f"[error] 命令菜单发送失败: {e}", flush=True)
+
+
 # ── 核心消息处理（async）─────────────────────────────────────
 
 def extract_chat_info(event: P2ImMessageReceiveV1) -> tuple[str, str, bool]:
@@ -140,18 +171,30 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
     user_id, chat_id, is_group = extract_chat_info(event)
     print(f"[Chat Info] user={user_id[:8]}... chat={chat_id[:8]}... is_group={is_group}", flush=True)
 
-    # /stop 命令在锁外处理（不需要排队）
+    # /stop 和 / 在锁外处理（不需要排队等 Claude）
     if msg.message_type == "text":
         try:
             _text = json.loads(msg.content).get("text", "").strip()
         except Exception:
             _text = ""
-        if _text.lower() in ("/stop", "@_user_1 /stop") or _text.strip().endswith("/stop"):
+        # 群聊去掉 @mention
+        if is_group:
+            for m in (getattr(msg, 'mentions', None) or []):
+                k = getattr(m, 'key', '')
+                if k:
+                    _text = _text.replace(k, '').strip()
+
+        if _text.lower() in ("/stop", "/stop") or _text.strip().endswith("/stop"):
             reply = await _handle_stop_command(user_id)
             if is_group:
                 await feishu.reply_card(msg.message_id, content=reply, loading=False)
             else:
                 await feishu.send_card_to_user(user_id, content=reply, loading=False)
+            return
+
+        # 单独输入 / → 显示命令菜单（按钮）
+        if _text == "/":
+            await _show_command_menu(user_id, chat_id, is_group, msg.message_id)
             return
 
     # 群聊只响应 @机器人 的消息
@@ -548,6 +591,18 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         resp.toast = toast
         return resp
 
+    # 命令菜单按钮 → 当作用户发了一条命令消息
+    if action_type == "run_cmd":
+        cmd_text = value.get("cmd", "")
+        if cmd_text and _ws_loop:
+            asyncio.ensure_future(_handle_menu_command(user_id, chat_id, cmd_text, clicked_msg_id))
+        resp = P2CardActionTriggerResponse()
+        toast = CallBackToast()
+        toast.type = "info"
+        toast.content = cmd_text
+        resp.toast = toast
+        return resp
+
     # 恢复会话按钮
     if action_type == "resume_session":
         sid = value.get("sid", "")
@@ -572,6 +627,43 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     toast.content = f"已发送: {reply_text}"
     resp.toast = toast
     return resp
+
+
+async def _handle_menu_command(user_id: str, chat_id: str, cmd_text: str, card_msg_id: str):
+    """命令菜单按钮点击 → 执行命令并更新卡片"""
+    is_group = (chat_id != user_id)
+    parsed = parse_command(cmd_text)
+    if not parsed:
+        return
+    cmd, args = parsed
+
+    # /stop 特殊处理
+    if cmd == "stop":
+        reply_text = await _handle_stop_command(user_id)
+        if card_msg_id:
+            try:
+                await feishu.update_card(card_msg_id, reply_text)
+            except Exception:
+                pass
+        return
+
+    reply = await handle_command(cmd, args, user_id, chat_id, store)
+    if reply is None:
+        return
+
+    if isinstance(reply, dict):
+        reply_text, reply_buttons = reply["text"], reply.get("buttons", [])
+    else:
+        reply_text, reply_buttons = reply, []
+
+    if card_msg_id:
+        try:
+            if reply_buttons:
+                await feishu.update_card_with_buttons(card_msg_id, reply_text, reply_buttons)
+            else:
+                await feishu.update_card(card_msg_id, reply_text)
+        except Exception as e:
+            print(f"[error] 菜单命令卡片更新失败: {e}", flush=True)
 
 
 async def _handle_resume_session(user_id: str, chat_id: str, session_id: str, card_msg_id: str):
@@ -697,6 +789,14 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                     _ws_loop,
                 )
             self._respond(200, {"toast": {"type": "success", "content": f"已切换: {mode}"}})
+        elif action_type == "run_cmd":
+            cmd_text = value.get("cmd", "")
+            if cmd_text and _ws_loop:
+                asyncio.run_coroutine_threadsafe(
+                    _handle_menu_command(user_id, chat_id, cmd_text, clicked_msg_id),
+                    _ws_loop,
+                )
+            self._respond(200, {"toast": {"type": "info", "content": cmd_text}})
         elif action_type == "resume_session":
             sid = value.get("sid", "")
             if sid and _ws_loop:
