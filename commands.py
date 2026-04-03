@@ -129,8 +129,18 @@ async def _build_session_list(user_id: str, chat_id: str, store: SessionStore, c
     return deduped[:15]
 
 
-async def _format_session_list(user_id: str, chat_id: str, store: SessionStore) -> str:
-    """生成历史 sessions 列表（去重 + 手机友好格式），含当前 session"""
+def _strip_md(text: str) -> str:
+    """去除 markdown 格式 + 压成单行纯文本"""
+    text = " ".join(text.split())
+    while text.startswith("#"):
+        text = text.lstrip("#").lstrip()
+    text = text.replace("**", "").replace("__", "").replace("`", "")
+    text = text.replace("<", "").replace(">", "")
+    return text.strip()
+
+
+async def _format_session_list(user_id: str, chat_id: str, store: SessionStore):
+    """生成历史 sessions 列表，每个会话一个按钮。返回 dict(text, buttons) 或 str。"""
     from session_store import _clean_preview
 
     cur = await store.get_current_raw(user_id, chat_id)
@@ -138,8 +148,36 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore) 
 
     cli_all = scan_cli_sessions(30)
     cli_preview_map = {s["session_id"]: s for s in cli_all}
-
     all_sessions = await _build_session_list(user_id, chat_id, store, cli_all=cli_all)
+
+    if not cur_sid and not all_sessions:
+        return "暂无历史 sessions。"
+
+    # 收集已缓存的摘要，缺失的后台生成（不阻塞列表展示）
+    summaries = {}
+    missing = []
+    all_sids = [cur_sid] if cur_sid else []
+    all_sids += [s["session_id"] for s in all_sessions]
+    for sid in all_sids:
+        cached = store.get_summary(user_id, sid)
+        if cached:
+            summaries[sid] = cached
+        else:
+            missing.append(sid)
+    if missing:
+        for sid in missing[:5]:
+            asyncio.create_task(store._bg_generate_summary(user_id, sid))
+
+    def _desc(sid: str, preview_raw: str) -> str:
+        s = summaries.get(sid, "")
+        if s:
+            s = _strip_md(s)
+            return s if len(s) <= 30 else s[:28] + ".."
+        p = _clean_preview(preview_raw or "")
+        if not p:
+            return "（无预览）"
+        p = _strip_md(p)
+        return p if len(p) <= 30 else p[:28] + ".."
 
     def _fmt_time(raw: str) -> str:
         t = raw[:16].replace("T", " ")
@@ -147,87 +185,30 @@ async def _format_session_list(user_id: str, chat_id: str, store: SessionStore) 
             t = t[5:16].replace("-", "/")
         return t
 
-    # 收集所有需要展示的 session_id
-    all_sids = []
-    if cur_sid:
-        all_sids.append(cur_sid)
-    for s in all_sessions:
-        all_sids.append(s["session_id"])
-
-    # 懒加载：为缺失摘要的 session 生成（限制 5 个，避免太慢）
-    summaries = {}
-    missing = []
-    for sid in all_sids:
-        cached = store.get_summary(user_id, sid)
-        if cached:
-            summaries[sid] = cached
-        else:
-            missing.append(sid)
-
-    if missing:
-        token = _get_api_token()
-        if token:
-            # 并行生成摘要，不逐个阻塞
-            tasks = [asyncio.to_thread(generate_summary, sid, token) for sid in missing[:5]]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            new_summaries = {}
-            for sid, result in zip(missing[:5], results):
-                if isinstance(result, str) and result:
-                    new_summaries[sid] = result
-                    summaries[sid] = result
-                    _write_custom_title(sid, result)
-            if new_summaries:
-                await store.batch_set_summaries(user_id, new_summaries)
-
+    # 当前 session 信息
     lines = []
-
-    def _strip_md(text: str) -> str:
-        """去除 markdown 格式 + 压成单行纯文本"""
-        # 换行 → 空格，压成单行
-        text = " ".join(text.split())
-        # heading 标记
-        while text.startswith("#"):
-            text = text.lstrip("#").lstrip()
-        # bold / italic
-        text = text.replace("**", "").replace("__", "")
-        # backtick
-        text = text.replace("`", "")
-        # XML 残留标签名（如 <tool_call>）
-        text = text.replace("<", "").replace(">", "")
-        return text.strip()
-
-    def _desc(sid: str, preview_raw: str) -> str:
-        """用 summary 优先，没有就用 preview，拼成简短描述"""
-        s = summaries.get(sid, "")
-        if s:
-            s = _strip_md(s)
-            return s if len(s) <= 40 else s[:37] + "..."
-        p = _clean_preview(preview_raw or "")
-        if not p:
-            return "（无预览）"
-        p = _strip_md(p)
-        return p if len(p) <= 40 else p[:37] + "..."
-
-    # 当前 session
     if cur_sid:
         cli_info = cli_preview_map.get(cur_sid)
         preview = (cli_info.get("preview") if cli_info and cli_info.get("preview")
                    else cur.get("preview") or "")
-        started = _fmt_time(cur.get("started_at", ""))
-        lines.append(f"当前  {_desc(cur_sid, preview)} ({started})  #{cur_sid[:8]}")
+        lines.append(f"当前：{_desc(cur_sid, preview)} ({_fmt_time(cur.get('started_at', ''))})")
 
-    if not cur_sid and not all_sessions:
-        return "暂无历史 sessions。"
+    lines.append(f"共 {len(all_sessions)} 个历史会话")
 
-    for i, s in enumerate(all_sessions, 1):
+    # 每个历史会话一个按钮
+    buttons = []
+    for s in all_sessions[:10]:
         sid = s["session_id"]
         preview = s.get("preview", "")
-        started = _fmt_time(s.get("started_at", ""))
-        lines.append(f"{i}. {_desc(sid, preview)} ({started})  #{sid[:8]}")
+        desc = _desc(sid, preview)
+        time_str = _fmt_time(s.get("started_at", ""))
+        buttons.append({
+            "text": f"{desc} ({time_str})",
+            "value": {"action": "resume_session", "sid": sid, "cid": chat_id},
+        })
 
-    if all_sessions:
-        lines.append("")
-        lines.append("回复 /resume 序号 恢复")
+    if buttons:
+        return {"text": "\n".join(lines), "buttons": buttons}
     return "\n".join(lines)
 
 

@@ -413,12 +413,7 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
             else:
                 reply_text, reply_buttons = reply, []
 
-            if cmd == "resume" and not args:
-                if is_group:
-                    await feishu.reply_card(msg.message_id, content=reply_text, loading=False)
-                else:
-                    await feishu.send_text_to_user(user_id, reply_text)
-            elif reply_buttons:
+            if reply_buttons:
                 if is_group:
                     card_id = await feishu.reply_card(msg.message_id, content=reply_text, loading=False)
                 else:
@@ -553,6 +548,18 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         resp.toast = toast
         return resp
 
+    # 恢复会话按钮
+    if action_type == "resume_session":
+        sid = value.get("sid", "")
+        if sid:
+            asyncio.ensure_future(_handle_resume_session(user_id, chat_id, sid, clicked_msg_id))
+        resp = P2CardActionTriggerResponse()
+        toast = CallBackToast()
+        toast.type = "info"
+        toast.content = "正在恢复..."
+        resp.toast = toast
+        return resp
+
     # 选项回复按钮（发给 Claude）
     reply_text = value.get("reply", "")
     if reply_text:
@@ -565,6 +572,23 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     toast.content = f"已发送: {reply_text}"
     resp.toast = toast
     return resp
+
+
+async def _handle_resume_session(user_id: str, chat_id: str, session_id: str, card_msg_id: str):
+    """卡片按钮恢复历史会话"""
+    sid, old_title = await store.resume_session(user_id, chat_id, session_id)
+    if not sid:
+        print(f"[resume] 未找到 session: {session_id[:8]}", flush=True)
+        return
+    print(f"[resume] 已恢复 session: {sid[:8]}", flush=True)
+    if card_msg_id:
+        try:
+            text = f"✅ 已恢复会话 `{sid[:8]}...`，继续对话吧。"
+            if old_title:
+                text += f"\n上个会话：「{old_title}」"
+            await feishu.update_card(card_msg_id, text)
+        except Exception:
+            pass
 
 
 async def _handle_set_mode(user_id: str, chat_id: str, mode: str, card_msg_id: str):
@@ -671,6 +695,14 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                     _ws_loop,
                 )
             self._respond(200, {"toast": {"type": "success", "content": f"已切换: {mode}"}})
+        elif action_type == "resume_session":
+            sid = value.get("sid", "")
+            if sid and _ws_loop:
+                asyncio.run_coroutine_threadsafe(
+                    _handle_resume_session(user_id, chat_id, sid, clicked_msg_id),
+                    _ws_loop,
+                )
+            self._respond(200, {"toast": {"type": "info", "content": "正在恢复..."}})
         else:
             reply_text = value.get("reply", "")
             if reply_text and _ws_loop:
