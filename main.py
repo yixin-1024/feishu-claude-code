@@ -131,19 +131,25 @@ _COMMAND_MENU_GROUPS = [
 async def _show_command_menu(user_id: str, chat_id: str, is_group: bool, msg_id: str):
     """显示分组命令菜单（markdown 标题 + 按钮混排），不走队列锁"""
     elements = []
-    for i, (title, buttons) in enumerate(_COMMAND_MENU_GROUPS):
+    for title, buttons in _COMMAND_MENU_GROUPS:
         elements.append({"tag": "markdown", "content": title})
+        columns = []
         for btn in buttons:
             value = {**btn["value"], "cid": chat_id}
-            elements.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": btn["text"]},
-                "type": "primary" if i == 0 else "default",
-                "size": "small",
-                "name": f"menu_{btn['value']['cmd'].replace('/', '').replace(' ', '_')}",
-                "value": value,
-                "behaviors": [{"type": "callback", "value": value}],
+            columns.append({
+                "tag": "column",
+                "width": "auto",
+                "elements": [{
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": btn["text"]},
+                    "type": "default",
+                    "size": "small",
+                    "name": f"menu_{btn['value']['cmd'].replace('/', '').replace(' ', '_')}",
+                    "value": value,
+                    "behaviors": [{"type": "callback", "value": value}],
+                }],
             })
+        elements.append({"tag": "column_set", "flex_mode": "flow", "columns": columns})
     try:
         if is_group:
             card_id = await feishu.reply_card(msg_id, content="⚡ 快捷命令", loading=False)
