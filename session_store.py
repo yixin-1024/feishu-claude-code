@@ -544,13 +544,7 @@ class SessionStore:
             summaries = self._data[user_id].get("summaries", {})
             old_title = summaries.get(old_id, "")
             if not old_title:
-                try:
-                    old_title = await asyncio.to_thread(generate_summary, old_id)
-                    if old_title:
-                        self._data[user_id].setdefault("summaries", {})[old_id] = old_title
-                        await asyncio.to_thread(_write_custom_title, old_id, old_title)
-                except Exception:
-                    old_title = ""
+                asyncio.create_task(self._bg_generate_summary(user_id, old_id))
 
         # 从 history 中找回原始 preview 和 started_at
         original_preview = ""
