@@ -382,7 +382,9 @@ async def _run_and_display(
                 {"text": display, "value": {"reply": value, "cid": chat_id}}
                 for display, value in options
             ]
-            await feishu.update_card_with_buttons(card_msg_id, final, buttons)
+            # 短选项(Y/N等)横排，长选项竖排
+            short = all(len(b["text"]) <= 10 for b in buttons)
+            await feishu.update_card_with_buttons(card_msg_id, final, buttons, flow=short)
         else:
             await feishu.update_card(card_msg_id, final)
         card_patched = True
@@ -489,7 +491,8 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                     card_id = await feishu.send_card_to_user(user_id, content=reply_text, loading=False)
                 print(f"[按钮] 卡片已发送 card_id={card_id}, 准备添加 {len(reply_buttons)} 个按钮", flush=True)
                 try:
-                    await feishu.update_card_with_buttons(card_id, reply_text, reply_buttons)
+                    short = all(len(b["text"]) <= 12 for b in reply_buttons)
+                    await feishu.update_card_with_buttons(card_id, reply_text, reply_buttons, flow=short)
                     print(f"[按钮] 按钮添加成功", flush=True)
                 except Exception as btn_err:
                     print(f"[按钮] 按钮添加失败: {btn_err}", flush=True)
@@ -685,7 +688,8 @@ async def _handle_menu_command(user_id: str, chat_id: str, cmd_text: str, card_m
     if card_msg_id:
         try:
             if reply_buttons:
-                await feishu.update_card_with_buttons(card_msg_id, reply_text, reply_buttons)
+                short = all(len(b["text"]) <= 12 for b in reply_buttons)
+                await feishu.update_card_with_buttons(card_msg_id, reply_text, reply_buttons, flow=short)
             else:
                 await feishu.update_card(card_msg_id, reply_text)
         except Exception as e:

@@ -230,19 +230,28 @@ class FeishuClient:
 
         return tmp_path
 
-    async def update_card_with_buttons(self, message_id: str, content: str, buttons: list[dict]):
-        """更新卡片内容并附加操作按钮（Card JSON 2.0: 按钮直接放 elements + behaviors 回调）"""
+    async def update_card_with_buttons(self, message_id: str, content: str, buttons: list[dict],
+                                      flow: bool = False):
+        """更新卡片内容并附加操作按钮。flow=True 时横排自动换行，False 时竖排。"""
         base = json.loads(_card_json(content))
+        btn_elements = []
         for i, btn in enumerate(buttons):
-            base["body"]["elements"].append({
+            btn_elements.append({
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": btn["text"]},
-                "type": "primary",
+                "type": "default",
                 "size": "small",
                 "name": f"btn_{i}",
                 "value": btn["value"],
                 "behaviors": [{"type": "callback", "value": btn["value"]}],
             })
+        if flow and btn_elements:
+            # 横排: column_set + flex_mode flow
+            columns = [{"tag": "column", "width": "auto", "elements": [b]} for b in btn_elements]
+            base["body"]["elements"].append({"tag": "column_set", "flex_mode": "flow", "columns": columns})
+        else:
+            # 竖排: 每个按钮独占一行
+            base["body"]["elements"].extend(btn_elements)
         card_content = json.dumps(base, ensure_ascii=False)
 
         async def _update():
