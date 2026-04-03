@@ -106,14 +106,23 @@ async def _handle_stop_command(sender_open_id: str) -> str:
 # ── 命令菜单（锁外即时响应）──────────────────────────────────
 
 _COMMAND_MENU = [
+    # 会话管理
     {"text": "🆕 新会话",      "value": {"action": "run_cmd", "cmd": "/new", "cid": ""}},
     {"text": "📋 新会话(规划)", "value": {"action": "run_cmd", "cmd": "/new plan", "cid": ""}},
     {"text": "📂 恢复会话",    "value": {"action": "run_cmd", "cmd": "/resume", "cid": ""}},
+    {"text": "⏹ 停止任务",     "value": {"action": "run_cmd", "cmd": "/stop", "cid": ""}},
+    # 配置
     {"text": "📊 状态",        "value": {"action": "run_cmd", "cmd": "/status", "cid": ""}},
     {"text": "🔄 切模型",      "value": {"action": "run_cmd", "cmd": "/model", "cid": ""}},
     {"text": "⚙️ 切模式",      "value": {"action": "run_cmd", "cmd": "/mode", "cid": ""}},
+    {"text": "📁 工作空间",    "value": {"action": "run_cmd", "cmd": "/ws", "cid": ""}},
+    # 查看
     {"text": "📈 用量",        "value": {"action": "run_cmd", "cmd": "/usage", "cid": ""}},
-    {"text": "⏹ 停止",        "value": {"action": "run_cmd", "cmd": "/stop", "cid": ""}},
+    {"text": "🛠 Skills",      "value": {"action": "run_cmd", "cmd": "/skills", "cid": ""}},
+    {"text": "🔌 MCP",         "value": {"action": "run_cmd", "cmd": "/mcp", "cid": ""}},
+    {"text": "📄 目录",        "value": {"action": "run_cmd", "cmd": "/ls", "cid": ""}},
+    # Claude Skills
+    {"text": "💾 提交代码",    "value": {"action": "reply", "reply": "/commit", "cid": ""}},
     {"text": "❓ 帮助",        "value": {"action": "run_cmd", "cmd": "/help", "cid": ""}},
 ]
 
