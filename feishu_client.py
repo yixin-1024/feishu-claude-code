@@ -262,6 +262,30 @@ class FeishuClient:
 
         await self._retry_with_backoff(_update, max_retries=3)
 
+    async def update_card_elements(self, message_id: str, elements: list[dict]):
+        """用自定义 elements 列表更新卡片（支持 markdown + button 混排）"""
+        card_content = json.dumps({
+            "schema": "2.0",
+            "body": {"elements": elements},
+        }, ensure_ascii=False)
+
+        async def _update():
+            req = (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    PatchMessageRequestBody.builder()
+                    .content(card_content)
+                    .build()
+                )
+                .build()
+            )
+            resp = await self.client.im.v1.message.apatch(req)
+            if not resp.success():
+                raise RuntimeError(f"patch 卡片失败: {resp.code} {resp.msg}")
+
+        await self._retry_with_backoff(_update, max_retries=3)
+
     async def reply_text(self, message_id: str, text: str) -> str:
         """回复纯文本消息（触发通知）"""
         async def _reply():

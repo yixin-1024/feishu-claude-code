@@ -105,38 +105,51 @@ async def _handle_stop_command(sender_open_id: str) -> str:
 
 # ── 命令菜单（锁外即时响应）──────────────────────────────────
 
-_COMMAND_MENU = [
-    # 会话管理
-    {"text": "🆕 新会话",      "value": {"action": "run_cmd", "cmd": "/new", "cid": ""}},
-    {"text": "📋 新会话(规划)", "value": {"action": "run_cmd", "cmd": "/new plan", "cid": ""}},
-    {"text": "📂 恢复会话",    "value": {"action": "run_cmd", "cmd": "/resume", "cid": ""}},
-    {"text": "⏹ 停止任务",     "value": {"action": "run_cmd", "cmd": "/stop", "cid": ""}},
-    # 配置
-    {"text": "📊 状态",        "value": {"action": "run_cmd", "cmd": "/status", "cid": ""}},
-    {"text": "🔄 切模型",      "value": {"action": "run_cmd", "cmd": "/model", "cid": ""}},
-    {"text": "⚙️ 切模式",      "value": {"action": "run_cmd", "cmd": "/mode", "cid": ""}},
-    {"text": "📁 工作空间",    "value": {"action": "run_cmd", "cmd": "/ws", "cid": ""}},
-    # 查看
-    {"text": "📈 用量",        "value": {"action": "run_cmd", "cmd": "/usage", "cid": ""}},
-    {"text": "🛠 Skills",      "value": {"action": "run_cmd", "cmd": "/skills", "cid": ""}},
-    {"text": "🔌 MCP",         "value": {"action": "run_cmd", "cmd": "/mcp", "cid": ""}},
-    {"text": "📄 目录",        "value": {"action": "run_cmd", "cmd": "/ls", "cid": ""}},
-    {"text": "❓ 帮助",        "value": {"action": "run_cmd", "cmd": "/help", "cid": ""}},
+_COMMAND_MENU_GROUPS = [
+    ("**会话**", [
+        {"text": "🆕 新会话",      "value": {"action": "run_cmd", "cmd": "/new"}},
+        {"text": "📋 新会话(规划)", "value": {"action": "run_cmd", "cmd": "/new plan"}},
+        {"text": "📂 恢复会话",    "value": {"action": "run_cmd", "cmd": "/resume"}},
+        {"text": "⏹ 停止任务",     "value": {"action": "run_cmd", "cmd": "/stop"}},
+    ]),
+    ("**配置**", [
+        {"text": "🔄 切模型",      "value": {"action": "run_cmd", "cmd": "/model"}},
+        {"text": "⚙️ 切模式",      "value": {"action": "run_cmd", "cmd": "/mode"}},
+        {"text": "📁 工作空间",    "value": {"action": "run_cmd", "cmd": "/ws"}},
+    ]),
+    ("**查看**", [
+        {"text": "📊 状态",        "value": {"action": "run_cmd", "cmd": "/status"}},
+        {"text": "📈 用量",        "value": {"action": "run_cmd", "cmd": "/usage"}},
+        {"text": "🛠 Skills",      "value": {"action": "run_cmd", "cmd": "/skills"}},
+        {"text": "🔌 MCP",         "value": {"action": "run_cmd", "cmd": "/mcp"}},
+        {"text": "📄 目录",        "value": {"action": "run_cmd", "cmd": "/ls"}},
+        {"text": "❓ 帮助",        "value": {"action": "run_cmd", "cmd": "/help"}},
+    ]),
 ]
 
 
 async def _show_command_menu(user_id: str, chat_id: str, is_group: bool, msg_id: str):
-    """显示命令菜单（按钮卡片），不走队列锁"""
-    buttons = [
-        {**btn, "value": {**btn["value"], "cid": chat_id}}
-        for btn in _COMMAND_MENU
-    ]
+    """显示分组命令菜单（markdown 标题 + 按钮混排），不走队列锁"""
+    elements = []
+    for i, (title, buttons) in enumerate(_COMMAND_MENU_GROUPS):
+        elements.append({"tag": "markdown", "content": title})
+        for btn in buttons:
+            value = {**btn["value"], "cid": chat_id}
+            elements.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": btn["text"]},
+                "type": "primary" if i == 0 else "default",
+                "size": "small",
+                "name": f"menu_{btn['value']['cmd'].replace('/', '').replace(' ', '_')}",
+                "value": value,
+                "behaviors": [{"type": "callback", "value": value}],
+            })
     try:
         if is_group:
-            card_id = await feishu.reply_card(msg_id, content="⚡ **快捷命令**", loading=False)
+            card_id = await feishu.reply_card(msg_id, content="⚡ 快捷命令", loading=False)
         else:
-            card_id = await feishu.send_card_to_user(user_id, content="⚡ **快捷命令**", loading=False)
-        await feishu.update_card_with_buttons(card_id, "⚡ **快捷命令**", buttons)
+            card_id = await feishu.send_card_to_user(user_id, content="⚡ 快捷命令", loading=False)
+        await feishu.update_card_elements(card_id, elements)
     except Exception as e:
         print(f"[error] 命令菜单发送失败: {e}", flush=True)
 
