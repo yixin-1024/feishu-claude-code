@@ -624,6 +624,49 @@ class SessionStore:
         await self.set_cwd(user_id, chat_id, path, workspace_name=name)
         return path
 
+    async def handover_session(
+        self, user_id: str, chat_id: str, session_id: str,
+        cwd: str = "", model: str = "",
+    ) -> dict:
+        """CLI handover: 将指定 session_id 设为当前会话。
+        返回 {"old_session_id", "old_summary"} 供通知使用。"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        cur = chat_data["current"]
+        old_sid = cur.get("session_id")
+        old_summary = ""
+
+        if old_sid and old_sid != session_id:
+            # 归档当前会话
+            chat_data["history"] = [h for h in chat_data["history"] if h["session_id"] != old_sid]
+            chat_data["history"].append({
+                "session_id": old_sid,
+                "started_at": cur.get("started_at", ""),
+                "preview": cur.get("preview", ""),
+            })
+            chat_data["history"] = chat_data["history"][-20:]
+            summaries = self._data[user_id].get("summaries", {})
+            old_summary = summaries.get(old_sid, "")
+            if not old_summary:
+                asyncio.create_task(self._bg_generate_summary(user_id, old_sid))
+
+        cur["session_id"] = session_id
+        cur["started_at"] = datetime.now().isoformat()
+        if cwd:
+            cur["cwd"] = cwd
+        if model:
+            cur["model"] = model
+        # preview 留空，等飞书第一条消息时再更新
+        cur["preview"] = ""
+        await self._save_async()
+        return {"old_session_id": old_sid or "", "old_summary": old_summary}
+
+    def find_primary_user(self) -> Optional[str]:
+        """找到主用户（第一个有 private chat 且 open_id 格式的用户）"""
+        for uid in self._data:
+            if uid.startswith("ou_") and "private" in self._data[uid]:
+                return uid
+        return None
+
     async def get_current_raw(self, user_id: str, chat_id: str = None) -> dict:
         """Get raw current session data for a specific chat"""
         if chat_id is None:

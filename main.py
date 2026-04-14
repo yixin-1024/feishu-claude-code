@@ -54,7 +54,16 @@ def _watchdog():
 
 # ── 全局单例 ──────────────────────────────────────────────────
 
-_ws_loop = None  # WebSocket 事件循环引用，供 HTTP 回调线程调度异步任务
+# 独立的 asyncio 事件循环，启动时即就绪，不依赖 lark SDK 的首条消息
+_bot_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+
+
+def _start_bot_loop():
+    asyncio.set_event_loop(_bot_loop)
+    _bot_loop.run_forever()
+
+
+threading.Thread(target=_start_bot_loop, daemon=True, name="bot-loop").start()
 
 lark_client = lark.Client.builder() \
     .app_id(config.FEISHU_APP_ID) \
@@ -612,7 +621,7 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     if action_type == "set_mode":
         mode = value.get("mode", "")
         if mode:
-            asyncio.ensure_future(_handle_set_mode(user_id, chat_id, mode, clicked_msg_id))
+            asyncio.run_coroutine_threadsafe(_handle_set_mode(user_id, chat_id, mode, clicked_msg_id), _bot_loop)
         resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "success"
@@ -623,8 +632,8 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     # 命令菜单按钮 → 当作用户发了一条命令消息
     if action_type == "run_cmd":
         cmd_text = value.get("cmd", "")
-        if cmd_text and _ws_loop:
-            asyncio.ensure_future(_handle_menu_command(user_id, chat_id, cmd_text, clicked_msg_id))
+        if cmd_text:
+            asyncio.run_coroutine_threadsafe(_handle_menu_command(user_id, chat_id, cmd_text, clicked_msg_id), _bot_loop)
         resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "info"
@@ -636,7 +645,7 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     if action_type == "resume_session":
         sid = value.get("sid", "")
         if sid:
-            asyncio.ensure_future(_handle_resume_session(user_id, chat_id, sid, clicked_msg_id))
+            asyncio.run_coroutine_threadsafe(_handle_resume_session(user_id, chat_id, sid, clicked_msg_id), _bot_loop)
         resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "info"
@@ -648,7 +657,7 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     reply_text = value.get("reply", "")
     if reply_text:
         print(f"[按钮] user={user_id[:8]}... reply={reply_text}", flush=True)
-        asyncio.ensure_future(_handle_button_reply(user_id, chat_id, reply_text, clicked_msg_id))
+        asyncio.run_coroutine_threadsafe(_handle_button_reply(user_id, chat_id, reply_text, clicked_msg_id), _bot_loop)
 
     resp = P2CardActionTriggerResponse()
     toast = CallBackToast()
@@ -767,15 +776,49 @@ async def _handle_button_reply(user_id: str, chat_id: str, text: str, clicked_ms
 # ── 飞书事件回调（同步）→ 调度异步任务 ───────────────────────
 
 def on_message_receive(data: P2ImMessageReceiveV1) -> None:
-    """
-    飞书 SDK 同步回调。
-    ws.Client 内部运行 asyncio loop，此处用 ensure_future 调度异步任务。
-    """
-    global _last_event, _ws_loop
+    """飞书 SDK 同步回调，调度异步任务到 _bot_loop。"""
+    global _last_event
     _last_event = time.time()
-    if _ws_loop is None:
-        _ws_loop = asyncio.get_event_loop()
-    asyncio.ensure_future(handle_message_async(data))
+    asyncio.run_coroutine_threadsafe(handle_message_async(data), _bot_loop)
+
+
+# ── CLI Handover ─────────────────────────────────────────────
+
+async def _handle_handover(session_id: str, cwd: str, model: str,
+                           target_user: str = "", target_chat: str = "") -> dict:
+    """处理来自 CLI 的 handover 请求：切换飞书当前会话并推送通知"""
+    user_id = target_user or store.find_primary_user()
+    if not user_id:
+        return {"ok": False, "error": "no user found in sessions, pass user_id param"}
+
+    chat_id = target_chat or user_id  # 默认私聊
+
+    result = await store.handover_session(user_id, chat_id, session_id, cwd=cwd, model=model)
+
+    # 构造通知文本
+    cur = await store.get_current_raw(user_id, chat_id)
+    display_cwd = cur.get("cwd", "~")
+    display_model = cur.get("model", "unknown")
+    display_mode = cur.get("permission_mode", "bypassPermissions")
+    old_summary = result.get("old_summary", "")
+    old_note = f"\n上个会话：「{old_summary}」" if old_summary else ""
+
+    notify_text = (
+        f"**CLI 会话已接入**\n"
+        f"Session: `{session_id[:12]}...`\n"
+        f"目录: `{display_cwd}`\n"
+        f"模型: `{display_model}`\n"
+        f"模式: `{display_mode}`{old_note}\n\n"
+        f"直接发消息即可继续对话。"
+    )
+
+    try:
+        await feishu.send_card_to_user(user_id, content=notify_text, loading=False)
+    except Exception as e:
+        print(f"[handover] 推送通知失败: {e}", flush=True)
+
+    print(f"[handover] session={session_id[:8]}... cwd={display_cwd}", flush=True)
+    return {"ok": True, "user_id": user_id, "session_id": session_id}
 
 
 # ── 卡片回调 HTTP 服务（配合 ngrok 暴露给飞书）────────────────
@@ -812,36 +855,64 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
 
         if action_type == "set_mode":
             mode = value.get("mode", "")
-            if mode and _ws_loop:
+            if mode:
                 asyncio.run_coroutine_threadsafe(
                     _handle_set_mode(user_id, chat_id, mode, clicked_msg_id),
-                    _ws_loop,
+                    _bot_loop,
                 )
             self._respond(200, {"toast": {"type": "success", "content": f"已切换: {mode}"}})
         elif action_type == "run_cmd":
             cmd_text = value.get("cmd", "")
-            if cmd_text and _ws_loop:
+            if cmd_text:
                 asyncio.run_coroutine_threadsafe(
                     _handle_menu_command(user_id, chat_id, cmd_text, clicked_msg_id),
-                    _ws_loop,
+                    _bot_loop,
                 )
             self._respond(200, {"toast": {"type": "info", "content": cmd_text}})
         elif action_type == "resume_session":
             sid = value.get("sid", "")
-            if sid and _ws_loop:
+            if sid:
                 asyncio.run_coroutine_threadsafe(
                     _handle_resume_session(user_id, chat_id, sid, clicked_msg_id),
-                    _ws_loop,
+                    _bot_loop,
                 )
             self._respond(200, {"toast": {"type": "info", "content": "正在恢复..."}})
         else:
             reply_text = value.get("reply", "")
-            if reply_text and _ws_loop:
+            if reply_text:
                 asyncio.run_coroutine_threadsafe(
                     _handle_button_reply(user_id, chat_id, reply_text, clicked_msg_id),
-                    _ws_loop,
+                    _bot_loop,
                 )
             self._respond(200, {"toast": {"type": "info", "content": f"已发送: {reply_text}"}})
+
+    def do_GET(self):
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/handover":
+            params = parse_qs(parsed.query)
+            session_id = params.get("session_id", [""])[0]
+            cwd = params.get("cwd", [""])[0]
+            model = params.get("model", [""])[0]
+            target_user = params.get("user_id", [""])[0]
+            target_chat = params.get("chat_id", [""])[0]
+
+            if not session_id:
+                self._respond(400, {"error": "session_id required"})
+                return
+
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    _handle_handover(session_id, cwd, model, target_user, target_chat),
+                    _bot_loop,
+                )
+                result = future.result(timeout=15)
+                self._respond(200, result)
+            except Exception as e:
+                self._respond(500, {"error": str(e)})
+        else:
+            self._respond(404, {"error": "not found"})
 
     def _respond(self, code, data):
         body = json.dumps(data).encode()

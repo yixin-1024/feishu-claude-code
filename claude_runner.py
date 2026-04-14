@@ -6,11 +6,22 @@
 import asyncio
 import json
 import os
+import subprocess as sp
 from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, CLAUDE_CLI
 
-IDLE_TIMEOUT = 300  # 5 分钟无任何输出视为挂死
+IDLE_TIMEOUT = 300  # 5 分钟无输出且无子进程，视为挂死
+_CHECK_INTERVAL = 30  # 静默时每 30 秒检查一次子进程
+
+
+def _has_children(pid: int) -> bool:
+    """进程是否有活跃子进程（说明在跑 bash 命令、编译等）。"""
+    try:
+        result = sp.run(["pgrep", "-P", str(pid)], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 def _extract_text_content(value) -> str:
@@ -90,18 +101,28 @@ async def run_claude(
         pending_tool_name = ""
         pending_tool_input_json = ""
 
+        idle_seconds = 0
+
         try:
             while True:
                 try:
                     raw_line = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=IDLE_TIMEOUT
+                        proc.stdout.readline(), timeout=_CHECK_INTERVAL
                     )
+                    idle_seconds = 0  # 收到输出，重置计时
                 except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
-                    raise RuntimeError(
-                        f"Claude 执行超时（{IDLE_TIMEOUT}秒无输出），已终止进程"
-                    )
+                    if _has_children(proc.pid):
+                        # 有子进程在跑（编译/下载等），继续等
+                        idle_seconds = 0
+                        continue
+                    idle_seconds += _CHECK_INTERVAL
+                    if idle_seconds >= IDLE_TIMEOUT:
+                        proc.kill()
+                        await proc.wait()
+                        raise RuntimeError(
+                            f"Claude 执行超时（{IDLE_TIMEOUT}秒无输出且无活跃子进程），已终止进程"
+                        )
+                    continue
 
                 if not raw_line:  # EOF
                     break
