@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 from bot_config import CLAUDE_CLI, DEFAULT_CWD
-from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title
+from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title, _find_session_file
 
 PLUGINS_DIR = os.path.expanduser("~/.claude/plugins")
 
@@ -52,6 +52,7 @@ HELP_TEXT = """\
 `/status` — 显示当前 session 信息
 `/cd [路径]` — 切换工具执行的工作目录
 `/ls [路径]` — 查看当前工作目录下的文件/目录
+`/exec <命令>` — 在当前 cwd 执行 shell 命令（30s 超时）
 `/workspace` 或 `/ws` — 保存/切换群组工作空间
 
 **查看能力：**
@@ -87,7 +88,7 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 # Bot 自身处理的命令，其余 /xxx 转发给 Claude
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "model", "mode", "status", "cd", "ls",
-    "workspace", "ws", "skills", "mcp", "usage", "stop",
+    "exec", "workspace", "ws", "skills", "mcp", "usage", "stop",
 }
 
 
@@ -390,6 +391,181 @@ def _list_mcp() -> str:
     return f"🔌 **已配置的 MCP Servers**\n\n{output}"
 
 
+def _context_window_for(model: str) -> int:
+    m = (model or "").lower()
+    if "1m" in m:
+        return 1_000_000
+    return 200_000
+
+
+def _fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
+    if n >= 1000:
+        return f"{n/1000:.1f}".rstrip("0").rstrip(".") + "k"
+    return str(n)
+
+
+def _read_last_usage(session_id: Optional[str]) -> dict:
+    """从 session 的 .jsonl 倒着找最后一条 assistant 消息的 usage。"""
+    if not session_id:
+        return {}
+    fpath = _find_session_file(session_id)
+    if not fpath:
+        return {}
+    try:
+        with open(fpath, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return {}
+    for raw in reversed(lines):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if d.get("type") != "assistant":
+            continue
+        usage = (d.get("message") or {}).get("usage") or {}
+        if usage:
+            return usage
+    return {}
+
+
+def _format_context_line(session_id: Optional[str], model: str) -> str:
+    usage = _read_last_usage(session_id)
+    if not usage:
+        return "上下文: （暂无数据，发一条消息后可见）"
+    total = (
+        int(usage.get("input_tokens", 0) or 0)
+        + int(usage.get("cache_read_input_tokens", 0) or 0)
+        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+        + int(usage.get("output_tokens", 0) or 0)
+    )
+    if total <= 0:
+        return "上下文: （无）"
+    window = _context_window_for(model)
+    pct = total / window * 100
+    return f"上下文: `{_fmt_tokens(total)} / {_fmt_tokens(window)} ({pct:.1f}%)`"
+
+
+def _get_quota_compact() -> str:
+    """获取 Claude Max 5h/7d 用量的紧凑一行版本，失败返回空串。"""
+    if sys.platform != "darwin":
+        return ""
+    import urllib.request, urllib.error, ssl
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True, text=True, timeout=5,
+        )
+        creds = json.loads(result.stdout.strip())
+        token = creds["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return ""
+    body = json.dumps({
+        "model": "claude-haiku-4-5-20251001", "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, context=ctx, timeout=8) as resp:
+            headers = dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        headers = dict(e.headers)
+    except Exception:
+        return ""
+
+    def h(key):
+        return headers.get(key) or headers.get(key.lower())
+
+    u5 = h("anthropic-ratelimit-unified-5h-utilization")
+    u7 = h("anthropic-ratelimit-unified-7d-utilization")
+    r5 = h("anthropic-ratelimit-unified-5h-reset")
+    if u5 is None and u7 is None:
+        return ""
+    parts = []
+    if u5 is not None:
+        parts.append(f"5h {float(u5)*100:.1f}%")
+    if u7 is not None:
+        parts.append(f"7d {float(u7)*100:.1f}%")
+    tail = ""
+    if r5:
+        try:
+            dt = datetime.fromtimestamp(int(r5))
+            diff = dt - datetime.now()
+            h_ = int(diff.total_seconds() // 3600)
+            m_ = int((diff.total_seconds() % 3600) // 60)
+            tail = f"（5h 重置 {h_}h{m_}m 后）"
+        except Exception:
+            pass
+    return f"Claude 配额: `{' · '.join(parts)}` {tail}".strip()
+
+
+_EXEC_TIMEOUT_SEC = 30
+_EXEC_MAX_OUTPUT = 3000
+
+
+async def _exec_shell(user_id: str, chat_id: str, store: SessionStore, args: str) -> str:
+    if not args:
+        return "⚠️ 用法：`/exec <shell命令>`，例如：`/exec git status`"
+    cur = await store.get_current_raw(user_id, chat_id)
+    cwd = cur.get("cwd", DEFAULT_CWD)
+    if not os.path.isdir(cwd):
+        return f"❌ 当前 cwd 不存在：`{cwd}`"
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            args,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except Exception as e:
+        return f"❌ 启动失败：{type(e).__name__}: {e}"
+
+    timed_out = False
+    try:
+        out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=_EXEC_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        timed_out = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        out_bytes = b""
+
+    output = (out_bytes or b"").decode("utf-8", errors="replace")
+    truncated = len(output) > _EXEC_MAX_OUTPUT
+    if truncated:
+        output = output[:_EXEC_MAX_OUTPUT] + f"\n...（输出超过 {_EXEC_MAX_OUTPUT} 字符已截断）"
+    if not output.strip():
+        output = "（无输出）"
+
+    header = [
+        f"💻 `$ {args}`",
+        f"📂 cwd: `{cwd}`",
+    ]
+    if timed_out:
+        header.append(f"⏱ 超时（>{_EXEC_TIMEOUT_SEC}s），已终止")
+    else:
+        header.append(f"返回码：`{proc.returncode}`")
+    return "\n".join(header) + f"\n```\n{output}\n```"
+
+
 async def _list_directory(user_id: str, chat_id: str, store: SessionStore, args: str) -> str:
     cur = await store.get_current_raw(user_id, chat_id)
     base_dir = cur.get("cwd", DEFAULT_CWD)
@@ -633,15 +809,23 @@ async def handle_command(
         workspace = cur.get("workspace") or "（未绑定）"
         started = cur.get("started_at", "")[:16].replace("T", " ")
         mode = cur.get("permission_mode") or "bypassPermissions"
-        return (
-            f"📊 **当前 Session 状态**\n"
-            f"Session ID: `{sid}`\n"
-            f"模型: `{model}`\n"
-            f"权限模式: `{mode}`\n"
-            f"工作空间: `{workspace}`\n"
-            f"工作目录: `{cwd}`\n"
-            f"开始时间: {started}"
-        )
+
+        context_line = _format_context_line(cur.get("session_id"), model)
+        quota_line = await asyncio.to_thread(_get_quota_compact)
+
+        lines = [
+            "📊 **当前 Session 状态**",
+            f"Session ID: `{sid}`",
+            f"模型: `{model}`",
+            f"权限模式: `{mode}`",
+            f"工作空间: `{workspace}`",
+            f"工作目录: `{cwd}`",
+            f"开始时间: {started}",
+            context_line,
+        ]
+        if quota_line:
+            lines.append(quota_line)
+        return "\n".join(lines)
 
     elif cmd == "mode":
         if not args:
@@ -674,6 +858,9 @@ async def handle_command(
 
     elif cmd == "ls":
         return await _list_directory(user_id, chat_id, store, args)
+
+    elif cmd == "exec":
+        return await _exec_shell(user_id, chat_id, store, args)
 
     elif cmd == "workspace":
         return await _handle_workspace_command(args, user_id, chat_id, store)

@@ -14,11 +14,20 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1.model import (
     CreateMessageRequest,
     CreateMessageRequestBody,
+    ListMessageRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
+
+
+def _sanitize_filename(name: str) -> str:
+    """把不安全的字符替换成下划线，保留 CJK/字母数字/常见标点。截断到 100 字符。"""
+    safe_chars = "-_.() "
+    cleaned = "".join(c if c.isalnum() or c in safe_chars else "_" for c in name)
+    cleaned = cleaned.strip()
+    return cleaned[:100] or "file"
 
 
 def _card_json(content: str, loading: bool = False) -> str:
@@ -97,6 +106,40 @@ class FeishuClient:
         self._app_id = app_id
         self._app_secret = app_secret
         self._domain = domain.rstrip("/")
+        self._bot_open_id: Optional[str] = None
+
+    async def get_bot_open_id(self) -> Optional[str]:
+        """查询机器人自己的 open_id（首次调用时请求 /bot/v3/info 并缓存）。"""
+        if self._bot_open_id:
+            return self._bot_open_id
+
+        def _fetch() -> Optional[str]:
+            import ssl
+            import urllib.request
+            ctx = ssl.create_default_context()
+            token_body = json.dumps({"app_id": self._app_id, "app_secret": self._app_secret}).encode()
+            token_req = urllib.request.Request(
+                f"{self._domain}/open-apis/auth/v3/tenant_access_token/internal",
+                data=token_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
+                token = json.loads(r.read())["tenant_access_token"]
+            info_req = urllib.request.Request(
+                f"{self._domain}/open-apis/bot/v3/info",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(info_req, context=ctx, timeout=10) as r:
+                data = json.loads(r.read())
+            return (data.get("bot") or {}).get("open_id")
+
+        try:
+            self._bot_open_id = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            print(f"[warn] 获取 bot open_id 失败: {e}", flush=True)
+            return None
+        return self._bot_open_id
 
     async def _retry_with_backoff(self, coro_func, max_retries: int = 3, initial_delay: float = 0.5):
         """
@@ -197,14 +240,31 @@ class FeishuClient:
     async def download_image(self, message_id: str, image_key: str) -> str:
         """下载飞书图片到临时文件，返回本地路径（不阻塞事件循环）"""
         return await asyncio.to_thread(
-            self._download_image_sync, message_id, image_key
+            self._download_resource_sync, message_id, image_key, "image", ""
         )
 
-    def _download_image_sync(self, message_id: str, image_key: str) -> str:
-        """同步下载逻辑，在线程池中执行"""
+    async def download_file(
+        self, message_id: str, file_key: str, msg_type: str = "file", file_name: str = "",
+    ) -> str:
+        """下载飞书文件/音频/视频到临时文件，返回本地路径。
+
+        msg_type: 原始消息类型（file/audio/media/sticker/image），决定 API 的 type 参数
+        file_name: 原始文件名（用于保留后缀和可读性）
+        """
+        return await asyncio.to_thread(
+            self._download_resource_sync, message_id, file_key, msg_type, file_name
+        )
+
+    def _download_resource_sync(
+        self, message_id: str, resource_key: str, msg_type: str, file_name: str,
+    ) -> str:
+        """同步下载逻辑，在线程池中执行。统一处理 image/file/audio/media。"""
         import ssl
         import urllib.request
         import uuid
+
+        # Feishu /resources 接口 type 只接受 image 或 file
+        api_type = "image" if msg_type in ("image", "sticker") else "file"
 
         ctx = ssl.create_default_context()
 
@@ -218,19 +278,61 @@ class FeishuClient:
         with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
             token = json.loads(r.read())["tenant_access_token"]
 
-        url = f"{self._domain}/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image"
-        img_req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-        tmp_path = os.path.join(tempfile.gettempdir(), f"feishu-img-{uuid.uuid4().hex[:8]}.jpg")
-        with urllib.request.urlopen(img_req, context=ctx, timeout=15) as r:
-            ct = r.headers.get("Content-Type", "")
-            if "png" in ct:
-                tmp_path = tmp_path.replace(".jpg", ".png")
-            elif "gif" in ct:
-                tmp_path = tmp_path.replace(".jpg", ".gif")
+        url = f"{self._domain}/open-apis/im/v1/messages/{message_id}/resources/{resource_key}?type={api_type}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+
+        tmp_dir = tempfile.gettempdir()
+
+        # 组装本地路径：优先用原始文件名保留可读性和后缀
+        if file_name:
+            safe_name = _sanitize_filename(file_name)
+            tmp_path = os.path.join(tmp_dir, f"feishu-{uuid.uuid4().hex[:6]}-{safe_name}")
+        else:
+            # 无 file_name 时用 msg_type 作前缀；图片后缀根据 Content-Type 确定
+            default_ext = ".jpg" if api_type == "image" else ".bin"
+            tmp_path = os.path.join(
+                tmp_dir, f"feishu-{msg_type}-{uuid.uuid4().hex[:8]}{default_ext}"
+            )
+
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+            if api_type == "image" and not file_name:
+                ct = r.headers.get("Content-Type", "")
+                if "png" in ct:
+                    tmp_path = tmp_path[:-4] + ".png"
+                elif "gif" in ct:
+                    tmp_path = tmp_path[:-4] + ".gif"
+                elif "webp" in ct:
+                    tmp_path = tmp_path[:-4] + ".webp"
             with open(tmp_path, "wb") as f:
                 f.write(r.read())
 
         return tmp_path
+
+    async def list_thread_messages(self, thread_id: str, limit: int = 200) -> list:
+        """列出话题里的消息，按创建时间升序。返回 Message 对象列表。"""
+        messages: list = []
+        page_token = ""
+        while len(messages) < limit:
+            builder = (
+                ListMessageRequest.builder()
+                .container_id_type("thread")
+                .container_id(thread_id)
+                .sort_type("ByCreateTimeAsc")
+                .page_size(min(50, limit - len(messages)))
+            )
+            if page_token:
+                builder = builder.page_token(page_token)
+            req = builder.build()
+            resp = await self.client.im.v1.message.alist(req)
+            if not resp.success():
+                raise RuntimeError(f"list thread messages 失败: {resp.code} {resp.msg}")
+            items = (resp.data.items or []) if resp.data else []
+            messages.extend(items)
+            has_more = bool(resp.data and resp.data.has_more)
+            page_token = (resp.data.page_token or "") if resp.data else ""
+            if not has_more or not page_token:
+                break
+        return messages
 
     async def update_card_with_buttons(self, message_id: str, content: str, buttons: list[dict],
                                       flow: bool = False):

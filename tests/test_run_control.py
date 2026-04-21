@@ -28,21 +28,21 @@ class RunControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_run_returns_false_when_no_active_run(self):
         registry = ActiveRunRegistry()
 
-        stopped = await stop_run(registry, "user-1")
+        stopped = await stop_run(registry, "user-1", "chat-1")
 
         self.assertFalse(stopped)
 
     async def test_stop_run_terminates_active_process_and_marks_state(self):
         registry = ActiveRunRegistry()
-        run = registry.start_run("user-1", "card-1")
+        run = registry.start_run("user-1", "chat-1", "card-1")
         proc = FakeProc()
-        registry.attach_process("user-1", proc)
+        registry.attach_process("user-1", "chat-1", proc)
         stopped_runs = []
 
         async def on_stopped(active_run):
             stopped_runs.append(active_run)
 
-        stopped = await stop_run(registry, "user-1", on_stopped=on_stopped)
+        stopped = await stop_run(registry, "user-1", "chat-1", on_stopped=on_stopped)
 
         self.assertTrue(stopped)
         self.assertTrue(run.stop_requested)
@@ -54,14 +54,26 @@ class RunControlTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_attach_process_terminates_if_stop_was_requested_earlier(self):
         registry = ActiveRunRegistry()
-        run = registry.start_run("user-1", "card-1")
+        run = registry.start_run("user-1", "chat-1", "card-1")
         run.stop_requested = True
         proc = FakeProc()
 
-        registry.attach_process("user-1", proc)
+        registry.attach_process("user-1", "chat-1", proc)
 
         self.assertIs(run.proc, proc)
         self.assertTrue(proc.terminate_called)
+
+    async def test_runs_are_isolated_per_chat(self):
+        registry = ActiveRunRegistry()
+        run_a = registry.start_run("user-1", "chat-a", "card-a")
+        run_b = registry.start_run("user-1", "chat-b", "card-b")
+
+        self.assertIs(registry.get_run("user-1", "chat-a"), run_a)
+        self.assertIs(registry.get_run("user-1", "chat-b"), run_b)
+
+        registry.clear_run("user-1", "chat-a", run_a)
+        self.assertIsNone(registry.get_run("user-1", "chat-a"))
+        self.assertIs(registry.get_run("user-1", "chat-b"), run_b)
 
 
 if __name__ == "__main__":

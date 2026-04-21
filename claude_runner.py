@@ -55,6 +55,8 @@ async def run_claude(
     on_text_chunk: Optional[Callable[[str], None]] = None,
     on_tool_use: Optional[Callable[[str, dict], None]] = None,
     on_process_start: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
+    on_usage: Optional[Callable[[dict], None]] = None,
+    append_system_prompt: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
     """
     调用 claude CLI 并流式解析输出。
@@ -76,6 +78,8 @@ async def run_claude(
             cmd += ["--resume", active_session_id]
         if model:
             cmd += ["--model", model]
+        if append_system_prompt:
+            cmd += ["--append-system-prompt", append_system_prompt]
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
@@ -184,6 +188,27 @@ async def run_claude(
                     final_text = _extract_text_content(data.get("result", ""))
                     if final_text:
                         full_text = final_text
+                    # usage 顶层是跨内部迭代的累加值，不反映上下文实际占用。
+                    # iterations[-1] 才是最后一次内部调用的真实 prompt 大小，≈ 当前 context fill。
+                    raw_usage = dict(data.get("usage") or {})
+                    iterations = raw_usage.get("iterations") or []
+                    if isinstance(iterations, list) and iterations:
+                        last = iterations[-1]
+                        if isinstance(last, dict):
+                            usage = dict(last)
+                        else:
+                            usage = raw_usage
+                    else:
+                        usage = raw_usage
+                    usage.pop("iterations", None)
+                    # modelUsage 里带 contextWindow，优先用准确值
+                    model_usage = data.get("modelUsage") or {}
+                    if isinstance(model_usage, dict) and model_usage:
+                        first = next(iter(model_usage.values()), {})
+                        if isinstance(first, dict) and first.get("contextWindow"):
+                            usage["_context_window"] = first["contextWindow"]
+                    if usage:
+                        await _fire_callback(on_usage, usage)
 
         except RuntimeError:
             raise

@@ -1,10 +1,11 @@
 # feishu-claude-code
 
-在飞书里直接和你本机的 Claude Code 对话。
+在飞书/Lark 里直接和你本机的 Claude Code 对话。
 
-WebSocket 长连接，流式卡片输出，手机上随时 code review、debug、问问题。
+WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心跳、自主发文件/截图。手机上随时 code review、debug、问问题。
 
 > 复用 Claude Max/Pro 订阅，不需要 API Key，不需要公网 IP。
+> 同时支持 **飞书** (`open.feishu.cn`) 和 **Lark 国际版** (`open.larksuite.com`)。
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.11+-blue" alt="Python" />
@@ -18,7 +19,14 @@ WebSocket 长连接，流式卡片输出，手机上随时 code review、debug�
 
 - Claude 边想边输出，不是等半天发一坨
 - 工具调用进度实时显示 (Bash、Read、Edit、Grep 等)
+- **运行心跳**：卡片底部实时滚动 `⏱ 总时长 · 🔧 当前工具耗时 · ⚠️ 无输出 N 秒`，长任务不再让人怀疑进程死没死
 - 长回复自动分段，不丢内容
+
+**Bot 主动发文件/截图/文档**
+
+- Claude 知道自己在 Lark 里，用户说"截图发群里"就会自己调 `lark-cli` 直接发到评论区
+- 输出过长时自动建 Lark 文档，只把 doc URL 回给聊天，不刷屏卡片
+- 动态系统提示注入当前 `chat_id` / `thread_id` / `message_id`，三种场景（私聊/普通群/话题群）无缝切换
 
 **跨设备 Session 管理**
 
@@ -33,22 +41,33 @@ WebSocket 长连接，流式卡片输出，手机上随时 code review、debug�
 - Y/N 确认、编号选项、Plan 模式审批，一键响应
 - 输入 `/` 显示命令菜单，按钮分组一目了然
 
-**群聊支持**
+**群聊和话题群支持**
 
-- @机器人 即可对话，不 @ 的消息静默忽略
-- 每个群独立 session、模型、工作目录
-- `/ws` 为不同群绑定不同项目，多群并发互不阻塞
+- **精确 @ 识别**：首次启动拉取 bot 自己的 `open_id` 缓存，只有真正 @ 到 bot 才响应
+- **话题群上下文**：在话题评论里 @bot，自动拉取 `last_seen` 之后的话题历史作为前缀，不丢上下文
+- **忘记 @ 补 @**：第一条忘记 @bot 没关系，下一条补一个 `@bot` 就能把前面那条捡回来处理（话题群生效）
+- 每个群/话题独立 session、模型、工作目录（同用户跨 chat 互不阻塞）
+- `/ws` 为不同群绑定不同项目
+- **访问控制**：`ALLOWED_OPEN_IDS` 用户白名单、`ALLOWED_GROUP_CHAT_IDS` 群聊白名单，未授权者静默忽略
 
-**图片识别**
+**消息队列**
+
+- 新消息不再打断当前任务，而是排队等待（同 chat 串行，跨 chat 并发）
+- 当前任务繁忙时新消息收到 `📬 排队中` 回执
+- 想真正打断时用 `/stop` 显式终止
+
+**图片 / 文件 / 富文本**
 
 - 直接发截图，Claude 自动下载并分析
+- 支持文件 (`file`)、post 富文本（图文混排）、语音、视频下载
+- Lark 附件会被解析后转成本地路径喂给 Claude
 
 **健壮运行**
 
-- 新消息自动中断上一个运行中的任务 (优雅 SIGTERM + SIGKILL)
 - 智能空闲超时: 检测子进程存活，编译/下载不会被误杀
-- 看门狗 4 小时自动重启，防止 WebSocket 假死
+- 看门狗 6 小时自动重启，防止 WebSocket 假死
 - API 调用自动重试 (指数退避)
+- `cc-lark` 脚本封装 launchd + ngrok，一键 install/start/stop/restart/status/logs
 
 ## 快速开始
 
@@ -119,6 +138,7 @@ python3 main.py
 |------|------|
 | `/cd ~/project` | 切换工作目录 |
 | `/ls` | 查看目录内容 |
+| `/exec <cmd>` | 在当前 cwd 执行 shell 命令 (30s 超时) |
 | `/ws save api ~/projects/api` | 保存命名工作空间 |
 | `/ws use api` | 绑定当前会话到工作空间 |
 | `/ws list` | 列出所有工作空间 |
@@ -214,26 +234,45 @@ python3 main.py
 
 | 变量 | 必填 | 默认值 | 说明 |
 |------|:---:|-------|------|
-| `FEISHU_APP_ID` | 是 | - | 飞书应用 App ID |
-| `FEISHU_APP_SECRET` | 是 | - | 飞书应用 App Secret |
+| `FEISHU_APP_ID` | 是 | - | 飞书/Lark 应用 App ID |
+| `FEISHU_APP_SECRET` | 是 | - | 飞书/Lark 应用 App Secret |
+| `LARK_DOMAIN` | 否 | `https://open.feishu.cn` | Lark 国际版填 `https://open.larksuite.com` |
 | `DEFAULT_MODEL` | 否 | `claude-opus-4-6` | 默认 Claude 模型 |
 | `DEFAULT_CWD` | 否 | `~` | Claude CLI 默认工作目录 |
 | `PERMISSION_MODE` | 否 | `bypassPermissions` | 工具权限模式 |
+| `ALLOWED_OPEN_IDS` | 推荐 | 空=允许所有 | 用户 open_id 白名单，逗号分隔 |
+| `ALLOWED_GROUP_CHAT_IDS` | 推荐 | 空=禁用所有群 | 群聊 chat_id 白名单 (oc_*)，逗号分隔 |
+| `CALLBACK_PORT` | 否 | `9981` | 卡片按钮回调 HTTP 端口 |
+| `NGROK_DOMAIN` | 否 | 随机 | ngrok 固定域名 (避免每次重启换 URL) |
 | `STREAM_CHUNK_SIZE` | 否 | `20` | 流式推送的字符积累阈值 |
 | `CLAUDE_CLI_PATH` | 否 | 自动查找 | Claude CLI 可执行文件路径 |
-| `CALLBACK_PORT` | 否 | `9981` | 卡片按钮回调 HTTP 端口 |
+
+> 查自己的 open_id / chat_id：bot 启动后发条消息，终端日志里会打印 `user=ou_...` / `chat=oc_...`。
 
 ## 部署
 
-### macOS (launchctl)
+### macOS：推荐用 `cc-lark` 包装脚本
+
+一条命令装好 launchd + ngrok + 开机自启 + 符号链接：
+
+```bash
+./deploy/cc-lark install          # 装 bot + ngrok，开机自启
+./deploy/cc-lark install --no-ngrok  # 只装 bot
+cc-lark status                    # 查状态 + 看最近 10 行日志
+cc-lark restart                   # 重启（ngrok 优先，再重启 bot）
+cc-lark logs -f                   # 跟踪 bot 日志
+cc-lark logs ngrok -f             # 跟踪 ngrok 日志
+cc-lark uninstall                 # 卸载
+```
+
+脚本会读 `.env` 里的 `CALLBACK_PORT` / `NGROK_DOMAIN`，自动生成 plist。`ALLOWED_GROUP_CHAT_IDS=oc_xxx,oc_yyy` 支持多群白名单。
+
+### macOS：手动 launchctl（不走包装）
 
 ```bash
 cp deploy/feishu-claude.plist ~/Library/LaunchAgents/com.feishu-claude.bot.plist
 # 修改 plist 中的路径为实际路径
-
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.feishu-claude.bot.plist
-launchctl list | grep feishu-claude
-tail -f /tmp/feishu-claude.log
 ```
 
 ### Linux (systemd)
@@ -247,7 +286,7 @@ sudo systemctl enable --now feishu-claude
 journalctl -u feishu-claude -f
 ```
 
-服务会自动重启。看门狗每 4 小时主动重启一次进程，刷新 WebSocket 连接。
+服务会自动重启。看门狗每 6 小时主动重启一次进程，刷新 WebSocket 连接。
 
 ## CLI Handover
 
@@ -263,20 +302,24 @@ python3 handover.py "对话中的一段独特文本"
 
 ## English
 
-**feishu-claude-code** bridges your local Claude Code CLI with Feishu/Lark messenger via WebSocket.
+**feishu-claude-code** bridges your local Claude Code CLI with Feishu/Lark messenger via WebSocket. Supports both Feishu (`open.feishu.cn`) and Lark international (`open.larksuite.com`).
 
-- **No public IP needed** - Feishu WebSocket long connection, runs on your local machine
-- **Streaming card output** - Real-time typing effect with tool call progress visualization
-- **Reuses Claude Max/Pro subscription** - No API key required
-- **Cross-device sessions** - Continue conversations between phone and desktop
-- **Group chat support** - @mention filtering, per-group session isolation, concurrent groups
-- **Interactive buttons** - Options and confirmations rendered as clickable buttons
-- **Image recognition** - Send screenshots for Claude to analyze
-- **Skills passthrough** - `/commit`, `/review`, etc. work directly in Feishu
-- **CLI handover** - Transfer terminal sessions to Feishu on the go
-- **Smart idle timeout** - Detects active child processes, won't kill long compilations
+- **No public IP needed** — WebSocket long connection, runs on your local machine
+- **Streaming card output** — Real-time typing, tool-call progress, and a live footer showing elapsed / current-tool / idle time so long-running scripts never look frozen
+- **Autonomous file/screenshot/doc sending** — Claude knows it's in Lark and can call `lark-cli` to push images, files, or auto-generate a Lark doc and reply with the URL when output is long
+- **Reuses Claude Max/Pro subscription** — No API key required
+- **Cross-device sessions** — Continue between phone, desktop, and terminal (`/resume` + CLI handover)
+- **Topic/thread groups** — Auto-fetch thread history as context; forgot to `@bot`? Just add one in the next message and it catches up
+- **Precise @ detection** — Caches the bot's own open_id; only replies when actually mentioned
+- **Access control** — Per-user and per-group allowlists
+- **Queued messages** — New messages queue instead of interrupting; explicit `/stop` cancels
+- **Interactive buttons** — Options and confirmations rendered as clickable buttons
+- **Image / file / post support** — Screenshots, attachments, rich-text posts all downloaded and piped to Claude
+- **Skills passthrough** — `/commit`, `/review`, etc. work directly
+- **Smart idle timeout** — Detects active child processes, won't kill long compilations
+- **`cc-lark` launchctl wrapper** — One-command install/start/stop/restart/status/logs for macOS
 
-Quick start: clone, `pip install -r requirements.txt`, configure `.env` with Feishu app credentials, run `python3 main.py`.
+Quick start: clone, `pip install -r requirements.txt`, configure `.env` with Feishu/Lark app credentials, run `python3 main.py` (or `./deploy/cc-lark install` on macOS).
 
 See Chinese sections above for detailed setup instructions.
 

@@ -6,26 +6,33 @@ from typing import Awaitable, Callable, Optional
 @dataclass
 class ActiveRun:
     user_id: str
+    chat_id: str
     card_msg_id: str
     proc: object | None = None
     stop_requested: bool = False
     stop_announced: bool = False
 
 
+def _key(user_id: str, chat_id: str) -> str:
+    return f"{user_id}::{chat_id}"
+
+
 class ActiveRunRegistry:
+    """按 (user_id, chat_id) 索引 — 同一用户在不同 chat/话题里的任务互不干扰。"""
+
     def __init__(self):
         self._runs: dict[str, ActiveRun] = {}
 
-    def start_run(self, user_id: str, card_msg_id: str) -> ActiveRun:
-        active_run = ActiveRun(user_id=user_id, card_msg_id=card_msg_id)
-        self._runs[user_id] = active_run
+    def start_run(self, user_id: str, chat_id: str, card_msg_id: str) -> ActiveRun:
+        active_run = ActiveRun(user_id=user_id, chat_id=chat_id, card_msg_id=card_msg_id)
+        self._runs[_key(user_id, chat_id)] = active_run
         return active_run
 
-    def get_run(self, user_id: str) -> Optional[ActiveRun]:
-        return self._runs.get(user_id)
+    def get_run(self, user_id: str, chat_id: str) -> Optional[ActiveRun]:
+        return self._runs.get(_key(user_id, chat_id))
 
-    def attach_process(self, user_id: str, proc) -> Optional[ActiveRun]:
-        active_run = self._runs.get(user_id)
+    def attach_process(self, user_id: str, chat_id: str, proc) -> Optional[ActiveRun]:
+        active_run = self._runs.get(_key(user_id, chat_id))
         if active_run is None:
             return None
         active_run.proc = proc
@@ -33,13 +40,14 @@ class ActiveRunRegistry:
             proc.terminate()
         return active_run
 
-    def clear_run(self, user_id: str, active_run: Optional[ActiveRun] = None):
-        current = self._runs.get(user_id)
+    def clear_run(self, user_id: str, chat_id: str, active_run: Optional[ActiveRun] = None):
+        k = _key(user_id, chat_id)
+        current = self._runs.get(k)
         if current is None:
             return
         if active_run is not None and current is not active_run:
             return
-        self._runs.pop(user_id, None)
+        self._runs.pop(k, None)
 
 
 async def _maybe_await(result):
@@ -50,10 +58,11 @@ async def _maybe_await(result):
 async def stop_run(
     registry: ActiveRunRegistry,
     user_id: str,
+    chat_id: str,
     on_stopped: Optional[Callable[[ActiveRun], Awaitable[None] | None]] = None,
     grace_seconds: float = 2.0,
 ) -> bool:
-    active_run = registry.get_run(user_id)
+    active_run = registry.get_run(user_id, chat_id)
     if active_run is None:
         return False
 

@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+# cc-lark — 飞书/Lark Claude Bot 服务控制
+# 封装 launchd，支持 install/start/stop/restart/status/logs。
+
+set -euo pipefail
+
+LABEL="com.cc-lark.bot"
+NGROK_LABEL="com.cc-lark.ngrok"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+NGROK_PLIST="$HOME/Library/LaunchAgents/${NGROK_LABEL}.plist"
+LOG_FILE="$HOME/.feishu-claude/cc-lark.log"
+NGROK_LOG="$HOME/.feishu-claude/cc-lark-ngrok.log"
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
+SCRIPT_PATH="$REPO_ROOT/deploy/cc-lark"
+ENV_FILE="$REPO_ROOT/.env"
+
+_service_target() { echo "gui/$UID/$1"; }
+_is_loaded() { launchctl print "$(_service_target "$1")" >/dev/null 2>&1; }
+
+_read_env_var() {
+    # 从 .env 里读一行 KEY=VALUE，不存在返回空。简单实现，够用。
+    local key="$1"
+    [[ -f "$ENV_FILE" ]] || return 0
+    grep -E "^[[:space:]]*${key}=" "$ENV_FILE" 2>/dev/null \
+        | tail -n 1 \
+        | sed -E "s/^[[:space:]]*${key}=//; s/^\"//; s/\"$//; s/^'//; s/'$//"
+}
+
+_require_plist() {
+    if [[ ! -f "$PLIST" ]]; then
+        echo "❌ 未安装：$PLIST 不存在" >&2
+        echo "   先运行: cc-lark install" >&2
+        exit 1
+    fi
+}
+
+_write_ngrok_plist() {
+    local ngrok_bin port domain args
+    ngrok_bin="$(command -v ngrok || true)"
+    if [[ -z "$ngrok_bin" ]]; then
+        return 1  # 没装 ngrok 跳过
+    fi
+    port="$(_read_env_var CALLBACK_PORT)"
+    port="${port:-9981}"
+    domain="$(_read_env_var NGROK_DOMAIN)"
+
+    mkdir -p "$(dirname "$NGROK_LOG")"
+    if [[ -n "$domain" ]]; then
+        args="        <string>http</string>
+        <string>--url</string>
+        <string>${domain}</string>
+        <string>${port}</string>"
+    else
+        args="        <string>http</string>
+        <string>${port}</string>"
+    fi
+
+    cat > "$NGROK_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${NGROK_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${ngrok_bin}</string>
+${args}
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>${NGROK_LOG}</string>
+    <key>StandardErrorPath</key><string>${NGROK_LOG}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>${HOME}</string>
+    </dict>
+</dict>
+</plist>
+EOF
+    echo "📝 写入 plist: $NGROK_PLIST"
+    echo "   ngrok  : $ngrok_bin"
+    echo "   port   : $port"
+    echo "   domain : ${domain:-（free 随机域名）}"
+    return 0
+}
+
+_write_plist() {
+    local python_bin claude_bin path_env
+    python_bin="${PYTHON_BIN:-$(command -v python3 || true)}"
+    claude_bin="$(command -v claude || true)"
+    if [[ -z "$python_bin" ]]; then
+        echo "❌ 找不到 python3（可用 PYTHON_BIN=/path/to/python3 覆盖）" >&2
+        exit 1
+    fi
+
+    path_env="$(dirname "$python_bin"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    if [[ -n "$claude_bin" ]] && [[ ":$path_env:" != *":$(dirname "$claude_bin"):"* ]]; then
+        path_env="$(dirname "$claude_bin"):$path_env"
+    fi
+
+    mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$PLIST")"
+
+    cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${python_bin}</string>
+        <string>${REPO_ROOT}/main.py</string>
+    </array>
+    <key>WorkingDirectory</key><string>${REPO_ROOT}</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key><false/>
+    </dict>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>${LOG_FILE}</string>
+    <key>StandardErrorPath</key><string>${LOG_FILE}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>${path_env}</string>
+        <key>HOME</key><string>${HOME}</string>
+    </dict>
+</dict>
+</plist>
+EOF
+    echo "📝 写入 plist: $PLIST"
+    echo "   python : $python_bin"
+    echo "   claude : ${claude_bin:-（未找到，bot 可能报错）}"
+}
+
+_try_symlink() {
+    local candidates=(/opt/homebrew/bin /usr/local/bin "$HOME/.local/bin")
+    for dir in "${candidates[@]}"; do
+        if [[ -d "$dir" ]] && [[ -w "$dir" ]]; then
+            ln -sf "$SCRIPT_PATH" "$dir/cc-lark"
+            echo "🔗 已创建 symlink: $dir/cc-lark -> $SCRIPT_PATH"
+            return 0
+        fi
+    done
+    echo "⚠️ 未找到可写的 PATH 目录，请手动添加: ln -s $SCRIPT_PATH /usr/local/bin/cc-lark"
+    return 1
+}
+
+_bootstrap_service() {
+    local label="$1" plist="$2"
+    if _is_loaded "$label"; then
+        launchctl bootout "$(_service_target "$label")" 2>/dev/null || true
+        sleep 1
+    fi
+    launchctl bootstrap "gui/$UID" "$plist"
+    launchctl enable "$(_service_target "$label")" 2>/dev/null || true
+}
+
+cmd_install() {
+    local skip_ngrok=false
+    [[ "${1:-}" == "--no-ngrok" ]] && skip_ngrok=true
+
+    _write_plist
+    _bootstrap_service "$LABEL" "$PLIST"
+    _try_symlink || true
+
+    if ! $skip_ngrok && _write_ngrok_plist; then
+        # 如果已有外部 ngrok 在跑同一端口，先停掉避免冲突
+        pgrep -x ngrok >/dev/null && { pkill -x ngrok 2>/dev/null || true; sleep 2; }
+        _bootstrap_service "$NGROK_LABEL" "$NGROK_PLIST"
+        # bot 刚刚可能在 ngrok 启动前已经跑了，重启让它抓到 tunnel URL
+        sleep 3
+        launchctl kickstart -k "$(_service_target "$LABEL")" 2>/dev/null || true
+    fi
+
+    echo "✅ 安装完成，开机自启已启用"
+    echo "   bot   日志: $LOG_FILE"
+    [[ -f "$NGROK_PLIST" ]] && echo "   ngrok 日志: $NGROK_LOG"
+    echo "   状态查询: cc-lark status"
+}
+
+cmd_uninstall() {
+    for lbl in "$LABEL" "$NGROK_LABEL"; do
+        _is_loaded "$lbl" && launchctl bootout "$(_service_target "$lbl")" 2>/dev/null || true
+    done
+    rm -f "$PLIST" "$NGROK_PLIST"
+    for dir in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
+        [[ -L "$dir/cc-lark" ]] && rm -f "$dir/cc-lark"
+    done
+    echo "✅ 已卸载（bot + ngrok plist + symlink 都清掉了）"
+}
+
+cmd_start() {
+    _require_plist
+    for lbl_plist in "$LABEL:$PLIST" "$NGROK_LABEL:$NGROK_PLIST"; do
+        local lbl="${lbl_plist%%:*}" pl="${lbl_plist##*:}"
+        [[ ! -f "$pl" ]] && continue
+        if _is_loaded "$lbl"; then
+            launchctl kickstart "$(_service_target "$lbl")"
+        else
+            launchctl bootstrap "gui/$UID" "$pl"
+        fi
+    done
+    echo "✅ 已启动"
+}
+
+cmd_stop() {
+    local stopped=0
+    for lbl in "$LABEL" "$NGROK_LABEL"; do
+        if _is_loaded "$lbl"; then
+            launchctl bootout "$(_service_target "$lbl")" 2>/dev/null || true
+            stopped=$((stopped + 1))
+        fi
+    done
+    if [[ $stopped -eq 0 ]]; then
+        echo "ℹ️ 服务本来就没在跑"
+    else
+        echo "⏹ 已停止 $stopped 个服务（不会自动拉起）"
+    fi
+}
+
+cmd_restart() {
+    _require_plist
+    for lbl_plist in "$NGROK_LABEL:$NGROK_PLIST" "$LABEL:$PLIST"; do
+        local lbl="${lbl_plist%%:*}" pl="${lbl_plist##*:}"
+        [[ ! -f "$pl" ]] && continue
+        if _is_loaded "$lbl"; then
+            launchctl kickstart -k "$(_service_target "$lbl")"
+        else
+            launchctl bootstrap "gui/$UID" "$pl"
+        fi
+    done
+    echo "♻️ 已重启（ngrok 先，bot 后）"
+}
+
+_status_one() {
+    local name="$1" lbl="$2" plist="$3" logf="$4"
+    if [[ ! -f "$plist" ]]; then
+        printf "  %-8s %s\n" "$name:" "未安装"
+        return
+    fi
+    if ! _is_loaded "$lbl"; then
+        printf "  %-8s %s\n" "$name:" "已安装但未运行"
+        return
+    fi
+    local out pid last_exit state
+    out="$(launchctl print "$(_service_target "$lbl")" 2>/dev/null || true)"
+    pid=$(echo "$out" | awk -F'= ' '/^\tpid = /{print $2}' | tr -d ' ')
+    last_exit=$(echo "$out" | awk -F'= ' '/last exit code/{print $2}' | tr -d ' ')
+    state=$(echo "$out" | awk -F'= ' '/^\tstate = /{print $2}' | tr -d ' ')
+    printf "  %-8s %s (PID %s, last_exit=%s)\n" "$name:" "${state:-?}" "${pid:-?}" "${last_exit:-n/a}"
+}
+
+cmd_status() {
+    if [[ ! -f "$PLIST" ]]; then
+        echo "📊 未安装（运行 cc-lark install）"
+        return 1
+    fi
+    echo "📊 服务状态"
+    _status_one "bot"   "$LABEL"       "$PLIST"       "$LOG_FILE"
+    _status_one "ngrok" "$NGROK_LABEL" "$NGROK_PLIST" "$NGROK_LOG"
+    echo
+    echo "  bot   日志: $LOG_FILE"
+    [[ -f "$NGROK_PLIST" ]] && echo "  ngrok 日志: $NGROK_LOG"
+    if [[ -f "$LOG_FILE" ]]; then
+        echo
+        echo "── bot 最近 10 行 ──"
+        tail -n 10 "$LOG_FILE"
+    fi
+}
+
+cmd_logs() {
+    local follow=false n=50 target="bot"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--follow) follow=true; shift ;;
+            -n) n="$2"; shift 2 ;;
+            -n*) n="${1#-n}"; shift ;;
+            bot|ngrok) target="$1"; shift ;;
+            *) shift ;;
+        esac
+    done
+    local f="$LOG_FILE"
+    [[ "$target" == "ngrok" ]] && f="$NGROK_LOG"
+    if [[ ! -f "$f" ]]; then
+        echo "❌ 日志文件不存在: $f" >&2
+        exit 1
+    fi
+    if $follow; then tail -n "$n" -f "$f"; else tail -n "$n" "$f"; fi
+}
+
+usage() {
+    cat <<EOF
+cc-lark — 飞书/Lark Claude Bot 服务控制（基于 macOS launchd）
+管理两个服务：bot（主进程）+ ngrok（卡片回调隧道）
+
+用法:
+  cc-lark install [--no-ngrok]        安装 + 启动 + 开机自启
+  cc-lark uninstall                   卸载
+  cc-lark start                       启动（全部）
+  cc-lark stop                        停止（全部）
+  cc-lark restart                     重启（先 ngrok 后 bot）
+  cc-lark status                      两个服务的运行状态 + bot 日志
+  cc-lark logs [bot|ngrok] [-n N] [-f]  查看指定服务的日志（默认 bot，-f 跟踪）
+
+文件:
+  bot   plist : ${PLIST}
+  ngrok plist : ${NGROK_PLIST}
+  bot   日志  : ${LOG_FILE}
+  ngrok 日志  : ${NGROK_LOG}
+
+.env 可配置（cc-lark 会读取）:
+  CALLBACK_PORT   卡片回调端口（默认 9981）
+  NGROK_DOMAIN    ngrok 固定域名（免费版也支持，形如 xxx.ngrok-free.dev）
+                  不设置则用随机域名，每次重启 URL 变动，需在开放平台同步更新
+
+环境变量:
+  PYTHON_BIN      覆盖 python3 路径（默认 \$(command -v python3)）
+EOF
+}
+
+case "${1:-}" in
+    install|uninstall|start|stop|restart|status|logs)
+        cmd="cmd_${1}"; shift
+        "$cmd" "$@"
+        ;;
+    ""|-h|--help|help) usage ;;
+    *) echo "❌ 未知命令: $1" >&2; usage; exit 1 ;;
+esac

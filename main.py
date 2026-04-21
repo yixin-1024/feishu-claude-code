@@ -31,26 +31,26 @@ from session_store import SessionStore, generate_summary, _write_custom_title
 from commands import parse_command, handle_command
 from claude_runner import run_claude
 from run_control import ActiveRun, ActiveRunRegistry, stop_run
+from thread_context import build_thread_context
 
 # ── 看门狗：定时重启防止 WebSocket 假死 ──────────────────────
+# launchd 只能检测进程退出，检测不到"假死"（进程在但 WS 不响应）。
+# watchdog 在指定时长后主动退出，由 launchd KeepAlive 拉起，作为保险。
 
-MAX_UPTIME = 4 * 3600   # 最长运行 4 小时后主动重启
+MAX_UPTIME = 6 * 3600   # 最长运行 6 小时后主动重启
 _start_time = time.time()
 _last_event = time.time()
 
 
 def _watchdog():
-    """后台线程，定期检查进程健康。异常时退出让 launchctl 拉起。"""
+    """后台线程，定期检查进程健康。超时退出让 launchctl 拉起。"""
     while True:
         time.sleep(300)  # 每 5 分钟检查
         uptime = time.time() - _start_time
-        idle = time.time() - _last_event
-
         if uptime > MAX_UPTIME:
             print(f"[watchdog] 运行 {uptime/3600:.1f}h，定时重启刷新连接", flush=True)
             os._exit(0)
-
-        print(f"[watchdog] uptime={uptime/3600:.1f}h idle={idle/60:.0f}min", flush=True)
+        # 常态不打日志，避免刷屏。需要巡检时用 cc-lark status 查看进程信息。
 
 
 # ── 全局单例 ──────────────────────────────────────────────────
@@ -96,15 +96,8 @@ async def _announce_stopped_run(active_run: ActiveRun):
         print(f"[warn] update stopped card failed: {exc}", flush=True)
 
 
-async def _announce_interrupted(active_run: ActiveRun):
-    try:
-        await feishu.update_card(active_run.card_msg_id, "⏹ 已被新消息打断")
-    except Exception:
-        pass
-
-
-async def _handle_stop_command(sender_open_id: str) -> str:
-    active_run = _active_runs.get_run(sender_open_id)
+async def _handle_stop_command(sender_open_id: str, chat_id: str) -> str:
+    active_run = _active_runs.get_run(sender_open_id, chat_id)
     if active_run is None:
         return "当前没有正在运行的任务"
     if active_run.stop_requested:
@@ -112,6 +105,7 @@ async def _handle_stop_command(sender_open_id: str) -> str:
     stopped = await stop_run(
         _active_runs,
         sender_open_id,
+        chat_id,
         on_stopped=_announce_stopped_run,
     )
     if not stopped:
@@ -178,14 +172,15 @@ async def _show_command_menu(user_id: str, chat_id: str, is_group: bool, msg_id:
 
 # ── 核心消息处理（async）─────────────────────────────────────
 
-def extract_chat_info(event: P2ImMessageReceiveV1) -> tuple[str, str, bool]:
+def extract_chat_info(event: P2ImMessageReceiveV1) -> tuple[str, str, bool, str, str]:
     """
-    Extract user_id, chat_id, and is_group from message event.
+    Extract chat context from message event.
 
     Returns:
-        (user_id, chat_id, is_group)
-        - For private chat: chat_id = user_id
-        - For group chat: chat_id = group's chat_id
+        (user_id, chat_id, is_group, raw_chat_id, thread_id)
+        - private chat: chat_id == user_id, raw_chat_id == p2p chat id
+        - group chat: chat_id == raw_chat_id (or "raw_chat_id:thread_id" when in topic)
+        - thread_id: 话题群话题 id，非话题则为空
     """
     sender = event.event.sender
     user_id = sender.sender_id.open_id
@@ -193,15 +188,16 @@ def extract_chat_info(event: P2ImMessageReceiveV1) -> tuple[str, str, bool]:
     message = event.event.message
     chat_type = message.chat_type
     chat_id_raw = message.chat_id
+    thread_id = getattr(message, "thread_id", "") or ""
 
     is_group = (chat_type == "group")
 
     if is_group:
-        chat_id = chat_id_raw
+        chat_id = f"{chat_id_raw}:{thread_id}" if thread_id else chat_id_raw
     else:
         chat_id = user_id
 
-    return user_id, chat_id, is_group
+    return user_id, chat_id, is_group, chat_id_raw, thread_id
 
 
 async def handle_message_async(event: P2ImMessageReceiveV1):
@@ -210,8 +206,20 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
     print(f"[收到消息] type={msg.message_type} chat={msg.chat_type}", flush=True)
 
     # Extract chat info (supports both private and group chats)
-    user_id, chat_id, is_group = extract_chat_info(event)
-    print(f"[Chat Info] user={user_id[:8]}... chat={chat_id[:8]}... is_group={is_group}", flush=True)
+    user_id, chat_id, is_group, raw_chat_id, thread_id = extract_chat_info(event)
+    print(
+        f"[Chat Info] user={user_id[:8]}... chat={raw_chat_id[:10]}... "
+        f"thread={thread_id[:10] if thread_id else '-'} is_group={is_group}",
+        flush=True,
+    )
+
+    # 访问控制：群聊白名单 + 用户 allowlist（静默忽略，避免泄露 bot 存在）
+    if is_group and raw_chat_id not in config.ALLOWED_GROUP_CHAT_IDS:
+        print(f"[拒绝] 群不在白名单 chat={raw_chat_id[:10]}...", flush=True)
+        return
+    if config.ALLOWED_OPEN_IDS and user_id not in config.ALLOWED_OPEN_IDS:
+        print(f"[拒绝] user={user_id[:8]}... 不在 allowlist", flush=True)
+        return
 
     # /stop 和 / 在锁外处理（不需要排队等 Claude）
     if msg.message_type == "text":
@@ -227,7 +235,7 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
                     _text = _text.replace(k, '').strip()
 
         if _text.lower() in ("/stop", "/stop") or _text.strip().endswith("/stop"):
-            reply = await _handle_stop_command(user_id)
+            reply = await _handle_stop_command(user_id, chat_id)
             if is_group:
                 await feishu.reply_card(msg.message_id, content=reply, loading=False)
             else:
@@ -239,19 +247,21 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
             await _show_command_menu(user_id, chat_id, is_group, msg.message_id)
             return
 
-    # 群聊只响应 @机器人 的消息
+    # 群聊只响应 @机器人 的消息（@其他人不触发）
     if is_group:
         mentions = getattr(msg, 'mentions', None) or []
         if not mentions:
-            return  # 没有 @mention，忽略
+            return
+        bot_open_id = await feishu.get_bot_open_id()
+        if bot_open_id:
+            mentioned_bot = any(
+                getattr(getattr(m, 'id', None), 'open_id', '') == bot_open_id
+                for m in mentions
+            )
+            if not mentioned_bot:
+                return
 
-    # 自动打断：新消息到达时，停止该用户的活跃任务（模拟终端 Escape）
-    active = _active_runs.get_run(user_id)
-    if active and not active.stop_requested:
-        print(f"[打断] 新消息到达，自动停止当前任务", flush=True)
-        await stop_run(_active_runs, user_id, on_stopped=_announce_interrupted)
-
-    # 获取该群组的队列锁，保证同一群组消息串行处理，不同群组可并发
+    # 获取该 chat/话题的队列锁，新消息不打断当前任务，自然排队等待
     if chat_id not in _chat_locks:
         # 简单的 LRU 清理：超出上限时清掉所有锁（已释放的锁丢弃无害）
         if len(_chat_locks) >= _MAX_CHAT_LOCKS:
@@ -262,9 +272,15 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
         _chat_locks[chat_id] = asyncio.Lock()
     lock = _chat_locks[chat_id]
 
+    if lock.locked():
+        try:
+            await feishu.reply_text(msg.message_id, "📬 前面还有任务在跑，排队中（/stop 可打断）")
+        except Exception:
+            pass
+
     async with lock:
         try:
-            await _process_message(user_id, chat_id, is_group, msg)
+            await _process_message(user_id, chat_id, is_group, thread_id, msg)
         except Exception as e:
             print(f"[error] 消息处理异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
@@ -274,18 +290,40 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
 async def _run_and_display(
     user_id: str, chat_id: str, is_group: bool,
     text: str, card_msg_id: str, session, notify_msg_id: str,
+    preview_text: str = "",
+    append_system_prompt: str = "",
 ):
-    """调用 Claude 并流式展示结果，检测选项时附加按钮。消息处理和按钮回复共用此函数。"""
-    active_run = _active_runs.start_run(user_id, card_msg_id)
+    """调用 Claude 并流式展示结果，检测选项时附加按钮。消息处理和按钮回复共用此函数。
+
+    preview_text: 用于 /resume 列表展示的简短预览（传空则用 text）。话题上下文
+                  场景下，text 是含历史的完整 prompt，这里传原始用户输入避免脏数据。
+    """
+    active_run = _active_runs.start_run(user_id, chat_id, card_msg_id)
 
     accumulated = ""
     tool_history: list[str] = []
     ask_options: list[tuple[str, str]] = []  # AskUserQuestion 解析出的选项
     plan_exited = False  # Claude 调了 ExitPlanMode
+    final_usage: dict = {}
     last_push_time = 0.0
     push_failures = 0
     _PUSH_INTERVAL = 0.4
     _MAX_STREAM_DISPLAY = 2500
+
+    # 心跳 / 工具计时状态
+    start_ts = time.time()
+    last_output_ts = start_ts
+    current_tool: tuple[str, float] | None = None  # (name, start_ts)
+
+    def _fmt_duration(seconds: float) -> str:
+        s = int(seconds)
+        if s < 60:
+            return f"{s}s"
+        m, sec = divmod(s, 60)
+        if m < 60:
+            return f"{m}m{sec:02d}s"
+        h, m = divmod(m, 60)
+        return f"{h}h{m:02d}m"
 
     async def push(content: str):
         nonlocal push_failures
@@ -309,10 +347,21 @@ async def _run_and_display(
             if len(d) > _MAX_STREAM_DISPLAY:
                 d = "...\n\n" + d[-_MAX_STREAM_DISPLAY:]
             parts.append(d)
-        return "\n".join(parts) if parts else "⏳ 思考中..."
+        body = "\n".join(parts) if parts else "⏳ 思考中..."
+
+        # footer: 运行时长 / 当前工具耗时 / idle 警告
+        now = time.time()
+        footer = [f"⏱ {_fmt_duration(now - start_ts)}"]
+        if current_tool:
+            tname, t_started = current_tool
+            footer.append(f"🔧 {tname} {_fmt_duration(now - t_started)}")
+        idle = now - last_output_ts
+        if idle >= 30:
+            footer.append(f"⚠️ 无输出 {_fmt_duration(idle)}")
+        return f"{body}\n\n`{' · '.join(footer)}`"
 
     async def on_tool_use(name: str, inp: dict):
-        nonlocal accumulated, last_push_time, plan_exited
+        nonlocal accumulated, last_push_time, plan_exited, current_tool, last_output_ts
         if name.lower() == "exitplanmode":
             plan_exited = True
             return
@@ -344,16 +393,39 @@ async def _run_and_display(
             tool_history[-1] = tool_line
         else:
             tool_history.append(tool_line)
+        current_tool = (name, time.time())
+        last_output_ts = time.time()
         await push(_build_display())
         last_push_time = time.time()
 
     async def on_text_chunk(chunk: str):
-        nonlocal accumulated, last_push_time
+        nonlocal accumulated, last_push_time, current_tool, last_output_ts
+        # Claude 开始生成文本说明上一个工具已返回
+        if current_tool:
+            current_tool = None
         accumulated += chunk
+        last_output_ts = time.time()
         now = time.time()
         if now - last_push_time >= _PUSH_INTERVAL:
             await push(_build_display())
             last_push_time = now
+
+    def on_usage(usage: dict):
+        final_usage.update(usage)
+
+    async def _heartbeat():
+        """空闲时每秒刷新一次卡片 footer，让用户看到运行时长和工具计时。"""
+        nonlocal last_push_time
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                if time.time() - last_push_time >= 1.5:
+                    await push(_build_display())
+                    last_push_time = time.time()
+        except asyncio.CancelledError:
+            pass
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
 
     claude_msg = text
     try:
@@ -366,7 +438,9 @@ async def _run_and_display(
             permission_mode=session.permission_mode,
             on_text_chunk=on_text_chunk,
             on_tool_use=on_tool_use,
-            on_process_start=lambda proc: _active_runs.attach_process(user_id, proc),
+            on_process_start=lambda proc: _active_runs.attach_process(user_id, chat_id, proc),
+            on_usage=on_usage,
+            append_system_prompt=append_system_prompt or None,
         )
         print(f"[run_claude] 完成, session={new_session_id}", flush=True)
     except Exception as e:
@@ -380,7 +454,8 @@ async def _run_and_display(
             pass
         return
     finally:
-        _active_runs.clear_run(user_id, active_run)
+        heartbeat_task.cancel()
+        _active_runs.clear_run(user_id, chat_id, active_run)
 
     # 最终更新卡片，检测选项时附加按钮
     # AskUserQuestion 的内容在 accumulated 里，full_text 可能不含，需要兜底
@@ -390,6 +465,9 @@ async def _run_and_display(
             "⚠️ 检测到工作目录已变化，旧会话无法继续。"
             "本次已自动切换到新 session。\n\n" + final
         )
+    footer = _format_usage_footer(final_usage, session.model)
+    if footer:
+        final = f"{final}\n\n{footer}"
     options = _extract_options(final) or ask_options
     card_patched = False
     try:
@@ -424,7 +502,9 @@ async def _run_and_display(
             pass
 
     if new_session_id:
-        await store.on_claude_response(user_id, chat_id, new_session_id, text)
+        await store.on_claude_response(
+            user_id, chat_id, new_session_id, preview_text or text,
+        )
 
     # ExitPlanMode: Claude 批准方案后要切到执行模式
     if plan_exited and session.permission_mode == "plan":
@@ -440,11 +520,15 @@ async def _run_and_display(
             pass
 
 
-async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
+async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id: str, msg):
     """实际处理消息的逻辑，在 per-chat lock 保护下执行"""
-    print(f"[处理消息] user={user_id[:8]}... chat={chat_id[:8]}... is_group={is_group}", flush=True)
+    print(
+        f"[处理消息] user={user_id[:8]}... chat={chat_id[:10]}... "
+        f"thread={thread_id[:10] if thread_id else '-'} is_group={is_group}",
+        flush=True,
+    )
     text = ""
-    img_path = None
+    preview_text = ""  # 原始用户文本，用于 /resume 列表展示
 
     if msg.message_type == "text":
         try:
@@ -461,10 +545,11 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                 key = getattr(mention, 'key', '')
                 if key:
                     text = text.replace(key, '').strip()
-            if not text:
-                return
+            if not text and not thread_id:
+                return  # 非话题群光 @bot 没上下文来源，忽略；话题群交给下方 thread_context 补全
 
-        print(f"[文本] {text[:50]}", flush=True)
+        preview_text = text
+        print(f"[文本] {text[:50] if text else '(空)'}", flush=True)
 
     elif msg.message_type == "image":
         try:
@@ -473,6 +558,7 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                 return
             img_path = await feishu.download_image(msg.message_id, image_key)
             text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
+            preview_text = "[图片]"
         except Exception as e:
             print(f"[error] 下载图片失败: {e}")
             if is_group:
@@ -482,6 +568,32 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                     pass
             else:
                 await feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
+            return
+
+    elif msg.message_type == "file":
+        try:
+            content_obj = json.loads(msg.content)
+            file_key = content_obj.get("file_key", "")
+            file_name = content_obj.get("file_name", "") or "file"
+            if not file_key:
+                return
+            fpath = await feishu.download_file(
+                msg.message_id, file_key, msg_type="file", file_name=file_name,
+            )
+            text = (
+                f"[用户发送了文件：{file_name}，本地路径：{fpath}。"
+                f"请根据需要读取该文件并分析，用中文回复。]"
+            )
+            preview_text = f"[文件 {file_name}]"
+        except Exception as e:
+            print(f"[error] 下载文件失败: {e}")
+            if is_group:
+                try:
+                    await feishu.reply_card(msg.message_id, content=f"❌ 下载文件失败：{e}", loading=False)
+                except Exception:
+                    pass
+            else:
+                await feishu.send_text_to_user(user_id, f"❌ 下载文件失败：{e}")
             return
 
     elif msg.message_type == "post":
@@ -516,9 +628,10 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                 f"图片路径：\n{paths_list}\n"
                 f"请读取并分析这些图片，结合文字回复（中文）。"
             )
-            img_path = img_paths[0]  # 仅用于日志兼容
+            preview_text = post_text[:40] if post_text else f"[富文本 + {len(img_paths)} 图]"
         else:
             text = post_text
+            preview_text = post_text
 
         print(f"[post] text_len={len(post_text)} imgs={len(img_paths)}", flush=True)
 
@@ -562,6 +675,40 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
     session = await store.get_current(user_id, chat_id)
     print(f"[Claude] session={session.session_id} model={session.model}", flush=True)
 
+    # 话题群：拉取未见过的历史消息（话题正文 + 前置评论）作为上下文前缀
+    if thread_id:
+        try:
+            last_seen = await store.get_last_seen(user_id, chat_id)
+            context_block, ctx_paths = await build_thread_context(
+                feishu, thread_id, last_seen, msg.message_id,
+            )
+            if context_block:
+                print(
+                    f"[thread] 注入上下文：last_seen={last_seen[:12] if last_seen else '-'}, "
+                    f"附件={len(ctx_paths)}",
+                    flush=True,
+                )
+                if text.strip():
+                    text = f"{context_block}\n\n【用户刚刚 @ 你并说】\n{text}"
+                else:
+                    text = f"{context_block}\n\n【用户刚刚 @ 你，没有新正文，请基于上方内容回复】"
+            # 不管有没有新增，都把 last_seen 推进到当前消息
+            await store.set_last_seen(user_id, chat_id, msg.message_id)
+        except Exception as e:
+            print(f"[thread] 构建上下文失败（继续处理当前消息）: {e}", flush=True)
+
+    # 安全网：话题群光 @bot 无正文且没拉到任何上下文 → 给个提示，别发空 prompt 给 Claude
+    if not text.strip():
+        try:
+            await feishu.reply_card(
+                msg.message_id,
+                content="ℹ️ 只 @ 了我但没有正文，也没有新的话题消息可读。请补一句说明你想做什么。",
+                loading=False,
+            )
+        except Exception:
+            pass
+        return
+
     # 1. 发送"思考中"占位卡片，拿到 message_id
     try:
         if is_group:
@@ -580,7 +727,104 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
             await feishu.send_text_to_user(user_id, f"❌ 发送消息失败：{e}")
         return
 
-    await _run_and_display(user_id, chat_id, is_group, text, card_msg_id, session, msg.message_id)
+    raw_chat_id = chat_id.split(":", 1)[0] if ":" in chat_id else chat_id
+    lark_sys = _build_lark_system_prompt(raw_chat_id, thread_id, msg.message_id, is_group)
+
+    await _run_and_display(
+        user_id, chat_id, is_group, text, card_msg_id, session, msg.message_id,
+        preview_text=preview_text,
+        append_system_prompt=lark_sys,
+    )
+
+
+def _context_window_for(model: str) -> int:
+    """Return context window size in tokens. Rough heuristic by model id."""
+    m = (model or "").lower()
+    if "[1m]" in m or "1m" in m:
+        return 1_000_000
+    return 200_000
+
+
+def _build_lark_system_prompt(
+    raw_chat_id: str,
+    thread_id: str,
+    user_message_id: str,
+    is_group: bool,
+) -> str:
+    """构造注入到 Claude 的 Lark 语境系统提示。"""
+    location_lines = [f"- chat_id: {raw_chat_id}"]
+    if thread_id:
+        location_lines.append(f"- thread_id: {thread_id}（话题群 / topic thread）")
+    location_lines.append(f"- 用户刚发的消息 id: {user_message_id}")
+    location_lines.append(f"- 场景: {'群聊' if is_group else '私聊'}")
+
+    reply_flag = "--reply-in-thread " if thread_id else ""
+    reply_cmd_text = (
+        f'lark-cli im +messages-reply --as bot --message-id {user_message_id} '
+        f'{reply_flag}--text "<文本>"'
+    )
+    reply_cmd_image = (
+        f'cd <文件所在目录> && lark-cli im +messages-reply --as bot '
+        f'--message-id {user_message_id} {reply_flag}--image <相对路径>'
+    )
+    reply_cmd_file = (
+        f'cd <文件所在目录> && lark-cli im +messages-reply --as bot '
+        f'--message-id {user_message_id} {reply_flag}--file <相对路径>'
+    )
+
+    return f"""你正在通过飞书/Lark 与用户对话。你输出的文本由后台 bot 渲染成 Lark 卡片发到用户的聊天里。除此之外，你可以主动调用 `lark-cli` 往当前会话发送图片、文件、文档链接。
+
+【当前会话信息】
+{chr(10).join(location_lines)}
+
+【何时主动调用 lark-cli（而不是把内容塞进你的文字回复）】
+
+1. 用户让你"发/截图/把X发过来/发文件"等 → 用 lark-cli 把文件/图片发到评论区：
+   ```
+   {reply_cmd_image}
+   {reply_cmd_file}
+   ```
+   ⚠️ lark-cli 要求相对路径，**必须先 `cd` 到文件目录，再用文件名调用**，不能直接用绝对路径。
+
+2. 你的回复内容偏长（估计超 40 行或 2000 字），比如大段审计报告、SQL 结果、长列表、多文件分析总结 → **先创建 Lark 文档，再把链接回给用户**：
+   ```
+   lark-cli docs +create --as user --title "<简短标题>" --markdown "<完整内容>"
+   ```
+   拿到 doc_url 后，你只在文字回复里写一两句摘要 + 链接。**不要把长内容铺满卡片**，否则用户很难读。
+
+3. 代码片段（< 30 行）、简短回答、状态更新 → 直接在文字里回复即可，不需要 lark-cli。
+
+【额外提示】
+- 注意 lark-cli 调用是你主动发送一条新消息，和你当前这条回复是独立的。调完之后可以在文字回复里写一句"文件已发 ↑"或"文档见 <url>"告诉用户。
+- 如果要发文本消息到评论区（不是作为你当前回复的一部分），用：`{reply_cmd_text}`
+- 用户可能说中文或英文，保持和用户相同语言回复。
+"""
+
+
+def _format_usage_footer(usage: dict, model: str) -> str:
+    """格式化上下文占用脚注。空 usage 返回空串。"""
+    if not usage:
+        return ""
+    input_tok = int(usage.get("input_tokens", 0) or 0)
+    cache_read = int(usage.get("cache_read_input_tokens", 0) or 0)
+    cache_create = int(usage.get("cache_creation_input_tokens", 0) or 0)
+    output_tok = int(usage.get("output_tokens", 0) or 0)
+    total_context = input_tok + cache_read + cache_create + output_tok
+    if total_context <= 0:
+        return ""
+    window = int(usage.get("_context_window") or 0) or _context_window_for(model)
+    pct = total_context / window * 100
+
+    def fmt(n: int) -> str:
+        if n >= 1_000_000:
+            s = f"{n/1_000_000:.1f}".rstrip("0").rstrip(".")
+            return f"{s}M"
+        if n >= 1000:
+            s = f"{n/1000:.1f}".rstrip("0").rstrip(".")
+            return f"{s}k"
+        return str(n)
+
+    return f"— 📊 上下文 {fmt(total_context)} / {fmt(window)} ({pct:.1f}%)"
 
 
 def _extract_options(text: str) -> list[tuple[str, str]]:
@@ -722,7 +966,7 @@ async def _handle_menu_command(user_id: str, chat_id: str, cmd_text: str, card_m
 
     # /stop 特殊处理
     if cmd == "stop":
-        reply_text = await _handle_stop_command(user_id)
+        reply_text = await _handle_stop_command(user_id, chat_id)
         if card_msg_id:
             try:
                 await feishu.update_card(card_msg_id, reply_text)
@@ -785,11 +1029,7 @@ async def _handle_button_reply(user_id: str, chat_id: str, text: str, clicked_ms
     """按钮点击 → 走正常的 lock + Claude 流程"""
     is_group = (chat_id != user_id)
 
-    # 自动打断活跃任务
-    active = _active_runs.get_run(user_id)
-    if active and not active.stop_requested:
-        await stop_run(_active_runs, user_id, on_stopped=_announce_interrupted)
-
+    # 按钮点击不打断当前任务，自然排队等待
     if chat_id not in _chat_locks:
         if len(_chat_locks) >= _MAX_CHAT_LOCKS:
             idle = [k for k, v in _chat_locks.items() if not v.locked()]
@@ -797,6 +1037,12 @@ async def _handle_button_reply(user_id: str, chat_id: str, text: str, clicked_ms
                 del _chat_locks[k]
         _chat_locks[chat_id] = asyncio.Lock()
     lock = _chat_locks[chat_id]
+
+    if lock.locked() and clicked_msg_id:
+        try:
+            await feishu.reply_text(clicked_msg_id, "📬 前面还有任务在跑，排队中（/stop 可打断）")
+        except Exception:
+            pass
 
     async with lock:
         try:
@@ -809,9 +1055,14 @@ async def _handle_button_reply(user_id: str, chat_id: str, text: str, clicked_ms
             except Exception as e:
                 print(f"[error] 按钮回复占位卡片失败: {e}", flush=True)
                 return
+            raw_chat_id, _, btn_thread_id = chat_id.partition(":")
+            lark_sys = _build_lark_system_prompt(
+                raw_chat_id, btn_thread_id, clicked_msg_id or "", is_group,
+            )
             await _run_and_display(
                 user_id, chat_id, is_group, text,
                 card_msg_id, session, clicked_msg_id or "",
+                append_system_prompt=lark_sys,
             )
         except Exception as e:
             print(f"[error] 按钮回复处理异常: {type(e).__name__}: {e}", flush=True)
@@ -1051,6 +1302,12 @@ def main():
     print(f"   默认模型    : {config.DEFAULT_MODEL}")
     print(f"   默认工作目录: {config.DEFAULT_CWD}")
     print(f"   权限模式    : {config.PERMISSION_MODE}")
+    allow_desc = f"{len(config.ALLOWED_OPEN_IDS)} 人" if config.ALLOWED_OPEN_IDS else "⚠️ 所有人"
+    group_desc = (
+        f"{len(config.ALLOWED_GROUP_CHAT_IDS)} 个群"
+        if config.ALLOWED_GROUP_CHAT_IDS else "禁用"
+    )
+    print(f"   访问控制    : allowlist={allow_desc}, 群聊白名单={group_desc}")
 
     # 卡片回调 HTTP 服务 + ngrok 隧道
     cb_port = config.CALLBACK_PORT

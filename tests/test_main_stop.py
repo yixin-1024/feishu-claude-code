@@ -73,6 +73,7 @@ def _install_fake_lark():
         "P2ImMessageReceiveV1",
         "CreateMessageRequest",
         "CreateMessageRequestBody",
+        "ListMessageRequest",
         "PatchMessageRequest",
         "PatchMessageRequestBody",
         "ReplyMessageRequest",
@@ -95,7 +96,7 @@ import main
 class MainStopTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_stop_command_returns_no_active_run_message(self):
         with mock.patch.object(main, "stop_run", mock.AsyncMock(return_value=False)):
-            reply = await main._handle_stop_command("user-1")
+            reply = await main._handle_stop_command("user-1", "chat-1")
 
         self.assertIn("没有正在运行", reply)
 
@@ -111,7 +112,7 @@ class MainStopTests(unittest.IsolatedAsyncioTestCase):
             "stop_run",
             mock.AsyncMock(return_value=True),
         ) as stop_run_mock:
-            reply = await main._handle_stop_command("user-1")
+            reply = await main._handle_stop_command("user-1", "chat-1")
 
         stop_run_mock.assert_awaited_once()
         self.assertIn("已发送停止请求", reply)

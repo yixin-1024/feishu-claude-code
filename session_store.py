@@ -362,6 +362,8 @@ class SessionStore:
             "started_at": datetime.now().isoformat(),
             "preview": "",
             "workspace": "",
+            # 话题群：上一次处理过的 thread 消息 id，用于增量拉取新评论
+            "last_seen_message_id": "",
         }
 
     def _normalize_chat_key(self, user_id: str, chat_id: str) -> str:
@@ -503,6 +505,7 @@ class SessionStore:
             "started_at": datetime.now().isoformat(),
             "preview": "",
             "workspace": cur.get("workspace", ""),
+            "last_seen_message_id": "",
         }
         await self._save_async()
         return old_title
@@ -666,6 +669,17 @@ class SessionStore:
             if uid.startswith("ou_") and "private" in self._data[uid]:
                 return uid
         return None
+
+    async def get_last_seen(self, user_id: str, chat_id: str) -> str:
+        """获取话题群最后处理过的 message_id"""
+        cur = await self.get_current_raw(user_id, chat_id)
+        return cur.get("last_seen_message_id", "") or ""
+
+    async def set_last_seen(self, user_id: str, chat_id: str, message_id: str):
+        """更新话题群最后处理过的 message_id"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        chat_data["current"]["last_seen_message_id"] = message_id
+        await self._save_async()
 
     async def get_current_raw(self, user_id: str, chat_id: str = None) -> dict:
         """Get raw current session data for a specific chat"""

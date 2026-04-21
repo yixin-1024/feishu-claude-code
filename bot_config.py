@@ -23,6 +23,17 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-opus-4-6")
 DEFAULT_CWD = os.path.expanduser(os.getenv("DEFAULT_CWD", "~"))
 PERMISSION_MODE = os.getenv("PERMISSION_MODE", "bypassPermissions")
 
+# 访问控制
+# ALLOWED_OPEN_IDS: 允许使用 bot 的用户 open_id 列表（逗号分隔），为空则允许所有人（不推荐）
+ALLOWED_OPEN_IDS: set[str] = {
+    s.strip() for s in os.getenv("ALLOWED_OPEN_IDS", "").split(",") if s.strip()
+}
+# ALLOWED_GROUP_CHAT_IDS: 群聊白名单（逗号分隔的 chat_id，oc_ 开头），为空则禁用所有群聊
+# 私聊始终允许（仍受 ALLOWED_OPEN_IDS 约束）
+ALLOWED_GROUP_CHAT_IDS: set[str] = {
+    s.strip() for s in os.getenv("ALLOWED_GROUP_CHAT_IDS", "").split(",") if s.strip()
+}
+
 SESSIONS_DIR = os.path.expanduser("~/.feishu-claude")
 
 # 卡片按钮回调 HTTP 端口（需 ngrok 暴露）
