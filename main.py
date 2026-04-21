@@ -1,6 +1,9 @@
 """
-飞书 × Claude Code Bot
-通过飞书 WebSocket 长连接接收私聊/群聊消息，调用本机 claude CLI 回复，支持流式卡片输出。
+飞书/Lark × Claude Code Bot — 多 profile 版本。
+
+每个 profile 对应一个独立的 Lark/Feishu 应用（app_id/app_secret/brand 独立），
+运行在各自的 WebSocket 长连接和 SessionStore 上；多个 profile 共用同一个
+事件循环、卡片回调 HTTP 端口、ngrok 隧道、看门狗和摘要后台线程。
 
 启动：python main.py
 """
@@ -19,12 +22,26 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import lark_oapi as lark
+import lark_oapi.ws.client as _lark_ws_mod  # noqa: E402
 from lark_oapi.api.im.v1.model import P2ImMessageReceiveV1
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger, P2CardActionTriggerResponse, CallBackToast,
 )
 
+
+# lark_oapi.ws.client 有一个模块级全局 `loop`，所有 ws.Client 实例共用它，
+# 所以原生不支持「同进程跑多个 bot」。把它替换成代理对象，按调用线程的
+# 默认事件循环动态分发 —— 每个 WS 线程先 set_event_loop(new_loop) 拿到自己的
+# 事件循环，然后 lark_oapi 内部所有 `loop.*` 调用都会落到正确的那个 loop。
+class _PerThreadLoopProxy:
+    def __getattr__(self, attr):
+        return getattr(asyncio.get_event_loop(), attr)
+
+
+_lark_ws_mod.loop = _PerThreadLoopProxy()
+
 import bot_config as config
+from bot_config import Profile
 from feishu_client import FeishuClient
 from feishu_post import parse_post_content, extract_post_image_keys
 from session_store import SessionStore, generate_summary, _write_custom_title
@@ -53,7 +70,7 @@ def _watchdog():
         # 常态不打日志，避免刷屏。需要巡检时用 cc-lark status 查看进程信息。
 
 
-# ── 全局单例 ──────────────────────────────────────────────────
+# ── 全局单例（跨 profile 共享）──────────────────────────────
 
 # 独立的 asyncio 事件循环，启动时即就绪，不依赖 lark SDK 的首条消息
 _bot_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
@@ -66,47 +83,99 @@ def _start_bot_loop():
 
 threading.Thread(target=_start_bot_loop, daemon=True, name="bot-loop").start()
 
-lark_client = lark.Client.builder() \
-    .app_id(config.FEISHU_APP_ID) \
-    .app_secret(config.FEISHU_APP_SECRET) \
-    .domain(config.LARK_DOMAIN) \
-    .log_level(lark.LogLevel.INFO) \
-    .build()
 
-feishu = FeishuClient(
-    lark_client,
-    app_id=config.FEISHU_APP_ID,
-    app_secret=config.FEISHU_APP_SECRET,
-    domain=config.LARK_DOMAIN,
-)
-store = SessionStore()
-_active_runs = ActiveRunRegistry()
+# ── BotInstance：一个 profile 的运行时包 ───────────────────
 
-# per-chat 消息队列锁，保证同一群组的消息串行处理，允许不同群组并发处理
-_chat_locks: dict[str, asyncio.Lock] = {}
-_MAX_CHAT_LOCKS = 200  # 防止无界增长
+class BotInstance:
+    """一个 profile 的全部状态：Lark SDK client、FeishuClient、session store、
+    per-chat 锁、运行注册表。消息处理函数把 self 当作上下文。"""
+
+    _MAX_CHAT_LOCKS = 200
+
+    def __init__(self, profile: Profile):
+        self.profile = profile
+        self.lark_client = (
+            lark.Client.builder()
+            .app_id(profile.app_id)
+            .app_secret(profile.app_secret)
+            .domain(profile.domain)
+            .log_level(lark.LogLevel.INFO)
+            .build()
+        )
+        self.feishu = FeishuClient(
+            self.lark_client,
+            app_id=profile.app_id,
+            app_secret=profile.app_secret,
+            domain=profile.domain,
+        )
+        self.store = SessionStore(
+            profile=profile.name,
+            default_cwd=profile.default_cwd,
+        )
+        self.active_runs = ActiveRunRegistry()
+        # per-chat 消息队列锁，保证同一群组的消息串行处理，允许不同群组并发处理
+        self.chat_locks: dict[str, asyncio.Lock] = {}
+
+    # ── 锁管理 ───────────────────────────────────────────────
+    def _ensure_chat_lock(self, chat_id: str) -> asyncio.Lock:
+        if chat_id not in self.chat_locks:
+            if len(self.chat_locks) >= self._MAX_CHAT_LOCKS:
+                idle = [k for k, v in self.chat_locks.items() if not v.locked()]
+                for k in idle[:len(idle) // 2]:
+                    del self.chat_locks[k]
+            self.chat_locks[chat_id] = asyncio.Lock()
+        return self.chat_locks[chat_id]
+
+
+# profile_name → BotInstance
+_bots: dict[str, BotInstance] = {}
+
+
+# ── 消息工具函数 ─────────────────────────────────────────────
+
+def extract_chat_info(event: P2ImMessageReceiveV1) -> tuple[str, str, bool, str, str]:
+    """
+    Returns:
+        (user_id, chat_id, is_group, raw_chat_id, thread_id)
+    """
+    sender = event.event.sender
+    user_id = sender.sender_id.open_id
+
+    message = event.event.message
+    chat_type = message.chat_type
+    chat_id_raw = message.chat_id
+    thread_id = getattr(message, "thread_id", "") or ""
+
+    is_group = (chat_type == "group")
+
+    if is_group:
+        chat_id = f"{chat_id_raw}:{thread_id}" if thread_id else chat_id_raw
+    else:
+        chat_id = user_id
+
+    return user_id, chat_id, is_group, chat_id_raw, thread_id
 
 
 # ── /stop 命令处理 ───────────────────────────────────────────
 
-async def _announce_stopped_run(active_run: ActiveRun):
+async def _announce_stopped_run(bot: BotInstance, active_run: ActiveRun):
     try:
-        await feishu.update_card(active_run.card_msg_id, "⏹ 已停止当前任务")
+        await bot.feishu.update_card(active_run.card_msg_id, "⏹ 已停止当前任务")
     except Exception as exc:
-        print(f"[warn] update stopped card failed: {exc}", flush=True)
+        print(f"[{bot.profile.name}][warn] update stopped card failed: {exc}", flush=True)
 
 
-async def _handle_stop_command(sender_open_id: str, chat_id: str) -> str:
-    active_run = _active_runs.get_run(sender_open_id, chat_id)
+async def _handle_stop_command(bot: BotInstance, sender_open_id: str, chat_id: str) -> str:
+    active_run = bot.active_runs.get_run(sender_open_id, chat_id)
     if active_run is None:
         return "当前没有正在运行的任务"
     if active_run.stop_requested:
         return "正在停止当前任务，请稍候"
     stopped = await stop_run(
-        _active_runs,
+        bot.active_runs,
         sender_open_id,
         chat_id,
-        on_stopped=_announce_stopped_run,
+        on_stopped=lambda run: _announce_stopped_run(bot, run),
     )
     if not stopped:
         return "当前没有正在运行的任务"
@@ -138,14 +207,14 @@ _COMMAND_MENU_GROUPS = [
 ]
 
 
-async def _show_command_menu(user_id: str, chat_id: str, is_group: bool, msg_id: str):
-    """显示分组命令菜单（markdown 标题 + 按钮混排），不走队列锁"""
+async def _show_command_menu(bot: BotInstance, user_id: str, chat_id: str, is_group: bool, msg_id: str):
+    """显示分组命令菜单，不走队列锁"""
     elements = []
     for title, buttons in _COMMAND_MENU_GROUPS:
         elements.append({"tag": "markdown", "content": title})
         columns = []
         for btn in buttons:
-            value = {**btn["value"], "cid": chat_id}
+            value = {**btn["value"], "cid": chat_id, "profile": bot.profile.name}
             columns.append({
                 "tag": "column",
                 "width": "auto",
@@ -162,97 +231,67 @@ async def _show_command_menu(user_id: str, chat_id: str, is_group: bool, msg_id:
         elements.append({"tag": "column_set", "flex_mode": "flow", "columns": columns})
     try:
         if is_group:
-            card_id = await feishu.reply_card(msg_id, content="⚡ 快捷命令", loading=False)
+            card_id = await bot.feishu.reply_card(msg_id, content="⚡ 快捷命令", loading=False)
         else:
-            card_id = await feishu.send_card_to_user(user_id, content="⚡ 快捷命令", loading=False)
-        await feishu.update_card_elements(card_id, elements)
+            card_id = await bot.feishu.send_card_to_user(user_id, content="⚡ 快捷命令", loading=False)
+        await bot.feishu.update_card_elements(card_id, elements)
     except Exception as e:
-        print(f"[error] 命令菜单发送失败: {e}", flush=True)
+        print(f"[{bot.profile.name}][error] 命令菜单发送失败: {e}", flush=True)
 
 
-# ── 核心消息处理（async）─────────────────────────────────────
+# ── 核心消息处理 ─────────────────────────────────────────────
 
-def extract_chat_info(event: P2ImMessageReceiveV1) -> tuple[str, str, bool, str, str]:
-    """
-    Extract chat context from message event.
-
-    Returns:
-        (user_id, chat_id, is_group, raw_chat_id, thread_id)
-        - private chat: chat_id == user_id, raw_chat_id == p2p chat id
-        - group chat: chat_id == raw_chat_id (or "raw_chat_id:thread_id" when in topic)
-        - thread_id: 话题群话题 id，非话题则为空
-    """
-    sender = event.event.sender
-    user_id = sender.sender_id.open_id
-
-    message = event.event.message
-    chat_type = message.chat_type
-    chat_id_raw = message.chat_id
-    thread_id = getattr(message, "thread_id", "") or ""
-
-    is_group = (chat_type == "group")
-
-    if is_group:
-        chat_id = f"{chat_id_raw}:{thread_id}" if thread_id else chat_id_raw
-    else:
-        chat_id = user_id
-
-    return user_id, chat_id, is_group, chat_id_raw, thread_id
-
-
-async def handle_message_async(event: P2ImMessageReceiveV1):
+async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
     """异步处理一条飞书消息"""
     msg = event.event.message
-    print(f"[收到消息] type={msg.message_type} chat={msg.chat_type}", flush=True)
+    tag = bot.profile.name
+    print(f"[{tag}][收到消息] type={msg.message_type} chat={msg.chat_type}", flush=True)
 
-    # Extract chat info (supports both private and group chats)
     user_id, chat_id, is_group, raw_chat_id, thread_id = extract_chat_info(event)
     print(
-        f"[Chat Info] user={user_id[:8]}... chat={raw_chat_id[:10]}... "
+        f"[{tag}][Chat Info] user={user_id[:8]}... chat={raw_chat_id[:10]}... "
         f"thread={thread_id[:10] if thread_id else '-'} is_group={is_group}",
         flush=True,
     )
 
     # 访问控制：群聊白名单 + 用户 allowlist（静默忽略，避免泄露 bot 存在）
-    if is_group and raw_chat_id not in config.ALLOWED_GROUP_CHAT_IDS:
-        print(f"[拒绝] 群不在白名单 chat={raw_chat_id[:10]}...", flush=True)
+    if is_group and raw_chat_id not in bot.profile.allowed_group_chat_ids:
+        print(f"[{tag}][拒绝] 群不在白名单 chat={raw_chat_id[:10]}...", flush=True)
         return
-    if config.ALLOWED_OPEN_IDS and user_id not in config.ALLOWED_OPEN_IDS:
-        print(f"[拒绝] user={user_id[:8]}... 不在 allowlist", flush=True)
+    if bot.profile.allowed_open_ids and user_id not in bot.profile.allowed_open_ids:
+        print(f"[{tag}][拒绝] user={user_id[:8]}... 不在 allowlist", flush=True)
         return
 
-    # /stop 和 / 在锁外处理（不需要排队等 Claude）
+    # /stop 和 / 在锁外处理
     if msg.message_type == "text":
         try:
             _text = json.loads(msg.content).get("text", "").strip()
         except Exception:
             _text = ""
-        # 群聊去掉 @mention
         if is_group:
             for m in (getattr(msg, 'mentions', None) or []):
                 k = getattr(m, 'key', '')
                 if k:
                     _text = _text.replace(k, '').strip()
 
-        if _text.lower() in ("/stop", "/stop") or _text.strip().endswith("/stop"):
-            reply = await _handle_stop_command(user_id, chat_id)
+        if _text.lower() == "/stop" or _text.strip().endswith("/stop"):
+            reply = await _handle_stop_command(bot, user_id, chat_id)
             if is_group:
-                await feishu.reply_card(msg.message_id, content=reply, loading=False)
+                await bot.feishu.reply_card(msg.message_id, content=reply, loading=False)
             else:
-                await feishu.send_card_to_user(user_id, content=reply, loading=False)
+                await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
 
-        # 单独输入 / → 显示命令菜单（按钮）
         if _text == "/":
-            await _show_command_menu(user_id, chat_id, is_group, msg.message_id)
+            await _show_command_menu(bot, user_id, chat_id, is_group, msg.message_id)
             return
 
-    # 群聊只响应 @机器人 的消息（@其他人不触发）
+    # 群聊只响应 @机器人 的消息
     if is_group:
         mentions = getattr(msg, 'mentions', None) or []
         if not mentions:
             return
-        bot_open_id = await feishu.get_bot_open_id()
+        bot_open_id = await bot.feishu.get_bot_open_id()
         if bot_open_id:
             mentioned_bot = any(
                 getattr(getattr(m, 'id', None), 'open_id', '') == bot_open_id
@@ -261,59 +300,46 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
             if not mentioned_bot:
                 return
 
-    # 获取该 chat/话题的队列锁，新消息不打断当前任务，自然排队等待
-    if chat_id not in _chat_locks:
-        # 简单的 LRU 清理：超出上限时清掉所有锁（已释放的锁丢弃无害）
-        if len(_chat_locks) >= _MAX_CHAT_LOCKS:
-            # 只清理未持有的锁，避免误杀正在使用的锁导致并发串行保护失效
-            idle = [k for k, v in _chat_locks.items() if not v.locked()]
-            for k in idle[:len(idle) // 2]:
-                del _chat_locks[k]
-        _chat_locks[chat_id] = asyncio.Lock()
-    lock = _chat_locks[chat_id]
+    lock = bot._ensure_chat_lock(chat_id)
 
     if lock.locked():
         try:
-            await feishu.reply_text(msg.message_id, "📬 前面还有任务在跑，排队中（/stop 可打断）")
+            await bot.feishu.reply_text(msg.message_id, "📬 前面还有任务在跑，排队中（/stop 可打断）")
         except Exception:
             pass
 
     async with lock:
         try:
-            await _process_message(user_id, chat_id, is_group, thread_id, msg)
+            await _process_message(bot, user_id, chat_id, is_group, thread_id, msg)
         except Exception as e:
-            print(f"[error] 消息处理异常: {type(e).__name__}: {e}", flush=True)
+            print(f"[{tag}][error] 消息处理异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
 
 
 async def _run_and_display(
+    bot: BotInstance,
     user_id: str, chat_id: str, is_group: bool,
     text: str, card_msg_id: str, session, notify_msg_id: str,
     preview_text: str = "",
     append_system_prompt: str = "",
 ):
-    """调用 Claude 并流式展示结果，检测选项时附加按钮。消息处理和按钮回复共用此函数。
-
-    preview_text: 用于 /resume 列表展示的简短预览（传空则用 text）。话题上下文
-                  场景下，text 是含历史的完整 prompt，这里传原始用户输入避免脏数据。
-    """
-    active_run = _active_runs.start_run(user_id, chat_id, card_msg_id)
+    """调用 Claude 并流式展示结果，检测选项时附加按钮。消息处理和按钮回复共用此函数。"""
+    active_run = bot.active_runs.start_run(user_id, chat_id, card_msg_id)
 
     accumulated = ""
     tool_history: list[str] = []
-    ask_options: list[tuple[str, str]] = []  # AskUserQuestion 解析出的选项
-    plan_exited = False  # Claude 调了 ExitPlanMode
+    ask_options: list[tuple[str, str]] = []
+    plan_exited = False
     final_usage: dict = {}
     last_push_time = 0.0
     push_failures = 0
     _PUSH_INTERVAL = 0.4
     _MAX_STREAM_DISPLAY = 2500
 
-    # 心跳 / 工具计时状态
     start_ts = time.time()
     last_output_ts = start_ts
-    current_tool: tuple[str, float] | None = None  # (name, start_ts)
+    current_tool: tuple[str, float] | None = None
 
     def _fmt_duration(seconds: float) -> str:
         s = int(seconds)
@@ -330,11 +356,11 @@ async def _run_and_display(
         if push_failures >= 3:
             return
         try:
-            await feishu.update_card(card_msg_id, content)
+            await bot.feishu.update_card(card_msg_id, content)
             push_failures = 0
         except Exception as push_err:
             push_failures += 1
-            print(f"[warn] push 失败 ({push_failures}/3): {push_err}", flush=True)
+            print(f"[{bot.profile.name}][warn] push 失败 ({push_failures}/3): {push_err}", flush=True)
 
     def _build_display() -> str:
         parts = []
@@ -349,7 +375,6 @@ async def _run_and_display(
             parts.append(d)
         body = "\n".join(parts) if parts else "⏳ 思考中..."
 
-        # footer: 运行时长 / 当前工具耗时 / idle 警告
         now = time.time()
         footer = [f"⏱ {_fmt_duration(now - start_ts)}"]
         if current_tool:
@@ -367,16 +392,16 @@ async def _run_and_display(
             return
         if name.lower() == "enterplanmode":
             if session.permission_mode != "plan":
-                print(f"[Plan] EnterPlanMode 检测到，切换为 plan", flush=True)
-                await store.set_permission_mode(user_id, chat_id, "plan")
+                print(f"[{bot.profile.name}][Plan] EnterPlanMode 检测到，切换为 plan", flush=True)
+                await bot.store.set_permission_mode(user_id, chat_id, "plan")
             return
         if name.lower() == "enterworktree" and inp:
             wt_name = inp.get("name", "")
             if wt_name:
-                print(f"[Worktree] 进入 worktree: {wt_name}", flush=True)
+                print(f"[{bot.profile.name}][Worktree] 进入: {wt_name}", flush=True)
             return
         if name.lower() == "exitworktree":
-            print(f"[Worktree] 退出 worktree", flush=True)
+            print(f"[{bot.profile.name}][Worktree] 退出", flush=True)
             return
         if name.lower() == "askuserquestion":
             question = inp.get("question", inp.get("text", ""))
@@ -400,7 +425,6 @@ async def _run_and_display(
 
     async def on_text_chunk(chunk: str):
         nonlocal accumulated, last_push_time, current_tool, last_output_ts
-        # Claude 开始生成文本说明上一个工具已返回
         if current_tool:
             current_tool = None
         accumulated += chunk
@@ -414,7 +438,6 @@ async def _run_and_display(
         final_usage.update(usage)
 
     async def _heartbeat():
-        """空闲时每秒刷新一次卡片 footer，让用户看到运行时长和工具计时。"""
         nonlocal last_push_time
         try:
             while True:
@@ -429,7 +452,7 @@ async def _run_and_display(
 
     claude_msg = text
     try:
-        print(f"[run_claude] 开始调用...", flush=True)
+        print(f"[{bot.profile.name}][run_claude] 开始调用...", flush=True)
         full_text, new_session_id, used_fresh_session_fallback = await run_claude(
             message=claude_msg,
             session_id=session.session_id,
@@ -438,27 +461,25 @@ async def _run_and_display(
             permission_mode=session.permission_mode,
             on_text_chunk=on_text_chunk,
             on_tool_use=on_tool_use,
-            on_process_start=lambda proc: _active_runs.attach_process(user_id, chat_id, proc),
+            on_process_start=lambda proc: bot.active_runs.attach_process(user_id, chat_id, proc),
             on_usage=on_usage,
             append_system_prompt=append_system_prompt or None,
         )
-        print(f"[run_claude] 完成, session={new_session_id}", flush=True)
+        print(f"[{bot.profile.name}][run_claude] 完成, session={new_session_id}", flush=True)
     except Exception as e:
         if active_run.stop_requested:
             return
-        print(f"[error] Claude 运行失败: {type(e).__name__}: {e}", flush=True)
+        print(f"[{bot.profile.name}][error] Claude 运行失败: {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
         try:
-            await feishu.update_card(card_msg_id, f"❌ Claude 执行出错：{type(e).__name__}: {e}")
+            await bot.feishu.update_card(card_msg_id, f"❌ Claude 执行出错：{type(e).__name__}: {e}")
         except Exception:
             pass
         return
     finally:
         heartbeat_task.cancel()
-        _active_runs.clear_run(user_id, chat_id, active_run)
+        bot.active_runs.clear_run(user_id, chat_id, active_run)
 
-    # 最终更新卡片，检测选项时附加按钮
-    # AskUserQuestion 的内容在 accumulated 里，full_text 可能不含，需要兜底
     final = full_text or accumulated or "（无输出）"
     if used_fresh_session_fallback:
         final = (
@@ -473,62 +494,61 @@ async def _run_and_display(
     try:
         if options:
             buttons = [
-                {"text": display, "value": {"reply": value, "cid": chat_id}}
+                {"text": display, "value": {"reply": value, "cid": chat_id, "profile": bot.profile.name}}
                 for display, value in options
             ]
-            # 短选项(Y/N等)横排，长选项竖排
             short = all(len(b["text"]) <= 10 for b in buttons)
-            await feishu.update_card_with_buttons(card_msg_id, final, buttons, flow=short)
+            await bot.feishu.update_card_with_buttons(card_msg_id, final, buttons, flow=short)
         else:
-            await feishu.update_card(card_msg_id, final)
+            await bot.feishu.update_card(card_msg_id, final)
         card_patched = True
     except Exception as e:
-        print(f"[error] 卡片更新失败，回退发文本: {e}", flush=True)
+        print(f"[{bot.profile.name}][error] 卡片更新失败，回退发文本: {e}", flush=True)
         try:
             if is_group and notify_msg_id:
-                await feishu.reply_card(notify_msg_id, content=final, loading=False)
+                await bot.feishu.reply_card(notify_msg_id, content=final, loading=False)
             else:
-                await feishu.send_text_to_user(user_id, final)
+                await bot.feishu.send_text_to_user(user_id, final)
         except Exception as fallback_err:
-            print(f"[error] 文本回退也失败: {fallback_err}", flush=True)
+            print(f"[{bot.profile.name}][error] 文本回退也失败: {fallback_err}", flush=True)
 
     if card_patched:
         try:
             if is_group and notify_msg_id:
-                await feishu.reply_text(notify_msg_id, "✅")
+                await bot.feishu.reply_text(notify_msg_id, "✅")
             else:
-                await feishu.send_text_to_user(user_id, "✅")
+                await bot.feishu.send_text_to_user(user_id, "✅")
         except Exception:
             pass
 
     if new_session_id:
-        await store.on_claude_response(
+        await bot.store.on_claude_response(
             user_id, chat_id, new_session_id, preview_text or text,
         )
 
-    # ExitPlanMode: Claude 批准方案后要切到执行模式
     if plan_exited and session.permission_mode == "plan":
-        print(f"[Plan] ExitPlanMode 检测到，切换为 bypassPermissions", flush=True)
-        await store.set_permission_mode(user_id, chat_id, "bypassPermissions")
+        print(f"[{bot.profile.name}][Plan] ExitPlanMode 检测到，切换为 bypassPermissions", flush=True)
+        await bot.store.set_permission_mode(user_id, chat_id, "bypassPermissions")
         try:
             notice = "🚀 已退出规划模式，发送任意消息开始执行。"
             if is_group and notify_msg_id:
-                await feishu.reply_text(notify_msg_id, notice)
+                await bot.feishu.reply_text(notify_msg_id, notice)
             else:
-                await feishu.send_text_to_user(user_id, notice)
+                await bot.feishu.send_text_to_user(user_id, notice)
         except Exception:
             pass
 
 
-async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id: str, msg):
+async def _process_message(bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, msg):
     """实际处理消息的逻辑，在 per-chat lock 保护下执行"""
+    tag = bot.profile.name
     print(
-        f"[处理消息] user={user_id[:8]}... chat={chat_id[:10]}... "
+        f"[{tag}][处理消息] user={user_id[:8]}... chat={chat_id[:10]}... "
         f"thread={thread_id[:10] if thread_id else '-'} is_group={is_group}",
         flush=True,
     )
     text = ""
-    preview_text = ""  # 原始用户文本，用于 /resume 列表展示
+    preview_text = ""
 
     if msg.message_type == "text":
         try:
@@ -538,7 +558,6 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id
         if not text:
             return
 
-        # 群聊：去掉 @mention 占位符
         if is_group:
             mentions = getattr(msg, 'mentions', None) or []
             for mention in mentions:
@@ -546,28 +565,28 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id
                 if key:
                     text = text.replace(key, '').strip()
             if not text and not thread_id:
-                return  # 非话题群光 @bot 没上下文来源，忽略；话题群交给下方 thread_context 补全
+                return
 
         preview_text = text
-        print(f"[文本] {text[:50] if text else '(空)'}", flush=True)
+        print(f"[{tag}][文本] {text[:50] if text else '(空)'}", flush=True)
 
     elif msg.message_type == "image":
         try:
             image_key = json.loads(msg.content).get("image_key", "")
             if not image_key:
                 return
-            img_path = await feishu.download_image(msg.message_id, image_key)
+            img_path = await bot.feishu.download_image(msg.message_id, image_key)
             text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
             preview_text = "[图片]"
         except Exception as e:
-            print(f"[error] 下载图片失败: {e}")
+            print(f"[{tag}][error] 下载图片失败: {e}")
             if is_group:
                 try:
-                    await feishu.reply_card(msg.message_id, content=f"❌ 下载图片失败：{e}", loading=False)
+                    await bot.feishu.reply_card(msg.message_id, content=f"❌ 下载图片失败：{e}", loading=False)
                 except Exception:
                     pass
             else:
-                await feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
+                await bot.feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
             return
 
     elif msg.message_type == "file":
@@ -577,7 +596,7 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id
             file_name = content_obj.get("file_name", "") or "file"
             if not file_key:
                 return
-            fpath = await feishu.download_file(
+            fpath = await bot.feishu.download_file(
                 msg.message_id, file_key, msg_type="file", file_name=file_name,
             )
             text = (
@@ -586,21 +605,20 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id
             )
             preview_text = f"[文件 {file_name}]"
         except Exception as e:
-            print(f"[error] 下载文件失败: {e}")
+            print(f"[{tag}][error] 下载文件失败: {e}")
             if is_group:
                 try:
-                    await feishu.reply_card(msg.message_id, content=f"❌ 下载文件失败：{e}", loading=False)
+                    await bot.feishu.reply_card(msg.message_id, content=f"❌ 下载文件失败：{e}", loading=False)
                 except Exception:
                     pass
             else:
-                await feishu.send_text_to_user(user_id, f"❌ 下载文件失败：{e}")
+                await bot.feishu.send_text_to_user(user_id, f"❌ 下载文件失败：{e}")
             return
 
     elif msg.message_type == "post":
         post_text = parse_post_content(msg.content).strip()
         image_keys = extract_post_image_keys(msg.content)
 
-        # 群聊去掉 @mention 占位符（post 文本里也可能混入）
         if is_group:
             for mention in (getattr(msg, 'mentions', None) or []):
                 key = getattr(mention, 'key', '')
@@ -610,13 +628,13 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id
         img_paths: list[str] = []
         for ik in image_keys:
             try:
-                path = await feishu.download_image(msg.message_id, ik)
+                path = await bot.feishu.download_image(msg.message_id, ik)
                 img_paths.append(path)
             except Exception as e:
-                print(f"[error] 下载 post 图片失败 key={ik[:8]}...: {e}", flush=True)
+                print(f"[{tag}][error] 下载 post 图片失败 key={ik[:8]}...: {e}", flush=True)
 
         if not post_text and not img_paths:
-            print(f"[post] 空内容，忽略", flush=True)
+            print(f"[{tag}][post] 空内容，忽略", flush=True)
             return
 
         if img_paths:
@@ -633,58 +651,59 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id
             text = post_text
             preview_text = post_text
 
-        print(f"[post] text_len={len(post_text)} imgs={len(img_paths)}", flush=True)
+        print(f"[{tag}][post] text_len={len(post_text)} imgs={len(img_paths)}", flush=True)
 
     else:
-        return  # 不支持的消息类型
+        return
 
     # ── 斜杠命令 ──────────────────────────────────────────────
     parsed = parse_command(text)
     if parsed:
         cmd, args = parsed
-        print(f"[cmd] 执行命令 {cmd}", flush=True)
-        reply = await handle_command(cmd, args, user_id, chat_id, store)
-        print(f"[cmd] 命令返回 type={type(reply).__name__}", flush=True)
+        print(f"[{tag}][cmd] 执行命令 {cmd}", flush=True)
+        reply = await handle_command(cmd, args, user_id, chat_id, bot.store)
         if reply is not None:
             if isinstance(reply, dict):
                 reply_text, reply_buttons = reply["text"], reply.get("buttons", [])
             else:
                 reply_text, reply_buttons = reply, []
 
+            # 给每个按钮带上 profile，用于后续回调路由
+            for btn in reply_buttons:
+                val = btn.get("value")
+                if isinstance(val, dict):
+                    val.setdefault("profile", bot.profile.name)
+
             if reply_buttons:
                 if is_group:
-                    card_id = await feishu.reply_card(msg.message_id, content=reply_text, loading=False)
+                    card_id = await bot.feishu.reply_card(msg.message_id, content=reply_text, loading=False)
                 else:
-                    card_id = await feishu.send_card_to_user(user_id, content=reply_text, loading=False)
-                print(f"[按钮] 卡片已发送 card_id={card_id}, 准备添加 {len(reply_buttons)} 个按钮", flush=True)
+                    card_id = await bot.feishu.send_card_to_user(user_id, content=reply_text, loading=False)
                 try:
                     short = all(len(b["text"]) <= 12 for b in reply_buttons)
-                    await feishu.update_card_with_buttons(card_id, reply_text, reply_buttons, flow=short)
-                    print(f"[按钮] 按钮添加成功", flush=True)
+                    await bot.feishu.update_card_with_buttons(card_id, reply_text, reply_buttons, flow=short)
                 except Exception as btn_err:
-                    print(f"[按钮] 按钮添加失败: {btn_err}", flush=True)
+                    print(f"[{tag}][按钮] 失败: {btn_err}", flush=True)
             else:
                 if is_group:
-                    await feishu.reply_card(msg.message_id, content=reply_text, loading=False)
+                    await bot.feishu.reply_card(msg.message_id, content=reply_text, loading=False)
                 else:
-                    await feishu.send_card_to_user(user_id, content=reply_text, loading=False)
+                    await bot.feishu.send_card_to_user(user_id, content=reply_text, loading=False)
             return
-        # reply is None → 不是 bot 命令，当作普通消息（含 /xxx）转发给 Claude
 
     # ── 普通消息 → 调用 Claude ──────────────────────────────
-    session = await store.get_current(user_id, chat_id)
-    print(f"[Claude] session={session.session_id} model={session.model}", flush=True)
+    session = await bot.store.get_current(user_id, chat_id)
+    print(f"[{tag}][Claude] session={session.session_id} model={session.model}", flush=True)
 
-    # 话题群：拉取未见过的历史消息（话题正文 + 前置评论）作为上下文前缀
     if thread_id:
         try:
-            last_seen = await store.get_last_seen(user_id, chat_id)
+            last_seen = await bot.store.get_last_seen(user_id, chat_id)
             context_block, ctx_paths = await build_thread_context(
-                feishu, thread_id, last_seen, msg.message_id,
+                bot.feishu, thread_id, last_seen, msg.message_id,
             )
             if context_block:
                 print(
-                    f"[thread] 注入上下文：last_seen={last_seen[:12] if last_seen else '-'}, "
+                    f"[{tag}][thread] 注入上下文 last_seen={last_seen[:12] if last_seen else '-'}, "
                     f"附件={len(ctx_paths)}",
                     flush=True,
                 )
@@ -692,15 +711,13 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id
                     text = f"{context_block}\n\n【用户刚刚 @ 你并说】\n{text}"
                 else:
                     text = f"{context_block}\n\n【用户刚刚 @ 你，没有新正文，请基于上方内容回复】"
-            # 不管有没有新增，都把 last_seen 推进到当前消息
-            await store.set_last_seen(user_id, chat_id, msg.message_id)
+            await bot.store.set_last_seen(user_id, chat_id, msg.message_id)
         except Exception as e:
-            print(f"[thread] 构建上下文失败（继续处理当前消息）: {e}", flush=True)
+            print(f"[{tag}][thread] 构建上下文失败（继续处理当前消息）: {e}", flush=True)
 
-    # 安全网：话题群光 @bot 无正文且没拉到任何上下文 → 给个提示，别发空 prompt 给 Claude
     if not text.strip():
         try:
-            await feishu.reply_card(
+            await bot.feishu.reply_card(
                 msg.message_id,
                 content="ℹ️ 只 @ 了我但没有正文，也没有新的话题消息可读。请补一句说明你想做什么。",
                 loading=False,
@@ -709,28 +726,27 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id
             pass
         return
 
-    # 1. 发送"思考中"占位卡片，拿到 message_id
     try:
         if is_group:
-            card_msg_id = await feishu.reply_card(msg.message_id, loading=True)
+            card_msg_id = await bot.feishu.reply_card(msg.message_id, loading=True)
         else:
-            card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
-        print(f"[卡片] card_msg_id={card_msg_id}", flush=True)
+            card_msg_id = await bot.feishu.send_card_to_user(user_id, loading=True)
     except Exception as e:
-        print(f"[error] 发送占位卡片失败: {e}", flush=True)
+        print(f"[{tag}][error] 发送占位卡片失败: {e}", flush=True)
         if is_group:
             try:
-                await feishu.reply_card(msg.message_id, content=f"❌ 发送消息失败：{e}", loading=False)
+                await bot.feishu.reply_card(msg.message_id, content=f"❌ 发送消息失败：{e}", loading=False)
             except Exception:
                 pass
         else:
-            await feishu.send_text_to_user(user_id, f"❌ 发送消息失败：{e}")
+            await bot.feishu.send_text_to_user(user_id, f"❌ 发送消息失败：{e}")
         return
 
     raw_chat_id = chat_id.split(":", 1)[0] if ":" in chat_id else chat_id
-    lark_sys = _build_lark_system_prompt(raw_chat_id, thread_id, msg.message_id, is_group)
+    lark_sys = _build_lark_system_prompt(bot.profile, raw_chat_id, thread_id, msg.message_id, is_group)
 
     await _run_and_display(
+        bot,
         user_id, chat_id, is_group, text, card_msg_id, session, msg.message_id,
         preview_text=preview_text,
         append_system_prompt=lark_sys,
@@ -738,7 +754,6 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, thread_id
 
 
 def _context_window_for(model: str) -> int:
-    """Return context window size in tokens. Rough heuristic by model id."""
     m = (model or "").lower()
     if "[1m]" in m or "1m" in m:
         return 1_000_000
@@ -746,38 +761,52 @@ def _context_window_for(model: str) -> int:
 
 
 def _build_lark_system_prompt(
+    profile: Profile,
     raw_chat_id: str,
     thread_id: str,
     user_message_id: str,
     is_group: bool,
 ) -> str:
-    """构造注入到 Claude 的 Lark 语境系统提示。"""
+    """构造注入到 Claude 的 Lark 语境系统提示，含 profile 名（决定 lark-cli --profile）。"""
+    brand = profile.brand_label
+    cli_profile = profile.lark_cli_profile or profile.name
+
     location_lines = [f"- chat_id: {raw_chat_id}"]
     if thread_id:
         location_lines.append(f"- thread_id: {thread_id}（话题群 / topic thread）")
     location_lines.append(f"- 用户刚发的消息 id: {user_message_id}")
     location_lines.append(f"- 场景: {'群聊' if is_group else '私聊'}")
+    location_lines.append(f"- 平台: {brand}（domain: {profile.domain}）")
+    location_lines.append(f"- 对应 lark-cli profile: **{cli_profile}**")
 
     reply_flag = "--reply-in-thread " if thread_id else ""
+    profile_flag = f"--profile {cli_profile} "
     reply_cmd_text = (
-        f'lark-cli im +messages-reply --as bot --message-id {user_message_id} '
+        f'lark-cli {profile_flag}im +messages-reply --as bot --message-id {user_message_id} '
         f'{reply_flag}--text "<文本>"'
     )
     reply_cmd_image = (
-        f'cd <文件所在目录> && lark-cli im +messages-reply --as bot '
+        f'cd <文件所在目录> && lark-cli {profile_flag}im +messages-reply --as bot '
         f'--message-id {user_message_id} {reply_flag}--image <相对路径>'
     )
     reply_cmd_file = (
-        f'cd <文件所在目录> && lark-cli im +messages-reply --as bot '
+        f'cd <文件所在目录> && lark-cli {profile_flag}im +messages-reply --as bot '
         f'--message-id {user_message_id} {reply_flag}--file <相对路径>'
     )
+    create_doc = (
+        f'lark-cli {profile_flag}docs +create --as user '
+        f'--title "<简短标题>" --markdown "<完整内容>"'
+    )
 
-    return f"""你正在通过飞书/Lark 与用户对话。你输出的文本由后台 bot 渲染成 Lark 卡片发到用户的聊天里。除此之外，你可以主动调用 `lark-cli` 往当前会话发送图片、文件、文档链接。
+    return f"""你正在通过{brand}与用户对话。你输出的文本由后台 bot 渲染成卡片发到用户的聊天里。除此之外，你可以主动调用 `lark-cli` 往当前会话发送图片、文件、文档链接。
 
 【当前会话信息】
 {chr(10).join(location_lines)}
 
-【何时主动调用 lark-cli（而不是把内容塞进你的文字回复）】
+【⚠️ 多账号注意】
+本机 lark-cli 配置了多个 profile（不同租户 / 不同 bot 账号）。本次对话绑定到 profile **{cli_profile}**（{brand}）。**每一条 lark-cli 命令都必须显式加 `--profile {cli_profile}`**，否则会发到错的租户里。不要依赖当前默认 profile。
+
+【何时主动调用 lark-cli】
 
 1. 用户让你"发/截图/把X发过来/发文件"等 → 用 lark-cli 把文件/图片发到评论区：
    ```
@@ -786,23 +815,22 @@ def _build_lark_system_prompt(
    ```
    ⚠️ lark-cli 要求相对路径，**必须先 `cd` 到文件目录，再用文件名调用**，不能直接用绝对路径。
 
-2. 你的回复内容偏长（估计超 40 行或 2000 字），比如大段审计报告、SQL 结果、长列表、多文件分析总结 → **先创建 Lark 文档，再把链接回给用户**：
+2. 你的回复内容偏长（估计超 40 行或 2000 字），比如大段审计报告、SQL 结果、长列表、多文件分析总结 → **先创建文档，再把链接回给用户**：
    ```
-   lark-cli docs +create --as user --title "<简短标题>" --markdown "<完整内容>"
+   {create_doc}
    ```
-   拿到 doc_url 后，你只在文字回复里写一两句摘要 + 链接。**不要把长内容铺满卡片**，否则用户很难读。
+   拿到 doc_url 后，你只在文字回复里写一两句摘要 + 链接。**不要把长内容铺满卡片**。
 
 3. 代码片段（< 30 行）、简短回答、状态更新 → 直接在文字里回复即可，不需要 lark-cli。
 
 【额外提示】
-- 注意 lark-cli 调用是你主动发送一条新消息，和你当前这条回复是独立的。调完之后可以在文字回复里写一句"文件已发 ↑"或"文档见 <url>"告诉用户。
 - 如果要发文本消息到评论区（不是作为你当前回复的一部分），用：`{reply_cmd_text}`
+- lark-cli 调用是你主动发送一条新消息，和你当前这条回复是独立的。
 - 用户可能说中文或英文，保持和用户相同语言回复。
 """
 
 
 def _format_usage_footer(usage: dict, model: str) -> str:
-    """格式化上下文占用脚注。空 usage 返回空串。"""
     if not usage:
         return ""
     input_tok = int(usage.get("input_tokens", 0) or 0)
@@ -828,10 +856,9 @@ def _format_usage_footer(usage: dict, model: str) -> str:
 
 
 def _extract_options(text: str) -> list[tuple[str, str]]:
-    """从文本中提取选项，适配 Claude Code 原生输出格式。返回 [(按钮文字, 回复值), ...]"""
+    """从文本中提取选项，适配 Claude Code 原生输出格式。"""
     lines = text.strip().split('\n')
 
-    # 从末尾向上扫描连续的编号选项
     option_lines = []
     for line in reversed(lines):
         line = line.strip()
@@ -839,7 +866,6 @@ def _extract_options(text: str) -> list[tuple[str, str]]:
             if option_lines:
                 break
             continue
-        # 匹配: 1. xxx / 1) xxx / 1、xxx / a) xxx / A) xxx
         m = re.match(r'^(\d+|[a-zA-Z])[.）\)、]\s*(.+)', line)
         if m:
             option_lines.append((m.group(1), m.group(2).strip()))
@@ -854,7 +880,6 @@ def _extract_options(text: str) -> list[tuple[str, str]]:
             for key, desc in option_lines
         ]
 
-    # Y/N 及变体
     tail = "\n".join(lines[-3:]) if len(lines) >= 3 else text
     if re.search(r'\by\b.*\bn\b|Y/N|yes.*no|是/否|确认/取消', tail, re.IGNORECASE):
         return [("Yes", "yes"), ("No", "no")]
@@ -863,7 +888,6 @@ def _extract_options(text: str) -> list[tuple[str, str]]:
 
 
 def _format_tool(name: str, inp: dict) -> str:
-    """格式化工具调用的进度提示"""
     n = name.lower()
     if n == "bash":
         cmd = inp.get("command", "")
@@ -890,12 +914,21 @@ def _format_tool(name: str, inp: dict) -> str:
         return f"⚙️ **{name}**"
 
 
-# ── 飞书事件回调（同步）→ 调度异步任务 ───────────────────────
+# ── 卡片按钮点击处理 ─────────────────────────────────────────
 
-# ── 卡片按钮点击处理（选项选择）──────────────────────────────
+def _resolve_bot_from_value(value: dict) -> BotInstance | None:
+    """从按钮 value.profile 取 BotInstance；兼容老卡片（无 profile 字段）时取第一个 profile。"""
+    name = value.get("profile") if isinstance(value, dict) else None
+    if name and name in _bots:
+        return _bots[name]
+    # 老卡片 fallback：只有一个 profile 时用它，否则放弃
+    if len(_bots) == 1:
+        return next(iter(_bots.values()))
+    return None
+
 
 def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
-    """用户点击卡片按钮：选项回复 or 模式切换"""
+    """用户点击卡片按钮（SDK 回调路径，长连接模式下使用）"""
     global _last_event
     _last_event = time.time()
 
@@ -906,11 +939,19 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     chat_id = value.get("cid", user_id)
     clicked_msg_id = event.context.open_message_id if event.context else None
 
-    # 模式切换按钮
+    bot = _resolve_bot_from_value(value)
+    if bot is None:
+        resp = P2CardActionTriggerResponse()
+        toast = CallBackToast()
+        toast.type = "warning"
+        toast.content = "按钮已过期，请重新操作"
+        resp.toast = toast
+        return resp
+
     if action_type == "set_mode":
         mode = value.get("mode", "")
         if mode:
-            asyncio.run_coroutine_threadsafe(_handle_set_mode(user_id, chat_id, mode, clicked_msg_id), _bot_loop)
+            asyncio.run_coroutine_threadsafe(_handle_set_mode(bot, user_id, chat_id, mode, clicked_msg_id), _bot_loop)
         resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "success"
@@ -918,11 +959,10 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         resp.toast = toast
         return resp
 
-    # 命令菜单按钮 → 当作用户发了一条命令消息
     if action_type == "run_cmd":
         cmd_text = value.get("cmd", "")
         if cmd_text:
-            asyncio.run_coroutine_threadsafe(_handle_menu_command(user_id, chat_id, cmd_text, clicked_msg_id), _bot_loop)
+            asyncio.run_coroutine_threadsafe(_handle_menu_command(bot, user_id, chat_id, cmd_text, clicked_msg_id), _bot_loop)
         resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "info"
@@ -930,11 +970,10 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         resp.toast = toast
         return resp
 
-    # 恢复会话按钮
     if action_type == "resume_session":
         sid = value.get("sid", "")
         if sid:
-            asyncio.run_coroutine_threadsafe(_handle_resume_session(user_id, chat_id, sid, clicked_msg_id), _bot_loop)
+            asyncio.run_coroutine_threadsafe(_handle_resume_session(bot, user_id, chat_id, sid, clicked_msg_id), _bot_loop)
         resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "info"
@@ -942,11 +981,9 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         resp.toast = toast
         return resp
 
-    # 选项回复按钮（发给 Claude）
     reply_text = value.get("reply", "")
     if reply_text:
-        print(f"[按钮] user={user_id[:8]}... reply={reply_text}", flush=True)
-        asyncio.run_coroutine_threadsafe(_handle_button_reply(user_id, chat_id, reply_text, clicked_msg_id), _bot_loop)
+        asyncio.run_coroutine_threadsafe(_handle_button_reply(bot, user_id, chat_id, reply_text, clicked_msg_id), _bot_loop)
 
     resp = P2CardActionTriggerResponse()
     toast = CallBackToast()
@@ -956,25 +993,23 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     return resp
 
 
-async def _handle_menu_command(user_id: str, chat_id: str, cmd_text: str, card_msg_id: str):
-    """命令菜单按钮点击 → 执行命令并更新卡片"""
+async def _handle_menu_command(bot: BotInstance, user_id: str, chat_id: str, cmd_text: str, card_msg_id: str):
     is_group = (chat_id != user_id)
     parsed = parse_command(cmd_text)
     if not parsed:
         return
     cmd, args = parsed
 
-    # /stop 特殊处理
     if cmd == "stop":
-        reply_text = await _handle_stop_command(user_id, chat_id)
+        reply_text = await _handle_stop_command(bot, user_id, chat_id)
         if card_msg_id:
             try:
-                await feishu.update_card(card_msg_id, reply_text)
+                await bot.feishu.update_card(card_msg_id, reply_text)
             except Exception:
                 pass
         return
 
-    reply = await handle_command(cmd, args, user_id, chat_id, store)
+    reply = await handle_command(cmd, args, user_id, chat_id, bot.store)
     if reply is None:
         return
 
@@ -983,116 +1018,111 @@ async def _handle_menu_command(user_id: str, chat_id: str, cmd_text: str, card_m
     else:
         reply_text, reply_buttons = reply, []
 
+    for btn in reply_buttons:
+        val = btn.get("value")
+        if isinstance(val, dict):
+            val.setdefault("profile", bot.profile.name)
+
     if card_msg_id:
         try:
             if reply_buttons:
                 short = all(len(b["text"]) <= 12 for b in reply_buttons)
-                await feishu.update_card_with_buttons(card_msg_id, reply_text, reply_buttons, flow=short)
+                await bot.feishu.update_card_with_buttons(card_msg_id, reply_text, reply_buttons, flow=short)
             else:
-                await feishu.update_card(card_msg_id, reply_text)
+                await bot.feishu.update_card(card_msg_id, reply_text)
         except Exception as e:
-            print(f"[error] 菜单命令卡片更新失败: {e}", flush=True)
+            print(f"[{bot.profile.name}][error] 菜单命令卡片更新失败: {e}", flush=True)
 
 
-async def _handle_resume_session(user_id: str, chat_id: str, session_id: str, card_msg_id: str):
-    """卡片按钮恢复历史会话"""
-    sid, old_title = await store.resume_session(user_id, chat_id, session_id)
+async def _handle_resume_session(bot: BotInstance, user_id: str, chat_id: str, session_id: str, card_msg_id: str):
+    sid, old_title = await bot.store.resume_session(user_id, chat_id, session_id)
     if not sid:
-        print(f"[resume] 未找到 session: {session_id[:8]}", flush=True)
+        print(f"[{bot.profile.name}][resume] 未找到 session: {session_id[:8]}", flush=True)
         return
-    print(f"[resume] 已恢复 session: {sid[:8]}", flush=True)
+    print(f"[{bot.profile.name}][resume] 已恢复 session: {sid[:8]}", flush=True)
     if card_msg_id:
         try:
-            name = store.get_summary(user_id, sid) or f"#{sid[:8]}"
+            name = bot.store.get_summary(user_id, sid) or f"#{sid[:8]}"
             text = f"✅ 已恢复会话「{name}」，继续对话吧。"
             if old_title:
                 text += f"\n上个会话：「{old_title}」"
-            await feishu.update_card(card_msg_id, text)
+            await bot.feishu.update_card(card_msg_id, text)
         except Exception:
             pass
 
 
-async def _handle_set_mode(user_id: str, chat_id: str, mode: str, card_msg_id: str):
-    """卡片按钮切换权限模式"""
+async def _handle_set_mode(bot: BotInstance, user_id: str, chat_id: str, mode: str, card_msg_id: str):
     from commands import VALID_MODES
-    await store.set_permission_mode(user_id, chat_id, mode)
+    await bot.store.set_permission_mode(user_id, chat_id, mode)
     desc = VALID_MODES.get(mode, "")
-    print(f"[模式切换] user={user_id[:8]}... mode={mode}", flush=True)
+    print(f"[{bot.profile.name}][模式切换] user={user_id[:8]}... mode={mode}", flush=True)
     if card_msg_id:
         try:
-            await feishu.update_card(card_msg_id, f"✅ 已切换为 **{mode}**\n{desc}")
+            await bot.feishu.update_card(card_msg_id, f"✅ 已切换为 **{mode}**\n{desc}")
         except Exception:
             pass
 
 
-async def _handle_button_reply(user_id: str, chat_id: str, text: str, clicked_msg_id: str):
-    """按钮点击 → 走正常的 lock + Claude 流程"""
+async def _handle_button_reply(bot: BotInstance, user_id: str, chat_id: str, text: str, clicked_msg_id: str):
     is_group = (chat_id != user_id)
-
-    # 按钮点击不打断当前任务，自然排队等待
-    if chat_id not in _chat_locks:
-        if len(_chat_locks) >= _MAX_CHAT_LOCKS:
-            idle = [k for k, v in _chat_locks.items() if not v.locked()]
-            for k in idle[:len(idle) // 2]:
-                del _chat_locks[k]
-        _chat_locks[chat_id] = asyncio.Lock()
-    lock = _chat_locks[chat_id]
+    lock = bot._ensure_chat_lock(chat_id)
 
     if lock.locked() and clicked_msg_id:
         try:
-            await feishu.reply_text(clicked_msg_id, "📬 前面还有任务在跑，排队中（/stop 可打断）")
+            await bot.feishu.reply_text(clicked_msg_id, "📬 前面还有任务在跑，排队中（/stop 可打断）")
         except Exception:
             pass
 
     async with lock:
         try:
-            session = await store.get_current(user_id, chat_id)
+            session = await bot.store.get_current(user_id, chat_id)
             try:
                 if is_group and clicked_msg_id:
-                    card_msg_id = await feishu.reply_card(clicked_msg_id, loading=True)
+                    card_msg_id = await bot.feishu.reply_card(clicked_msg_id, loading=True)
                 else:
-                    card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
+                    card_msg_id = await bot.feishu.send_card_to_user(user_id, loading=True)
             except Exception as e:
-                print(f"[error] 按钮回复占位卡片失败: {e}", flush=True)
+                print(f"[{bot.profile.name}][error] 按钮回复占位卡片失败: {e}", flush=True)
                 return
             raw_chat_id, _, btn_thread_id = chat_id.partition(":")
             lark_sys = _build_lark_system_prompt(
-                raw_chat_id, btn_thread_id, clicked_msg_id or "", is_group,
+                bot.profile, raw_chat_id, btn_thread_id, clicked_msg_id or "", is_group,
             )
             await _run_and_display(
+                bot,
                 user_id, chat_id, is_group, text,
                 card_msg_id, session, clicked_msg_id or "",
                 append_system_prompt=lark_sys,
             )
         except Exception as e:
-            print(f"[error] 按钮回复处理异常: {type(e).__name__}: {e}", flush=True)
+            print(f"[{bot.profile.name}][error] 按钮回复处理异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
-
-
-# ── 飞书事件回调（同步）→ 调度异步任务 ───────────────────────
-
-def on_message_receive(data: P2ImMessageReceiveV1) -> None:
-    """飞书 SDK 同步回调，调度异步任务到 _bot_loop。"""
-    global _last_event
-    _last_event = time.time()
-    asyncio.run_coroutine_threadsafe(handle_message_async(data), _bot_loop)
 
 
 # ── CLI Handover ─────────────────────────────────────────────
 
-async def _handle_handover(session_id: str, cwd: str, model: str,
-                           target_user: str = "", target_chat: str = "") -> dict:
-    """处理来自 CLI 的 handover 请求：切换飞书当前会话并推送通知"""
-    user_id = target_user or store.find_primary_user()
+async def _handle_handover(
+    session_id: str, cwd: str, model: str,
+    profile_name: str = "", target_user: str = "", target_chat: str = "",
+) -> dict:
+    """处理来自 CLI 的 handover 请求。profile_name 为空时自动选第一个。"""
+    bot: BotInstance | None = None
+    if profile_name:
+        bot = _bots.get(profile_name)
+    if bot is None:
+        if not _bots:
+            return {"ok": False, "error": "no bot profile loaded"}
+        bot = next(iter(_bots.values()))
+
+    user_id = target_user or bot.store.find_primary_user()
     if not user_id:
-        return {"ok": False, "error": "no user found in sessions, pass user_id param"}
+        return {"ok": False, "error": f"no user found in profile {bot.profile.name}, pass user_id param"}
 
-    chat_id = target_chat or user_id  # 默认私聊
+    chat_id = target_chat or user_id
 
-    result = await store.handover_session(user_id, chat_id, session_id, cwd=cwd, model=model)
+    result = await bot.store.handover_session(user_id, chat_id, session_id, cwd=cwd, model=model)
 
-    # 构造通知文本
-    cur = await store.get_current_raw(user_id, chat_id)
+    cur = await bot.store.get_current_raw(user_id, chat_id)
     display_cwd = cur.get("cwd", "~")
     display_model = cur.get("model", "unknown")
     display_mode = cur.get("permission_mode", "bypassPermissions")
@@ -1100,7 +1130,7 @@ async def _handle_handover(session_id: str, cwd: str, model: str,
     old_note = f"\n上个会话：「{old_summary}」" if old_summary else ""
 
     notify_text = (
-        f"**CLI 会话已接入**\n"
+        f"**CLI 会话已接入**（profile `{bot.profile.name}`）\n"
         f"Session: `{session_id[:12]}...`\n"
         f"目录: `{display_cwd}`\n"
         f"模型: `{display_model}`\n"
@@ -1109,18 +1139,18 @@ async def _handle_handover(session_id: str, cwd: str, model: str,
     )
 
     try:
-        await feishu.send_card_to_user(user_id, content=notify_text, loading=False)
+        await bot.feishu.send_card_to_user(user_id, content=notify_text, loading=False)
     except Exception as e:
-        print(f"[handover] 推送通知失败: {e}", flush=True)
+        print(f"[{bot.profile.name}][handover] 推送通知失败: {e}", flush=True)
 
-    print(f"[handover] session={session_id[:8]}... cwd={display_cwd}", flush=True)
-    return {"ok": True, "user_id": user_id, "session_id": session_id}
+    print(f"[{bot.profile.name}][handover] session={session_id[:8]}... cwd={display_cwd}", flush=True)
+    return {"ok": True, "profile": bot.profile.name, "user_id": user_id, "session_id": session_id}
 
 
-# ── 卡片回调 HTTP 服务（配合 ngrok 暴露给飞书）────────────────
+# ── 卡片回调 HTTP 服务 ───────────────────────────────────────
 
 class _CardCallbackHandler(BaseHTTPRequestHandler):
-    """处理飞书卡片按钮点击的 HTTP 回调"""
+    """处理飞书/Lark 卡片按钮点击的 HTTP 回调"""
 
     def do_POST(self):
         length = int(self.headers.get('Content-Length', 0))
@@ -1131,7 +1161,6 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             self._respond(400, {"error": "bad json"})
             return
 
-        # 飞书 URL 验证
         if data.get("type") == "url_verification":
             self._respond(200, {"challenge": data.get("challenge", "")})
             return
@@ -1140,20 +1169,25 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         operator = event.get("operator", {})
         user_id = operator.get("open_id", "")
         action = event.get("action", {})
-        value = action.get("value", {})
+        value = action.get("value", {}) or {}
         context = event.get("context", {})
 
         action_type = value.get("action", "")
         chat_id = value.get("cid", user_id)
         clicked_msg_id = context.get("open_message_id", "")
 
-        print(f"[HTTP回调] user={user_id[:8]}... action={action_type or 'reply'}", flush=True)
+        bot = _resolve_bot_from_value(value)
+        if bot is None:
+            self._respond(200, {"toast": {"type": "warning", "content": "按钮已过期"}})
+            return
+
+        print(f"[{bot.profile.name}][HTTP回调] user={user_id[:8]}... action={action_type or 'reply'}", flush=True)
 
         if action_type == "set_mode":
             mode = value.get("mode", "")
             if mode:
                 asyncio.run_coroutine_threadsafe(
-                    _handle_set_mode(user_id, chat_id, mode, clicked_msg_id),
+                    _handle_set_mode(bot, user_id, chat_id, mode, clicked_msg_id),
                     _bot_loop,
                 )
             self._respond(200, {"toast": {"type": "success", "content": f"已切换: {mode}"}})
@@ -1161,7 +1195,7 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             cmd_text = value.get("cmd", "")
             if cmd_text:
                 asyncio.run_coroutine_threadsafe(
-                    _handle_menu_command(user_id, chat_id, cmd_text, clicked_msg_id),
+                    _handle_menu_command(bot, user_id, chat_id, cmd_text, clicked_msg_id),
                     _bot_loop,
                 )
             self._respond(200, {"toast": {"type": "info", "content": cmd_text}})
@@ -1169,7 +1203,7 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             sid = value.get("sid", "")
             if sid:
                 asyncio.run_coroutine_threadsafe(
-                    _handle_resume_session(user_id, chat_id, sid, clicked_msg_id),
+                    _handle_resume_session(bot, user_id, chat_id, sid, clicked_msg_id),
                     _bot_loop,
                 )
             self._respond(200, {"toast": {"type": "info", "content": "正在恢复..."}})
@@ -1177,7 +1211,7 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             reply_text = value.get("reply", "")
             if reply_text:
                 asyncio.run_coroutine_threadsafe(
-                    _handle_button_reply(user_id, chat_id, reply_text, clicked_msg_id),
+                    _handle_button_reply(bot, user_id, chat_id, reply_text, clicked_msg_id),
                     _bot_loop,
                 )
             self._respond(200, {"toast": {"type": "info", "content": f"已发送: {reply_text}"}})
@@ -1191,6 +1225,7 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             session_id = params.get("session_id", [""])[0]
             cwd = params.get("cwd", [""])[0]
             model = params.get("model", [""])[0]
+            profile_name = params.get("profile", [""])[0]
             target_user = params.get("user_id", [""])[0]
             target_chat = params.get("chat_id", [""])[0]
 
@@ -1200,7 +1235,7 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
 
             try:
                 future = asyncio.run_coroutine_threadsafe(
-                    _handle_handover(session_id, cwd, model, target_user, target_chat),
+                    _handle_handover(session_id, cwd, model, profile_name, target_user, target_chat),
                     _bot_loop,
                 )
                 result = future.result(timeout=15)
@@ -1219,37 +1254,38 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        pass  # 静默 HTTP 日志
+        pass
 
 
 # ── 后台定时摘要生成 ─────────────────────────────────────────
 
 def _bg_summary_thread():
-    """后台线程: 每 10 分钟扫描未摘要的会话，逐个生成摘要"""
-    time.sleep(60)  # 启动后等 1 分钟再开始
+    """扫描所有 profile 下未摘要的会话，逐个生成摘要"""
+    time.sleep(60)
     while True:
         try:
-            unsummarized = store.get_all_unsummarized()
-            if unsummarized:
-                print(f"[摘要] 发现 {len(unsummarized)} 个未摘要会话", flush=True)
+            for bot in _bots.values():
+                unsummarized = bot.store.get_all_unsummarized()
+                if not unsummarized:
+                    continue
+                print(f"[{bot.profile.name}][摘要] 发现 {len(unsummarized)} 个未摘要会话", flush=True)
                 count = 0
                 for user_id, sid in unsummarized[:5]:
                     try:
                         summary = generate_summary(sid)
                         if summary:
-                            store._data.setdefault(user_id, {}).setdefault("summaries", {})[sid] = summary
+                            bot.store._data.setdefault(user_id, {}).setdefault("summaries", {})[sid] = summary
                             _write_custom_title(sid, summary)
                             count += 1
-                            print(f"[摘要] #{sid[:8]} → {summary}", flush=True)
+                            print(f"[{bot.profile.name}][摘要] #{sid[:8]} → {summary}", flush=True)
                     except Exception as e:
-                        print(f"[摘要] #{sid[:8]} 失败: {e}", flush=True)
-                    time.sleep(5)  # 每个请求间隔 5 秒，避免 429
+                        print(f"[{bot.profile.name}][摘要] #{sid[:8]} 失败: {e}", flush=True)
+                    time.sleep(5)
                 if count:
-                    store._save()  # 同步原子写入
-                    print(f"[摘要] 本轮完成 {count}/{len(unsummarized)} 个", flush=True)
+                    bot.store._save()
         except Exception as e:
             print(f"[摘要] 定时任务异常: {e}", flush=True)
-        time.sleep(600)  # 10 分钟
+        time.sleep(600)
 
 
 def _start_callback_server(port):
@@ -1263,7 +1299,6 @@ def _start_ngrok(port):
     import subprocess
     import urllib.request
 
-    # 先检查已有的 ngrok 隧道
     try:
         with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as r:
             tunnels = json.loads(r.read())
@@ -1273,7 +1308,6 @@ def _start_ngrok(port):
     except Exception:
         pass
 
-    # 启动新 ngrok（有固定域名就用，保证重启后 URL 不变）
     try:
         ngrok_domain = os.environ.get("NGROK_DOMAIN", "")
         ngrok_cmd = ["ngrok", "http", "--url", ngrok_domain, str(port)] if ngrok_domain else ["ngrok", "http", str(port)]
@@ -1293,23 +1327,70 @@ def _start_ngrok(port):
     return None
 
 
+# ── 启动每个 profile 的 WebSocket 客户端 ──────────────────────
+
+def _start_profile_ws(bot: BotInstance):
+    """为一个 profile 启动独立的 WebSocket 客户端（跑在单独线程里，阻塞调用）。"""
+    def _on_message(data: P2ImMessageReceiveV1) -> None:
+        global _last_event
+        _last_event = time.time()
+        asyncio.run_coroutine_threadsafe(handle_message_async(bot, data), _bot_loop)
+
+    handler = (
+        lark.EventDispatcherHandler.builder("", "")
+        .register_p2_im_message_receive_v1(_on_message)
+        .register_p2_card_action_trigger(on_card_action)
+        .register_p2_im_message_message_read_v1(lambda _e: None)
+        .build()
+    )
+
+    ws_client = lark.ws.Client(
+        bot.profile.app_id,
+        bot.profile.app_secret,
+        event_handler=handler,
+        domain=bot.profile.domain,
+        log_level=lark.LogLevel.INFO,
+    )
+
+    def _run():
+        # 给这条 WS 线程分配独立的 asyncio 事件循环；lark_oapi 内部的
+        # 模块级 `loop` 代理会据此分发，不同 profile 的 ws.Client 互不打架。
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        ws_client.start()
+
+    t = threading.Thread(
+        target=_run,
+        daemon=True,
+        name=f"ws-{bot.profile.name}",
+    )
+    t.start()
+    print(f"   [{bot.profile.name}] WS 客户端已启动 ({bot.profile.brand_label} · {bot.profile.domain})")
+
+
 # ── 启动 ──────────────────────────────────────────────────────
 
 def main():
-    print("🚀 飞书 Claude Bot 启动中...")
-    print(f"   平台        : {config.LARK_PLATFORM} ({config.LARK_DOMAIN})")
-    print(f"   App ID      : {config.FEISHU_APP_ID}")
+    print("🚀 飞书/Lark Claude Bot 启动中...")
+    print(f"   已加载 {len(config.PROFILES)} 个 profile")
+    for p in config.PROFILES:
+        allow_desc = f"{len(p.allowed_open_ids)} 人" if p.allowed_open_ids else "⚠️ 所有人"
+        group_desc = (
+            f"{len(p.allowed_group_chat_ids)} 群" if p.allowed_group_chat_ids else "禁用"
+        )
+        print(
+            f"   · {p.name:<8} {p.brand_label}  "
+            f"app={p.app_id}  cwd={p.default_cwd}  "
+            f"allow={allow_desc}  groups={group_desc}  "
+            f"lark-cli profile={p.lark_cli_profile}"
+        )
     print(f"   默认模型    : {config.DEFAULT_MODEL}")
-    print(f"   默认工作目录: {config.DEFAULT_CWD}")
     print(f"   权限模式    : {config.PERMISSION_MODE}")
-    allow_desc = f"{len(config.ALLOWED_OPEN_IDS)} 人" if config.ALLOWED_OPEN_IDS else "⚠️ 所有人"
-    group_desc = (
-        f"{len(config.ALLOWED_GROUP_CHAT_IDS)} 个群"
-        if config.ALLOWED_GROUP_CHAT_IDS else "禁用"
-    )
-    print(f"   访问控制    : allowlist={allow_desc}, 群聊白名单={group_desc}")
 
-    # 卡片回调 HTTP 服务 + ngrok 隧道
+    # 构建 BotInstance
+    for p in config.PROFILES:
+        _bots[p.name] = BotInstance(p)
+
+    # 卡片回调 HTTP 服务 + ngrok 隧道（所有 profile 共用一个端口）
     cb_port = config.CALLBACK_PORT
     _start_callback_server(cb_port)
     ngrok_url = _start_ngrok(cb_port)
@@ -1318,26 +1399,21 @@ def main():
     else:
         print(f"   卡片回调    : http://localhost:{cb_port}/callback (需启动 ngrok)")
 
-    handler = lark.EventDispatcherHandler.builder("", "") \
-        .register_p2_im_message_receive_v1(on_message_receive) \
-        .register_p2_card_action_trigger(on_card_action) \
-        .register_p2_im_message_message_read_v1(lambda _e: None) \
-        .build()
-
-    ws_client = lark.ws.Client(
-        config.FEISHU_APP_ID,
-        config.FEISHU_APP_SECRET,
-        event_handler=handler,
-        domain=config.LARK_DOMAIN,
-        log_level=lark.LogLevel.INFO,
-    )
-
     # 启动后台线程
     threading.Thread(target=_watchdog, daemon=True).start()
     threading.Thread(target=_bg_summary_thread, daemon=True).start()
 
-    print("✅ 连接飞书 WebSocket 长连接（自动重连）...")
-    ws_client.start()  # 阻塞，内部运行 asyncio loop
+    # 每个 profile 起一个 WS 客户端（单独线程，阻塞等事件）
+    print("✅ 连接 WebSocket 长连接（自动重连）...")
+    for bot in _bots.values():
+        _start_profile_ws(bot)
+
+    # 主线程保持运行，让 _bot_loop 和 WS 线程持续工作
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\n⛔ 退出")
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-CLI → 飞书 Bot 会话移交工具。
+CLI → 飞书/Lark Bot 会话移交工具。
 
 用法:
-  python3 handover.py "对话中的独特文本"
+  python3 handover.py "对话中的独特文本" [profile_name]
 
-通过内容指纹在所有 ~/.claude/projects/ 下的 .jsonl 中搜索，
-匹配到的文件就是当前会话，然后调用飞书 Bot 的 handover 端点完成移交。
+profile_name 可选；省略时 bot 会选第一个已配置的 profile（多 profile 场景下
+明确指定可避免发错）。通过内容指纹在所有 ~/.claude/projects/ 下的 .jsonl 中
+搜索，匹配到的文件就是当前会话。
 """
 
 import json
@@ -47,7 +48,7 @@ def _find_session(fingerprint: str) -> tuple[str, str] | None:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: handover.py <fingerprint>", file=sys.stderr)
+        print("Usage: handover.py <fingerprint> [profile]", file=sys.stderr)
         sys.exit(1)
 
     found = _find_session(sys.argv[1])
@@ -56,11 +57,14 @@ def main():
         sys.exit(1)
 
     session_id, cwd = found
-    params = urllib.parse.urlencode({
+    query = {
         "session_id": session_id,
         "cwd": cwd,
         "model": os.environ.get("CLAUDE_MODEL", "claude-opus-4-6"),
-    })
+    }
+    if len(sys.argv) >= 3:
+        query["profile"] = sys.argv[2]
+    params = urllib.parse.urlencode(query)
 
     try:
         with urllib.request.urlopen(f"{HANDOVER_URL}?{params}", timeout=10) as resp:

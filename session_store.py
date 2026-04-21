@@ -267,7 +267,12 @@ def _write_custom_title(session_id: str, title: str):
         pass
 
 
-SESSIONS_FILE = os.path.join(SESSIONS_DIR, "sessions.json")
+LEGACY_SESSIONS_FILE = os.path.join(SESSIONS_DIR, "sessions.json")
+
+
+def _sessions_file_for(profile: str) -> str:
+    """每个 profile 一份独立的 sessions json。"""
+    return os.path.join(SESSIONS_DIR, f"sessions-{profile}.json")
 
 
 class Session:
@@ -287,34 +292,49 @@ class Session:
 
 
 class SessionStore:
-    def __init__(self):
+    def __init__(self, profile: str = "default", default_cwd: Optional[str] = None):
+        """
+        每个 profile 独占一个 SessionStore 实例和一份 json 文件。
+        default_cwd 给新用户的初始 cwd（覆盖全局 DEFAULT_CWD）。
+        """
         os.makedirs(SESSIONS_DIR, exist_ok=True)
+        self.profile = profile
+        self._default_cwd = default_cwd or DEFAULT_CWD
+        self._sessions_file = _sessions_file_for(profile)
         self._save_lock = asyncio.Lock()  # 保护 _save() 的全局锁
         self._data: dict = self._load()
         self._dedup_all_histories()
 
     def _load(self) -> dict:
-        if os.path.exists(SESSIONS_FILE):
+        # 优先读 profile 专属文件
+        if os.path.exists(self._sessions_file):
             try:
-                with open(SESSIONS_FILE) as f:
+                with open(self._sessions_file) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        # 向后兼容：profile=default 且旧的 sessions.json 存在时读一次，下次 save 会写新文件
+        if self.profile == "default" and os.path.exists(LEGACY_SESSIONS_FILE):
+            try:
+                with open(LEGACY_SESSIONS_FILE) as f:
                     return json.load(f)
             except Exception:
                 pass
         return {}
 
     def _save(self):
-        tmp = SESSIONS_FILE + ".tmp"
+        tmp = self._sessions_file + ".tmp"
         with open(tmp, "w") as f:
             json.dump(self._data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, SESSIONS_FILE)  # 原子操作，崩溃时不会截断原文件
+        os.replace(tmp, self._sessions_file)  # 原子操作，崩溃时不会截断原文件
 
     async def _save_async(self):
         """异步保存，使用锁保护并发写入（原子写入）"""
         async with self._save_lock:
-            tmp = SESSIONS_FILE + ".tmp"
+            tmp = self._sessions_file + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(self._data, f, indent=2, ensure_ascii=False)
-            os.replace(tmp, SESSIONS_FILE)
+            os.replace(tmp, self._sessions_file)
 
     async def _bg_generate_summary(self, user_id: str, session_id: str):
         """后台生成会话摘要，不阻塞消息流"""
@@ -357,7 +377,7 @@ class SessionStore:
         return {
             "session_id": None,
             "model": DEFAULT_MODEL,
-            "cwd": DEFAULT_CWD,
+            "cwd": self._default_cwd,
             "permission_mode": PERMISSION_MODE,
             "started_at": datetime.now().isoformat(),
             "preview": "",
@@ -442,7 +462,7 @@ class SessionStore:
         return Session(
             session_id=cur.get("session_id"),
             model=cur.get("model", DEFAULT_MODEL),
-            cwd=cur.get("cwd", DEFAULT_CWD),
+            cwd=cur.get("cwd", self._default_cwd),
             permission_mode=cur.get("permission_mode", PERMISSION_MODE),
             workspace=cur.get("workspace", ""),
         )
@@ -500,7 +520,7 @@ class SessionStore:
         chat_data["current"] = {
             "session_id": None,
             "model": cur.get("model", DEFAULT_MODEL),
-            "cwd": cur.get("cwd", DEFAULT_CWD),
+            "cwd": cur.get("cwd", self._default_cwd),
             "permission_mode": cur.get("permission_mode", PERMISSION_MODE),
             "started_at": datetime.now().isoformat(),
             "preview": "",
