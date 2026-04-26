@@ -114,10 +114,7 @@ _write_plist() {
     </array>
     <key>WorkingDirectory</key><string>${REPO_ROOT}</string>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key><false/>
-    </dict>
+    <key>KeepAlive</key><true/>
     <key>ThrottleInterval</key><integer>10</integer>
     <key>StandardOutPath</key><string>${LOG_FILE}</string>
     <key>StandardErrorPath</key><string>${LOG_FILE}</string>

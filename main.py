@@ -66,7 +66,8 @@ def _watchdog():
         uptime = time.time() - _start_time
         if uptime > MAX_UPTIME:
             print(f"[watchdog] 运行 {uptime/3600:.1f}h，定时重启刷新连接", flush=True)
-            os._exit(0)
+            # 用非零退出码，确保即使 plist 是 SuccessfulExit-only 模式也能被拉起
+            os._exit(1)
         # 常态不打日志，避免刷屏。需要巡检时用 cc-lark status 查看进程信息。
 
 
@@ -259,7 +260,7 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
         print(f"[{tag}][拒绝] 群不在白名单 chat={raw_chat_id[:10]}...", flush=True)
         return
     if bot.profile.allowed_open_ids and user_id not in bot.profile.allowed_open_ids:
-        print(f"[{tag}][拒绝] user={user_id[:8]}... 不在 allowlist", flush=True)
+        print(f"[{tag}][拒绝] user={user_id} 不在 allowlist", flush=True)
         return
 
     # /stop 和 / 在锁外处理
@@ -827,6 +828,15 @@ def _build_lark_system_prompt(
 - 如果要发文本消息到评论区（不是作为你当前回复的一部分），用：`{reply_cmd_text}`
 - lark-cli 调用是你主动发送一条新消息，和你当前这条回复是独立的。
 - 用户可能说中文或英文，保持和用户相同语言回复。
+
+【⚠️ 运行环境约束（重要）】
+你运行在一次性 bot 进程里（`claude --print`），没有持久 runtime，也没有定时器。
+- **不要调用 `ScheduleWakeup`**：在本环境里它不会被执行，也不会真的唤醒你。
+- **不要向用户承诺"X 分钟后自动继续 / 自动检查 / 自动唤醒"**：后台没人接这种信号，会变成空头支票。需要后续跟进就明确告诉用户"请再发一条消息（比如『继续』）触发下一轮"。
+- **禁止运行阻塞式长驻命令**：`tail -f`、`tail -F`、`watch`、`journalctl -f`、`kubectl logs -f`、`npm run dev`、`nc -l`、交互式 REPL 等不会自己退出的命令会把 bot 卡住。**单轮有 20 分钟 wall-clock 硬上限**，超了会被强杀、本轮所有进度丢失。
+  - 看日志用一次性快照：`tail -n 200 <file>` / `grep` / `sed -n '1,200p'`。
+  - 等服务就绪用**带超时**的轮询：`curl --max-time 5 ...`、`timeout 10 <cmd>`，不要 `-f/-F` 盯流。
+  - 调用别人封装的 `make` 目标/脚本前，先看清内部有没有 `-f / --follow / watch / tail -F` —— 从表面看很正常、实际死循环的坑主要出在这里（例：`make deploy-logs` 内部是 `tail -F`）。
 """
 
 

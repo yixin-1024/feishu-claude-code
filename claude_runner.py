@@ -13,6 +13,10 @@ from bot_config import PERMISSION_MODE, CLAUDE_CLI
 
 IDLE_TIMEOUT = 300  # 5 分钟无输出且无子进程，视为挂死
 _CHECK_INTERVAL = 30  # 静默时每 30 秒检查一次子进程
+# 单轮 wall-clock 硬上限：无论是否还有活子进程、是否还在产出，都会强杀。
+# 用来兜住 `tail -f / watch / npm run dev` 之类永不退出但一直有子进程的命令
+# —— 这些情况 _has_children 会一直归零 idle_seconds，IDLE_TIMEOUT 永远不触发。
+WALL_CLOCK_LIMIT = 1200  # 20 分钟
 
 
 def _has_children(pid: int) -> bool:
@@ -106,9 +110,20 @@ async def run_claude(
         pending_tool_input_json = ""
 
         idle_seconds = 0
+        loop = asyncio.get_event_loop()
+        start_time = loop.time()
 
         try:
             while True:
+                # wall-clock 硬上限：防 tail -f / watch 之类永远有子进程的卡死场景
+                if loop.time() - start_time >= WALL_CLOCK_LIMIT:
+                    proc.kill()
+                    await proc.wait()
+                    raise RuntimeError(
+                        f"Claude 单轮执行超过 wall-clock 硬上限（{WALL_CLOCK_LIMIT}秒），已终止进程。"
+                        f"常见原因：运行了 tail -f / watch / npm run dev 等永不退出的命令。"
+                    )
+
                 try:
                     raw_line = await asyncio.wait_for(
                         proc.stdout.readline(), timeout=_CHECK_INTERVAL
