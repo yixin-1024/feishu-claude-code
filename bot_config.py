@@ -56,6 +56,9 @@ class Profile:
     allowed_open_ids: set[str] = field(default_factory=set)
     allowed_group_chat_ids: set[str] = field(default_factory=set)
     lark_cli_profile: str = ""  # 告诉 Claude 用 `lark-cli --profile <name>` 发消息
+    # "会话群" chat_id：bot 在其它群被 @ 时（=调度 session），会被指引把任务派单到
+    # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
+    dispatch_chat_id: str = ""
 
     @property
     def brand_label(self) -> str:
@@ -93,6 +96,7 @@ def _load_profile(name: str) -> Profile:
         allowed_open_ids=_split_csv(env("ALLOWED_OPEN_IDS")),
         allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),
+        dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
     )
 
 

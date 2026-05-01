@@ -62,9 +62,22 @@ WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心�
 - 支持文件 (`file`)、post 富文本（图文混排）、语音、视频下载
 - Lark 附件会被解析后转成本地路径喂给 Claude
 
+**派单 / 会话群分流**（可选）
+
+- 把"调度群"和"会话群"分开：在大群被 @ → bot 自动在指定话题群创建新话题、把任务派给独立 session 跑，原群只回一两句"已派单去 XX"
+- 适合人多噪声大的项目群：复杂任务（写代码 / 跑 SQL / 多步分析）在干净的话题群里推进，避免刷屏
+- 派单前自动 list 群里最近 20 条消息当上下文，承接 session 不丢链路
+- 配 `<PROFILE>_DISPATCH_CHAT_ID` 启用，未配则关闭
+
+**定时任务**
+
+- YAML 配 cron → 到点自动在话题群发顶楼消息 + 派单到独立 session（每日报、周报、巡检都能写）
+- prompt 支持 `${VAR}` 引用 .env 变量，避免把 chat_id 落到代码库
+- 本地 HTTP 端点：`/trigger` 手动触发、`/reload` 热加载 yaml，无需重启 bot
+
 **健壮运行**
 
-- 智能空闲超时: 检测子进程存活，编译/下载不会被误杀
+- 三段式超时：5 分钟无输出且无子进程 → 杀；15 分钟有子进程但无输出 → 杀；任意情况 60 分钟 wall-clock → 杀。编译/下载不会被误杀，runaway loop 也兜得住
 - 看门狗 6 小时自动重启，防止 WebSocket 假死
 - API 调用自动重试 (指数退避)
 - `cc-lark` 脚本封装 launchd + ngrok，一键 install/start/stop/restart/status/logs
@@ -242,12 +255,58 @@ python3 main.py
 | `PERMISSION_MODE` | 否 | `bypassPermissions` | 工具权限模式 |
 | `ALLOWED_OPEN_IDS` | 推荐 | 空=允许所有 | 用户 open_id 白名单，逗号分隔 |
 | `ALLOWED_GROUP_CHAT_IDS` | 推荐 | 空=禁用所有群 | 群聊 chat_id 白名单 (oc_*)，逗号分隔 |
+| `DISPATCH_CHAT_ID` | 否 | 空=禁用派单 | 会话群 chat_id；bot 在其它群被 @ 时把任务派到这里的新话题 |
 | `CALLBACK_PORT` | 否 | `9981` | 卡片按钮回调 HTTP 端口 |
 | `NGROK_DOMAIN` | 否 | 随机 | ngrok 固定域名 (避免每次重启换 URL) |
 | `STREAM_CHUNK_SIZE` | 否 | `20` | 流式推送的字符积累阈值 |
 | `CLAUDE_CLI_PATH` | 否 | 自动查找 | Claude CLI 可执行文件路径 |
 
 > 查自己的 open_id / chat_id：bot 启动后发条消息，终端日志里会打印 `user=ou_...` / `chat=oc_...`。
+>
+> 多 profile 模式下，所有变量都加 profile 前缀，例如 `WORK_DISPATCH_CHAT_ID`、`PERSONAL_ALLOWED_OPEN_IDS`。
+
+## 派单 / 会话群分流
+
+适合人多噪声大的项目群：复杂任务在干净的话题群里跑，原群只留派单回执。
+
+**启用：** 在 `.env` 里给某个 profile 加 `<NAME>_DISPATCH_CHAT_ID=oc_xxx`（指向一个话题群）。
+
+**行为：** 之后凡是在**别的群**（非会话群本身）@ bot，bot 不会直接动手，而是：
+
+1. 读最近 20 条群消息当上下文
+2. 在会话群发一条 post 顶楼（@ 提问者拉订阅），起新话题
+3. 把任务派给 `/spawn` 起独立 session 处理
+4. 在原群只回一两句"已派单去 XX，请去会话群看进度"
+
+**简单问候不走派单**（"你在干嘛"、"链接是啥"），系统提示有判断规则。
+
+**手动派单：** 也可以直接 `curl http://localhost:9981/spawn -d '{"profile":"work","chat_id":"oc_xxx","thread_id":"omt_xxx","anchor_message_id":"om_xxx","prompt":"..."}'` —— 仅本机可调。
+
+## 定时任务
+
+YAML 定义 cron 任务，到点自动在话题群发顶楼并派给 `/spawn`。
+
+```bash
+cp scheduled_tasks.yaml.example scheduled_tasks.yaml
+# 按需改：cron / chat_id / user_id / topic / prompt 或 prompt_file
+mkdir prompts && vim prompts/work_daily_briefing.md
+```
+
+`scheduled_tasks.yaml` 字段说明见模板内注释；支持 `${VAR}` 引用 `.env` 变量。
+
+**本地控制端点**（仅 127.0.0.1）：
+
+| 端点 | 用途 |
+|------|------|
+| `GET /trigger` | 列出已注册任务 |
+| `GET /trigger?name=xxx` 或 `POST /trigger` | 手动触发任务（绕过 cron） |
+| `GET/POST /reload` | 热加载 yaml + prompt 文件，不打断进行中的任务 |
+
+```bash
+curl http://localhost:9981/trigger                        # 看有哪些任务
+curl http://localhost:9981/trigger?name=work_daily_briefing  # 立即跑一次
+curl http://localhost:9981/reload                         # 改完 yaml 不重启刷新
+```
 
 ## 部署
 
@@ -318,6 +377,8 @@ python3 handover.py "对话中的一段独特文本"
 - **Skills passthrough** — `/commit`, `/review`, etc. work directly
 - **Smart idle timeout** — Detects active child processes, won't kill long compilations
 - **`cc-lark` launchctl wrapper** — One-command install/start/stop/restart/status/logs for macOS
+- **Dispatch / session group** — Mention bot in any group, it auto-creates a thread in a designated "session group" and runs the task in an isolated session there
+- **Cron tasks** — YAML-defined cron jobs that fire posts into a thread group and spawn isolated sessions; hot-reload via `/reload` endpoint
 
 Quick start: clone, `pip install -r requirements.txt`, configure `.env` with Feishu/Lark app credentials, run `python3 main.py` (or `./deploy/cc-lark install` on macOS).
 

@@ -1,0 +1,43 @@
+# 定时任务配置 — 每条任务到点后会在 chat_id 群里发一条顶楼 post（@user_id）
+# 创建新话题，然后把 prompt 派给 /spawn 起独立 session 处理。
+#
+# 字段：
+#   name         任务唯一名（apscheduler job_id）
+#   profile      绑定到哪个 bot profile（PROFILES 里的名字）
+#   cron         五段 cron 表达式（分 时 日 月 周）
+#   timezone     默认 Asia/Shanghai
+#   chat_id      话题群 chat_id（必须支持 thread；通常 = profile.dispatch_chat_id）
+#   user_id      任务归属人 open_id；顶楼消息 @ 这个人拉订阅
+#   topic_title  顶楼消息标题
+#   topic_body   顶楼消息正文（标题之后的一行）
+#   prompt       内联 prompt（短的）。
+#   prompt_file  prompt 文件路径（长的）。相对路径以 yaml 同目录为根。
+#                prompt / prompt_file 二选一。
+#
+# yaml 文件支持 ${VAR} 引用 .env 里的变量，避免把 chat_id 写死到代码库。
+#
+# 用法：
+#   1. cp scheduled_tasks.yaml.example scheduled_tasks.yaml
+#   2. 按需改字段；prompt_file 指向的文件自己放 prompts/ 目录
+#   3. 重启 bot 或 curl http://localhost:9981/reload 热加载
+
+- name: work_daily_briefing
+  profile: work
+  cron: "50 17 * * *"               # 每天 17:50
+  timezone: "Asia/Shanghai"
+  chat_id: ${WORK_DISPATCH_CHAT_ID}  # 复用 .env 里的值
+  user_id: ${WORK_ALLOWED_OPEN_IDS}
+  topic_title: "📅 每日报"
+  topic_body: "🧵 整理今天日报（昨天 18:00 → 现在）"
+  prompt_file: prompts/work_daily_briefing.md
+
+# 内联 prompt 的写法：
+# - name: ping
+#   profile: work
+#   cron: "0 9 * * 1"                # 每周一 09:00
+#   chat_id: ${WORK_DISPATCH_CHAT_ID}
+#   user_id: ${WORK_ALLOWED_OPEN_IDS}
+#   topic_title: "🌅 周一提醒"
+#   topic_body: "🧵 周计划"
+#   prompt: |
+#     列出本周需要处理的事项，按优先级排序。

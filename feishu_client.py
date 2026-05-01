@@ -308,6 +308,38 @@ class FeishuClient:
 
         return tmp_path
 
+    async def get_message_thread_id(self, message_id: str) -> str:
+        """通过 GET /im/v1/messages/{id} 拿这条消息所在的 thread_id（话题群里专用）。
+        用于 /spawn 兜底：dispatcher Claude 偶尔会把 anchor 的 message_id 当 thread_id 传过来，
+        我们识别出 om_xxx 形式后调本方法换成真正的 omt_xxx。"""
+        def _http() -> str:
+            import ssl
+            import urllib.request
+            ctx = ssl.create_default_context()
+            token_body = json.dumps({
+                "app_id": self._app_id, "app_secret": self._app_secret
+            }).encode()
+            token_req = urllib.request.Request(
+                f"{self._domain}/open-apis/auth/v3/tenant_access_token/internal",
+                data=token_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
+                token = json.loads(r.read())["tenant_access_token"]
+            req = urllib.request.Request(
+                f"{self._domain}/open-apis/im/v1/messages/{message_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                data = json.loads(r.read())
+            items = (data.get("data") or {}).get("items") or []
+            if items:
+                return items[0].get("thread_id", "") or ""
+            return ""
+
+        return await asyncio.to_thread(_http)
+
     async def list_thread_messages(self, thread_id: str, limit: int = 200) -> list:
         """列出话题里的消息，按创建时间升序。返回 Message 对象列表。"""
         messages: list = []
@@ -419,6 +451,43 @@ class FeishuClient:
             return resp.data.message_id
 
         return await self._retry_with_backoff(_reply, max_retries=2)
+
+    async def send_post_to_chat(
+        self, chat_id: str, title: str, body_text: str, mention_open_id: str = "",
+    ) -> str:
+        """往群里发一条 post（富文本）顶楼消息，可选 @ 一个 user。
+
+        话题群（dispatch group）里把它当 anchor 用：返回的 message_id 是 om_xxx，
+        /spawn 服务端会自动 mget 转成 omt_xxx 作 thread_id。
+        """
+        line: list[dict] = []
+        if mention_open_id:
+            line.append({"tag": "at", "user_id": mention_open_id})
+            line.append({"tag": "text", "text": " "})
+        line.append({"tag": "text", "text": body_text})
+
+        content_payload = {
+            "zh_cn": {
+                "title": title,
+                "content": [line],
+            }
+        }
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("post")
+                .content(json.dumps(content_payload, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = await self.client.im.v1.message.acreate(req)
+        if not resp.success():
+            raise RuntimeError(f"发送 post 消息失败: {resp.code} {resp.msg}")
+        return resp.data.message_id
 
     async def send_text_to_user(self, open_id: str, text: str) -> str:
         """发送纯文本消息"""

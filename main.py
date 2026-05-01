@@ -17,6 +17,7 @@ import threading
 import time
 import traceback
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 # 确保项目目录在 sys.path 最前面
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,6 +50,7 @@ from commands import parse_command, handle_command
 from claude_runner import run_claude
 from run_control import ActiveRun, ActiveRunRegistry, stop_run
 from thread_context import build_thread_context
+from scheduler import start_scheduler, fire_task_now, list_tasks, reload_tasks
 
 # ── 看门狗：定时重启防止 WebSocket 假死 ──────────────────────
 # launchd 只能检测进程退出，检测不到"假死"（进程在但 WS 不响应）。
@@ -452,92 +454,97 @@ async def _run_and_display(
     heartbeat_task = asyncio.create_task(_heartbeat())
 
     claude_msg = text
+    # 外层 try/finally 让 active_run 的生命周期对齐 lock —— 后处理（卡片 patch、发✅、
+    # 写 session）期间 lock 仍然 held，active_run 也必须仍可被 /stop 找到，否则会出现
+    # "队列说在跑、/stop 说没在跑" 的死区。
     try:
-        print(f"[{bot.profile.name}][run_claude] 开始调用...", flush=True)
-        full_text, new_session_id, used_fresh_session_fallback = await run_claude(
-            message=claude_msg,
-            session_id=session.session_id,
-            model=session.model,
-            cwd=session.cwd,
-            permission_mode=session.permission_mode,
-            on_text_chunk=on_text_chunk,
-            on_tool_use=on_tool_use,
-            on_process_start=lambda proc: bot.active_runs.attach_process(user_id, chat_id, proc),
-            on_usage=on_usage,
-            append_system_prompt=append_system_prompt or None,
-        )
-        print(f"[{bot.profile.name}][run_claude] 完成, session={new_session_id}", flush=True)
-    except Exception as e:
-        if active_run.stop_requested:
+        try:
+            print(f"[{bot.profile.name}][run_claude] 开始调用...", flush=True)
+            full_text, new_session_id, used_fresh_session_fallback = await run_claude(
+                message=claude_msg,
+                session_id=session.session_id,
+                model=session.model,
+                cwd=session.cwd,
+                permission_mode=session.permission_mode,
+                on_text_chunk=on_text_chunk,
+                on_tool_use=on_tool_use,
+                on_process_start=lambda proc: bot.active_runs.attach_process(user_id, chat_id, proc),
+                on_usage=on_usage,
+                append_system_prompt=append_system_prompt or None,
+            )
+            print(f"[{bot.profile.name}][run_claude] 完成, session={new_session_id}", flush=True)
+        except Exception as e:
+            if active_run.stop_requested:
+                return
+            print(f"[{bot.profile.name}][error] Claude 运行失败: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+            try:
+                await bot.feishu.update_card(card_msg_id, f"❌ Claude 执行出错：{type(e).__name__}: {e}")
+            except Exception:
+                pass
             return
-        print(f"[{bot.profile.name}][error] Claude 运行失败: {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
+        finally:
+            heartbeat_task.cancel()
+
+        final = full_text or accumulated or "（无输出）"
+        if used_fresh_session_fallback:
+            final = (
+                "⚠️ 检测到工作目录已变化，旧会话无法继续。"
+                "本次已自动切换到新 session。\n\n" + final
+            )
+        footer = _format_usage_footer(final_usage, session.model)
+        if footer:
+            final = f"{final}\n\n{footer}"
+        options = _extract_options(final) or ask_options
+        card_patched = False
         try:
-            await bot.feishu.update_card(card_msg_id, f"❌ Claude 执行出错：{type(e).__name__}: {e}")
-        except Exception:
-            pass
-        return
+            if options:
+                buttons = [
+                    {"text": display, "value": {"reply": value, "cid": chat_id, "profile": bot.profile.name}}
+                    for display, value in options
+                ]
+                short = all(len(b["text"]) <= 10 for b in buttons)
+                await bot.feishu.update_card_with_buttons(card_msg_id, final, buttons, flow=short)
+            else:
+                await bot.feishu.update_card(card_msg_id, final)
+            card_patched = True
+        except Exception as e:
+            print(f"[{bot.profile.name}][error] 卡片更新失败，回退发文本: {e}", flush=True)
+            try:
+                if is_group and notify_msg_id:
+                    await bot.feishu.reply_card(notify_msg_id, content=final, loading=False)
+                else:
+                    await bot.feishu.send_text_to_user(user_id, final)
+            except Exception as fallback_err:
+                print(f"[{bot.profile.name}][error] 文本回退也失败: {fallback_err}", flush=True)
+
+        if card_patched:
+            try:
+                if is_group and notify_msg_id:
+                    await bot.feishu.reply_text(notify_msg_id, "✅")
+                else:
+                    await bot.feishu.send_text_to_user(user_id, "✅")
+            except Exception:
+                pass
+
+        if new_session_id:
+            await bot.store.on_claude_response(
+                user_id, chat_id, new_session_id, preview_text or text,
+            )
+
+        if plan_exited and session.permission_mode == "plan":
+            print(f"[{bot.profile.name}][Plan] ExitPlanMode 检测到，切换为 bypassPermissions", flush=True)
+            await bot.store.set_permission_mode(user_id, chat_id, "bypassPermissions")
+            try:
+                notice = "🚀 已退出规划模式，发送任意消息开始执行。"
+                if is_group and notify_msg_id:
+                    await bot.feishu.reply_text(notify_msg_id, notice)
+                else:
+                    await bot.feishu.send_text_to_user(user_id, notice)
+            except Exception:
+                pass
     finally:
-        heartbeat_task.cancel()
         bot.active_runs.clear_run(user_id, chat_id, active_run)
-
-    final = full_text or accumulated or "（无输出）"
-    if used_fresh_session_fallback:
-        final = (
-            "⚠️ 检测到工作目录已变化，旧会话无法继续。"
-            "本次已自动切换到新 session。\n\n" + final
-        )
-    footer = _format_usage_footer(final_usage, session.model)
-    if footer:
-        final = f"{final}\n\n{footer}"
-    options = _extract_options(final) or ask_options
-    card_patched = False
-    try:
-        if options:
-            buttons = [
-                {"text": display, "value": {"reply": value, "cid": chat_id, "profile": bot.profile.name}}
-                for display, value in options
-            ]
-            short = all(len(b["text"]) <= 10 for b in buttons)
-            await bot.feishu.update_card_with_buttons(card_msg_id, final, buttons, flow=short)
-        else:
-            await bot.feishu.update_card(card_msg_id, final)
-        card_patched = True
-    except Exception as e:
-        print(f"[{bot.profile.name}][error] 卡片更新失败，回退发文本: {e}", flush=True)
-        try:
-            if is_group and notify_msg_id:
-                await bot.feishu.reply_card(notify_msg_id, content=final, loading=False)
-            else:
-                await bot.feishu.send_text_to_user(user_id, final)
-        except Exception as fallback_err:
-            print(f"[{bot.profile.name}][error] 文本回退也失败: {fallback_err}", flush=True)
-
-    if card_patched:
-        try:
-            if is_group and notify_msg_id:
-                await bot.feishu.reply_text(notify_msg_id, "✅")
-            else:
-                await bot.feishu.send_text_to_user(user_id, "✅")
-        except Exception:
-            pass
-
-    if new_session_id:
-        await bot.store.on_claude_response(
-            user_id, chat_id, new_session_id, preview_text or text,
-        )
-
-    if plan_exited and session.permission_mode == "plan":
-        print(f"[{bot.profile.name}][Plan] ExitPlanMode 检测到，切换为 bypassPermissions", flush=True)
-        await bot.store.set_permission_mode(user_id, chat_id, "bypassPermissions")
-        try:
-            notice = "🚀 已退出规划模式，发送任意消息开始执行。"
-            if is_group and notify_msg_id:
-                await bot.feishu.reply_text(notify_msg_id, notice)
-            else:
-                await bot.feishu.send_text_to_user(user_id, notice)
-        except Exception:
-            pass
 
 
 async def _process_message(bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, msg):
@@ -744,7 +751,7 @@ async def _process_message(bot: BotInstance, user_id: str, chat_id: str, is_grou
         return
 
     raw_chat_id = chat_id.split(":", 1)[0] if ":" in chat_id else chat_id
-    lark_sys = _build_lark_system_prompt(bot.profile, raw_chat_id, thread_id, msg.message_id, is_group)
+    lark_sys = _build_lark_system_prompt(bot.profile, raw_chat_id, thread_id, msg.message_id, is_group, asker_open_id=user_id)
 
     await _run_and_display(
         bot,
@@ -767,6 +774,7 @@ def _build_lark_system_prompt(
     thread_id: str,
     user_message_id: str,
     is_group: bool,
+    asker_open_id: str = "",
 ) -> str:
     """构造注入到 Claude 的 Lark 语境系统提示，含 profile 名（决定 lark-cli --profile）。"""
     brand = profile.brand_label
@@ -776,6 +784,8 @@ def _build_lark_system_prompt(
     if thread_id:
         location_lines.append(f"- thread_id: {thread_id}（话题群 / topic thread）")
     location_lines.append(f"- 用户刚发的消息 id: {user_message_id}")
+    if asker_open_id:
+        location_lines.append(f"- 提问者 open_id: {asker_open_id}")
     location_lines.append(f"- 场景: {'群聊' if is_group else '私聊'}")
     location_lines.append(f"- 平台: {brand}（domain: {profile.domain}）")
     location_lines.append(f"- 对应 lark-cli profile: **{cli_profile}**")
@@ -799,13 +809,84 @@ def _build_lark_system_prompt(
         f'--title "<简短标题>" --markdown "<完整内容>"'
     )
 
+    # 派单协议：当前在「需要派单的群」（非私聊、非会话群本身），把任务派到会话群独立话题处理
+    dispatch_section = ""
+    if (
+        is_group
+        and profile.dispatch_chat_id
+        and raw_chat_id != profile.dispatch_chat_id
+    ):
+        asker_at_tag = (
+            f'{{"tag":"at","user_id":"{asker_open_id}"}}'
+            if asker_open_id else
+            '{"tag":"text","text":""}'
+        )
+        dispatch_section = f"""
+
+【⚠️ 调度 / 派单（最高优先级，先判断这一条）】
+你现在在「调度 session」里：当前群 `{raw_chat_id}` 不是会话群。会话群 chat_id 是 `{profile.dispatch_chat_id}`（话题群）。提问者 open_id：`{asker_open_id or '<未知>'}`。
+
+**只要用户提的是"需要做事的任务"**（写代码 / 查数据 / 跑 SQL / 审计 / 生成报告 / 多步分析 等），你**不应在当前群里直接动手**——大群人多噪声大、回滚困难。**派单到会话群新话题里跑**：
+
+派单 4 步（按顺序执行 bash）：
+
+**0) 派单前先读最近群消息当上下文** —— 你只看到了用户最新这条 @ 你的消息，但她可能在追问上面别人的对话、图片、链接。先 list 一下：
+```bash
+lark-cli --profile {cli_profile} im +chat-messages-list --as bot \\
+  --chat-id {raw_chat_id} --page-size 20 --sort desc
+```
+扫最近 20 条，把**与当前任务相关**的（其他人发的图片、链接、对话、文件路径、之前 bot 的回复）摘要出来，编进 spawn prompt。承接 session 不会再读上面，所有上下文你必须给齐。**这一步不能省。**
+
+**1) 在会话群发顶楼消息建新话题**——必须用 post + `<at>` 标签 mention 提问者，话题群里 @ 谁就把谁拉进订阅，否则她收不到后续推送：
+```bash
+RESP=$(lark-cli --profile {cli_profile} im +messages-send --as bot \\
+  --chat-id {profile.dispatch_chat_id} \\
+  --msg-type post \\
+  --content "$(jq -n --arg label '<10字内简述任务>' '{{
+    "zh_cn": {{
+      "content": [[
+        {asker_at_tag},
+        {{"tag":"text","text":(" 🧵 接管：" + $label)}}
+      ]]
+    }}
+  }}')")
+ANCHOR=$(echo "$RESP" | jq -r '.data.message_id')
+echo "ANCHOR=$ANCHOR"
+```
+⚠️ `--markdown` 里写 `<at>` **不会**被识别为真 mention，会变成普通字符串文本，提问者收不到通知也不订阅。**必须用上面的 post+content 写法**。
+
+**2) 把完整 prompt 派给 /spawn**（含步骤 0 摘出的关键背景、用户原话、附件路径——承接 session 全靠这段 prompt）：
+
+`thread_id` 直接传刚拿到的 `$ANCHOR`（om_xxx 形式）—— /spawn 服务端会**自动 mget 转换成真正的 omt_xxx**，不要自己再去 chat-messages-list 查，那一步绕路且容易出错（race condition / jq 失败时 Claude 走捷径用 message_id 替代会污染 session 索引，已踩过坑）：
+
+```bash
+curl -sS -X POST http://localhost:9981/spawn -H 'Content-Type: application/json' \\
+  -d "$(jq -n --arg a "$ANCHOR" --arg p '<完整 prompt 多行字符串>' \\
+     '{{profile:"{cli_profile}", chat_id:"{profile.dispatch_chat_id}", thread_id:$a, anchor_message_id:$a, prompt:$p}}')"
+```
+返回 `{{"ok": true, "chat_id": "...:omt_xxx"}}` 表示已起新 session（chat_id 里的 omt_xxx 就是服务端解析出来的真 thread_id）。
+
+**3) 在当前大群只回一两句**："已派单到会话群新话题处理：🧵 接管：<简述>。请去那边看进度。" 然后**结束本轮**——别继续动手，承接 session 会接管。
+
+【何时不派单（直接在当前群答即可）】
+- 一句话能答完的简单问候、信息查询（"你在干嘛"、"链接是啥"）
+- 用户明确说"就在这里答 / 别派单"
+- 用户在追问已派单的事情（"那张卡有结论了吗"）→ 直接告诉他去会话群看
+- 派单本身失败（curl 返回 ok=false 或 lark-cli 报错）→ 把错误回给用户，不要硬撑
+
+【绝对不要】
+- 在当前大群里直接写代码 / 跑 SQL / 改文件——派单。
+- 把"派单 + 自己也再处理一遍"——只派单一次。
+- 派单到会话群以外的群——`/spawn` 的 chat_id 必须是 `{profile.dispatch_chat_id}`。
+- 跳过步骤 0 直接派单——承接 session 没上下文等于盲做。"""
+
     return f"""你正在通过{brand}与用户对话。你输出的文本由后台 bot 渲染成卡片发到用户的聊天里。除此之外，你可以主动调用 `lark-cli` 往当前会话发送图片、文件、文档链接。
 
 【当前会话信息】
 {chr(10).join(location_lines)}
 
 【⚠️ 多账号注意】
-本机 lark-cli 配置了多个 profile（不同租户 / 不同 bot 账号）。本次对话绑定到 profile **{cli_profile}**（{brand}）。**每一条 lark-cli 命令都必须显式加 `--profile {cli_profile}`**，否则会发到错的租户里。不要依赖当前默认 profile。
+本机 lark-cli 配置了多个 profile（不同租户 / 不同 bot 账号）。本次对话绑定到 profile **{cli_profile}**（{brand}）。**每一条 lark-cli 命令都必须显式加 `--profile {cli_profile}`**，否则会发到错的租户里。不要依赖当前默认 profile。{dispatch_section}
 
 【何时主动调用 lark-cli】
 
@@ -833,7 +914,7 @@ def _build_lark_system_prompt(
 你运行在一次性 bot 进程里（`claude --print`），没有持久 runtime，也没有定时器。
 - **不要调用 `ScheduleWakeup`**：在本环境里它不会被执行，也不会真的唤醒你。
 - **不要向用户承诺"X 分钟后自动继续 / 自动检查 / 自动唤醒"**：后台没人接这种信号，会变成空头支票。需要后续跟进就明确告诉用户"请再发一条消息（比如『继续』）触发下一轮"。
-- **禁止运行阻塞式长驻命令**：`tail -f`、`tail -F`、`watch`、`journalctl -f`、`kubectl logs -f`、`npm run dev`、`nc -l`、交互式 REPL 等不会自己退出的命令会把 bot 卡住。**单轮有 20 分钟 wall-clock 硬上限**，超了会被强杀、本轮所有进度丢失。
+- **禁止运行阻塞式长驻命令**：`tail -f`、`tail -F`、`watch`、`journalctl -f`、`kubectl logs -f`、`npm run dev`、`nc -l`、交互式 REPL 等不会自己退出的命令会把 bot 卡住。超时阈值：有子进程但你 15 分钟没新输出 → 强杀；任何情况下单轮 60 分钟 wall-clock → 强杀。被杀后本轮所有进度丢失。
   - 看日志用一次性快照：`tail -n 200 <file>` / `grep` / `sed -n '1,200p'`。
   - 等服务就绪用**带超时**的轮询：`curl --max-time 5 ...`、`timeout 10 <cmd>`，不要 `-f/-F` 盯流。
   - 调用别人封装的 `make` 目标/脚本前，先看清内部有没有 `-f / --follow / watch / tail -F` —— 从表面看很正常、实际死循环的坑主要出在这里（例：`make deploy-logs` 内部是 `tail -F`）。
@@ -1097,6 +1178,7 @@ async def _handle_button_reply(bot: BotInstance, user_id: str, chat_id: str, tex
             raw_chat_id, _, btn_thread_id = chat_id.partition(":")
             lark_sys = _build_lark_system_prompt(
                 bot.profile, raw_chat_id, btn_thread_id, clicked_msg_id or "", is_group,
+                asker_open_id=user_id,
             )
             await _run_and_display(
                 bot,
@@ -1157,14 +1239,245 @@ async def _handle_handover(
     return {"ok": True, "profile": bot.profile.name, "user_id": user_id, "session_id": session_id}
 
 
+# ── /spawn：在指定 (user, chat:thread) 起一条全新 session ────
+
+async def _handle_spawn(
+    bot: BotInstance,
+    user_id: str,
+    chat_id_raw: str,
+    thread_id: str,
+    anchor_message_id: str,
+    prompt: str,
+):
+    """在 (user, chat_id_raw:thread_id) 这一格强制开新 session 跑 prompt。
+
+    设计场景：大群里的"调度 session"读完上下文后，用 lark-cli 在会话群创建新话题，
+    再 curl 这个端点把后续工作派给独立 session。和 WS 路径不冲突——这是绕过 WS 的
+    内部触发入口。
+    """
+    tag = bot.profile.name
+
+    # 兜底：dispatcher Claude 偶尔会把 anchor 的 message_id (om_xxx) 当成 thread_id 传过来。
+    # 这样起的 session chat_key 是 oc_xxx:om_xxx，跟用户后续在该话题 @ bot 时构造的
+    # oc_xxx:omt_xxx 不匹配，session 就丢了。识别出 om_xxx 形式 → 主动 mget 转成真 thread_id。
+    if thread_id.startswith("om_") and not thread_id.startswith("omt_"):
+        try:
+            actual = await bot.feishu.get_message_thread_id(thread_id)
+        except Exception as e:
+            actual = ""
+            print(f"[{tag}][spawn] mget thread_id 失败 {thread_id[:14]}...: {e}", flush=True)
+        if actual and actual.startswith("omt_"):
+            print(
+                f"[{tag}][spawn] 自动修正 thread_id: {thread_id[:14]}... → {actual[:14]}...",
+                flush=True,
+            )
+            thread_id = actual
+        else:
+            print(
+                f"[{tag}][spawn] 拒绝：thread_id={thread_id[:14]}... 既非 omt_ 也无法 mget 成 omt_",
+                flush=True,
+            )
+            try:
+                await bot.feishu.reply_text(
+                    anchor_message_id,
+                    f"⚠️ /spawn 收到的 thread_id 不是 omt_ 形式且无法转换（{thread_id[:14]}...）。"
+                    f"请检查派单代码是否把 message_id 误传成了 thread_id。",
+                )
+            except Exception:
+                pass
+            return
+
+    chat_id = f"{chat_id_raw}:{thread_id}"
+
+    lock = bot._ensure_chat_lock(chat_id)
+    if lock.locked():
+        try:
+            await bot.feishu.reply_text(
+                anchor_message_id,
+                "⚠️ 这条话题里已有任务在跑，spawn 已忽略",
+            )
+        except Exception:
+            pass
+        print(
+            f"[{tag}][spawn] 拒绝：目标话题忙 chat={chat_id_raw[:10]}... thread={thread_id[:10]}...",
+            flush=True,
+        )
+        return
+
+    async with lock:
+        try:
+            await bot.store.new_session(user_id, chat_id)
+            session = await bot.store.get_current(user_id, chat_id)
+
+            try:
+                card_msg_id = await bot.feishu.reply_card(anchor_message_id, loading=True)
+            except Exception as e:
+                print(f"[{tag}][spawn] 占位卡片发送失败: {e}", flush=True)
+                try:
+                    await bot.feishu.reply_text(anchor_message_id, f"❌ spawn 失败：{e}")
+                except Exception:
+                    pass
+                return
+
+            lark_sys = _build_lark_system_prompt(
+                bot.profile, chat_id_raw, thread_id, anchor_message_id, is_group=True,
+                asker_open_id=user_id,
+            )
+
+            print(
+                f"[{tag}][spawn] user={user_id[:8]}... chat={chat_id_raw[:10]}... "
+                f"thread={thread_id[:10]}... anchor={anchor_message_id[:12]}... "
+                f"prompt_len={len(prompt)}",
+                flush=True,
+            )
+
+            await _run_and_display(
+                bot,
+                user_id, chat_id, True, prompt,
+                card_msg_id, session, anchor_message_id,
+                preview_text=prompt[:40],
+                append_system_prompt=lark_sys,
+            )
+        except Exception as e:
+            print(f"[{tag}][spawn] 异常: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
+
+
+def _resolve_spawn_request(params: dict) -> tuple[
+    "BotInstance | None", str, dict, "dict | None"
+]:
+    """从扁平 dict 解析 spawn 参数。返回 (bot, user_id, kwargs, error_dict)。
+    error_dict 非空表示参数有误，应该直接回给 HTTP 客户端。"""
+    chat_id_raw = (params.get("chat_id") or "").strip()
+    thread_id = (params.get("thread_id") or "").strip()
+    anchor_message_id = (params.get("anchor_message_id") or "").strip()
+    prompt = params.get("prompt") or ""
+    profile_name = (params.get("profile") or "").strip()
+    user_id_in = (params.get("user_id") or "").strip()
+
+    missing = [
+        n for n, v in (
+            ("chat_id", chat_id_raw),
+            ("thread_id", thread_id),
+            ("anchor_message_id", anchor_message_id),
+            ("prompt", prompt),
+        ) if not v
+    ]
+    if missing:
+        return None, "", {}, {
+            "ok": False,
+            "error": f"missing required params: {', '.join(missing)}",
+        }
+
+    bot: BotInstance | None = None
+    if profile_name:
+        bot = _bots.get(profile_name)
+        if bot is None:
+            return None, "", {}, {
+                "ok": False,
+                "error": f"profile {profile_name!r} not loaded",
+            }
+    else:
+        if len(_bots) == 1:
+            bot = next(iter(_bots.values()))
+        else:
+            return None, "", {}, {
+                "ok": False,
+                "error": "profile required when multiple bots loaded",
+            }
+
+    user_id = user_id_in or bot.store.find_primary_user() or ""
+    if not user_id:
+        return None, "", {}, {
+            "ok": False,
+            "error": f"no user found in profile {bot.profile.name}, pass user_id",
+        }
+
+    return bot, user_id, {
+        "chat_id_raw": chat_id_raw,
+        "thread_id": thread_id,
+        "anchor_message_id": anchor_message_id,
+        "prompt": prompt,
+    }, None
+
+
+def _is_localhost(client_address) -> bool:
+    """HTTP 客户端是否来自本机（防止 /spawn 被 ngrok 暴露公网调用）"""
+    if not client_address:
+        return False
+    ip = client_address[0]
+    return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+
 # ── 卡片回调 HTTP 服务 ───────────────────────────────────────
 
 class _CardCallbackHandler(BaseHTTPRequestHandler):
     """处理飞书/Lark 卡片按钮点击的 HTTP 回调"""
 
     def do_POST(self):
+        parsed = urlparse(self.path)
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length)
+
+        if parsed.path == "/spawn":
+            if not _is_localhost(self.client_address):
+                self._respond(403, {"error": "spawn is localhost only"})
+                return
+            try:
+                params = json.loads(body)
+                if not isinstance(params, dict):
+                    raise ValueError("body must be a JSON object")
+            except Exception as e:
+                self._respond(400, {"error": f"bad json: {e}"})
+                return
+            bot, user_id, kwargs, err = _resolve_spawn_request(params)
+            if err:
+                self._respond(400, err)
+                return
+            asyncio.run_coroutine_threadsafe(
+                _handle_spawn(bot, user_id=user_id, **kwargs),
+                _bot_loop,
+            )
+            self._respond(200, {
+                "ok": True,
+                "profile": bot.profile.name,
+                "user_id": user_id,
+                "chat_id": f"{kwargs['chat_id_raw']}:{kwargs['thread_id']}",
+            })
+            return
+
+        if parsed.path == "/trigger":
+            if not _is_localhost(self.client_address):
+                self._respond(403, {"error": "trigger is localhost only"})
+                return
+            try:
+                params = json.loads(body) if body else {}
+            except Exception as e:
+                self._respond(400, {"error": f"bad json: {e}"})
+                return
+            name = (params.get("name") or "").strip()
+            if not name:
+                self._respond(400, {"error": "name required", "available": list_tasks()})
+                return
+            if name not in list_tasks():
+                self._respond(404, {"error": f"task {name!r} not registered", "available": list_tasks()})
+                return
+            asyncio.run_coroutine_threadsafe(fire_task_now(name), _bot_loop)
+            self._respond(200, {"ok": True, "fired": name})
+            return
+
+        if parsed.path == "/reload":
+            if not _is_localhost(self.client_address):
+                self._respond(403, {"error": "reload is localhost only"})
+                return
+            try:
+                result = reload_tasks()
+                self._respond(200, result)
+            except Exception as e:
+                self._respond(500, {"error": f"{type(e).__name__}: {e}"})
+            return
+
         try:
             data = json.loads(body)
         except Exception:
@@ -1227,8 +1540,57 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             self._respond(200, {"toast": {"type": "info", "content": f"已发送: {reply_text}"}})
 
     def do_GET(self):
-        from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
+
+        if parsed.path == "/spawn":
+            if not _is_localhost(self.client_address):
+                self._respond(403, {"error": "spawn is localhost only"})
+                return
+            raw = parse_qs(parsed.query)
+            params = {k: (v[0] if v else "") for k, v in raw.items()}
+            bot, user_id, kwargs, err = _resolve_spawn_request(params)
+            if err:
+                self._respond(400, err)
+                return
+            asyncio.run_coroutine_threadsafe(
+                _handle_spawn(bot, user_id=user_id, **kwargs),
+                _bot_loop,
+            )
+            self._respond(200, {
+                "ok": True,
+                "profile": bot.profile.name,
+                "user_id": user_id,
+                "chat_id": f"{kwargs['chat_id_raw']}:{kwargs['thread_id']}",
+            })
+            return
+
+        if parsed.path == "/trigger":
+            if not _is_localhost(self.client_address):
+                self._respond(403, {"error": "trigger is localhost only"})
+                return
+            raw = parse_qs(parsed.query)
+            name = (raw.get("name", [""])[0] or "").strip()
+            if not name:
+                # 不带参数 = 列出可用任务
+                self._respond(200, {"ok": True, "available": list_tasks()})
+                return
+            if name not in list_tasks():
+                self._respond(404, {"error": f"task {name!r} not registered", "available": list_tasks()})
+                return
+            asyncio.run_coroutine_threadsafe(fire_task_now(name), _bot_loop)
+            self._respond(200, {"ok": True, "fired": name})
+            return
+
+        if parsed.path == "/reload":
+            if not _is_localhost(self.client_address):
+                self._respond(403, {"error": "reload is localhost only"})
+                return
+            try:
+                result = reload_tasks()
+                self._respond(200, result)
+            except Exception as e:
+                self._respond(500, {"error": f"{type(e).__name__}: {e}"})
+            return
 
         if parsed.path == "/handover":
             params = parse_qs(parsed.query)
@@ -1377,6 +1739,26 @@ def _start_profile_ws(bot: BotInstance):
     print(f"   [{bot.profile.name}] WS 客户端已启动 ({bot.profile.brand_label} · {bot.profile.domain})")
 
 
+# ── 定时任务调度（必须在 _bot_loop 内启动）────────────────────
+
+_scheduler = None  # 持有引用避免被 GC
+
+
+async def _start_scheduler_on_loop(config_path: str):
+    """在 _bot_loop 里构造 AsyncIOScheduler（apscheduler 要求在目标 loop 内 start）。"""
+    global _scheduler
+    try:
+        _scheduler = start_scheduler(
+            config_path=config_path,
+            bots=_bots,
+            loop=asyncio.get_running_loop(),
+            spawn_fn=_handle_spawn,
+        )
+    except Exception as e:
+        print(f"[scheduler] ❌ 启动失败: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc(file=sys.stdout)
+
+
 # ── 启动 ──────────────────────────────────────────────────────
 
 def main():
@@ -1417,6 +1799,13 @@ def main():
     print("✅ 连接 WebSocket 长连接（自动重连）...")
     for bot in _bots.values():
         _start_profile_ws(bot)
+
+    # 定时任务调度器（cron → 派单到话题群新话题）
+    sched_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduled_tasks.yaml")
+    asyncio.run_coroutine_threadsafe(
+        _start_scheduler_on_loop(sched_path),
+        _bot_loop,
+    )
 
     # 主线程保持运行，让 _bot_loop 和 WS 线程持续工作
     try:

@@ -8,3 +8,7 @@ dist/
 build/
 .DS_Store
 *.log
+
+# 本地业务配置（含 chat_id / 个人路径），按 .example 模板自行创建
+scheduled_tasks.yaml
+prompts/

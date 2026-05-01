@@ -11,12 +11,14 @@ from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, CLAUDE_CLI
 
-IDLE_TIMEOUT = 300  # 5 分钟无输出且无子进程，视为挂死
+IDLE_TIMEOUT = 300  # 5 分钟无输出且无子进程 → 视为挂死
 _CHECK_INTERVAL = 30  # 静默时每 30 秒检查一次子进程
-# 单轮 wall-clock 硬上限：无论是否还有活子进程、是否还在产出，都会强杀。
-# 用来兜住 `tail -f / watch / npm run dev` 之类永不退出但一直有子进程的命令
-# —— 这些情况 _has_children 会一直归零 idle_seconds，IDLE_TIMEOUT 永远不触发。
-WALL_CLOCK_LIMIT = 1200  # 20 分钟
+# 有子进程但 Claude 端持续无新输出的"卡死"上限。
+# 专治 tail -f / watch / npm run dev：子进程一直在但 Claude 端再也不产出。
+# 留得比 IDLE_TIMEOUT 宽，避免误杀正常长编译/长安装。
+STUCK_CHILD_TIMEOUT = 900  # 15 分钟
+# 单轮 wall-clock 最终保险：无论是否还在产出，都会强杀，防 runaway loop。
+WALL_CLOCK_LIMIT = 3600  # 60 分钟
 
 
 def _has_children(pid: int) -> bool:
@@ -115,13 +117,12 @@ async def run_claude(
 
         try:
             while True:
-                # wall-clock 硬上限：防 tail -f / watch 之类永远有子进程的卡死场景
+                # 60 分钟 wall-clock 最终保险，防 runaway loop
                 if loop.time() - start_time >= WALL_CLOCK_LIMIT:
                     proc.kill()
                     await proc.wait()
                     raise RuntimeError(
-                        f"Claude 单轮执行超过 wall-clock 硬上限（{WALL_CLOCK_LIMIT}秒），已终止进程。"
-                        f"常见原因：运行了 tail -f / watch / npm run dev 等永不退出的命令。"
+                        f"Claude 单轮执行超过 wall-clock 最终上限（{WALL_CLOCK_LIMIT}秒），已终止进程。"
                     )
 
                 try:
@@ -130,16 +131,19 @@ async def run_claude(
                     )
                     idle_seconds = 0  # 收到输出，重置计时
                 except asyncio.TimeoutError:
-                    if _has_children(proc.pid):
-                        # 有子进程在跑（编译/下载等），继续等
-                        idle_seconds = 0
-                        continue
                     idle_seconds += _CHECK_INTERVAL
-                    if idle_seconds >= IDLE_TIMEOUT:
+                    has_kids = _has_children(proc.pid)
+                    threshold = STUCK_CHILD_TIMEOUT if has_kids else IDLE_TIMEOUT
+                    if idle_seconds >= threshold:
                         proc.kill()
                         await proc.wait()
+                        if has_kids:
+                            raise RuntimeError(
+                                f"Claude 执行超时（{threshold}秒有子进程但 Claude 端无任何新输出），已终止进程。"
+                                f"常见原因：tail -f / watch / npm run dev 等永不退出的阻塞命令。"
+                            )
                         raise RuntimeError(
-                            f"Claude 执行超时（{IDLE_TIMEOUT}秒无输出且无活跃子进程），已终止进程"
+                            f"Claude 执行超时（{threshold}秒无输出且无活跃子进程），已终止进程"
                         )
                     continue
 
@@ -238,7 +242,9 @@ async def run_claude(
 
     # Claude 的 session 与 cwd 不兼容时，CLI 有时直接 code=1 且 stderr 为空。
     # 这种场景自动退回新 session，避免用户必须手动 /new。
-    if session_id and returncode != 0 and not stderr_text and not final_text:
+    # returncode 为负数 = 被信号杀（如 /stop 的 SIGTERM/SIGKILL），不能 fallback——
+    # 否则用户 /stop 后会立刻在 lock 内拉起新进程，造成"队列说在跑、/stop 杀不死"的死循环。
+    if session_id and returncode is not None and returncode > 0 and not stderr_text and not final_text:
         print("[run_claude] resume failed without stderr, retrying with fresh session", flush=True)
         final_text, new_session_id, returncode, stderr_text = await _run_once(None)
         used_fresh_session_fallback = True
