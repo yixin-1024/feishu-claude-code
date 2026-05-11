@@ -809,10 +809,12 @@ def _build_lark_system_prompt(
         f'--title "<简短标题>" --markdown "<完整内容>"'
     )
 
-    # 派单协议：当前在「需要派单的群」（非私聊、非会话群本身），把任务派到会话群独立话题处理
+    # 派单协议：当前在「需要派单的群」（非私聊、非会话群本身、且不在某个话题线里），把任务派到会话群独立话题处理
+    # 已经在 thread_id 里说明用户是在某个话题内追问——再 spawn 等于话题套话题，直接当前线里答
     dispatch_section = ""
     if (
         is_group
+        and not thread_id
         and profile.dispatch_chat_id
         and raw_chat_id != profile.dispatch_chat_id
     ):
@@ -918,6 +920,7 @@ curl -sS -X POST http://localhost:9981/spawn -H 'Content-Type: application/json'
   - 看日志用一次性快照：`tail -n 200 <file>` / `grep` / `sed -n '1,200p'`。
   - 等服务就绪用**带超时**的轮询：`curl --max-time 5 ...`、`timeout 10 <cmd>`，不要 `-f/-F` 盯流。
   - 调用别人封装的 `make` 目标/脚本前，先看清内部有没有 `-f / --follow / watch / tail -F` —— 从表面看很正常、实际死循环的坑主要出在这里（例：`make deploy-logs` 内部是 `tail -F`）。
+  - **不要把轮询循环塞进单次 bash 调用**：`until <cmd>; do sleep N; done` / `while ! <cmd>; do sleep N; done` / `for i in {{1..60}}; do ...; sleep N; done` 这类循环只在循环结束时才把 stdout 回传给你，循环期间 bot 端 0 输出，等价于 `tail -f`，会撞 15 分钟无输出红线被强杀。**正确做法：每次轮询单独发一次 Bash 调用**——跑一次检查命令、看到结果、再决定要不要再发下一次。这样每轮都有事件，bot 不会判你卡死，你也能在中途调整策略或回报进度。等服务/部署用这种"模型驱动的轮询"，不要用 shell 内置循环。
 """
 
 
