@@ -14,7 +14,8 @@ import pytest
 # 添加项目根目录到 sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import handle_message_async, BotInstance
+from dispatcher import handle_message_async
+from bot_instance import BotInstance
 from bot_config import Profile
 from session_store import SessionStore
 
@@ -69,7 +70,7 @@ async def test_concurrent_messages_different_groups():
     """同一 bot 不同群消息：并发处理，使用各自的锁。"""
     bot = _make_bot()
 
-    with patch("main._process_message", new_callable=AsyncMock):
+    with patch("dispatcher._process_message", new_callable=AsyncMock):
         await asyncio.gather(
             handle_message_async(bot, _make_event("group_a", "msg_a")),
             handle_message_async(bot, _make_event("group_b", "msg_b")),
@@ -86,7 +87,7 @@ async def test_same_group_messages_serialized():
     """同一 bot 同群消息：使用同一个锁，处理后锁应释放。"""
     bot = _make_bot()
 
-    with patch("main._process_message", new_callable=AsyncMock):
+    with patch("dispatcher._process_message", new_callable=AsyncMock):
         await asyncio.gather(
             handle_message_async(bot, _make_event("group_a", "msg_1")),
             handle_message_async(bot, _make_event("group_a", "msg_2")),

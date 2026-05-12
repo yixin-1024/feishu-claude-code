@@ -12,7 +12,7 @@ os.environ.setdefault("FEISHU_APP_SECRET", "test_app_secret")
 os.environ.setdefault("FEISHU_VERIFICATION_TOKEN", "test_token")
 os.environ.setdefault("FEISHU_ENCRYPT_KEY", "test_key")
 
-from main import extract_chat_info
+from dispatcher import extract_chat_info
 from session_store import SessionStore
 
 
