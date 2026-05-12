@@ -1,16 +1,9 @@
-"""
-⚠️ TODO(2026-05-13): SessionStore 在 multi-profile 重构后改成 per-profile
-存储（SESSIONS_FILE 改为 _sessions_file_for(profile)）；此文件还在 monkeypatch
-旧的 SESSIONS_FILE 属性。留到下一个 PR 重写。
-"""
+"""workspace 命令 + cd / ls 命令：基于 per-profile SessionStore 的 fixture。"""
+
 import os
 import sys
 
 import pytest
-
-pytestmark = pytest.mark.skip(
-    reason="待重写：multi-profile 后 SessionStore 持久化 API 变化"
-)
 
 os.environ.setdefault("FEISHU_APP_ID", "test_app_id")
 os.environ.setdefault("FEISHU_APP_SECRET", "test_app_secret")
@@ -24,14 +17,13 @@ from session_store import SessionStore
 
 @pytest.fixture
 def isolated_store(tmp_path, monkeypatch):
+    """每个测试一个独立的 SESSIONS_DIR，避免污染 ~/.feishu-claude/。"""
     sessions_dir = tmp_path / "state"
     sessions_dir.mkdir()
     monkeypatch.setattr(session_store_module, "SESSIONS_DIR", str(sessions_dir))
-    monkeypatch.setattr(session_store_module, "SESSIONS_FILE", str(sessions_dir / "sessions.json"))
-    return SessionStore()
+    return SessionStore(profile="test_ws")
 
 
-@pytest.mark.asyncio
 async def test_workspace_binding_isolated_per_group(isolated_store, tmp_path):
     user_id = "user_123"
     group_a = "group_a"
@@ -59,7 +51,6 @@ async def test_workspace_binding_isolated_per_group(isolated_store, tmp_path):
     assert session_b.cwd == str(project2)
 
 
-@pytest.mark.asyncio
 async def test_workspace_save_uses_current_cwd_by_default(isolated_store, tmp_path):
     user_id = "user_123"
     chat_id = "group_001"
@@ -73,7 +64,6 @@ async def test_workspace_save_uses_current_cwd_by_default(isolated_store, tmp_pa
     assert isolated_store.list_workspaces(user_id)["backend"] == str(project)
 
 
-@pytest.mark.asyncio
 async def test_cd_clears_named_workspace_binding(isolated_store, tmp_path):
     user_id = "user_123"
     chat_id = "group_001"
@@ -93,7 +83,6 @@ async def test_cd_clears_named_workspace_binding(isolated_store, tmp_path):
     assert current.cwd == str(other)
 
 
-@pytest.mark.asyncio
 async def test_ls_lists_current_workspace_contents(isolated_store, tmp_path):
     user_id = "user_123"
     chat_id = "group_001"
@@ -111,7 +100,6 @@ async def test_ls_lists_current_workspace_contents(isolated_store, tmp_path):
     assert "`README.md`" in reply
 
 
-@pytest.mark.asyncio
 async def test_ls_supports_relative_subdir(isolated_store, tmp_path):
     user_id = "user_123"
     chat_id = "group_001"
@@ -127,3 +115,20 @@ async def test_ls_supports_relative_subdir(isolated_store, tmp_path):
     assert "请求路径：`backend`" in reply
     assert f"绝对路径：`{nested}`" in reply
     assert "`app.py`" in reply
+
+
+async def test_workspace_isolation_across_profiles(tmp_path, monkeypatch):
+    """同 user_id 在不同 profile 下的 workspace 应该隔离。"""
+    sessions_dir = tmp_path / "state"
+    sessions_dir.mkdir()
+    monkeypatch.setattr(session_store_module, "SESSIONS_DIR", str(sessions_dir))
+
+    store_a = SessionStore(profile="profile_a")
+    store_b = SessionStore(profile="profile_b")
+    project = tmp_path / "p"
+    project.mkdir()
+
+    await handle_command("workspace", f'save shared "{project}"', "u1", "c1", store_a)
+    # profile_b 看不到 profile_a 的 workspace
+    assert "shared" not in store_b.list_workspaces("u1")
+    assert "shared" in store_a.list_workspaces("u1")
