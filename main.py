@@ -51,6 +51,8 @@ from claude_runner import run_claude
 from run_control import ActiveRun, ActiveRunRegistry, stop_run
 from thread_context import build_thread_context
 from scheduler import start_scheduler, fire_task_now, list_tasks, reload_tasks
+from lark_prompts import render_lark_prompt
+from trinity_dispatch import maybe_handle_trinity, TrinityContext
 
 # ── 看门狗：定时重启防止 WebSocket 假死 ──────────────────────
 # launchd 只能检测进程退出，检测不到"假死"（进程在但 WS 不响应）。
@@ -257,13 +259,34 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
         flush=True,
     )
 
+    # ── Trinity 三省体系入口（必须在 allowed_open_ids 检查之前）─────
+    # 因为 trinity bot 间通信时 sender 是另一个 bot 的 open_id，不会在用户白名单里。
+    # maybe_handle_trinity 内部会做角色识别 + transition 校验。
+    trinity_ctx: "TrinityContext | None" = None
+    if bot.profile.is_trinity:
+        decision = await maybe_handle_trinity(
+            bot.profile, user_id, raw_chat_id, thread_id, msg.message_id,
+        )
+        if decision.reject_reason:
+            try:
+                await bot.feishu.reply_text(msg.message_id, decision.reject_reason)
+            except Exception as e:
+                print(f"[{tag}][trinity] 拒绝回复失败: {e}", flush=True)
+            return
+        if decision.handled and decision.context is None:
+            # 静默忽略（非授权发件人）
+            return
+        trinity_ctx = decision.context
+        # trinity 路径通过后，跳过群白名单和用户白名单（同体系 bot 互发不受这两个限制）
+
     # 访问控制：群聊白名单 + 用户 allowlist（静默忽略，避免泄露 bot 存在）
-    if is_group and raw_chat_id not in bot.profile.allowed_group_chat_ids:
-        print(f"[{tag}][拒绝] 群不在白名单 chat={raw_chat_id[:10]}...", flush=True)
-        return
-    if bot.profile.allowed_open_ids and user_id not in bot.profile.allowed_open_ids:
-        print(f"[{tag}][拒绝] user={user_id} 不在 allowlist", flush=True)
-        return
+    if not bot.profile.is_trinity:
+        if is_group and raw_chat_id not in bot.profile.allowed_group_chat_ids:
+            print(f"[{tag}][拒绝] 群不在白名单 chat={raw_chat_id[:10]}...", flush=True)
+            return
+        if bot.profile.allowed_open_ids and user_id not in bot.profile.allowed_open_ids:
+            print(f"[{tag}][拒绝] user={user_id} 不在 allowlist", flush=True)
+            return
 
     # /stop 和 / 在锁外处理
     if msg.message_type == "text":
@@ -313,7 +336,10 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
 
     async with lock:
         try:
-            await _process_message(bot, user_id, chat_id, is_group, thread_id, msg)
+            await _process_message(
+                bot, user_id, chat_id, is_group, thread_id, msg,
+                trinity_ctx=trinity_ctx,
+            )
         except Exception as e:
             print(f"[{tag}][error] 消息处理异常: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc(file=sys.stdout)
@@ -547,7 +573,10 @@ async def _run_and_display(
         bot.active_runs.clear_run(user_id, chat_id, active_run)
 
 
-async def _process_message(bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, msg):
+async def _process_message(
+    bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, msg,
+    trinity_ctx: "TrinityContext | None" = None,
+):
     """实际处理消息的逻辑，在 per-chat lock 保护下执行"""
     tag = bot.profile.name
     print(
@@ -751,7 +780,10 @@ async def _process_message(bot: BotInstance, user_id: str, chat_id: str, is_grou
         return
 
     raw_chat_id = chat_id.split(":", 1)[0] if ":" in chat_id else chat_id
-    lark_sys = _build_lark_system_prompt(bot.profile, raw_chat_id, thread_id, msg.message_id, is_group, asker_open_id=user_id)
+    lark_sys = _build_lark_system_prompt(
+        bot.profile, raw_chat_id, thread_id, msg.message_id, is_group,
+        asker_open_id=user_id, trinity_ctx=trinity_ctx,
+    )
 
     await _run_and_display(
         bot,
@@ -775,153 +807,23 @@ def _build_lark_system_prompt(
     user_message_id: str,
     is_group: bool,
     asker_open_id: str = "",
+    trinity_ctx: "TrinityContext | None" = None,
 ) -> str:
-    """构造注入到 Claude 的 Lark 语境系统提示，含 profile 名（决定 lark-cli --profile）。"""
-    brand = profile.brand_label
-    cli_profile = profile.lark_cli_profile or profile.name
-
-    location_lines = [f"- chat_id: {raw_chat_id}"]
-    if thread_id:
-        location_lines.append(f"- thread_id: {thread_id}（话题群 / topic thread）")
-    location_lines.append(f"- 用户刚发的消息 id: {user_message_id}")
-    if asker_open_id:
-        location_lines.append(f"- 提问者 open_id: {asker_open_id}")
-    location_lines.append(f"- 场景: {'群聊' if is_group else '私聊'}")
-    location_lines.append(f"- 平台: {brand}（domain: {profile.domain}）")
-    location_lines.append(f"- 对应 lark-cli profile: **{cli_profile}**")
-
-    reply_flag = "--reply-in-thread " if thread_id else ""
-    profile_flag = f"--profile {cli_profile} "
-    reply_cmd_text = (
-        f'lark-cli {profile_flag}im +messages-reply --as bot --message-id {user_message_id} '
-        f'{reply_flag}--text "<文本>"'
+    """构造注入到 Claude 的 Lark 语境系统提示。模板见 prompts/。"""
+    ticket_state = trinity_ctx.new_state.value if trinity_ctx else None
+    ticket_id = trinity_ctx.ticket.ticket_id if trinity_ctx else ""
+    ticket_history = trinity_ctx.history_text if trinity_ctx else ""
+    return render_lark_prompt(
+        profile,
+        raw_chat_id=raw_chat_id,
+        thread_id=thread_id,
+        user_message_id=user_message_id,
+        is_group=is_group,
+        asker_open_id=asker_open_id,
+        ticket_state=ticket_state,
+        ticket_id=ticket_id,
+        ticket_history=ticket_history,
     )
-    reply_cmd_image = (
-        f'cd <文件所在目录> && lark-cli {profile_flag}im +messages-reply --as bot '
-        f'--message-id {user_message_id} {reply_flag}--image <相对路径>'
-    )
-    reply_cmd_file = (
-        f'cd <文件所在目录> && lark-cli {profile_flag}im +messages-reply --as bot '
-        f'--message-id {user_message_id} {reply_flag}--file <相对路径>'
-    )
-    create_doc = (
-        f'lark-cli {profile_flag}docs +create --as user '
-        f'--title "<简短标题>" --markdown "<完整内容>"'
-    )
-
-    # 派单协议：当前在「需要派单的群」（非私聊、非会话群本身、且不在某个话题线里），把任务派到会话群独立话题处理
-    # 已经在 thread_id 里说明用户是在某个话题内追问——再 spawn 等于话题套话题，直接当前线里答
-    dispatch_section = ""
-    if (
-        is_group
-        and not thread_id
-        and profile.dispatch_chat_id
-        and raw_chat_id != profile.dispatch_chat_id
-    ):
-        asker_at_tag = (
-            f'{{"tag":"at","user_id":"{asker_open_id}"}}'
-            if asker_open_id else
-            '{"tag":"text","text":""}'
-        )
-        dispatch_section = f"""
-
-【⚠️ 调度 / 派单（最高优先级，先判断这一条）】
-你现在在「调度 session」里：当前群 `{raw_chat_id}` 不是会话群。会话群 chat_id 是 `{profile.dispatch_chat_id}`（话题群）。提问者 open_id：`{asker_open_id or '<未知>'}`。
-
-**只要用户提的是"需要做事的任务"**（写代码 / 查数据 / 跑 SQL / 审计 / 生成报告 / 多步分析 等），你**不应在当前群里直接动手**——大群人多噪声大、回滚困难。**派单到会话群新话题里跑**：
-
-派单 4 步（按顺序执行 bash）：
-
-**0) 派单前先读最近群消息当上下文** —— 你只看到了用户最新这条 @ 你的消息，但她可能在追问上面别人的对话、图片、链接。先 list 一下：
-```bash
-lark-cli --profile {cli_profile} im +chat-messages-list --as bot \\
-  --chat-id {raw_chat_id} --page-size 20 --sort desc
-```
-扫最近 20 条，把**与当前任务相关**的（其他人发的图片、链接、对话、文件路径、之前 bot 的回复）摘要出来，编进 spawn prompt。承接 session 不会再读上面，所有上下文你必须给齐。**这一步不能省。**
-
-**1) 在会话群发顶楼消息建新话题**——必须用 post + `<at>` 标签 mention 提问者，话题群里 @ 谁就把谁拉进订阅，否则她收不到后续推送：
-```bash
-RESP=$(lark-cli --profile {cli_profile} im +messages-send --as bot \\
-  --chat-id {profile.dispatch_chat_id} \\
-  --msg-type post \\
-  --content "$(jq -n --arg label '<10字内简述任务>' '{{
-    "zh_cn": {{
-      "content": [[
-        {asker_at_tag},
-        {{"tag":"text","text":(" 🧵 接管：" + $label)}}
-      ]]
-    }}
-  }}')")
-ANCHOR=$(echo "$RESP" | jq -r '.data.message_id')
-echo "ANCHOR=$ANCHOR"
-```
-⚠️ `--markdown` 里写 `<at>` **不会**被识别为真 mention，会变成普通字符串文本，提问者收不到通知也不订阅。**必须用上面的 post+content 写法**。
-
-**2) 把完整 prompt 派给 /spawn**（含步骤 0 摘出的关键背景、用户原话、附件路径——承接 session 全靠这段 prompt）：
-
-`thread_id` 直接传刚拿到的 `$ANCHOR`（om_xxx 形式）—— /spawn 服务端会**自动 mget 转换成真正的 omt_xxx**，不要自己再去 chat-messages-list 查，那一步绕路且容易出错（race condition / jq 失败时 Claude 走捷径用 message_id 替代会污染 session 索引，已踩过坑）：
-
-```bash
-curl -sS -X POST http://localhost:9981/spawn -H 'Content-Type: application/json' \\
-  -d "$(jq -n --arg a "$ANCHOR" --arg p '<完整 prompt 多行字符串>' \\
-     '{{profile:"{cli_profile}", chat_id:"{profile.dispatch_chat_id}", thread_id:$a, anchor_message_id:$a, prompt:$p}}')"
-```
-返回 `{{"ok": true, "chat_id": "...:omt_xxx"}}` 表示已起新 session（chat_id 里的 omt_xxx 就是服务端解析出来的真 thread_id）。
-
-**3) 在当前大群只回一两句**："已派单到会话群新话题处理：🧵 接管：<简述>。请去那边看进度。" 然后**结束本轮**——别继续动手，承接 session 会接管。
-
-【何时不派单（直接在当前群答即可）】
-- 一句话能答完的简单问候、信息查询（"你在干嘛"、"链接是啥"）
-- 用户明确说"就在这里答 / 别派单"
-- 用户在追问已派单的事情（"那张卡有结论了吗"）→ 直接告诉他去会话群看
-- 派单本身失败（curl 返回 ok=false 或 lark-cli 报错）→ 把错误回给用户，不要硬撑
-
-【绝对不要】
-- 在当前大群里直接写代码 / 跑 SQL / 改文件——派单。
-- 把"派单 + 自己也再处理一遍"——只派单一次。
-- 派单到会话群以外的群——`/spawn` 的 chat_id 必须是 `{profile.dispatch_chat_id}`。
-- 跳过步骤 0 直接派单——承接 session 没上下文等于盲做。"""
-
-    return f"""你正在通过{brand}与用户对话。你输出的文本由后台 bot 渲染成卡片发到用户的聊天里。除此之外，你可以主动调用 `lark-cli` 往当前会话发送图片、文件、文档链接。
-
-【当前会话信息】
-{chr(10).join(location_lines)}
-
-【⚠️ 多账号注意】
-本机 lark-cli 配置了多个 profile（不同租户 / 不同 bot 账号）。本次对话绑定到 profile **{cli_profile}**（{brand}）。**每一条 lark-cli 命令都必须显式加 `--profile {cli_profile}`**，否则会发到错的租户里。不要依赖当前默认 profile。{dispatch_section}
-
-【何时主动调用 lark-cli】
-
-1. 用户让你"发/截图/把X发过来/发文件"等 → 用 lark-cli 把文件/图片发到评论区：
-   ```
-   {reply_cmd_image}
-   {reply_cmd_file}
-   ```
-   ⚠️ lark-cli 要求相对路径，**必须先 `cd` 到文件目录，再用文件名调用**，不能直接用绝对路径。
-
-2. 你的回复内容偏长（估计超 40 行或 2000 字），比如大段审计报告、SQL 结果、长列表、多文件分析总结 → **先创建文档，再把链接回给用户**：
-   ```
-   {create_doc}
-   ```
-   拿到 doc_url 后，你只在文字回复里写一两句摘要 + 链接。**不要把长内容铺满卡片**。
-
-3. 代码片段（< 30 行）、简短回答、状态更新 → 直接在文字里回复即可，不需要 lark-cli。
-
-【额外提示】
-- 如果要发文本消息到评论区（不是作为你当前回复的一部分），用：`{reply_cmd_text}`
-- lark-cli 调用是你主动发送一条新消息，和你当前这条回复是独立的。
-- 用户可能说中文或英文，保持和用户相同语言回复。
-
-【⚠️ 运行环境约束（重要）】
-你运行在一次性 bot 进程里（`claude --print`），没有持久 runtime，也没有定时器。
-- **不要调用 `ScheduleWakeup`**：在本环境里它不会被执行，也不会真的唤醒你。
-- **不要向用户承诺"X 分钟后自动继续 / 自动检查 / 自动唤醒"**：后台没人接这种信号，会变成空头支票。需要后续跟进就明确告诉用户"请再发一条消息（比如『继续』）触发下一轮"。
-- **禁止运行阻塞式长驻命令**：`tail -f`、`tail -F`、`watch`、`journalctl -f`、`kubectl logs -f`、`npm run dev`、`nc -l`、交互式 REPL 等不会自己退出的命令会把 bot 卡住。超时阈值：有子进程但你 15 分钟没新输出 → 强杀；任何情况下单轮 60 分钟 wall-clock → 强杀。被杀后本轮所有进度丢失。
-  - 看日志用一次性快照：`tail -n 200 <file>` / `grep` / `sed -n '1,200p'`。
-  - 等服务就绪用**带超时**的轮询：`curl --max-time 5 ...`、`timeout 10 <cmd>`，不要 `-f/-F` 盯流。
-  - 调用别人封装的 `make` 目标/脚本前，先看清内部有没有 `-f / --follow / watch / tail -F` —— 从表面看很正常、实际死循环的坑主要出在这里（例：`make deploy-logs` 内部是 `tail -F`）。
-  - **不要把轮询循环塞进单次 bash 调用**：`until <cmd>; do sleep N; done` / `while ! <cmd>; do sleep N; done` / `for i in {{1..60}}; do ...; sleep N; done` 这类循环只在循环结束时才把 stdout 回传给你，循环期间 bot 端 0 输出，等价于 `tail -f`，会撞 15 分钟无输出红线被强杀。**正确做法：每次轮询单独发一次 Bash 调用**——跑一次检查命令、看到结果、再决定要不要再发下一次。这样每轮都有事件，bot 不会判你卡死，你也能在中途调整策略或回报进度。等服务/部署用这种"模型驱动的轮询"，不要用 shell 内置循环。
-"""
 
 
 def _format_usage_footer(usage: dict, model: str) -> str:

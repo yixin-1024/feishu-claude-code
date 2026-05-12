@@ -1,0 +1,258 @@
+"""Lark 系统提示词模板加载与渲染。
+
+为什么不直接用 string.Template：模板里大量 bash 变量（$ANCHOR / $RESP / $1 等），
+string.Template 会把 `$ANCHOR` 也识别成 identifier。
+本模块只识别 `${name}` 形式（双大括号），bash 的孤立 `$var` 原样保留。
+
+模板放在 prompts/ 目录：
+    prompts/default.md         — 兜底模板（兼容当前单一 profile 行为）
+    prompts/_dispatch.md       — 派单段落（条件性注入到 default 的 ${dispatch_section}）
+    prompts/{role}.md          — Trinity 角色模板（yushitai / zhongshu / ...）
+
+调用入口：render_lark_prompt(profile, request_ctx) → str
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from typing import Optional
+
+from bot_config import Profile
+
+PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+
+# 只识别 ${var} 形式，bash 的 $var / $(cmd) 不动
+_VAR_RE = re.compile(r"\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+# 简单内存缓存，避免每条消息都读盘（模板不会频繁改）
+_template_cache: dict[str, str] = {}
+
+
+def _load_template(name: str) -> str:
+    """读取 prompts/{name}.md。命中缓存就直接返回。"""
+    if name in _template_cache:
+        return _template_cache[name]
+    path = os.path.join(PROMPTS_DIR, f"{name}.md")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    _template_cache[name] = text
+    return text
+
+
+def clear_cache() -> None:
+    """测试或热重载用。生产基本不调。"""
+    _template_cache.clear()
+
+
+def render(template_name: str, ctx: dict) -> str:
+    """读取模板，把 ${var} 替换为 ctx[var]。缺变量直接抛 KeyError，不静默。"""
+    template = _load_template(template_name)
+
+    def _sub(m: re.Match) -> str:
+        var = m.group(1)
+        if var not in ctx:
+            raise KeyError(
+                f"prompt template '{template_name}' 引用了未提供的变量 ${{{var}}}"
+            )
+        return str(ctx[var])
+
+    return _VAR_RE.sub(_sub, template)
+
+
+def _build_lark_commands(cli_profile: str, user_message_id: str, thread_id: str) -> dict:
+    """生成 lark-cli 命令片段（reply_cmd_text / image / file，create_doc）。
+
+    抽出来是为了：① 减少模板里硬编码 ② 角色模板需要时可直接复用。
+    """
+    reply_flag = "--reply-in-thread " if thread_id else ""
+    profile_flag = f"--profile {cli_profile} "
+    return {
+        "reply_cmd_text": (
+            f"lark-cli {profile_flag}im +messages-reply --as bot --message-id {user_message_id} "
+            f'{reply_flag}--text "<文本>"'
+        ),
+        "reply_cmd_image": (
+            f"cd <文件所在目录> && lark-cli {profile_flag}im +messages-reply --as bot "
+            f"--message-id {user_message_id} {reply_flag}--image <相对路径>"
+        ),
+        "reply_cmd_file": (
+            f"cd <文件所在目录> && lark-cli {profile_flag}im +messages-reply --as bot "
+            f"--message-id {user_message_id} {reply_flag}--file <相对路径>"
+        ),
+        "create_doc": (
+            f"lark-cli {profile_flag}docs +create --as user "
+            f'--title "<简短标题>" --markdown "<完整内容>"'
+        ),
+    }
+
+
+def _build_location_block(
+    raw_chat_id: str,
+    thread_id: str,
+    user_message_id: str,
+    asker_open_id: str,
+    is_group: bool,
+    brand: str,
+    domain: str,
+    cli_profile: str,
+) -> str:
+    """构造"当前会话信息"那一块条件性文本。"""
+    lines = [f"- chat_id: {raw_chat_id}"]
+    if thread_id:
+        lines.append(f"- thread_id: {thread_id}（话题群 / topic thread）")
+    lines.append(f"- 用户刚发的消息 id: {user_message_id}")
+    if asker_open_id:
+        lines.append(f"- 提问者 open_id: {asker_open_id}")
+    lines.append(f"- 场景: {'群聊' if is_group else '私聊'}")
+    lines.append(f"- 平台: {brand}（domain: {domain}）")
+    lines.append(f"- 对应 lark-cli profile: **{cli_profile}**")
+    return "\n".join(lines)
+
+
+def _build_dispatch_section(
+    profile: Profile,
+    raw_chat_id: str,
+    asker_open_id: str,
+    cli_profile: str,
+    thread_id: str,
+    is_group: bool,
+) -> str:
+    """派单段落，按条件注入。和原 _build_lark_system_prompt 的判定一致。"""
+    if not (
+        is_group
+        and not thread_id
+        and profile.dispatch_chat_id
+        and raw_chat_id != profile.dispatch_chat_id
+    ):
+        return ""
+
+    asker_at_tag = (
+        f'{{"tag":"at","user_id":"{asker_open_id}"}}'
+        if asker_open_id
+        else '{"tag":"text","text":""}'
+    )
+    return render(
+        "_dispatch",
+        {
+            "raw_chat_id": raw_chat_id,
+            "dispatch_chat_id": profile.dispatch_chat_id,
+            "asker_open_id_display": asker_open_id or "<未知>",
+            "cli_profile": cli_profile,
+            "asker_at_tag": asker_at_tag,
+        },
+    )
+
+
+def render_lark_prompt(
+    profile: Profile,
+    raw_chat_id: str,
+    thread_id: str,
+    user_message_id: str,
+    is_group: bool,
+    asker_open_id: str = "",
+    ticket_state: Optional[str] = None,
+    ticket_id: str = "",
+    ticket_history: str = "",
+) -> str:
+    """构造注入到 Claude 的 Lark 系统提示。
+
+    选择模板：
+        profile.role 存在  → prompts/{role}.md（trinity 角色模板）
+        profile.role 不存在 → prompts/default.md（兼容当前行为）
+    """
+    cli_profile = profile.lark_cli_profile or profile.name
+    brand = profile.brand_label
+
+    base_ctx = {
+        "brand": brand,
+        "cli_profile": cli_profile,
+        "location_block": _build_location_block(
+            raw_chat_id, thread_id, user_message_id, asker_open_id,
+            is_group, brand, profile.domain, cli_profile,
+        ),
+        "dispatch_section": _build_dispatch_section(
+            profile, raw_chat_id, asker_open_id, cli_profile, thread_id, is_group,
+        ),
+        **_build_lark_commands(cli_profile, user_message_id, thread_id),
+    }
+
+    role = getattr(profile, "role", None)
+    if not role:
+        return render("default", base_ctx)
+
+    # Trinity 角色模板：注入角色-特定上下文
+    role_ctx = {
+        **base_ctx,
+        "role": role,
+        "ticket_id": ticket_id or "<新 ticket>",
+        "state": ticket_state or "<待创建>",
+        "ticket_history": ticket_history or "<无>",
+        "court_chat_id": profile.dispatch_chat_id or raw_chat_id,
+        "boss_chat_id": raw_chat_id,
+        "boss_open_id": asker_open_id or "<未知>",
+        "yushitai_open_id": getattr(profile, "yushitai_open_id", "") or "<未配置>",
+        "zhongshu_open_id": getattr(profile, "zhongshu_open_id", "") or "<未配置>",
+        "menxia_open_id": getattr(profile, "menxia_open_id", "") or "<未配置>",
+        "shangshu_open_id": getattr(profile, "shangshu_open_id", "") or "<未配置>",
+        "ganhuode_open_id": getattr(profile, "ganhuode_open_id", "") or "<未配置>",
+        "message_id": user_message_id,
+        "redraft_count": "0",  # TODO: 从 ticket history 算
+        "rejection_count": "0",  # TODO: 从 ticket history 算
+    }
+    return render(role, role_ctx)
+
+
+# ── 自检 ───────────────────────────────────────────────────────────
+
+def _self_test():
+    """跑一遍 default 模板渲染，确认没遗漏变量。"""
+    from bot_config import Profile
+
+    fake = Profile(
+        name="test",
+        app_id="cli_test",
+        app_secret="secret",
+        platform="lark",
+        domain="open.larksuite.com",
+        default_cwd="/tmp",
+    )
+    out = render_lark_prompt(
+        fake,
+        raw_chat_id="oc_xxx",
+        thread_id="",
+        user_message_id="om_yyy",
+        is_group=False,
+        asker_open_id="ou_zzz",
+    )
+    assert "你正在通过 Lark" in out or "你正在通过Lark" in out
+    assert "oc_xxx" in out
+    assert "om_yyy" in out
+    assert "lark-cli --profile test" in out
+    print(f"default template render OK, {len(out)} chars")
+
+    # 带 dispatch 的渲染
+    fake_with_dispatch = Profile(
+        name="test",
+        app_id="cli_test",
+        app_secret="secret",
+        platform="lark",
+        domain="open.larksuite.com",
+        default_cwd="/tmp",
+        dispatch_chat_id="oc_dispatch",
+    )
+    out2 = render_lark_prompt(
+        fake_with_dispatch,
+        raw_chat_id="oc_other",
+        thread_id="",
+        user_message_id="om_yyy",
+        is_group=True,
+        asker_open_id="ou_zzz",
+    )
+    assert "调度 / 派单" in out2
+    assert "oc_dispatch" in out2
+    print(f"default+dispatch template render OK, {len(out2)} chars")
+
+
+if __name__ == "__main__":
+    _self_test()

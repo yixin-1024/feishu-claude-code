@@ -30,12 +30,15 @@ def test_extract_chat_info_private_chat():
     mock_event.event.sender.sender_id.open_id = "user_123"
     mock_event.event.message.chat_type = "p2p"
     mock_event.event.message.chat_id = "user_123"
+    mock_event.event.message.thread_id = ""
 
-    user_id, chat_id, is_group = extract_chat_info(mock_event)
+    user_id, chat_id, is_group, raw_chat_id, thread_id = extract_chat_info(mock_event)
 
     assert user_id == "user_123"
     assert chat_id == "user_123"
     assert is_group is False
+    assert raw_chat_id == "user_123"
+    assert thread_id == ""
 
 
 def test_extract_chat_info_group_chat():
@@ -44,12 +47,15 @@ def test_extract_chat_info_group_chat():
     mock_event.event.sender.sender_id.open_id = "user_456"
     mock_event.event.message.chat_type = "group"
     mock_event.event.message.chat_id = "group_789"
+    mock_event.event.message.thread_id = ""
 
-    user_id, chat_id, is_group = extract_chat_info(mock_event)
+    user_id, chat_id, is_group, raw_chat_id, thread_id = extract_chat_info(mock_event)
 
     assert user_id == "user_456"
     assert chat_id == "group_789"
     assert is_group is True
+    assert raw_chat_id == "group_789"
+    assert thread_id == ""
 
 
 # ── Test session isolation ──────────────────────────────────

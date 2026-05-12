@@ -265,7 +265,42 @@ python3 main.py
 >
 > 多 profile 模式下，所有变量都加 profile 前缀，例如 `WORK_DISPATCH_CHAT_ID`、`PERSONAL_ALLOWED_OPEN_IDS`。
 
-## 派单 / 会话群分流
+## Trinity 三省体系（实验性 · 5 角色协作）
+
+把"Boss 一句话 → bot 直接执行"重构成 5 个独立 bot 协作，每个 bot 是独立的 Lark app + 独立人格 + 独立 Claude session（**不共享上下文**），通过状态机驱动逐层调度。
+
+**链路：**
+
+```
+下行（5 跳）：Boss → 御史台 → 中书 → 门下 → 尚书 → 干活的
+上行（4 跳）：干活的 → 尚书 → 门下 → 御史台 → Boss
+驳回：       门下 → 中书 重拟
+升级：       御史台 → Boss 补信息
+```
+
+**5 个角色职责：**
+
+| 角色 | 职能 | 上游 | 下游 |
+|-|-|-|-|
+| 御史台 | 入口分诊 + 终审 + 升级 | Boss | 中书（或直接答简单任务） |
+| 中书 | 把口语化指令拟成结构化 ticket | 御史台 | 门下 |
+| 门下 | 事前审议（封驳）+ 事后影子复审 | 中书 / 尚书 | 尚书 / 御史台 / 中书（驳回） |
+| 尚书 | 拆并行子任务 / 派工 / 聚合 | 门下 / 干活的（回奏） | 干活的 / 门下（影子复审） |
+| 干活的 | 真正执行（KYC / 开户 / 代码 / ...）。内嵌六部 6 人格切换 | 尚书 | 尚书（回奏） |
+
+**配置：** 见 `.env.example` 的 "Trinity 三省体系" 段落，或 [`.planning/spx-trinity/DESIGN.md`](.planning/spx-trinity/DESIGN.md)。
+
+**特性：**
+- 每个角色独立 Claude session，**ticket 上下文不共享**——Boss 和御史台聊的不会泄露给下层
+- bot 间通过话题群 @ 调度，所有 ticket 流程在群消息里可见可追溯
+- 状态机 + valid_transitions 白名单，**非法转移直接拒绝、不进 Claude session**（省 token）
+- ticket 决策日志持久化到 `~/.feishu-claude/tickets.json`
+
+**何时启用：** 至少一个 profile 配了 `<NAME>_ROLE=yushitai/zhongshu/menxia/shangshu/ganhuode`。trinity 与非 trinity profile 可以在同一进程共存。
+
+**不启用就保持原行为**：非 trinity profile 走遗留派单路径（见下节）。
+
+## 派单 / 会话群分流（遗留单 bot 模式）
 
 适合人多噪声大的项目群：复杂任务在干净的话题群里跑，原群只留派单回执。
 

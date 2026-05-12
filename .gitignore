@@ -11,4 +11,14 @@ build/
 
 # 本地业务配置（含 chat_id / 个人路径），按 .example 模板自行创建
 scheduled_tasks.yaml
-prompts/
+
+# prompts/ 整体忽略（用户私有 cron prompt），但系统级模板要进版本控制。
+# 注意：用 prompts/* 而非 prompts/，否则 negate 对子文件不生效。
+prompts/*
+!prompts/default.md
+!prompts/_dispatch.md
+!prompts/yushitai.md
+!prompts/zhongshu.md
+!prompts/menxia.md
+!prompts/shangshu.md
+!prompts/ganhuode.md
