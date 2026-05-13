@@ -1,107 +1,140 @@
+"""并发锁行为：同一 BotInstance 内不同 chat 用不同锁，同 chat 用同锁。
+
+历史背景：multi-profile 重构后，全局 _chat_locks 搬进了 BotInstance。
+test_integration.py 已覆盖端到端"并发不同群应使用不同锁"的场景；本文件聚焦
+锁本身的契约（_ensure_chat_lock）+ SessionStore 并发写入。
+"""
+
 import asyncio
-import sys
 import os
+import sys
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
 import pytest
-from unittest.mock import Mock, patch, AsyncMock
 
 # 添加项目根目录到 sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from main import handle_message_async, _chat_locks
+from bot_config import Profile
+from bot_instance import BotInstance
+from dispatcher import handle_message_async
 from session_store import SessionStore
 
 
-@pytest.mark.asyncio
+def _make_bot() -> BotInstance:
+    """构造一个不真正连 Lark 的 BotInstance 测试桩。"""
+    profile = Profile(
+        name="test",
+        app_id="cli_test",
+        app_secret="secret",
+        platform="lark",
+        domain="open.larksuite.com",
+        default_cwd="/tmp",
+        allowed_group_chat_ids={"group_a", "group_b"},
+    )
+    bot = BotInstance.__new__(BotInstance)
+    bot.profile = profile
+    bot.chat_locks = {}
+    bot.active_runs = MagicMock()
+    bot.feishu = AsyncMock()
+    bot.feishu.get_bot_open_id = AsyncMock(return_value="bot_open_id")
+    return bot
+
+
+def _make_event(chat_id: str, msg_id: str) -> Mock:
+    ev = Mock()
+    ev.event.sender.sender_id.open_id = "user123"
+    ev.event.message.chat_id = chat_id
+    ev.event.message.chat_type = "group"
+    ev.event.message.message_type = "text"
+    ev.event.message.content = '{"text": "@_user_1 hi"}'
+    ev.event.message.message_id = msg_id
+    ev.event.message.thread_id = ""
+    fake_mention = Mock()
+    fake_mention.key = "@_user_1"
+    fake_mention.id = Mock()
+    fake_mention.id.open_id = "bot_open_id"
+    ev.event.message.mentions = [fake_mention]
+    return ev
+
+
 async def test_concurrent_messages_different_groups():
-    """测试同一用户在不同群组的消息并发处理"""
-    # 清空锁
-    _chat_locks.clear()
-
-    # 模拟两个不同群组的消息事件
-    event_group_a = Mock()
-    event_group_a.event.sender.sender_id.open_id = "user123"
-    event_group_a.event.message.chat_id = "group_a"
-    event_group_a.event.message.chat_type = "group"
-    event_group_a.event.message.message_type = "text"
-    event_group_a.event.message.content = '{"text": "message in group A"}'
-    event_group_a.event.message.message_id = "msg_a"
-
-    event_group_b = Mock()
-    event_group_b.event.sender.sender_id.open_id = "user123"
-    event_group_b.event.message.chat_id = "group_b"
-    event_group_b.event.message.chat_type = "group"
-    event_group_b.event.message.message_type = "text"
-    event_group_b.event.message.content = '{"text": "message in group B"}'
-    event_group_b.event.message.message_id = "msg_b"
-
-    # 验证两个群组使用不同的锁
-    with patch('main._process_message', new_callable=AsyncMock) as mock_process:
-        # 并发处理两个消息
+    """端到端：不同群消息并发跑，各自挂在不同锁上。"""
+    bot = _make_bot()
+    with patch("dispatcher._process_message", new_callable=AsyncMock) as proc:
         await asyncio.gather(
-            handle_message_async(event_group_a),
-            handle_message_async(event_group_b),
+            handle_message_async(bot, _make_event("group_a", "msg_a")),
+            handle_message_async(bot, _make_event("group_b", "msg_b")),
         )
-
-        # 验证两个消息都被处理
-        assert mock_process.call_count == 2
-
-        # 验证使用了不同的锁
-        assert "group_a" in _chat_locks
-        assert "group_b" in _chat_locks
-        assert _chat_locks["group_a"] is not _chat_locks["group_b"]
+    assert proc.await_count == 2
+    assert "group_a" in bot.chat_locks
+    assert "group_b" in bot.chat_locks
+    assert bot.chat_locks["group_a"] is not bot.chat_locks["group_b"]
 
 
-@pytest.mark.asyncio
 async def test_same_group_messages_serialized():
-    """测试同一群组的消息仍然串行处理"""
-    _chat_locks.clear()
-
-    event1 = Mock()
-    event1.event.sender.sender_id.open_id = "user123"
-    event1.event.message.chat_id = "group_a"
-    event1.event.message.chat_type = "group"
-    event1.event.message.message_type = "text"
-    event1.event.message.content = '{"text": "message 1"}'
-    event1.event.message.message_id = "msg_1"
-
-    event2 = Mock()
-    event2.event.sender.sender_id.open_id = "user123"
-    event2.event.message.chat_id = "group_a"
-    event2.event.message.chat_type = "group"
-    event2.event.message.message_type = "text"
-    event2.event.message.content = '{"text": "message 2"}'
-    event2.event.message.message_id = "msg_2"
-
-    with patch('main._process_message', new_callable=AsyncMock) as mock_process:
-        # 并发发送两个消息到同一群组
+    """端到端：同群两条消息共享同锁，处理完释放。"""
+    bot = _make_bot()
+    with patch("dispatcher._process_message", new_callable=AsyncMock) as proc:
         await asyncio.gather(
-            handle_message_async(event1),
-            handle_message_async(event2),
+            handle_message_async(bot, _make_event("group_a", "msg_1")),
+            handle_message_async(bot, _make_event("group_a", "msg_2")),
         )
-
-        # 验证两个消息都被处理
-        assert mock_process.call_count == 2
-
-        # 验证使用了同一个锁
-        assert _chat_locks["group_a"].locked() == False  # 锁已释放
+    assert proc.await_count == 2
+    assert bot.chat_locks["group_a"].locked() is False
 
 
-@pytest.mark.asyncio
-async def test_session_store_concurrent_writes():
-    """测试 SessionStore 并发写入的安全性"""
-    store = SessionStore()
+def test_chat_lock_isolation_unit():
+    """直接单测 _ensure_chat_lock 契约。"""
+    bot = _make_bot()
+    lock_a1 = bot._ensure_chat_lock("group_a")
+    lock_a2 = bot._ensure_chat_lock("group_a")
+    lock_b = bot._ensure_chat_lock("group_b")
 
-    # 并发调用 _save_async
-    async def update_session(chat_id):
+    assert lock_a1 is lock_a2
+    assert lock_a1 is not lock_b
+
+
+def test_chat_lock_eviction_under_pressure():
+    """超过 _MAX_CHAT_LOCKS 时清理空闲锁，活跃锁不动。"""
+    bot = _make_bot()
+    BotInstance._MAX_CHAT_LOCKS = 4  # 临时调小
+
+    # 先建 3 个 idle 锁 + 1 个 held 锁
+    held = bot._ensure_chat_lock("held")
+    asyncio.get_event_loop().run_until_complete(held.acquire()) if False else None
+    # 用同步方式 held：用一个新 lock 直接 acquire
+    import asyncio as _asyncio
+    loop = _asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(held.acquire())
+
+        bot._ensure_chat_lock("idle1")
+        bot._ensure_chat_lock("idle2")
+        bot._ensure_chat_lock("idle3")
+        assert len(bot.chat_locks) == 4
+
+        # 触发第 5 个 → 应该清理一半 idle
+        bot._ensure_chat_lock("new")
+        assert "held" in bot.chat_locks  # 持有的锁不被清
+        assert "new" in bot.chat_locks
+    finally:
+        held.release()
+        loop.close()
+        BotInstance._MAX_CHAT_LOCKS = 200
+
+
+async def test_session_store_concurrent_writes(tmp_path, monkeypatch):
+    """SessionStore 并发写入仍能 round-trip。"""
+    import session_store as _ss
+    monkeypatch.setattr(_ss, "SESSIONS_DIR", str(tmp_path))
+
+    store = SessionStore(profile="test")
+
+    async def update():
         await store._save_async()
 
-    # 模拟多个群组同时更新
-    await asyncio.gather(
-        update_session("group_a"),
-        update_session("group_b"),
-        update_session("group_c"),
-    )
+    await asyncio.gather(update(), update(), update())
 
-    # 验证文件仍然有效
-    store2 = SessionStore()
+    store2 = SessionStore(profile="test")
     assert store2._data is not None

@@ -60,9 +60,49 @@ class Profile:
     # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
     dispatch_chat_id: str = ""
 
+    # ── Trinity 三省体系 ─────────────────────────────────────────
+    # 角色：yushitai / zhongshu / menxia / shangshu / ganhuode
+    # 空 = 普通 bot（保留原 dispatch_chat_id 派单行为）
+    role: str = ""
+    # 朝廷群 chat_id：所有 trinity bot 在这个群里协作。等同于 dispatch_chat_id
+    # 但语义更明确——为了让 trinity 模式和遗留派单模式可以共存。
+    court_chat_id: str = ""
+    # 当前 bot 自己的 open_id（lark-cli 发出去的 sender_id），用于其他 bot
+    # 识别"是不是同体系内的 bot 在 @ 我"。
+    bot_open_id: str = ""
+    # 链路上 5 个 bot 的 open_id（每个 bot 都要知道全员，权限矩阵校验时用）
+    yushitai_open_id: str = ""
+    zhongshu_open_id: str = ""
+    menxia_open_id: str = ""
+    shangshu_open_id: str = ""
+    ganhuode_open_id: str = ""
+    # Boss（皇帝）本人的 open_id —— 只有 yushitai 实际需要，但放 Profile
+    # 里方便 prompt 模板统一引用。
+    boss_open_id: str = ""
+
     @property
     def brand_label(self) -> str:
         return "飞书" if self.platform == "feishu" else "Lark"
+
+    @property
+    def is_trinity(self) -> bool:
+        """是否启用 trinity 三省体系。
+
+        需要同时满足：
+            1. 全局开关 ENABLE_TRINITY=true（加载时清空 role 字段实现"软关闭"）
+            2. 本 profile 配置了 role
+        """
+        return bool(self.role)
+
+    def bot_open_id_for(self, role: str) -> str:
+        """根据角色名拿 open_id；未配置返回空串。"""
+        return {
+            "yushitai": self.yushitai_open_id,
+            "zhongshu": self.zhongshu_open_id,
+            "menxia": self.menxia_open_id,
+            "shangshu": self.shangshu_open_id,
+            "ganhuode": self.ganhuode_open_id,
+        }.get(role, "")
 
 
 def _load_profile(name: str) -> Profile:
@@ -86,6 +126,7 @@ def _load_profile(name: str) -> Profile:
 
     default_cwd = os.path.expanduser(env("DEFAULT_CWD", os.path.expanduser("~")))
 
+    role = env("ROLE").strip().lower()
     return Profile(
         name=name,
         app_id=app_id,
@@ -97,6 +138,17 @@ def _load_profile(name: str) -> Profile:
         allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),
         dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
+        role=role,
+        court_chat_id=env("COURT_CHAT_ID").strip(),
+        bot_open_id=env("BOT_OPEN_ID").strip(),
+        # 5 个角色 open_id 可以放在共享配置里（5 个 profile 都引用同一组），
+        # 也可以单独覆盖。这里先读 profile 专属，没有再回落到全局。
+        yushitai_open_id=env("YUSHITAI_OPEN_ID", os.getenv("YUSHITAI_OPEN_ID", "")).strip(),
+        zhongshu_open_id=env("ZHONGSHU_OPEN_ID", os.getenv("ZHONGSHU_OPEN_ID", "")).strip(),
+        menxia_open_id=env("MENXIA_OPEN_ID", os.getenv("MENXIA_OPEN_ID", "")).strip(),
+        shangshu_open_id=env("SHANGSHU_OPEN_ID", os.getenv("SHANGSHU_OPEN_ID", "")).strip(),
+        ganhuode_open_id=env("GANHUODE_OPEN_ID", os.getenv("GANHUODE_OPEN_ID", "")).strip(),
+        boss_open_id=env("BOSS_OPEN_ID", os.getenv("BOSS_OPEN_ID", "")).strip(),
     )
 
 
@@ -145,6 +197,37 @@ PROFILES: list[Profile] = _load_profiles()
 
 # 名字 → profile 索引，供 callback 路由使用
 PROFILES_BY_NAME: dict[str, Profile] = {p.name: p for p in PROFILES}
+
+
+# ── Trinity 三省体系开关 ─────────────────────────────────────
+#
+# 默认 OFF。设 ENABLE_TRINITY=true 才启用三省体系。即使 profile 配了 ROLE，
+# 没有这个开关也不会走 trinity 路径——保持 100% 向后兼容。
+#
+# 接受的真值：true / 1 / yes / on（大小写不敏感）
+
+_TRUTHY = {"true", "1", "yes", "on", "y"}
+TRINITY_ENABLED: bool = os.getenv("ENABLE_TRINITY", "").strip().lower() in _TRUTHY
+
+
+# 关闭时把 trinity 相关属性置零，让 Profile.is_trinity / PROFILES_BY_ROLE 等
+# 全部"看不见"角色配置，dispatcher/lark_prompts 走遗留路径。
+if not TRINITY_ENABLED:
+    for _p in PROFILES:
+        _p.role = ""
+
+# bot_open_id → profile 索引，供 trinity 路径识别"发件人是不是同体系内 bot"
+# 只有配置了 bot_open_id 的 profile 才会进入这张表
+PROFILES_BY_BOT_OPEN_ID: dict[str, Profile] = (
+    {p.bot_open_id: p for p in PROFILES if p.bot_open_id}
+    if TRINITY_ENABLED else {}
+)
+
+# role → profile 索引（只看 trinity profile）
+PROFILES_BY_ROLE: dict[str, Profile] = (
+    {p.role: p for p in PROFILES if p.role}
+    if TRINITY_ENABLED else {}
+)
 
 # ── 共享配置 ───────────────────────────────────────────────────
 
