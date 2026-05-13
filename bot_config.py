@@ -86,7 +86,12 @@ class Profile:
 
     @property
     def is_trinity(self) -> bool:
-        """是否启用 trinity 三省体系（区别于遗留 dispatch_chat_id 派单）。"""
+        """是否启用 trinity 三省体系。
+
+        需要同时满足：
+            1. 全局开关 ENABLE_TRINITY=true（加载时清空 role 字段实现"软关闭"）
+            2. 本 profile 配置了 role
+        """
         return bool(self.role)
 
     def bot_open_id_for(self, role: str) -> str:
@@ -193,17 +198,36 @@ PROFILES: list[Profile] = _load_profiles()
 # 名字 → profile 索引，供 callback 路由使用
 PROFILES_BY_NAME: dict[str, Profile] = {p.name: p for p in PROFILES}
 
+
+# ── Trinity 三省体系开关 ─────────────────────────────────────
+#
+# 默认 OFF。设 ENABLE_TRINITY=true 才启用三省体系。即使 profile 配了 ROLE，
+# 没有这个开关也不会走 trinity 路径——保持 100% 向后兼容。
+#
+# 接受的真值：true / 1 / yes / on（大小写不敏感）
+
+_TRUTHY = {"true", "1", "yes", "on", "y"}
+TRINITY_ENABLED: bool = os.getenv("ENABLE_TRINITY", "").strip().lower() in _TRUTHY
+
+
+# 关闭时把 trinity 相关属性置零，让 Profile.is_trinity / PROFILES_BY_ROLE 等
+# 全部"看不见"角色配置，dispatcher/lark_prompts 走遗留路径。
+if not TRINITY_ENABLED:
+    for _p in PROFILES:
+        _p.role = ""
+
 # bot_open_id → profile 索引，供 trinity 路径识别"发件人是不是同体系内 bot"
 # 只有配置了 bot_open_id 的 profile 才会进入这张表
-PROFILES_BY_BOT_OPEN_ID: dict[str, Profile] = {
-    p.bot_open_id: p for p in PROFILES if p.bot_open_id
-}
+PROFILES_BY_BOT_OPEN_ID: dict[str, Profile] = (
+    {p.bot_open_id: p for p in PROFILES if p.bot_open_id}
+    if TRINITY_ENABLED else {}
+)
 
 # role → profile 索引（只看 trinity profile）
-PROFILES_BY_ROLE: dict[str, Profile] = {p.role: p for p in PROFILES if p.role}
-
-# 是否启用 trinity 模式（至少一个 profile 配了 role）
-TRINITY_ENABLED: bool = bool(PROFILES_BY_ROLE)
+PROFILES_BY_ROLE: dict[str, Profile] = (
+    {p.role: p for p in PROFILES if p.role}
+    if TRINITY_ENABLED else {}
+)
 
 # ── 共享配置 ───────────────────────────────────────────────────
 

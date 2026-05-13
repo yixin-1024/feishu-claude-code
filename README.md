@@ -296,9 +296,9 @@ python3 main.py
 - 状态机 + valid_transitions 白名单，**非法转移直接拒绝、不进 Claude session**（省 token）
 - ticket 决策日志持久化到 `~/.feishu-claude/tickets.json`
 
-**何时启用：** 至少一个 profile 配了 `<NAME>_ROLE=yushitai/zhongshu/menxia/shangshu/ganhuode`。trinity 与非 trinity profile 可以在同一进程共存。
+**何时启用：** 设 `ENABLE_TRINITY=true` 并给 profile 配 `<NAME>_ROLE=yushitai/zhongshu/menxia/shangshu/ganhuode`。**两个条件都满足才生效**——这样允许 .env 里同时保留 trinity 配置和遗留 profile，开关切换。
 
-**不启用就保持原行为**：非 trinity profile 走遗留派单路径（见下节）。
+**默认 OFF**：不设 `ENABLE_TRINITY` 或设为 `false` 时，即使 profile 配了 `ROLE` 也走遗留行为，100% 向后兼容。
 
 ## 派单 / 会话群分流（遗留单 bot 模式）
 
