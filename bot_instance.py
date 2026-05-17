@@ -44,6 +44,7 @@ class BotInstance:
         self.store = SessionStore(
             profile=profile.name,
             default_cwd=profile.default_cwd,
+            chat_default_cwd=profile.chat_default_cwd,
         )
         self.active_runs = ActiveRunRegistry()
         # per-chat 消息队列锁：同一 chat 串行，跨 chat 并行

@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import threading
 import time
@@ -85,14 +84,8 @@ def create_bot_loop() -> asyncio.AbstractEventLoop:
     return loop
 
 
-# ── 看门狗：定时重启防止 WebSocket 假死 ──────────────────────
+# ── 活跃时间戳（供调用方追踪 WS 是否还在收事件） ──────────
 
-MAX_UPTIME = 6 * 3600  # 最长运行 6 小时后主动重启
-
-# launchd 只能检测进程退出，检测不到"假死"（进程在但 WS 不响应）。
-# watchdog 在指定时长后主动退出，由 launchd KeepAlive 拉起，作为保险。
-
-_start_time = time.time()
 last_event_ts = time.time()
 
 
@@ -100,21 +93,6 @@ def touch_event() -> None:
     """每收到一次 Lark event 调一次，刷新最近活跃时间。"""
     global last_event_ts
     last_event_ts = time.time()
-
-
-def _watchdog_loop():
-    while True:
-        time.sleep(300)  # 每 5 分钟检查
-        uptime = time.time() - _start_time
-        if uptime > MAX_UPTIME:
-            log("global", "watchdog", "info",
-                f"运行 {uptime/3600:.1f}h，定时重启刷新连接")
-            # 非零退出码，确保即使 plist 是 SuccessfulExit-only 也能被拉起
-            os._exit(1)
-
-
-def start_watchdog() -> None:
-    threading.Thread(target=_watchdog_loop, daemon=True, name="watchdog").start()
 
 
 # ── 后台定时摘要生成 ────────────────────────────────────────
@@ -155,6 +133,49 @@ def _bg_summary_loop():
 
 def start_summary_thread() -> None:
     threading.Thread(target=_bg_summary_loop, daemon=True, name="bg-summary").start()
+
+
+# ── Claude Max 用量监控（5h/7d 跨阈值 + 重置通报）─────────────
+
+def start_quota_watcher(
+    notify_profile: str,
+    notify_open_id: str,
+    interval_sec: int = 600,
+) -> None:
+    """启动 quota_watcher 后台线程。
+
+    通报通过 `notify_profile` 这个 bot 的 send_text_to_user 发给 `notify_open_id`。
+    watcher 跑在独立线程，所以 send_fn 用 run_coroutine_threadsafe 把异步发送
+    投回 bot_loop。
+    """
+    if _bot_loop is None or not _bots:
+        raise RuntimeError("runtime not configured; call configure() first")
+    bot = _bots.get(notify_profile)
+    if bot is None:
+        log("global", "quota", "warn",
+            f"quota_watcher: profile {notify_profile!r} 未加载，跳过")
+        return
+    if not notify_open_id:
+        log("global", "quota", "warn",
+            f"quota_watcher: notify_open_id 为空，跳过启动")
+        return
+
+    from quota_watcher import start_watcher_thread
+
+    def _send(text: str) -> None:
+        # watcher 线程里被调，必须投回 bot_loop 跑 async send
+        try:
+            asyncio.run_coroutine_threadsafe(
+                bot.feishu.send_text_to_user(notify_open_id, text),
+                _bot_loop,
+            )
+        except Exception as e:
+            log(notify_profile, "quota", "error",
+                f"投递 quota 通报失败: {e}")
+
+    start_watcher_thread(_send, interval=interval_sec)
+    log(notify_profile, "quota", "info",
+        f"quota watcher 启动 → 通报到 {notify_open_id[:14]}... 每 {interval_sec}s")
 
 
 # ── 为 profile 启动 WebSocket 客户端 ─────────────────────────
@@ -204,31 +225,28 @@ def start_profile_ws(bot: BotInstance) -> None:
         f"WS 客户端已启动 ({bot.profile.brand_label} · {bot.profile.domain})")
 
 
-# ── 定时任务调度（必须在 bot_loop 内启动） ───────────────────
+# ── 定时任务调度 ─────────────────────────────────────────────
 
 _scheduler = None  # 持有引用避免被 GC
 
 
-async def _start_scheduler_on_loop(config_path: str) -> None:
-    """在 bot_loop 内构造 AsyncIOScheduler（apscheduler 要求在目标 loop 内 start）。"""
+def start_scheduler_bg(config_path: str) -> None:
+    """主入口调一次。BackgroundScheduler 自己跑独立线程，不依赖 bot_loop 的 timer。
+
+    job 触发时同步 wrapper 用 run_coroutine_threadsafe 把 async 业务投回 bot_loop —
+    跨睡眠周期的 monotonic drift 不再影响调度准确性（详见 scheduler.py docstring）。
+    """
     global _scheduler
-    if _bindings is None:
+    if _bot_loop is None or _bindings is None:
         raise RuntimeError("runtime not configured; call configure() first")
     try:
         _scheduler = start_scheduler(
             config_path=config_path,
             bots=_bots,
-            loop=asyncio.get_running_loop(),
+            bot_loop=_bot_loop,
             spawn_fn=_bindings.spawn_fn,
         )
     except Exception as e:
         log("global", "scheduler", "error",
             f"启动失败: {type(e).__name__}: {e}")
         traceback.print_exc(file=sys.stdout)
-
-
-def start_scheduler_async(config_path: str) -> None:
-    """主入口调一次；在 bot_loop 内启动 scheduler。"""
-    if _bot_loop is None:
-        raise RuntimeError("runtime not configured; call configure() first")
-    asyncio.run_coroutine_threadsafe(_start_scheduler_on_loop(config_path), _bot_loop)

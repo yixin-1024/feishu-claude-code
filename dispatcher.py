@@ -99,6 +99,68 @@ async def _handle_stop_command(bot: BotInstance, sender_open_id: str, chat_id: s
     return "已发送停止请求"
 
 
+async def _handle_restart_command(originating_bot: BotInstance) -> int:
+    """
+    /restart：跨所有 bot 对每个 active run 调 stop_run（terminate PTY → 等子
+    进程退出 → on_stopped 改卡片），保证我们的"♻️ 重启"中断消息不被并发的
+    push() 流回覆盖。返回受影响数量。调用方负责回 ack + 触发 detach。
+    """
+    RESTART_MSG = "♻️ cc-lark 服务正在重启 — 本次任务被中断，~5s 后再发一遍。"
+
+    async def _stop_one(b: BotInstance, prof_name: str, run):
+        async def _announce(r):
+            if not r.card_msg_id:
+                return
+            try:
+                await b.feishu.update_card(r.card_msg_id, RESTART_MSG)
+            except Exception as e:
+                log(prof_name, "restart", "warn",
+                    f"update_card 失败 chat={r.chat_id[:12]}: {e}")
+        try:
+            await stop_run(
+                b.active_runs, run.user_id, run.chat_id,
+                on_stopped=_announce, grace_seconds=1.5,
+            )
+        except Exception as e:
+            log(prof_name, "restart", "warn",
+                f"stop_run 失败 chat={run.chat_id[:12]}: {e}")
+
+    tasks = []
+    affected = 0
+    for prof_name, b in list(_bots.items()):
+        for run in list(b.active_runs._runs.values()):
+            affected += 1
+            tasks.append(_stop_one(b, prof_name, run))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    log(originating_bot.profile.name, "restart", "info",
+        f"广播完毕（{affected} 个 active run），触发 detach + exit")
+    return affected
+
+
+# ── Hung 自动重试黑名单 ────────────────────────────────────
+# 这些 skill / endpoint 命中即跳过 auto-retry：它们是写操作（开卡 / 开 VA /
+# Bot-B 扣 credit），上一轮可能已经 commit 了一半，重试会 double-write。
+# user text + tool_history 任一命中即视为黑名单。
+_WRITE_OP_MARKERS = (
+    # issuer 发卡 / SGB 开户 API
+    "writeApi", "writeApi",
+    "writeApi", "writeApi",
+    "/write/pathA", "/write/pathB",
+    # 写操作类 skill 名
+    "example-write-skill", "example-write-skill",
+    "example-write-skill", "example-write-skill",
+    "example-write-skill", "example-write-skill",
+)
+
+
+def _is_write_op_context(user_text: str, tool_history: list[str]) -> bool:
+    blob = (user_text or "") + "\n" + "\n".join(tool_history or [])
+    return any(m in blob for m in _WRITE_OP_MARKERS)
+
+
 # ── 命令菜单（锁外即时响应）──────────────────────────────────
 
 _COMMAND_MENU_GROUPS = [
@@ -218,6 +280,20 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
                 await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
 
+        if _text.lower() == "/restart" or _text.strip().endswith("/restart"):
+            from commands import _trigger_restart
+            affected = await _handle_restart_command(bot)
+            ack = f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— ~5s 后回来。"
+            try:
+                if is_group:
+                    await bot.feishu.reply_card(msg.message_id, content=ack, loading=False)
+                else:
+                    await bot.feishu.send_card_to_user(user_id, content=ack, loading=False)
+            except Exception:
+                pass
+            _trigger_restart()
+            return
+
         if _text == "/":
             await _show_command_menu(bot, user_id, chat_id, is_group, msg.message_id)
             return
@@ -254,6 +330,16 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
             log(tag, "msg", "error", f"消息处理异常: {type(e).__name__}: {e}")
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
+            # _process_message 可能在建卡片之前就抛了（路由层 / store / 权限检查等），
+            # 此时没有 card_msg_id / notify_msg_id 可改。直接 reply 用户原消息，让出错可见。
+            try:
+                err_text = f"❌ 异常退出：{type(e).__name__}: {e}"
+                if is_group:
+                    await bot.feishu.reply_text(msg.message_id, err_text)
+                else:
+                    await bot.feishu.send_text_to_user(user_id, err_text)
+            except Exception:
+                pass
 
 
 async def _run_and_display(
@@ -279,6 +365,7 @@ async def _run_and_display(
     start_ts = time.time()
     last_output_ts = start_ts
     current_tool: tuple[str, float] | None = None
+    pty_warning: tuple[str, float] | None = None  # (label, since_ts) — PTY 抓到的 API 限流/过载提示
 
     def _fmt_duration(seconds: float) -> str:
         s = int(seconds)
@@ -323,6 +410,9 @@ async def _run_and_display(
         idle = now - last_output_ts
         if idle >= 30:
             footer.append(f"⚠️ 无输出 {_fmt_duration(idle)}")
+        if pty_warning:
+            label, since = pty_warning
+            footer.append(f"🚦 {label} {_fmt_duration(now - since)}")
         return f"{body}\n\n`{' · '.join(footer)}`"
 
     async def on_tool_use(name: str, inp: dict):
@@ -377,6 +467,20 @@ async def _run_and_display(
     def on_usage(usage: dict):
         final_usage.update(usage)
 
+    async def on_status(level: str, label: str):
+        nonlocal pty_warning, last_push_time
+        if level == "clear" or not label:
+            if pty_warning is None:
+                return
+            pty_warning = None
+        else:
+            if pty_warning and pty_warning[0] == label:
+                return  # 同一 label 不刷计时
+            pty_warning = (label, time.time())
+            log(bot.profile.name, "pty", "warn", f"PTY 抓到 API 异常: {label}")
+        await push(_build_display())
+        last_push_time = time.time()
+
     async def _heartbeat():
         nonlocal last_push_time
         try:
@@ -395,33 +499,131 @@ async def _run_and_display(
     # 写 session）期间 lock 仍然 held，active_run 也必须仍可被 /stop 找到，否则会出现
     # "队列说在跑、/stop 说没在跑" 的死区。
     try:
+        # ── Hung 自动重试 ───────────────────────────────────────
+        # 只对 claude_pty 抛的 "Claude 客户端疑似 hung" RuntimeError 重试；
+        # 其他错误（wall-clock、JSON、API key、orphan resume 等）一律不重试。
+        # 写操作 skill（SGB / issuer / Bot-B 等）跳过 retry，防止 double-write。
+        # max=1，硬编码；冷却 10s 让 TLS pool / claude 子进程释放。
+        _AUTO_RETRY_MAX = 1
+        _HUNG_MARKER = "客户端疑似 hung"
+        _COOLDOWN_SECONDS = 10
+        retry_count = 0
+        last_exc: Optional[Exception] = None
+        success = False
+        full_text = ""
+        new_session_id = ""
+        used_fresh_session_fallback = False
+
         try:
-            log(bot.profile.name, "claude", "info", "开始调用...")
-            full_text, new_session_id, used_fresh_session_fallback = await run_claude(
-                message=claude_msg,
-                session_id=session.session_id,
-                model=session.model,
-                cwd=session.cwd,
-                permission_mode=session.permission_mode,
-                on_text_chunk=on_text_chunk,
-                on_tool_use=on_tool_use,
-                on_process_start=lambda proc: bot.active_runs.attach_process(user_id, chat_id, proc),
-                on_usage=on_usage,
-                append_system_prompt=append_system_prompt or None,
+            while True:
+                try:
+                    if retry_count == 0:
+                        log(bot.profile.name, "claude", "info", "开始调用...")
+                    else:
+                        log(bot.profile.name, "claude", "info",
+                            f"重试调用 ({retry_count}/{_AUTO_RETRY_MAX})...")
+                    full_text, new_session_id, used_fresh_session_fallback = await run_claude(
+                        message=claude_msg,
+                        session_id=session.session_id,
+                        model=session.model,
+                        cwd=session.cwd,
+                        permission_mode=session.permission_mode,
+                        on_text_chunk=on_text_chunk,
+                        on_tool_use=on_tool_use,
+                        on_process_start=lambda proc: bot.active_runs.attach_process(user_id, chat_id, proc),
+                        on_usage=on_usage,
+                        on_status=on_status,
+                        append_system_prompt=append_system_prompt or None,
+                    )
+                    log(bot.profile.name, "claude", "info", f"完成, session={new_session_id}")
+                    success = True
+                    break
+                except Exception as e:
+                    # 先杀心跳——无论后续 retry 还是 ❌，都要先让心跳停，再 update_card，
+                    # 否则下一次心跳 push 会把 "🔄 重试中" 或 "❌" 覆盖回"进行中"画面。
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                    if active_run.stop_requested:
+                        return
+
+                    is_hung = isinstance(e, RuntimeError) and _HUNG_MARKER in str(e)
+                    blacklisted = _is_write_op_context(claude_msg, tool_history)
+                    can_retry = (
+                        is_hung
+                        and retry_count < _AUTO_RETRY_MAX
+                        and not blacklisted
+                    )
+
+                    if can_retry:
+                        retry_count += 1
+                        log(bot.profile.name, "claude", "warn",
+                            f"hung 检测，{_COOLDOWN_SECONDS}s 后自动重试 "
+                            f"({retry_count}/{_AUTO_RETRY_MAX})")
+                        # 死循环防御：旧 session_id 在 Claude 服务端大概率已经 dirty
+                        # （上轮 hung 时 API request 发到一半卡死），同一个 id 再 resume
+                        # 必然撞同一个坑。强制清掉，下一轮 run_claude 走 fresh session。
+                        # claude_pty 内部也有同样的 fresh-fallback 兜底，这里是双保险。
+                        if session.session_id:
+                            log(bot.profile.name, "claude", "warn",
+                                f"清掉 hung session={session.session_id[:8]}，下一轮 fresh")
+                            session.session_id = None
+                        try:
+                            await bot.feishu.update_card(
+                                card_msg_id,
+                                f"🔄 检测到 client hung，{_COOLDOWN_SECONDS}s 冷却后自动重试 "
+                                f"({retry_count}/{_AUTO_RETRY_MAX})...",
+                            )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(_COOLDOWN_SECONDS)
+                        # 重置心跳计时（否则下一轮一启动就报"无输出 N min"）
+                        last_output_ts = time.time()
+                        last_push_time = 0.0
+                        start_ts = time.time()
+                        current_tool = None
+                        pty_warning = None
+                        heartbeat_task = asyncio.create_task(_heartbeat())
+                        continue
+
+                    if is_hung and blacklisted and retry_count == 0:
+                        log(bot.profile.name, "claude", "warn",
+                            "hung 但本轮涉及写操作 skill，跳过 auto-retry")
+                    log(bot.profile.name, "claude", "error",
+                        f"运行失败: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+                    last_exc = e
+                    break
+        finally:
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+
+        if not success:
+            err_brief = (
+                f"❌ 自动重试 {retry_count} 次后仍失败：{type(last_exc).__name__}: {last_exc}"
+                if retry_count > 0
+                else f"❌ Claude 执行出错：{type(last_exc).__name__}: {last_exc}"
             )
-            log(bot.profile.name, "claude", "info", f"完成, session={new_session_id}")
-        except Exception as e:
-            if active_run.stop_requested:
-                return
-            log(bot.profile.name, "claude", "error", f"运行失败: {type(e).__name__}: {e}")
-            traceback.print_exc()
             try:
-                await bot.feishu.update_card(card_msg_id, f"❌ Claude 执行出错：{type(e).__name__}: {e}")
+                await bot.feishu.update_card(card_msg_id, err_brief)
+            except Exception:
+                pass
+            # 卡片是 in-place patch，不会触发 Lark 新消息通知。异常退出时额外发一条独立
+            # ❌ 短消息，与成功路径下的独立 ✅ 对齐，让用户能在消息列表里直接看到出错。
+            err_notify = "❌ 异常退出" + (
+                f"（已自动重试 {retry_count} 次）" if retry_count > 0 else ""
+            )
+            try:
+                if is_group and notify_msg_id:
+                    await bot.feishu.reply_text(notify_msg_id, err_notify)
+                else:
+                    await bot.feishu.send_text_to_user(user_id, err_notify)
             except Exception:
                 pass
             return
-        finally:
-            heartbeat_task.cancel()
 
         final = full_text or accumulated or "（无输出）"
         if used_fresh_session_fallback:
@@ -607,7 +809,7 @@ async def _process_message(
     if parsed:
         cmd, args = parsed
         log(tag, "cmd", "info", f"执行 {cmd}")
-        reply = await handle_command(cmd, args, user_id, chat_id, bot.store)
+        reply = await handle_command(cmd, args, user_id, chat_id, bot.store, bot=bot)
         if reply is not None:
             if isinstance(reply, dict):
                 reply_text, reply_buttons = reply["text"], reply.get("buttons", [])
@@ -920,7 +1122,19 @@ async def handle_menu_command(bot: BotInstance, user_id: str, chat_id: str, cmd_
                 pass
         return
 
-    reply = await handle_command(cmd, args, user_id, chat_id, bot.store)
+    if cmd == "restart":
+        from commands import _trigger_restart
+        affected = await _handle_restart_command(bot)
+        ack = f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— ~5s 后回来。"
+        if card_msg_id:
+            try:
+                await bot.feishu.update_card(card_msg_id, ack)
+            except Exception:
+                pass
+        _trigger_restart()
+        return
+
+    reply = await handle_command(cmd, args, user_id, chat_id, bot.store, bot=bot)
     if reply is None:
         return
 

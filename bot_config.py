@@ -14,6 +14,11 @@
     WORK_ALLOWED_GROUP_CHAT_IDS=oc_xxx
     WORK_LARK_CLI_PROFILE=work
 
+    # 可选：按 chat_id 覆盖默认 cwd（新群第一次接入时生效；
+    # 已有 sessions.json 记录的群不受影响，仍走持久化值）
+    WORK_CHAT_CWD_oc_aaa=/Users/me/spx
+    WORK_CHAT_CWD_oc_bbb=/Users/me/tools/feishu-claude-code
+
     PERSONAL_APP_ID=cli_yyy
     PERSONAL_APP_SECRET=yyy
     PERSONAL_PLATFORM=feishu
@@ -53,6 +58,9 @@ class Profile:
     platform: str
     domain: str
     default_cwd: str
+    # 可选：chat_id -> cwd 映射。新群初次进入时按此初始化 cwd（缺省回退到 default_cwd）。
+    # 不影响 sessions.json 已记录的群——那些走持久化值，可被 /ws set / /ws use 继续覆盖。
+    chat_default_cwd: dict[str, str] = field(default_factory=dict)
     allowed_open_ids: set[str] = field(default_factory=set)
     allowed_group_chat_ids: set[str] = field(default_factory=set)
     lark_cli_profile: str = ""  # 告诉 Claude 用 `lark-cli --profile <name>` 发消息
@@ -126,6 +134,15 @@ def _load_profile(name: str) -> Profile:
 
     default_cwd = os.path.expanduser(env("DEFAULT_CWD", os.path.expanduser("~")))
 
+    # 扫描 <PREFIX>_CHAT_CWD_<chat_id> 形式的环境变量（chat_id 大小写按用户写的原样）。
+    chat_cwd_prefix = f"{prefix}_CHAT_CWD_"
+    chat_default_cwd: dict[str, str] = {}
+    for env_key, env_val in os.environ.items():
+        if env_key.startswith(chat_cwd_prefix) and env_val:
+            chat_id = env_key[len(chat_cwd_prefix):]
+            if chat_id:
+                chat_default_cwd[chat_id] = os.path.expanduser(env_val)
+
     role = env("ROLE").strip().lower()
     return Profile(
         name=name,
@@ -134,6 +151,7 @@ def _load_profile(name: str) -> Profile:
         platform=platform,
         domain=_DOMAIN_MAP[platform],
         default_cwd=default_cwd,
+        chat_default_cwd=chat_default_cwd,
         allowed_open_ids=_split_csv(env("ALLOWED_OPEN_IDS")),
         allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),

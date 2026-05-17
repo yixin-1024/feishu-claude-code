@@ -118,6 +118,87 @@ async def test_new_session_with_chat_id(temp_store):
 
 
 @pytest.mark.asyncio
+async def test_chat_default_cwd_used_for_new_group():
+    """Per-chat default cwd should be applied to a freshly-seen group."""
+    fd, path = tempfile.mkstemp(suffix='.json')
+    os.close(fd)
+    try:
+        store = SessionStore(
+            default_cwd="/fallback",
+            chat_default_cwd={
+                "oc_spx": "/work/spx",
+                "oc_feishu": "/work/feishu-claude-code",
+            },
+        )
+        # Drop on-disk legacy state and any data the constructor loaded so we
+        # exercise the "new chat" path with our injected map only.
+        store._sessions_file = path
+        store._data = {}
+        store._save()
+
+        spx = await store.get_current("user_1", "oc_spx")
+        feishu = await store.get_current("user_1", "oc_feishu")
+        unknown = await store.get_current("user_1", "oc_other")
+
+        assert spx.cwd == "/work/spx"
+        assert feishu.cwd == "/work/feishu-claude-code"
+        assert unknown.cwd == "/fallback"
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_chat_default_cwd_does_not_override_persisted():
+    """Once a chat has a persisted cwd, the chat_default_cwd map must NOT touch it."""
+    fd, path = tempfile.mkstemp(suffix='.json')
+    os.close(fd)
+    try:
+        # First pass: no map. User manually sets cwd to /custom.
+        store1 = SessionStore(default_cwd="/fallback")
+        store1._sessions_file = path
+        store1._data = {}
+        store1._save()
+        await store1.set_cwd("user_1", "oc_spx", "/custom")
+
+        # Second pass: now map says oc_spx -> /work/spx. Persisted /custom wins.
+        store2 = SessionStore(
+            default_cwd="/fallback",
+            chat_default_cwd={"oc_spx": "/work/spx"},
+        )
+        store2._sessions_file = path
+        store2._data = json.load(open(path))
+
+        session = await store2.get_current("user_1", "oc_spx")
+        assert session.cwd == "/custom"
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_chat_default_cwd_private_uses_global_default():
+    """Private chats normalize to 'private', so a map keyed by user_id should NOT match."""
+    fd, path = tempfile.mkstemp(suffix='.json')
+    os.close(fd)
+    try:
+        store = SessionStore(
+            default_cwd="/fallback",
+            chat_default_cwd={"user_1": "/should-not-apply", "private": "/private-default"},
+        )
+        store._sessions_file = path
+        store._data = {}
+        store._save()
+
+        # chat_id == user_id → key normalizes to "private"
+        session = await store.get_current("user_1", "user_1")
+        assert session.cwd == "/private-default"
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+@pytest.mark.asyncio
 async def test_list_sessions_with_chat_id(temp_store):
     user_id = "user_123"
     chat_id = "group_456"

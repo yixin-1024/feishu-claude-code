@@ -16,20 +16,27 @@
       # prompt: |
       #   多行 prompt，承接 session 的全部上下文都靠这段。
 
-调度器只在主线程的 _bot_loop 上运行——和 WS 事件、HTTP 回调共用同一个 loop，
-所以 _handle_spawn 可以直接用 asyncio 调，不需要 run_coroutine_threadsafe。
+调度跑在独立的 BackgroundScheduler 线程里，不依赖 bot_loop 的 asyncio timer。
+job 触发时同步 wrapper 用 run_coroutine_threadsafe 把 _fire() 投回 bot_loop 跑实际业务。
+
+为什么不用 AsyncIOScheduler：macOS 上 asyncio 的 timer 走 time.monotonic()，
+系统睡眠期间不推进，长跑进程跨睡眠周期会错过 cron。BackgroundScheduler 本身
+也基于 monotonic，但配合 misfire_grace_time=None + 每 60s 的 wake-nudger，
+唤醒后会立即补跑 + 重算 next_run_time。
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import time
 import traceback
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 import yaml
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # ── 类型契约：main.py 注入的派单入口 ─────────────────────────
@@ -102,9 +109,16 @@ def _load_tasks(path: str) -> list[ScheduledTask]:
     return [ScheduledTask.from_dict(item, base_dir) for item in raw]
 
 
+# name -> async _fire；供 fire_task_now（HTTP /trigger 路径）await
 _TASK_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {}
 # 全局：start_scheduler 把构造好的 scheduler 和加载状态放这里，/reload 复用
-_STATE: dict = {"scheduler": None, "config_path": None, "bots": None, "spawn_fn": None}
+_STATE: dict = {
+    "scheduler": None,
+    "config_path": None,
+    "bots": None,
+    "bot_loop": None,
+    "spawn_fn": None,
+}
 
 
 def list_tasks() -> list[str]:
@@ -113,7 +127,10 @@ def list_tasks() -> list[str]:
 
 
 async def fire_task_now(name: str) -> None:
-    """手动触发一条任务（绕过 cron）。任务必须已通过 start_scheduler 注册。"""
+    """手动触发一条任务（绕过 cron）。任务必须已通过 start_scheduler 注册。
+
+    跑在 bot_loop 里（由 http_server 的 _submit 投入），可以直接 await async _fire。
+    """
     fn = _TASK_REGISTRY.get(name)
     if fn is None:
         raise KeyError(f"task {name!r} 不存在；已注册: {list_tasks()}")
@@ -131,6 +148,7 @@ def reload_tasks() -> dict:
 
     config_path = _STATE["config_path"]
     bots = _STATE["bots"]
+    bot_loop = _STATE["bot_loop"]
     spawn_fn = _STATE["spawn_fn"]
 
     try:
@@ -161,11 +179,12 @@ def reload_tasks() -> dict:
         except Exception as e:
             errors.append(f"{task.name}: cron 非法 {e}")
             continue
-        job_fn = _make_job(task, bot, spawn_fn)
-        _TASK_REGISTRY[task.name] = job_fn
+        async_fire = _make_async_fire(task, bot, spawn_fn)
+        _TASK_REGISTRY[task.name] = async_fire
         sched.add_job(
-            job_fn, trigger=trigger, id=task.name, name=task.name,
-            misfire_grace_time=300, coalesce=True, max_instances=1,
+            _make_sync_fire(task.name, async_fire, bot_loop),
+            trigger=trigger, id=task.name, name=task.name,
+            misfire_grace_time=None, coalesce=True, max_instances=1,
         )
         added.append(task.name)
         print(
@@ -179,12 +198,14 @@ def reload_tasks() -> dict:
 def start_scheduler(
     config_path: str,
     bots: dict,                 # profile_name -> BotInstance
-    loop: asyncio.AbstractEventLoop,
+    bot_loop: asyncio.AbstractEventLoop,
     spawn_fn: SpawnFn,
-) -> AsyncIOScheduler | None:
-    """加载 YAML 并启动 AsyncIOScheduler，绑定到 loop 上。
+) -> BackgroundScheduler | None:
+    """加载 YAML 并启动 BackgroundScheduler（独立线程跑）。
 
-    返回 scheduler；调用方持有引用即可，daemon 线程已经在 loop 内运行。
+    job 触发时同步 wrapper 用 run_coroutine_threadsafe 把 async _fire 投到 bot_loop —
+    避免 scheduler 线程阻塞，同时让业务逻辑跑在已经持有 bot 状态的那个 loop 上。
+
     若 yaml 不存在或为空，返回 None。
     """
     tasks = _load_tasks(config_path)
@@ -192,7 +213,7 @@ def start_scheduler(
         print(f"[scheduler] 未配置定时任务（{config_path}），跳过", flush=True)
         return None
 
-    scheduler = AsyncIOScheduler(event_loop=loop)
+    scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
     _TASK_REGISTRY.clear()
 
     for task in tasks:
@@ -207,17 +228,20 @@ def start_scheduler(
             print(f"[scheduler] ⚠️ 任务 {task.name!r} cron={task.cron!r} 非法: {e}", flush=True)
             continue
 
-        job_fn = _make_job(task, bot, spawn_fn)
-        _TASK_REGISTRY[task.name] = job_fn
+        async_fire = _make_async_fire(task, bot, spawn_fn)
+        _TASK_REGISTRY[task.name] = async_fire
 
         scheduler.add_job(
-            job_fn,
+            _make_sync_fire(task.name, async_fire, bot_loop),
             trigger=trigger,
             id=task.name,
             name=task.name,
-            misfire_grace_time=300,   # 错过 5 分钟内仍补跑；超过就跳过
-            coalesce=True,            # 多次错过合并成一次
-            max_instances=1,          # 同任务并发只能 1 个
+            # None = 永远补跑迟到的任务。
+            # 进程长跑 + 系统睡眠后唤醒，wall clock 可能已跨过多个 cron 时间点；
+            # coalesce=True 会把多次合并为 1 次，所以即便睡了 3 天醒来也只补 1 次。
+            misfire_grace_time=None,
+            coalesce=True,
+            max_instances=1,         # 同任务并发只能 1 个
         )
         print(
             f"[scheduler] ✅ {task.name} → profile={task.profile} chat={task.chat_id[:12]}... "
@@ -229,13 +253,41 @@ def start_scheduler(
     _STATE["scheduler"] = scheduler
     _STATE["config_path"] = config_path
     _STATE["bots"] = bots
+    _STATE["bot_loop"] = bot_loop
     _STATE["spawn_fn"] = spawn_fn
-    print(f"[scheduler] 已启动，加载 {len(scheduler.get_jobs())} 个定时任务", flush=True)
+
+    # 60s 一次的 wake-nudger：强制 scheduler 重算 next_run_time。
+    # 哪怕 monotonic clock 因系统睡眠而 drift，wakeup() 会让 scheduler 立刻按
+    # wall clock 重新检查所有 jobs，misfire_grace_time=None 的会被补跑。
+    threading.Thread(
+        target=_wake_nudge_loop, args=(scheduler,),
+        daemon=True, name="sched-nudger",
+    ).start()
+
+    print(
+        f"[scheduler] 已启动（BackgroundScheduler），加载 {len(scheduler.get_jobs())} 个定时任务",
+        flush=True,
+    )
     return scheduler
 
 
-def _make_job(task: ScheduledTask, bot, spawn_fn: SpawnFn):
-    """生成无参 coroutine，apscheduler 会在 loop 上 await 它。"""
+def _wake_nudge_loop(scheduler: BackgroundScheduler) -> None:
+    """每 60s 调一次 scheduler.wakeup() 强制重算 next_run_time。
+
+    APScheduler 内部用 threading.Event.wait(timeout) 等下次 fire，timeout 走的也是
+    CLOCK_MONOTONIC，macOS 睡眠期间不推进——长 wait 会被冻结，醒来后还得继续等。
+    这个 nudger 用短 sleep 把 scheduler 拉醒，让它按 wall clock 重新调度。
+    """
+    while True:
+        time.sleep(60)
+        try:
+            scheduler.wakeup()
+        except Exception:
+            pass
+
+
+def _make_async_fire(task: ScheduledTask, bot, spawn_fn: SpawnFn):
+    """生成无参 async coroutine。fire_task_now 直接 await，sync wrapper 投到 bot_loop。"""
     async def _fire():
         tag = f"[scheduler/{task.name}]"
         try:
@@ -263,3 +315,18 @@ def _make_job(task: ScheduledTask, bot, spawn_fn: SpawnFn):
             traceback.print_exc()
 
     return _fire
+
+
+def _make_sync_fire(
+    name: str,
+    async_fire: Callable[[], Awaitable[None]],
+    bot_loop: asyncio.AbstractEventLoop,
+):
+    """BackgroundScheduler 调的同步 job —— 把 async 业务投回 bot_loop，不阻塞 scheduler 线程。"""
+    def _sync_fire():
+        try:
+            asyncio.run_coroutine_threadsafe(async_fire(), bot_loop)
+        except Exception as e:
+            print(f"[scheduler/{name}] ❌ submit 失败: {type(e).__name__}: {e}", flush=True)
+
+    return _sync_fire

@@ -115,7 +115,6 @@ def main():
         print(f"   卡片回调    : http://localhost:{cb_port}/callback (需启动 ngrok)")
 
     # 5) 后台基础设施
-    runtime.start_watchdog()
     runtime.start_summary_thread()
 
     # 6) 每个 profile 起一个 WS 客户端
@@ -123,9 +122,25 @@ def main():
     for bot in _bots.values():
         runtime.start_profile_ws(bot)
 
-    # 7) 定时任务调度器
+    # 7) 定时任务调度器（独立后台线程，绕开 asyncio monotonic timer 的 macOS 睡眠坑）
     sched_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduled_tasks.yaml")
-    runtime.start_scheduler_async(sched_path)
+    runtime.start_scheduler_bg(sched_path)
+
+    # 8) Claude Max 用量监控：跨阈值 / 窗口重置时主动给 owner 私聊通报
+    # 通报通道：QUOTA_NOTIFY_PROFILE / QUOTA_NOTIFY_OPEN_ID 显式指定，
+    # 缺省退回到第一个 profile 的第一个 allowed_open_id（默认 owner）。
+    notify_profile = os.getenv("QUOTA_NOTIFY_PROFILE") or config.PROFILES[0].name
+    explicit_id = os.getenv("QUOTA_NOTIFY_OPEN_ID", "").strip()
+    if explicit_id:
+        notify_open_id = explicit_id
+    else:
+        target = config.PROFILES_BY_NAME.get(notify_profile) or config.PROFILES[0]
+        notify_open_id = next(iter(target.allowed_open_ids), "")
+    interval = int(os.getenv("QUOTA_WATCH_INTERVAL_SEC", "600"))
+    try:
+        runtime.start_quota_watcher(notify_profile, notify_open_id, interval)
+    except Exception as e:
+        print(f"⚠️ quota_watcher 启动失败: {e}")
 
     # 主线程保持运行
     try:

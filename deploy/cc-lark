@@ -1,267 +1,329 @@
 #!/usr/bin/env bash
-# cc-lark — 飞书/Lark Claude Bot 服务控制
-# 封装 launchd，支持 install/start/stop/restart/status/logs。
+# cc-lark — 飞书/Lark Claude Bot 服务控制（macOS .app + 登录项）
+# 早期版本用 launchd LaunchAgent。launchd 启动的进程，TCC 责任方 = launchd，
+# 导致 main.py 子进程链里的 peekaboo 拿不到「辅助功能 / 屏幕录制」等 GUI 权限。
+# 现在改成把 main.py + ngrok 放在 /Applications/cc-lark.app 里跑，
+# 责任方变成 cc-lark.app（com.cc-lark.bot.app），授权链能落到 peekaboo。
 
 set -euo pipefail
 
-LABEL="com.cc-lark.bot"
-NGROK_LABEL="com.cc-lark.ngrok"
-PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-NGROK_PLIST="$HOME/Library/LaunchAgents/${NGROK_LABEL}.plist"
-LOG_FILE="$HOME/.feishu-claude/cc-lark.log"
-NGROK_LOG="$HOME/.feishu-claude/cc-lark-ngrok.log"
+APP_NAME="cc-lark"
+APP_PATH="/Applications/${APP_NAME}.app"
+BUNDLE_ID="com.cc-lark.bot.app"
+WRAPPER_PATH="${APP_PATH}/Contents/MacOS/${APP_NAME}"
+INFO_PLIST="${APP_PATH}/Contents/Info.plist"
+
+LOG_DIR="$HOME/.feishu-claude"
+LOG_FILE="$LOG_DIR/cc-lark.log"
+NGROK_LOG="$LOG_DIR/cc-lark-ngrok.log"
+
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
 SCRIPT_PATH="$REPO_ROOT/deploy/cc-lark"
 ENV_FILE="$REPO_ROOT/.env"
 
-_service_target() { echo "gui/$UID/$1"; }
-_is_loaded() { launchctl print "$(_service_target "$1")" >/dev/null 2>&1; }
+TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
 
-_read_env_var() {
-    # 从 .env 里读一行 KEY=VALUE，不存在返回空。简单实现，够用。
-    local key="$1"
-    [[ -f "$ENV_FILE" ]] || return 0
-    grep -E "^[[:space:]]*${key}=" "$ENV_FILE" 2>/dev/null \
-        | tail -n 1 \
-        | sed -E "s/^[[:space:]]*${key}=//; s/^\"//; s/\"$//; s/^'//; s/'$//"
+# ── 进程探测 ──────────────────────────────────────────────────────────────
+
+_wrapper_pid() {
+    # 只匹配 .app 里的 wrapper，避免误杀别的 cc-lark
+    pgrep -f "^bash ${WRAPPER_PATH}$" 2>/dev/null | head -1
+}
+_is_running() { [[ -n "$(_wrapper_pid)" ]]; }
+
+_login_items_has() {
+    osascript -e "tell application \"System Events\" to (login item \"${APP_NAME}\" exists)" 2>/dev/null \
+        | grep -q "true"
 }
 
-_require_plist() {
-    if [[ ! -f "$PLIST" ]]; then
-        echo "❌ 未安装：$PLIST 不存在" >&2
-        echo "   先运行: cc-lark install" >&2
+# ── .app 生成 ────────────────────────────────────────────────────────────
+
+_resolve_python() {
+    local p="${PYTHON_BIN:-$(command -v python3 || true)}"
+    if [[ -z "$p" ]]; then
+        echo "❌ 找不到 python3（用 PYTHON_BIN=/path/to/python3 覆盖）" >&2
         exit 1
     fi
+    # pyenv shim 是 bash 脚本，TCC 跟踪 exec 后的真实解释器——这里直接解析掉，
+    # 让 wrapper 直接调真二进制，进程链更干净。
+    if [[ "$p" == *"/.pyenv/shims/"* ]]; then
+        local resolved
+        resolved="$($p -c 'import sys; print(sys.executable)' 2>/dev/null || true)"
+        [[ -n "$resolved" && -x "$resolved" ]] && p="$resolved"
+    fi
+    echo "$p"
 }
 
-_write_ngrok_plist() {
-    local ngrok_bin port domain args
+_write_wrapper() {
+    local python_bin ngrok_bin claude_bin extra_path
+    python_bin="$(_resolve_python)"
     ngrok_bin="$(command -v ngrok || true)"
-    if [[ -z "$ngrok_bin" ]]; then
-        return 1  # 没装 ngrok 跳过
-    fi
-    port="$(_read_env_var CALLBACK_PORT)"
-    port="${port:-9981}"
-    domain="$(_read_env_var NGROK_DOMAIN)"
+    claude_bin="$(command -v claude || true)"
 
-    mkdir -p "$(dirname "$NGROK_LOG")"
-    if [[ -n "$domain" ]]; then
-        args="        <string>http</string>
-        <string>--url</string>
-        <string>${domain}</string>
-        <string>${port}</string>"
+    extra_path=""
+    [[ -n "$claude_bin" ]] && extra_path="$(dirname "$claude_bin"):${extra_path}"
+    [[ -n "$ngrok_bin"  ]] && extra_path="$(dirname "$ngrok_bin"):${extra_path}"
+
+    mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
+
+    # 字面量模板（quoted heredoc 防止变量在生成时展开）
+    cat > "$WRAPPER_PATH" <<'WRAPPER_EOF'
+#!/usr/bin/env bash
+# cc-lark.app 启动器 — 由 `cc-lark install` 生成；手改请同步改 deploy/cc-lark
+set -uo pipefail
+
+REPO_ROOT="__REPO_ROOT__"
+PYTHON_BIN="__PYTHON_BIN__"
+NGROK_BIN="__NGROK_BIN__"
+
+LOG_DIR="$HOME/.feishu-claude"
+mkdir -p "$LOG_DIR"
+BOT_LOG="$LOG_DIR/cc-lark.log"
+NGROK_LOG="$LOG_DIR/cc-lark-ngrok.log"
+ENV_FILE="$REPO_ROOT/.env"
+
+CALLBACK_PORT="9981"
+NGROK_DOMAIN=""
+if [[ -f "$ENV_FILE" ]]; then
+    while IFS='=' read -r key val; do
+        val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
+        case "$key" in
+            CALLBACK_PORT) [[ -n "$val" ]] && CALLBACK_PORT="$val" ;;
+            NGROK_DOMAIN)  NGROK_DOMAIN="$val" ;;
+        esac
+    done < <(grep -E "^(CALLBACK_PORT|NGROK_DOMAIN)=" "$ENV_FILE")
+fi
+
+export PATH="__EXTRA_PATH__/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export HOME="__HOME_DIR__"
+
+cd "$REPO_ROOT" || { echo "[$(date)] cd $REPO_ROOT failed" >>"$BOT_LOG"; exit 1; }
+
+ngrok_pid=""; bot_pid=""
+cleanup() {
+    [[ -n "$bot_pid"   ]] && kill "$bot_pid"   2>/dev/null || true
+    [[ -n "$ngrok_pid" ]] && kill "$ngrok_pid" 2>/dev/null || true
+    wait 2>/dev/null
+    echo "[$(date)] cc-lark.app stopped" >>"$BOT_LOG"
+    exit 0
+}
+trap cleanup INT TERM
+
+echo "[$(date)] cc-lark.app starting (PID $$)" >>"$BOT_LOG"
+
+if [[ -n "$NGROK_BIN" && -x "$NGROK_BIN" ]]; then
+    if [[ -n "$NGROK_DOMAIN" ]]; then
+        "$NGROK_BIN" http --url "$NGROK_DOMAIN" "$CALLBACK_PORT" >>"$NGROK_LOG" 2>&1 &
     else
-        args="        <string>http</string>
-        <string>${port}</string>"
+        "$NGROK_BIN" http "$CALLBACK_PORT" >>"$NGROK_LOG" 2>&1 &
     fi
+    ngrok_pid=$!
+    sleep 2
+fi
 
-    cat > "$NGROK_PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>${NGROK_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${ngrok_bin}</string>
-${args}
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>ThrottleInterval</key><integer>10</integer>
-    <key>StandardOutPath</key><string>${NGROK_LOG}</string>
-    <key>StandardErrorPath</key><string>${NGROK_LOG}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key><string>${HOME}</string>
-    </dict>
-</dict>
-</plist>
-EOF
-    echo "📝 写入 plist: $NGROK_PLIST"
-    echo "   ngrok  : $ngrok_bin"
-    echo "   port   : $port"
-    echo "   domain : ${domain:-（free 随机域名）}"
-    return 0
+"$PYTHON_BIN" main.py >>"$BOT_LOG" 2>&1 &
+bot_pid=$!
+wait "$bot_pid"
+cleanup
+WRAPPER_EOF
+
+    # 占位符替换。用 | 作分隔符避免路径里的 / 冲突。
+    sed -i.bak \
+        -e "s|__REPO_ROOT__|${REPO_ROOT}|g" \
+        -e "s|__PYTHON_BIN__|${python_bin}|g" \
+        -e "s|__NGROK_BIN__|${ngrok_bin}|g" \
+        -e "s|__EXTRA_PATH__|${extra_path}|g" \
+        -e "s|__HOME_DIR__|${HOME}|g" \
+        "$WRAPPER_PATH"
+    rm -f "$WRAPPER_PATH.bak"
+    chmod +x "$WRAPPER_PATH"
+
+    echo "📝 wrapper : $WRAPPER_PATH"
+    echo "   python  : $python_bin"
+    echo "   ngrok   : ${ngrok_bin:-（未装，跳过 ngrok）}"
+    echo "   claude  : ${claude_bin:-（未找到，bot 可能报错）}"
 }
 
-_write_plist() {
-    local python_bin claude_bin path_env
-    python_bin="${PYTHON_BIN:-$(command -v python3 || true)}"
-    claude_bin="$(command -v claude || true)"
-    if [[ -z "$python_bin" ]]; then
-        echo "❌ 找不到 python3（可用 PYTHON_BIN=/path/to/python3 覆盖）" >&2
-        exit 1
-    fi
-
-    path_env="$(dirname "$python_bin"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-    if [[ -n "$claude_bin" ]] && [[ ":$path_env:" != *":$(dirname "$claude_bin"):"* ]]; then
-        path_env="$(dirname "$claude_bin"):$path_env"
-    fi
-
-    mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$PLIST")"
-
-    cat > "$PLIST" <<EOF
+_write_info_plist() {
+    cat > "$INFO_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>${LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${python_bin}</string>
-        <string>${REPO_ROOT}/main.py</string>
-    </array>
-    <key>WorkingDirectory</key><string>${REPO_ROOT}</string>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>ThrottleInterval</key><integer>10</integer>
-    <key>StandardOutPath</key><string>${LOG_FILE}</string>
-    <key>StandardErrorPath</key><string>${LOG_FILE}</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key><string>${path_env}</string>
-        <key>HOME</key><string>${HOME}</string>
-    </dict>
+    <key>CFBundleExecutable</key><string>${APP_NAME}</string>
+    <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
+    <key>CFBundleName</key><string>${APP_NAME}</string>
+    <key>CFBundleDisplayName</key><string>${APP_NAME}</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.0.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>LSUIElement</key><true/>
+    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
 EOF
-    echo "📝 写入 plist: $PLIST"
-    echo "   python : $python_bin"
-    echo "   claude : ${claude_bin:-（未找到，bot 可能报错）}"
+}
+
+_codesign() {
+    codesign --force --deep --sign - "$APP_PATH" >/dev/null 2>&1 || true
 }
 
 _try_symlink() {
     local candidates=(/opt/homebrew/bin /usr/local/bin "$HOME/.local/bin")
     for dir in "${candidates[@]}"; do
-        if [[ -d "$dir" ]] && [[ -w "$dir" ]]; then
+        if [[ -d "$dir" && -w "$dir" ]]; then
             ln -sf "$SCRIPT_PATH" "$dir/cc-lark"
-            echo "🔗 已创建 symlink: $dir/cc-lark -> $SCRIPT_PATH"
             return 0
         fi
     done
-    echo "⚠️ 未找到可写的 PATH 目录，请手动添加: ln -s $SCRIPT_PATH /usr/local/bin/cc-lark"
     return 1
 }
 
-_bootstrap_service() {
-    local label="$1" plist="$2"
-    if _is_loaded "$label"; then
-        launchctl bootout "$(_service_target "$label")" 2>/dev/null || true
-        sleep 1
-    fi
-    launchctl bootstrap "gui/$UID" "$plist"
-    launchctl enable "$(_service_target "$label")" 2>/dev/null || true
-}
+# ── 命令 ─────────────────────────────────────────────────────────────────
 
 cmd_install() {
-    local skip_ngrok=false
-    [[ "${1:-}" == "--no-ngrok" ]] && skip_ngrok=true
+    local add_login=true
+    [[ "${1:-}" == "--no-login-item" ]] && add_login=false
 
-    _write_plist
-    _bootstrap_service "$LABEL" "$PLIST"
+    local was_running=false
+    _is_running && was_running=true
+
+    echo "📦 (重新)生成 $APP_PATH"
+    _write_wrapper
+    _write_info_plist
+    _codesign
     _try_symlink || true
 
-    if ! $skip_ngrok && _write_ngrok_plist; then
-        # 如果已有外部 ngrok 在跑同一端口，先停掉避免冲突
-        pgrep -x ngrok >/dev/null && { pkill -x ngrok 2>/dev/null || true; sleep 2; }
-        _bootstrap_service "$NGROK_LABEL" "$NGROK_PLIST"
-        # bot 刚刚可能在 ngrok 启动前已经跑了，重启让它抓到 tunnel URL
-        sleep 3
-        launchctl kickstart -k "$(_service_target "$LABEL")" 2>/dev/null || true
+    if $add_login; then
+        if _login_items_has; then
+            echo "✅ 登录项已存在"
+        else
+            osascript -e "tell application \"System Events\" to make login item at end with properties {path:\"${APP_PATH}\", hidden:false}" >/dev/null
+            echo "✅ 已加入登录项"
+        fi
     fi
 
-    echo "✅ 安装完成，开机自启已启用"
-    echo "   bot   日志: $LOG_FILE"
-    [[ -f "$NGROK_PLIST" ]] && echo "   ngrok 日志: $NGROK_LOG"
-    echo "   状态查询: cc-lark status"
+    echo ""
+    if $was_running; then
+        echo "⚠️  当前有实例在跑（用旧 wrapper）"
+        echo "   要应用新 wrapper：cc-lark restart"
+        echo "   ⚠️  签名 cdhash 变了，TCC 授权可能失效；若 peekaboo 报权限错，"
+        echo "       去「系统设置 → 隐私与安全性」把 cc-lark 从相关权限移除再重新加。"
+    else
+        echo "下一步: cc-lark start"
+    fi
 }
 
 cmd_uninstall() {
-    for lbl in "$LABEL" "$NGROK_LABEL"; do
-        _is_loaded "$lbl" && launchctl bootout "$(_service_target "$lbl")" 2>/dev/null || true
-    done
-    rm -f "$PLIST" "$NGROK_PLIST"
+    cmd_stop >/dev/null 2>&1 || true
+    if _login_items_has; then
+        osascript -e "tell application \"System Events\" to delete login item \"${APP_NAME}\"" >/dev/null
+        echo "🗑  已从登录项移除"
+    fi
+    if [[ -d "$APP_PATH" ]]; then
+        rm -rf "$APP_PATH"
+        echo "🗑  已删除 $APP_PATH"
+    fi
     for dir in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
         [[ -L "$dir/cc-lark" ]] && rm -f "$dir/cc-lark"
     done
-    echo "✅ 已卸载（bot + ngrok plist + symlink 都清掉了）"
+    echo "✅ 已卸载（.app + 登录项 + symlink）"
+    echo "ℹ️  TCC 授权（辅助功能/屏幕录制/完全磁盘访问）需要你手动去系统设置里删，"
+    echo "    否则留下灰条目；下次同 bundle id 重装可能直接复用旧授权（也可能失效）。"
 }
 
 cmd_start() {
-    _require_plist
-    for lbl_plist in "$LABEL:$PLIST" "$NGROK_LABEL:$NGROK_PLIST"; do
-        local lbl="${lbl_plist%%:*}" pl="${lbl_plist##*:}"
-        [[ ! -f "$pl" ]] && continue
-        if _is_loaded "$lbl"; then
-            launchctl kickstart "$(_service_target "$lbl")"
-        else
-            launchctl bootstrap "gui/$UID" "$pl"
-        fi
-    done
-    echo "✅ 已启动"
+    if [[ ! -d "$APP_PATH" ]]; then
+        echo "❌ 未安装：$APP_PATH 不存在；先 cc-lark install" >&2
+        exit 1
+    fi
+    if _is_running; then
+        echo "ℹ️  已经在跑（PID $(_wrapper_pid)）"
+        return 0
+    fi
+    open "$APP_PATH"
+    sleep 2
+    if _is_running; then
+        echo "✅ 已启动（PID $(_wrapper_pid)）"
+    else
+        echo "❌ 启动失败，看日志: tail -n 50 $LOG_FILE" >&2
+        exit 1
+    fi
 }
 
 cmd_stop() {
-    local stopped=0
-    for lbl in "$LABEL" "$NGROK_LABEL"; do
-        if _is_loaded "$lbl"; then
-            launchctl bootout "$(_service_target "$lbl")" 2>/dev/null || true
-            stopped=$((stopped + 1))
-        fi
-    done
-    if [[ $stopped -eq 0 ]]; then
-        echo "ℹ️ 服务本来就没在跑"
-    else
-        echo "⏹ 已停止 $stopped 个服务（不会自动拉起）"
+    local pid
+    pid="$(_wrapper_pid)"
+    if [[ -z "$pid" ]]; then
+        echo "ℹ️  本来就没在跑"
+        return 0
     fi
+    kill -TERM "$pid" 2>/dev/null || true
+    local i
+    for i in 1 2 3 4 5 6 7 8; do
+        sleep 1
+        _is_running || break
+    done
+    if _is_running; then
+        echo "⚠️  TERM 无效，强杀"
+        kill -KILL "$(_wrapper_pid)" 2>/dev/null || true
+        sleep 1
+    fi
+    # 兜底：万一 trap cleanup 没跑到，把 ngrok 也清掉
+    pgrep -f "ngrok http.*${BUNDLE_ID%.*}" >/dev/null 2>&1 && pkill -f "ngrok http.*${BUNDLE_ID%.*}" || true
+    echo "⏹  已停止"
 }
 
 cmd_restart() {
-    _require_plist
-    for lbl_plist in "$NGROK_LABEL:$NGROK_PLIST" "$LABEL:$PLIST"; do
-        local lbl="${lbl_plist%%:*}" pl="${lbl_plist##*:}"
-        [[ ! -f "$pl" ]] && continue
-        if _is_loaded "$lbl"; then
-            launchctl kickstart -k "$(_service_target "$lbl")"
-        else
-            launchctl bootstrap "gui/$UID" "$pl"
-        fi
-    done
-    echo "♻️ 已重启（ngrok 先，bot 后）"
-}
-
-_status_one() {
-    local name="$1" lbl="$2" plist="$3" logf="$4"
-    if [[ ! -f "$plist" ]]; then
-        printf "  %-8s %s\n" "$name:" "未安装"
-        return
-    fi
-    if ! _is_loaded "$lbl"; then
-        printf "  %-8s %s\n" "$name:" "已安装但未运行"
-        return
-    fi
-    local out pid last_exit state
-    out="$(launchctl print "$(_service_target "$lbl")" 2>/dev/null || true)"
-    pid=$(echo "$out" | awk -F'= ' '/^\tpid = /{print $2}' | tr -d ' ')
-    last_exit=$(echo "$out" | awk -F'= ' '/last exit code/{print $2}' | tr -d ' ')
-    state=$(echo "$out" | awk -F'= ' '/^\tstate = /{print $2}' | tr -d ' ')
-    printf "  %-8s %s (PID %s, last_exit=%s)\n" "$name:" "${state:-?}" "${pid:-?}" "${last_exit:-n/a}"
+    cmd_stop || true
+    sleep 1
+    cmd_start
 }
 
 cmd_status() {
-    if [[ ! -f "$PLIST" ]]; then
-        echo "📊 未安装（运行 cc-lark install）"
+    if [[ ! -d "$APP_PATH" ]]; then
+        echo "📊 未安装（cc-lark install）"
         return 1
     fi
-    echo "📊 服务状态"
-    _status_one "bot"   "$LABEL"       "$PLIST"       "$LOG_FILE"
-    _status_one "ngrok" "$NGROK_LABEL" "$NGROK_PLIST" "$NGROK_LOG"
-    echo
+    echo "📊 cc-lark 状态"
+
+    if _is_running; then
+        local wpid bpid npid
+        wpid="$(_wrapper_pid)"
+        bpid="$(pgrep -P "$wpid" -f main.py 2>/dev/null || true)"
+        npid="$(pgrep -P "$wpid" -f ngrok    2>/dev/null || true)"
+        printf "  %-12s %s\n" "wrapper"  "运行中 (PID $wpid)"
+        printf "  %-12s %s\n" "bot"      "${bpid:-未启动}"
+        printf "  %-12s %s\n" "ngrok"    "${npid:-未启动}"
+    else
+        printf "  %-12s %s\n" "wrapper"  "未运行"
+    fi
+
+    if _login_items_has; then
+        printf "  %-12s %s\n" "登录项"   "已加入"
+    else
+        printf "  %-12s %s\n" "登录项"   "未加入（cc-lark install 会自动加）"
+    fi
+
+    if [[ -r "$TCC_DB" ]]; then
+        local granted
+        granted="$(sqlite3 "$TCC_DB" \
+            "SELECT service FROM access WHERE client='${BUNDLE_ID}' AND auth_value=2;" 2>/dev/null \
+            | sed -e 's/kTCCService//' | tr '\n' ' ')"
+        if [[ -n "$granted" ]]; then
+            printf "  %-12s %s\n" "TCC 授权" "$granted"
+        else
+            printf "  %-12s %s\n" "TCC 授权" "（无；首次使用 peekaboo 时去系统设置加）"
+        fi
+    fi
+
+    echo ""
     echo "  bot   日志: $LOG_FILE"
-    [[ -f "$NGROK_PLIST" ]] && echo "  ngrok 日志: $NGROK_LOG"
+    echo "  ngrok 日志: $NGROK_LOG"
     if [[ -f "$LOG_FILE" ]]; then
-        echo
+        echo ""
         echo "── bot 最近 10 行 ──"
         tail -n 10 "$LOG_FILE"
     fi
@@ -289,31 +351,33 @@ cmd_logs() {
 
 usage() {
     cat <<EOF
-cc-lark — 飞书/Lark Claude Bot 服务控制（基于 macOS launchd）
-管理两个服务：bot（主进程）+ ngrok（卡片回调隧道）
+cc-lark — 飞书/Lark Claude Bot 服务控制（macOS .app + 登录项）
 
 用法:
-  cc-lark install [--no-ngrok]        安装 + 启动 + 开机自启
-  cc-lark uninstall                   卸载
-  cc-lark start                       启动（全部）
-  cc-lark stop                        停止（全部）
-  cc-lark restart                     重启（先 ngrok 后 bot）
-  cc-lark status                      两个服务的运行状态 + bot 日志
-  cc-lark logs [bot|ngrok] [-n N] [-f]  查看指定服务的日志（默认 bot，-f 跟踪）
+  cc-lark install [--no-login-item]   生成/重写 /Applications/cc-lark.app + 登录项
+  cc-lark uninstall                   卸载 (.app + 登录项 + symlink)
+  cc-lark start                       启动（open .app）
+  cc-lark stop                        停止（TERM wrapper + ngrok 兜底）
+  cc-lark restart                     重启
+  cc-lark status                      运行状态 + 登录项 + TCC 授权 + bot 日志末尾
+  cc-lark logs [bot|ngrok] [-n N] [-f]  查看日志
 
 文件:
-  bot   plist : ${PLIST}
-  ngrok plist : ${NGROK_PLIST}
+  .app        : ${APP_PATH}
+  wrapper     : ${WRAPPER_PATH}
   bot   日志  : ${LOG_FILE}
   ngrok 日志  : ${NGROK_LOG}
 
-.env 可配置（cc-lark 会读取）:
+.env 可配置:
   CALLBACK_PORT   卡片回调端口（默认 9981）
-  NGROK_DOMAIN    ngrok 固定域名（免费版也支持，形如 xxx.ngrok-free.dev）
-                  不设置则用随机域名，每次重启 URL 变动，需在开放平台同步更新
+  NGROK_DOMAIN    ngrok 固定域名（不设置则随机域名）
 
 环境变量:
-  PYTHON_BIN      覆盖 python3 路径（默认 \$(command -v python3)）
+  PYTHON_BIN      覆盖 python3 路径（默认 \$(command -v python3)，pyenv shim 会自动解析为真实解释器）
+
+TCC 注意:
+  改 wrapper 后 ad-hoc 签名 cdhash 会变。若 peekaboo 报「不被允许」，
+  去「系统设置 → 隐私与安全性」把 cc-lark 从对应权限里删掉再重新加。
 EOF
 }
 

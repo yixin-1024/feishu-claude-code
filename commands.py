@@ -60,6 +60,10 @@ HELP_TEXT = """\
 `/mcp` — 列出已配置的 MCP Servers
 `/usage` — 查看 Claude Max 订阅用量百分比和重置时间
 
+**服务管理：**
+`/restart` — 重启 cc-lark 服务（detached，不会自残）
+`/group add <chat_id> [cwd]` — 把群加白名单并设默认 cwd（实时生效 + 持久化到 .env）
+
 
 **Claude Skills（直接转发给 Claude 执行）：**
 `/commit` — 提交代码
@@ -89,7 +93,11 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "model", "mode", "status", "cd", "ls",
     "exec", "workspace", "ws", "skills", "mcp", "usage", "stop",
+    "restart", "group",
 }
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+APP_PATH = "/Applications/cc-lark.app"
 
 
 async def _build_session_list(user_id: str, chat_id: str, store: SessionStore, cli_all: list[dict] | None = None) -> list[dict]:
@@ -279,12 +287,18 @@ def _read_skill_desc(fpath: str) -> str:
     return ""
 
 
-def _get_usage() -> str:
-    """
-    发一个轻量 API 请求，从响应 headers 获取 Claude Max 订阅用量百分比和重置时间。
+def fetch_quota_headers() -> dict:
+    """发轻量 API 请求拉 Claude Max 用量 headers。
+
+    返回结构：
+        {"ok": True,  "u5h": 0.31, "u7d": 0.33, "r5h": 1736900000, "r7d": ...,
+         "s5h": "allowed", "s7d": "allowed"}
+        {"ok": False, "error": "..."}
+
+    quota_watcher 和 /usage / /status 都共用这一个入口。
     """
     if sys.platform != "darwin":
-        return "❌ /usage 目前只支持 macOS"
+        return {"ok": False, "error": "目前只支持 macOS"}
 
     import urllib.request
     import urllib.error
@@ -298,7 +312,7 @@ def _get_usage() -> str:
         creds = json.loads(result.stdout.strip())
         token = creds["claudeAiOauth"]["accessToken"]
     except Exception as e:
-        return f"❌ 读取凭证失败：{e}"
+        return {"ok": False, "error": f"读取凭证失败：{e}"}
 
     body = json.dumps({
         "model": "claude-haiku-4-5-20251001",
@@ -325,51 +339,73 @@ def _get_usage() -> str:
     except urllib.error.HTTPError as e:
         headers = dict(e.headers)
     except Exception as e:
-        return f"❌ 获取用量失败：{e}"
+        return {"ok": False, "error": f"获取用量失败：{e}"}
 
     def h(key):
         return headers.get(key) or headers.get(key.lower()) or headers.get(key.replace("-", "_"))
 
-    def fmt_pct(val):
-        if val is None:
-            return "未知"
-        pct = float(val) * 100
-        bar_len = 20
-        filled = round(pct / 100 * bar_len)
-        bar = "█" * filled + "░" * (bar_len - filled)
-        return f"{bar} {pct:.1f}%"
-
-    def fmt_reset(ts):
-        if ts is None:
-            return "未知"
+    def _to_float(v):
         try:
-            dt = datetime.fromtimestamp(int(ts))
-            now = datetime.now()
-            diff = dt - now
-            hours = int(diff.total_seconds() // 3600)
-            minutes = int((diff.total_seconds() % 3600) // 60)
-            return f"{dt.strftime('%m/%d %H:%M')}（{hours}h{minutes}m 后）"
+            return float(v) if v is not None else None
         except Exception:
-            return ts
+            return None
 
-    u5h = h("anthropic-ratelimit-unified-5h-utilization")
-    u7d = h("anthropic-ratelimit-unified-7d-utilization")
-    r5h = h("anthropic-ratelimit-unified-5h-reset")
-    r7d = h("anthropic-ratelimit-unified-7d-reset")
-    s5h = h("anthropic-ratelimit-unified-5h-status") or "unknown"
-    s7d = h("anthropic-ratelimit-unified-7d-status") or "unknown"
+    def _to_int(v):
+        try:
+            return int(v) if v is not None else None
+        except Exception:
+            return None
 
-    if u5h is None and u7d is None:
-        return "📊 **Usage**\n\n未能获取用量数据（响应中无用量 headers）。"
+    out = {
+        "ok": True,
+        "u5h": _to_float(h("anthropic-ratelimit-unified-5h-utilization")),
+        "u7d": _to_float(h("anthropic-ratelimit-unified-7d-utilization")),
+        "r5h": _to_int(h("anthropic-ratelimit-unified-5h-reset")),
+        "r7d": _to_int(h("anthropic-ratelimit-unified-7d-reset")),
+        "s5h": h("anthropic-ratelimit-unified-5h-status") or "unknown",
+        "s7d": h("anthropic-ratelimit-unified-7d-status") or "unknown",
+    }
+    if out["u5h"] is None and out["u7d"] is None:
+        return {"ok": False, "error": "响应中无用量 headers"}
+    return out
+
+
+def _fmt_pct_bar(val) -> str:
+    if val is None:
+        return "未知"
+    pct = float(val) * 100
+    bar_len = 20
+    filled = round(pct / 100 * bar_len)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    return f"{bar} {pct:.1f}%"
+
+
+def _fmt_reset_ts(ts) -> str:
+    if ts is None:
+        return "未知"
+    try:
+        dt = datetime.fromtimestamp(int(ts))
+        diff = dt - datetime.now()
+        hours = int(diff.total_seconds() // 3600)
+        minutes = int((diff.total_seconds() % 3600) // 60)
+        return f"{dt.strftime('%m/%d %H:%M')}（{hours}h{minutes}m 后）"
+    except Exception:
+        return str(ts)
+
+
+def _get_usage() -> str:
+    """渲染 /usage 命令的完整输出。"""
+    data = fetch_quota_headers()
+    if not data.get("ok"):
+        return f"❌ {data.get('error', '获取用量失败')}"
 
     lines = ["📊 **Claude Max 用量**\n"]
-    lines.append(f"**5小时窗口**（状态：{s5h}）")
-    lines.append(f"{fmt_pct(u5h)}")
-    lines.append(f"重置时间：{fmt_reset(r5h)}\n")
-    lines.append(f"**7天窗口**（状态：{s7d}）")
-    lines.append(f"{fmt_pct(u7d)}")
-    lines.append(f"重置时间：{fmt_reset(r7d)}")
-
+    lines.append(f"**5小时窗口**（状态：{data['s5h']}）")
+    lines.append(f"{_fmt_pct_bar(data['u5h'])}")
+    lines.append(f"重置时间：{_fmt_reset_ts(data['r5h'])}\n")
+    lines.append(f"**7天窗口**（状态：{data['s7d']}）")
+    lines.append(f"{_fmt_pct_bar(data['u7d'])}")
+    lines.append(f"重置时间：{_fmt_reset_ts(data['r7d'])}")
     return "\n".join(lines)
 
 
@@ -453,59 +489,18 @@ def _format_context_line(session_id: Optional[str], model: str) -> str:
 
 def _get_quota_compact() -> str:
     """获取 Claude Max 5h/7d 用量的紧凑一行版本，失败返回空串。"""
-    if sys.platform != "darwin":
-        return ""
-    import urllib.request, urllib.error, ssl
-    try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        creds = json.loads(result.stdout.strip())
-        token = creds["claudeAiOauth"]["accessToken"]
-    except Exception:
-        return ""
-    body = json.dumps({
-        "model": "claude-haiku-4-5-20251001", "max_tokens": 1,
-        "messages": [{"role": "user", "content": "hi"}],
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, context=ctx, timeout=8) as resp:
-            headers = dict(resp.headers)
-    except urllib.error.HTTPError as e:
-        headers = dict(e.headers)
-    except Exception:
-        return ""
-
-    def h(key):
-        return headers.get(key) or headers.get(key.lower())
-
-    u5 = h("anthropic-ratelimit-unified-5h-utilization")
-    u7 = h("anthropic-ratelimit-unified-7d-utilization")
-    r5 = h("anthropic-ratelimit-unified-5h-reset")
-    if u5 is None and u7 is None:
+    data = fetch_quota_headers()
+    if not data.get("ok"):
         return ""
     parts = []
-    if u5 is not None:
-        parts.append(f"5h {float(u5)*100:.1f}%")
-    if u7 is not None:
-        parts.append(f"7d {float(u7)*100:.1f}%")
+    if data["u5h"] is not None:
+        parts.append(f"5h {data['u5h']*100:.1f}%")
+    if data["u7d"] is not None:
+        parts.append(f"7d {data['u7d']*100:.1f}%")
     tail = ""
-    if r5:
+    if data["r5h"]:
         try:
-            dt = datetime.fromtimestamp(int(r5))
+            dt = datetime.fromtimestamp(data["r5h"])
             diff = dt - datetime.now()
             h_ = int(diff.total_seconds() // 3600)
             m_ = int((diff.total_seconds() % 3600) // 60)
@@ -716,12 +711,146 @@ async def _handle_workspace_command(
     )
 
 
+def _modify_env_add_chat_to_profile(
+    profile_name: str, chat_id: str, cwd: Optional[str]
+) -> Tuple[bool, str]:
+    """
+    把 chat_id 追加到 .env 的 <PREFIX>_ALLOWED_GROUP_CHAT_IDS；
+    若 cwd 非空，再追加/覆盖 <PREFIX>_CHAT_CWD_<chat_id>=<cwd>。
+    返回 (是否改动, 提示信息)。
+    """
+    env_path = os.path.join(REPO_ROOT, ".env")
+    if not os.path.isfile(env_path):
+        return False, f"❌ .env 不存在: {env_path}"
+
+    prefix = profile_name.upper()
+    allow_key = f"{prefix}_ALLOWED_GROUP_CHAT_IDS"
+    cwd_key = f"{prefix}_CHAT_CWD_{chat_id}"
+
+    with open(env_path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+
+    changed = False
+    allow_seen = False
+    cwd_seen = False
+    out: list[str] = []
+    for ln in lines:
+        stripped = ln.lstrip()
+        if stripped.startswith(f"{allow_key}="):
+            allow_seen = True
+            head, _, val = ln.partition("=")
+            items = [x.strip() for x in val.split(",") if x.strip()]
+            if chat_id not in items:
+                items.append(chat_id)
+                ln = f"{head}={','.join(items)}"
+                changed = True
+            out.append(ln)
+            continue
+        if cwd is not None and stripped.startswith(f"{cwd_key}="):
+            cwd_seen = True
+            new_ln = f"{cwd_key}={cwd}"
+            if new_ln != ln:
+                changed = True
+            out.append(new_ln)
+            continue
+        out.append(ln)
+
+    if not allow_seen:
+        out.append(f"{allow_key}={chat_id}")
+        changed = True
+    if cwd is not None and not cwd_seen:
+        out.append(f"{cwd_key}={cwd}")
+        changed = True
+
+    if changed:
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+
+    return changed, env_path
+
+
+async def _handle_group_command(args: str, bot) -> str:
+    """/group add <chat_id> [cwd] — 加白名单 + 设默认 cwd"""
+    if bot is None:
+        return "❌ 内部错误：handler 缺少 bot 上下文"
+    parts = args.split(None, 2)
+    if not parts or parts[0].lower() != "add":
+        return "⚠️ 用法：`/group add <chat_id> [cwd]`"
+    if len(parts) < 2:
+        return "⚠️ 用法：`/group add <chat_id> [cwd]`"
+
+    chat_id = parts[1].strip()
+    cwd_arg = parts[2].strip() if len(parts) >= 3 else ""
+    cwd: Optional[str] = None
+    if cwd_arg:
+        cwd = os.path.expanduser(cwd_arg)
+        if not os.path.isdir(cwd):
+            return f"❌ cwd 不存在: `{cwd}`"
+
+    if not chat_id.startswith("oc_"):
+        return f"⚠️ chat_id 看起来不对（应以 `oc_` 开头）: `{chat_id}`"
+
+    profile = bot.profile
+    bot.profile.allowed_group_chat_ids.add(chat_id)
+    if cwd:
+        bot.profile.chat_default_cwd[chat_id] = cwd
+
+    changed, info = _modify_env_add_chat_to_profile(profile.name, chat_id, cwd)
+
+    lines = [
+        f"✅ 已加白群 `{chat_id}` 到 profile **{profile.name}** —— 实时生效",
+    ]
+    if cwd:
+        lines.append(f"   默认 cwd: `{cwd}`")
+    if changed:
+        lines.append(f"   .env 已更新: `{info}`")
+    else:
+        lines.append("   .env 无变化（已存在）")
+    lines.append("ℹ️  立即可用，无需 `/restart`。")
+    return "\n".join(lines)
+
+
+def _trigger_restart() -> None:
+    """
+    在新进程组里调度"清残留 + open .app"重启，然后让当前 bot 退出。
+    - start_new_session=True 让 sh 脱离 wrapper 进程组，trap cleanup 杀不到它。
+    - bash 退出后 Mach-O launcher（LSUIElement agent）不会自动退；不先 kill
+      掉它，`open .app` 会判定 app 在跑、不重新拉起。所以 sleep 3s 等 bot
+      exit + bash cleanup 跑完，再 pkill 整个 .app 进程树，最后 open。
+    """
+    quoted_app = shlex.quote(APP_PATH)
+    # 匹配带 trailing slash 路径，避免误伤其他同名进程
+    match = f"{APP_PATH}/"
+    script = (
+        f"sleep 3; "
+        f"pkill -TERM -f {shlex.quote(match)} 2>/dev/null; "
+        f"sleep 1; "
+        f"pkill -KILL -f {shlex.quote(match)} 2>/dev/null; "
+        f"sleep 0.5; "
+        f"open {quoted_app}"
+    )
+    subprocess.Popen(
+        ["sh", "-c", script],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+
+    def _die():
+        os._exit(0)
+
+    asyncio.get_event_loop().call_later(2.0, _die)
+
+
 async def handle_command(
     cmd: str,
     args: str,
     user_id: str,
     chat_id: str,
     store: SessionStore,
+    bot=None,
 ) -> Optional[str]:
     """处理命令，返回回复文本。返回 None 表示不是 bot 命令，应转发给 Claude。"""
 
@@ -876,6 +1005,15 @@ async def handle_command(
 
     elif cmd == "stop":
         return "⏹ /stop 命令在消息队列外处理，如果看到这条说明当前没有运行中的任务。"
+
+    elif cmd == "restart":
+        if not os.path.isdir(APP_PATH):
+            return f"❌ 未找到 {APP_PATH}，先 `deploy/cc-lark install`"
+        _trigger_restart()
+        return "♻️ 服务重启中 — wrapper 退出 ~2s 后由 `open .app` 拉起，全部就绪约 5s。"
+
+    elif cmd == "group":
+        return await _handle_group_command(args, bot)
 
     else:
         return None  # fallback: 转发给 Claude

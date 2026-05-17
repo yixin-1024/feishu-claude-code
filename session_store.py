@@ -292,14 +292,23 @@ class Session:
 
 
 class SessionStore:
-    def __init__(self, profile: str = "default", default_cwd: Optional[str] = None):
+    def __init__(
+        self,
+        profile: str = "default",
+        default_cwd: Optional[str] = None,
+        chat_default_cwd: Optional[dict[str, str]] = None,
+    ):
         """
         每个 profile 独占一个 SessionStore 实例和一份 json 文件。
         default_cwd 给新用户的初始 cwd（覆盖全局 DEFAULT_CWD）。
+        chat_default_cwd 给指定 chat_id 的初始 cwd（仅在新建 chat 数据时生效，
+        不会覆盖 sessions.json 里已有的 chat）。键用 normalized chat_key：
+        私聊用 "private"，群聊用 chat_id 原值。
         """
         os.makedirs(SESSIONS_DIR, exist_ok=True)
         self.profile = profile
         self._default_cwd = default_cwd or DEFAULT_CWD
+        self._chat_default_cwd = chat_default_cwd or {}
         self._sessions_file = _sessions_file_for(profile)
         self._save_lock = asyncio.Lock()  # 保护 _save() 的全局锁
         self._data: dict = self._load()
@@ -373,11 +382,19 @@ class SessionStore:
     def _user(self, user_id: str) -> dict:
         return self._data.setdefault(user_id, {})
 
-    def _default_current(self) -> dict:
+    def _default_current(self, chat_key: Optional[str] = None) -> dict:
+        # chat_key 在话题群里是 "oc_xxx:omt_yyy" 复合形式，env 里配置的 CHAT_CWD_<id>
+        # 用的是裸 chat_id，所以先按完整 key 查，未命中再剥掉 thread 后缀查一次。
+        cwd = self._default_cwd
+        if chat_key:
+            cwd = self._chat_default_cwd.get(chat_key)
+            if cwd is None:
+                raw_chat_id = chat_key.split(":", 1)[0]
+                cwd = self._chat_default_cwd.get(raw_chat_id, self._default_cwd)
         return {
             "session_id": None,
             "model": DEFAULT_MODEL,
-            "cwd": self._default_cwd,
+            "cwd": cwd,
             "permission_mode": PERMISSION_MODE,
             "started_at": datetime.now().isoformat(),
             "preview": "",
@@ -389,9 +406,9 @@ class SessionStore:
     def _normalize_chat_key(self, user_id: str, chat_id: str) -> str:
         return "private" if chat_id == user_id else chat_id
 
-    def _ensure_current_defaults(self, current: dict) -> bool:
+    def _ensure_current_defaults(self, current: dict, chat_key: Optional[str] = None) -> bool:
         changed = False
-        defaults = self._default_current()
+        defaults = self._default_current(chat_key=chat_key)
         for key, value in defaults.items():
             if key not in current:
                 current[key] = value
@@ -412,13 +429,16 @@ class SessionStore:
                 }
             else:
                 user[chat_key] = {
-                    "current": self._default_current(),
+                    "current": self._default_current(chat_key=chat_key),
                     "history": [],
                 }
             changed = True
 
         chat_data = user[chat_key]
-        if self._ensure_current_defaults(chat_data.setdefault("current", self._default_current())):
+        if self._ensure_current_defaults(
+            chat_data.setdefault("current", self._default_current(chat_key=chat_key)),
+            chat_key=chat_key,
+        ):
             changed = True
         if "history" not in chat_data:
             chat_data["history"] = []
