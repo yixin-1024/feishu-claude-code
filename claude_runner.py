@@ -1,6 +1,21 @@
 """
-通过 subprocess 调用本机 claude CLI，解析 stream-json 输出。
-复用 ~/.claude/ 中已有的 Max 订阅登录凭证，无需额外 API Key。
+本地调用 Claude Code CLI 的统一入口。
+
+两种后端：
+  - "pty"   （默认）→ claude_pty.run_claude：在 PTY 里跑交互式 claude，结构化
+                       事件靠 tail ~/.claude/projects/<cwd>/<sid>.jsonl 拿到。
+                       不依赖 --print，可以保留 slash 命令 / 权限 UX / plan
+                       mode 等交互式 Claude Code 的完整行为。
+  - "print" → 本文件 _run_claude_print：经典 `claude --print --output-format
+              stream-json` 子进程模式，按 token 级 delta 解析。
+
+通过 CLAUDE_RUNNER 环境变量切换，默认 pty。
+
+两种模式共享：
+  - 复用 ~/.claude/ 中已有的 Max 订阅登录凭证
+  - 相同的对外签名：run_claude(message, session_id, ...) →
+        (full_text, new_session_id, used_fresh_session_fallback)
+  - 相同的回调协议：on_text_chunk / on_tool_use / on_process_start / on_usage
 """
 
 import asyncio
@@ -10,6 +25,10 @@ import subprocess as sp
 from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, CLAUDE_CLI
+
+# ── 后端选择 ──────────────────────────────────────────────────
+# 默认走 PTY 后端；线上要回退到 -p 时设置 CLAUDE_RUNNER=print
+_RUNNER_BACKEND = os.getenv("CLAUDE_RUNNER", "pty").strip().lower()
 
 IDLE_TIMEOUT = 300  # 5 分钟无输出且无子进程 → 视为挂死
 _CHECK_INTERVAL = 30  # 静默时每 30 秒检查一次子进程
@@ -62,14 +81,62 @@ async def run_claude(
     on_tool_use: Optional[Callable[[str, dict], None]] = None,
     on_process_start: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
     on_usage: Optional[Callable[[dict], None]] = None,
+    on_status: Optional[Callable[[str, str], None]] = None,
     append_system_prompt: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
     """
-    调用 claude CLI 并流式解析输出。
+    调用 Claude Code CLI 并流式解析输出。
+
+    后端由 CLAUDE_RUNNER 环境变量决定：
+        pty   (默认) → PTY + JSONL tail，保留交互式 Claude Code 完整体验
+        print        → 经典 `claude --print` 子进程，按 token delta 解析
 
     Returns:
         (full_response_text, new_session_id, used_fresh_session_fallback)
     """
+    if _RUNNER_BACKEND == "print":
+        return await _run_claude_print(
+            message=message,
+            session_id=session_id,
+            model=model,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            on_usage=on_usage,
+            append_system_prompt=append_system_prompt,
+        )
+    # 默认 PTY 后端：延迟 import 避免 print-only 部署没装 termios 的奇怪环境出错
+    from claude_pty import run_claude as _run_claude_pty
+    return await _run_claude_pty(
+        message=message,
+        session_id=session_id,
+        model=model,
+        cwd=cwd,
+        permission_mode=permission_mode,
+        on_text_chunk=on_text_chunk,
+        on_tool_use=on_tool_use,
+        on_process_start=on_process_start,
+        on_usage=on_usage,
+        on_status=on_status,
+        append_system_prompt=append_system_prompt,
+    )
+
+
+async def _run_claude_print(
+    message: str,
+    session_id: Optional[str] = None,
+    model: Optional[str] = None,
+    cwd: Optional[str] = None,
+    permission_mode: Optional[str] = None,
+    on_text_chunk: Optional[Callable[[str], None]] = None,
+    on_tool_use: Optional[Callable[[str, dict], None]] = None,
+    on_process_start: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
+    on_usage: Optional[Callable[[dict], None]] = None,
+    append_system_prompt: Optional[str] = None,
+) -> tuple[str, Optional[str], bool]:
+    """`claude --print --output-format stream-json` 模式（兼容/兜底后端）。"""
 
     async def _run_once(active_session_id: Optional[str]) -> tuple[str, Optional[str], int, str]:
         cmd = [

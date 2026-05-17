@@ -1,6 +1,18 @@
 import asyncio
+import os
+import signal
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
+
+
+def _kill_pgroup(proc, sig: int) -> bool:
+    """杀 proc 所在进程组（spawn 时 start_new_session=True，proc 是 pgid leader）。
+    只杀 leader 会留下 claude 起的 MCP server / hook 子进程当孤儿。"""
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+        return True
+    except (ProcessLookupError, PermissionError, AttributeError):
+        return False
 
 
 @dataclass
@@ -37,7 +49,11 @@ class ActiveRunRegistry:
             return None
         active_run.proc = proc
         if active_run.stop_requested and getattr(proc, "returncode", None) is None:
-            proc.terminate()
+            if not _kill_pgroup(proc, signal.SIGTERM):
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
         return active_run
 
     def clear_run(self, user_id: str, chat_id: str, active_run: Optional[ActiveRun] = None):
@@ -69,11 +85,19 @@ async def stop_run(
     active_run.stop_requested = True
     proc = active_run.proc
     if proc is not None and getattr(proc, "returncode", None) is None:
-        proc.terminate()
+        if not _kill_pgroup(proc, signal.SIGTERM):
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
         try:
             await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
         except asyncio.TimeoutError:
-            proc.kill()
+            if not _kill_pgroup(proc, signal.SIGKILL):
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
             await proc.wait()
 
     if on_stopped is not None and not active_run.stop_announced:

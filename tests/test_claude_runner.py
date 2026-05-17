@@ -6,6 +6,10 @@ import pytest
 
 os.environ.setdefault("FEISHU_APP_ID", "test_app_id")
 os.environ.setdefault("FEISHU_APP_SECRET", "test_app_secret")
+# 这些用例覆盖 `claude --print` 后端（_run_claude_print）的解析逻辑——
+# 通过 mock asyncio.create_subprocess_exec 注入伪 stream-json 行。
+# 生产默认走 PTY 后端，PTY 路径的测试见 test_claude_pty.py。
+os.environ["CLAUDE_RUNNER"] = "print"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
