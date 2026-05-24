@@ -28,3 +28,11 @@ prompts/*
 !prompts/menxia.md
 !prompts/shangshu.md
 !prompts/ganhuode.md
+# spx_*.md 是 reflection 任务渐进演化的产物，进版本控制以保留 patch 历史。
+# verify.md 是通用验证模板。
+# cc_lark_prompt_reflection.md 是 meta-prompt，也要 tracked（反思任务本身的演化）。
+!prompts/spx_*.md
+!prompts/verify.md
+!prompts/cc_lark_prompt_reflection.md
+# 但 .bak.<TS> 仍然忽略（应急快速回滚快照，不该污染历史）
+prompts/*.bak.*
