@@ -28,6 +28,7 @@ job 触发时同步 wrapper 用 run_coroutine_threadsafe 把 _fire() 投回 bot_
 from __future__ import annotations
 
 import asyncio
+import glob
 import os
 import threading
 import time
@@ -38,6 +39,60 @@ from typing import Awaitable, Callable
 import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+# ── 后台 lock reaper：兜底清 stale lock，让链能自愈 ───────────
+# 背景：每个定时 task prompt STEP 0 里都有 `mkdir $LOCK` 的并发互斥。正常路径下
+# session 跑完会 rmdir，链就续上下一轮；但 PTY runner 早退 / Claude CLI 启动卡死 /
+# session crash 等异常路径下，lock 留在那直到下次 cron fire 才被新 session 自检清掉
+# （每个 prompt STEP 0 里都有 AGE > 3600 即过期的逻辑）。问题是：如果没新 fire 来
+# （比如 reflection 是日级 cron，错过 04:00 就要等明天），链彻底断在那。
+# reaper 解决"没新 session 来时也定期清"的兜底问题。
+LOCK_GLOBS = [
+    "/Users/user/Desktop/workspace/payment/spx/.*.lock",
+    "/Users/user/Desktop/workspace/tools/feishu-claude-code/.*.lock",
+]
+REAPER_STALE_MINUTES = 60   # 跟 prompt STEP 0 的 3600s 阈值对齐 — 任何 task 都不该跑超过 60min
+REAPER_INTERVAL_SECONDS = 300  # 每 5 分钟扫一次
+
+
+def _reap_stale_locks(stale_minutes: int = REAPER_STALE_MINUTES) -> int:
+    """扫已知 lock 目录，rmdir mtime 超过 stale_minutes 的 lock。返回清掉的数量。"""
+    now = time.time()
+    cleaned = 0
+    for pattern in LOCK_GLOBS:
+        for lock_path in glob.glob(pattern):
+            if not os.path.isdir(lock_path):
+                continue
+            try:
+                mtime = os.path.getmtime(lock_path)
+            except FileNotFoundError:
+                continue  # race: 已被其他人清
+            age_min = (now - mtime) / 60
+            if age_min <= stale_minutes:
+                continue
+            try:
+                os.rmdir(lock_path)
+                cleaned += 1
+                print(
+                    f"[reaper] cleaned stale lock {lock_path} (age {age_min:.1f}min)",
+                    flush=True,
+                )
+            except FileNotFoundError:
+                pass  # race
+            except OSError as e:
+                # 非空 dir（lock 协议升级后里面写了 pid/start_ts）或权限错 — log 不 crash
+                print(f"[reaper] failed to clean {lock_path}: {e}", flush=True)
+    return cleaned
+
+
+def _reap_loop() -> None:
+    """每 REAPER_INTERVAL_SECONDS 跑一次 reaper。daemon thread，跟 scheduler 同生命周期。"""
+    while True:
+        time.sleep(REAPER_INTERVAL_SECONDS)
+        try:
+            _reap_stale_locks()
+        except Exception as e:
+            print(f"[reaper] loop error: {e}", flush=True)
 
 # ── 类型契约：main.py 注入的派单入口 ─────────────────────────
 # (bot, user_id, chat_id_raw, thread_id, anchor_message_id, prompt) -> coroutine
@@ -264,8 +319,19 @@ def start_scheduler(
         daemon=True, name="sched-nudger",
     ).start()
 
+    # 5min 一次的 stale-lock reaper：清掉 mtime > 60min 的 stale lock dir，让链自愈。
+    threading.Thread(
+        target=_reap_loop,
+        daemon=True, name="sched-lock-reaper",
+    ).start()
+
+    # 启动时立即跑一次 reaper —— 让重启 cc-lark 时能立即清掉积压的 stale lock
+    initial_cleaned = _reap_stale_locks()
+    if initial_cleaned:
+        print(f"[reaper] startup pass cleaned {initial_cleaned} stale lock(s)", flush=True)
+
     print(
-        f"[scheduler] 已启动（BackgroundScheduler），加载 {len(scheduler.get_jobs())} 个定时任务",
+        f"[scheduler] 已启动（BackgroundScheduler），加载 {len(scheduler.get_jobs())} 个定时任务，lock-reaper 已起",
         flush=True,
     )
     return scheduler
