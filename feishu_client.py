@@ -107,6 +107,27 @@ class FeishuClient:
         self._app_secret = app_secret
         self._domain = domain.rstrip("/")
         self._bot_open_id: Optional[str] = None
+        # interactive 卡片的最终文本快照（message_id → markdown 内容）。
+        # 飞书 im.v1.message.list 拿到的 interactive content 是初始快照（loading 状态），
+        # update_card 流式 patch 上去的内容拿不到；thread_context 解析历史 bot 卡片时
+        # 会 fallback 到这个 cache。仅内存，重启就丢；只对"刚发完卡片就要审"场景有效。
+        self._card_text_cache: dict[str, str] = {}
+        self._CARD_CACHE_MAX = 500  # 简单上限防止无界增长
+
+    def _remember_card_text(self, message_id: str, content: str) -> None:
+        """记下一张卡片的当前文本，给 thread_context 解析 bot 历史卡片用。"""
+        if not message_id or not content:
+            return
+        # 朴素 FIFO 上限：超出就丢最早 1/4，避免无界内存增长
+        if len(self._card_text_cache) >= self._CARD_CACHE_MAX:
+            drop = max(1, self._CARD_CACHE_MAX // 4)
+            for k in list(self._card_text_cache.keys())[:drop]:
+                self._card_text_cache.pop(k, None)
+        self._card_text_cache[message_id] = content
+
+    def get_card_text(self, message_id: str) -> str:
+        """查这条 interactive 消息 update_card 之后的最终文本（没有则空串）。"""
+        return self._card_text_cache.get(message_id, "")
 
     async def get_bot_open_id(self) -> Optional[str]:
         """查询机器人自己的 open_id（首次调用时请求 /bot/v3/info 并缓存）。"""
@@ -195,7 +216,10 @@ class FeishuClient:
                 raise RuntimeError(f"发送卡片消息失败: {resp.code} {resp.msg}")
             return resp.data.message_id
 
-        return await self._retry_with_backoff(_send, max_retries=3)
+        mid = await self._retry_with_backoff(_send, max_retries=3)
+        if not loading:
+            self._remember_card_text(mid, content)
+        return mid
 
     async def reply_card(self, message_id: str, content: str = "", loading: bool = True) -> str:
         """回复用户消息（卡片形式），触发通知。返回回复消息的 message_id（带重试）"""
@@ -216,7 +240,10 @@ class FeishuClient:
                 raise RuntimeError(f"回复卡片消息失败: {resp.code} {resp.msg}")
             return resp.data.message_id
 
-        return await self._retry_with_backoff(_reply, max_retries=3)
+        mid = await self._retry_with_backoff(_reply, max_retries=3)
+        if not loading:
+            self._remember_card_text(mid, content)
+        return mid
 
     async def update_card(self, message_id: str, content: str):
         """用 patch 更新已发送的卡片内容（带重试）"""
@@ -236,6 +263,7 @@ class FeishuClient:
                 raise RuntimeError(f"patch 卡片失败: {resp.code} {resp.msg}")
 
         await self._retry_with_backoff(_update, max_retries=3)
+        self._remember_card_text(message_id, content)
 
     async def download_image(self, message_id: str, image_key: str) -> str:
         """下载飞书图片到临时文件，返回本地路径（不阻塞事件循环）"""
@@ -325,13 +353,13 @@ class FeishuClient:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
+            with urllib.request.urlopen(token_req, context=ctx, timeout=30) as r:
                 token = json.loads(r.read())["tenant_access_token"]
             req = urllib.request.Request(
                 f"{self._domain}/open-apis/im/v1/messages/{message_id}",
                 headers={"Authorization": f"Bearer {token}"},
             )
-            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+            with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
                 data = json.loads(r.read())
             items = (data.get("data") or {}).get("items") or []
             if items:
@@ -406,6 +434,7 @@ class FeishuClient:
                 raise RuntimeError(f"patch 卡片失败: {resp.code} {resp.msg}")
 
         await self._retry_with_backoff(_update, max_retries=3)
+        self._remember_card_text(message_id, content)
 
     async def update_card_elements(self, message_id: str, elements: list[dict]):
         """用自定义 elements 列表更新卡片（支持 markdown + button 混排）"""
@@ -431,6 +460,23 @@ class FeishuClient:
 
         await self._retry_with_backoff(_update, max_retries=3)
 
+        # 从 elements 抽出 markdown / div 内容拼成文本快照（按钮文字忽略）
+        chunks = []
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            tag = el.get("tag", "")
+            if tag == "markdown":
+                c = (el.get("content") or "").strip()
+                if c:
+                    chunks.append(c)
+            elif tag == "div":
+                c = ((el.get("text") or {}).get("content") or "").strip()
+                if c:
+                    chunks.append(c)
+        if chunks:
+            self._remember_card_text(message_id, "\n".join(chunks))
+
     async def reply_text(self, message_id: str, text: str) -> str:
         """回复纯文本消息（触发通知）"""
         async def _reply():
@@ -451,6 +497,42 @@ class FeishuClient:
             return resp.data.message_id
 
         return await self._retry_with_backoff(_reply, max_retries=2)
+
+    async def reply_post(
+        self, message_id: str, title: str, body_text: str,
+    ) -> str:
+        """post（富文本）格式 reply 一条已有消息。同 thread / reply 链下挂。
+
+        用于 inbox case session：同一 case 后续派单都 reply 到首条顶楼下，
+        话题群会自动把它聚到同一 thread，dispatcher 拿到的 thread_id 就一致，
+        Claude session 自然延续。
+        """
+        line: list[dict] = [{"tag": "text", "text": body_text}]
+        content_payload = {
+            "zh_cn": {
+                "title": title,
+                "content": [line],
+            }
+        }
+
+        async def _do():
+            req = (
+                ReplyMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(
+                    ReplyMessageRequestBody.builder()
+                    .msg_type("post")
+                    .content(json.dumps(content_payload, ensure_ascii=False))
+                    .build()
+                )
+                .build()
+            )
+            resp = await self.client.im.v1.message.areply(req)
+            if not resp.success():
+                raise RuntimeError(f"reply post 失败: {resp.code} {resp.msg}")
+            return resp.data.message_id
+
+        return await self._retry_with_backoff(_do, max_retries=2)
 
     async def send_post_to_chat(
         self, chat_id: str, title: str, body_text: str, mention_open_id: str = "",

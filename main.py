@@ -39,6 +39,7 @@ install_loop_proxy()
 import bot_config as config
 import dispatcher
 import http_server
+import inbox_watcher
 import runtime
 from bot_instance import BotInstance
 from log_util import log
@@ -125,6 +126,10 @@ def main():
     # 7) 定时任务调度器（独立后台线程，绕开 asyncio monotonic timer 的 macOS 睡眠坑）
     sched_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduled_tasks.yaml")
     runtime.start_scheduler_bg(sched_path)
+
+    # 7.1) inbox_watcher：事件驱动的"任务派单扫描器"
+    inbox_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox_config.yaml")
+    inbox_watcher.start(inbox_cfg_path, _bots, bot_loop)
 
     # 8) Claude Max 用量监控：跨阈值 / 窗口重置时主动给 owner 私聊通报
     # 通报通道：QUOTA_NOTIFY_PROFILE / QUOTA_NOTIFY_OPEN_ID 显式指定，

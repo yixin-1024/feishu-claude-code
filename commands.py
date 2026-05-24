@@ -60,6 +60,9 @@ HELP_TEXT = """\
 `/mcp` — 列出已配置的 MCP Servers
 `/usage` — 查看 Claude Max 订阅用量百分比和重置时间
 
+**审计：**
+`/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
+
 **服务管理：**
 `/restart` — 重启 cc-lark 服务（detached，不会自残）
 `/group add <chat_id> [cwd]` — 把群加白名单并设默认 cwd（实时生效 + 持久化到 .env）

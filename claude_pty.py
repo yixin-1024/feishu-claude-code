@@ -24,6 +24,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import signal
 import struct
 import subprocess as sp
@@ -162,17 +163,31 @@ def _jsonl_first_user_content(path: str, max_lines: int = 16) -> Optional[str]:
     return None
 
 
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _normalize_for_match(s: str) -> str:
+    """匹配前规范化空白：连续空白（含 \\n\\n）→ 单空格。
+
+    Claude Code 在 PTY bracketed-paste 模式下会把空行（`\\n\\n`）压成单 `\\n` 写进
+    jsonl —— 这是 /verify 这种"标题 + 空行 + 正文"模板必踩的坑：原 message 前 32 字
+    符里有 `\\n\\n`，jsonl 里只剩 `\\n`，子串 `in` 一查就是 False，永远匹配不上、超
+    时报"new session jsonl never appeared"。归一化后两边都是单空格，子串匹配就稳。
+    """
+    return _WHITESPACE_RUN.sub(" ", s).strip()
+
+
 def _expected_match_prefix(message: str) -> Optional[str]:
     """从用户消息里挑一段稳定的前缀做 jsonl 匹配 key。
     太短或全空白时返回 None——并发 race 概率极低，没法匹配就走单候选默认接受路径。
     """
     if not message:
         return None
-    stripped = message.strip()
-    if len(stripped) < 6:
+    normalized = _normalize_for_match(message)
+    if len(normalized) < 6:
         return None
     # 截前 32 字符——避开 Claude Code 对前置 `/ ! #` 加空格的 escape 差异
-    return stripped[:32]
+    return normalized[:32]
 
 
 # _jsonl_owns_message 的三态返回：
@@ -192,7 +207,7 @@ def _jsonl_owns_message(
         # 文件已存在但还没写 user 事件。单候选场景下可以认；多候选必须等内容
         # 落地再判，否则可能错选。
         return True if only_candidate else None
-    return expected_prefix in content
+    return expected_prefix in _normalize_for_match(content)
 
 
 def _ensure_cwd_trusted(cwd: str) -> None:
@@ -333,6 +348,7 @@ async def _drain_pty(
     master_fd: int,
     tail_buffer: bytearray,
     ready_event: Optional[asyncio.Event] = None,
+    bytes_counter: Optional[list] = None,
 ):
     """非阻塞 drain PTY 输出 + 可选的"第一个字节到达"信号。
 
@@ -345,6 +361,10 @@ async def _drain_pty(
 
     实现：fd 设 O_NONBLOCK + loop.add_reader 注册到 selector/kqueue，回调里
     os.read 立刻返回。零 executor 占用。
+
+    bytes_counter（如提供）：mutable [int]，每次写入累加 len(data)。单调
+    递增，不受 tail_buffer 8KB 裁剪影响——_wait_pty_quiet 用它来判 TUI
+    是否还在干活。
     """
     loop = asyncio.get_event_loop()
     finished = asyncio.Event()
@@ -365,6 +385,8 @@ async def _drain_pty(
         tail_buffer.extend(data)
         if len(tail_buffer) > _PTY_TAIL_BUFFER:
             del tail_buffer[:-_PTY_TAIL_BUFFER]
+        if bytes_counter is not None:
+            bytes_counter[0] += len(data)
         if ready_event is not None and not ready_event.is_set():
             ready_event.set()
 
@@ -489,13 +511,62 @@ async def _write_all_to_pty(
             await asyncio.sleep(inter_chunk_sleep)
 
 
-async def _send_user_input(master_fd: int, message: str):
+async def _wait_pty_quiet(
+    bytes_counter: list,
+    *,
+    quiet_seconds: float = 0.25,
+    max_wait: float = 5.0,
+    poll_interval: float = 0.04,
+) -> bool:
+    """等 PTY 输出连续 quiet_seconds 没有新字节 → TUI 已经处理完前面的输入。
+
+    比写死的 sleep(140ms) 准——bracketed paste 里如果含本地图片路径，Claude
+    Code TUI 会去 stat+读+base64 转 [Image: ...] 占位符（每张 100-400ms）。
+    时间猜测必然在某个图片数 / 路径长度组合下失手；事件驱动直接看 TUI 是不是
+    还在 echo，自适应任何大小。
+
+    saw_activity 守门：必须先观察到至少 1 个新 byte 才开始计 quiet。否则
+    "paste 还没开始处理 → counter 没动 → 误判为安静"。
+
+    返回 True = 真的安静；False = max_wait 兜底（PTY 一直在响，可能 MCP
+    在 log）。两种情况下调用方都会继续发 \\r——兜底版至少把不带图片的快
+    路径恢复成跟原来一样。
+    """
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    deadline = start + max_wait
+    initial = bytes_counter[0]
+    last = initial
+    last_change = start
+    while loop.time() < deadline:
+        await asyncio.sleep(poll_interval)
+        cur = bytes_counter[0]
+        if cur != last:
+            last = cur
+            last_change = loop.time()
+            continue
+        saw_activity = cur != initial
+        if saw_activity and loop.time() - last_change >= quiet_seconds:
+            return True
+    return False
+
+
+async def _send_user_input(
+    master_fd: int,
+    message: str,
+    bytes_counter: list,
+):
     """把用户消息送进 Claude Code 的输入框并提交。
 
-    实测：bracketed-paste 结束序列后立刻跟 \\r 不会被 Claude Code 当成提交——
-    paste 处理还没收尾就被 \\r 撞上去了。必须拆成两次写入 + 几十毫秒间隔。
-    长 paste（thread context 注入后动辄几 KB）需要更长的 settle，否则 \\r
-    撞在 paste 解析途中会被吞或被当成 paste 内的换行。
+    bracketed-paste 结束序列后立刻跟 \\r 会被 Claude Code 当 paste 内换行
+    吞掉——paste 处理（含本地图片路径的 stat/load/base64）还没收尾。
+    旧版用 settle=0.12+bytes/256*0.01 猜时间，多图片场景必失手（参见
+    [[project-pty-orphan-resume]] 相邻的"2 图必现 jsonl 不出"）。
+
+    这版改成事件驱动：写完 paste-end 后 poll PTY 字节计数器，等连续
+    250ms 没新字节再发 \\r。TUI 渲染完输入框一定会安静下来，不安静就是
+    还在干活。max_wait=5s 兜超慢图片加载，再不行也兜底发 \\r 保留旧
+    行为。
     """
     safe = _escape_for_pty(message)
     encoded = safe.encode("utf-8")
@@ -506,10 +577,7 @@ async def _send_user_input(master_fd: int, message: str):
         await _write_all_to_pty(master_fd, _BRACKETED_PASTE_END)
     else:
         await _write_all_to_pty(master_fd, encoded)
-    # 给 Claude Code 时间消化 paste 序列 / readline 缓冲。长消息按 256B/10ms
-    # 加码，封顶 ~450ms——长 paste 比短 paste 需要更多解析时间。
-    settle = 0.12 + min(len(encoded) // 256, 32) * 0.01
-    await asyncio.sleep(settle)
+    await _wait_pty_quiet(bytes_counter, quiet_seconds=0.25, max_wait=5.0)
     await _write_all_to_pty(master_fd, b"\r")
 
 
@@ -574,6 +642,10 @@ async def run_claude(
         proc: Optional[asyncio.subprocess.Process] = None
         drain_task: Optional[asyncio.Task] = None
         tail_buffer = bytearray()
+        # 单调递增的累计字节数——_wait_pty_quiet 用它判 PTY 是否还在响。
+        # 不能直接用 len(tail_buffer)：tail_buffer 被裁剪到 8KB 后，新数据
+        # 进来时 len 不变，会假"安静"。
+        pty_bytes_counter: list = [0]
         full_text = ""
         new_session_id = active_session_id
         last_usage: dict = {}
@@ -632,7 +704,7 @@ async def run_claude(
             # 0.6s 空窗已经在生产上把单一并发 claude 整死过。
             ready_event = asyncio.Event()
             drain_task = asyncio.create_task(
-                _drain_pty(master_fd, tail_buffer, ready_event)
+                _drain_pty(master_fd, tail_buffer, ready_event, pty_bytes_counter)
             )
 
             # ── 等 TUI 起来 ──────────────────────────────
@@ -645,7 +717,7 @@ async def run_claude(
 
                 # ── 发送用户消息 ──────────────────────────
                 try:
-                    await _send_user_input(master_fd, message)
+                    await _send_user_input(master_fd, message, pty_bytes_counter)
                 except (OSError, BrokenPipeError):
                     early_return = (
                         "", None,

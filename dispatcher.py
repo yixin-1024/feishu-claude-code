@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sys
 import time
@@ -33,6 +34,7 @@ from log_util import log
 from run_control import ActiveRun, stop_run
 from thread_context import build_thread_context
 from trinity_dispatch import maybe_handle_trinity, TrinityContext
+import inbox_watcher
 
 
 # ── 注入点 ────────────────────────────────────────────────────
@@ -50,6 +52,34 @@ def configure(
     global _bot_loop, _bots
     _bot_loop = bot_loop
     _bots = bots
+
+
+# ── 事件去重 ─────────────────────────────────────────────────
+# Lark WS 是 at-least-once：keepalive ping timeout / connection reset 后重连
+# 服务端会把未 ack 的 receive_v1 再投一次。同一条 om_ 不能跑两遍 claude，
+# 否则用户看到的就是"一条消息收到两次回复"（实际案例：2026-05-22 16:43，
+# 16:43:52 WS 断开 → 16:43:59 同事件复推 → 两次完整翻译 + 一次"排队中"）。
+#
+# 实现：module-level dict (message_id -> first_seen_ts)。所有 handler 都跑在
+# 同一个 bot_loop 上（runtime.py:_on_message 用 run_coroutine_threadsafe 投递），
+# 单线程访问，不需要锁。TTL 120s 足够覆盖 Lark 重连窗口，又不会无界增长。
+_SEEN_MSG_TTL_SEC = 120
+_seen_messages: dict[str, float] = {}
+
+
+def _is_duplicate_event(message_id: str) -> bool:
+    """同一 message_id 在 TTL 内重复送达返回 True；顺手清理过期项。"""
+    if not message_id:
+        return False
+    now = time.time()
+    if _seen_messages:
+        expired = [k for k, t in _seen_messages.items() if now - t > _SEEN_MSG_TTL_SEC]
+        for k in expired:
+            _seen_messages.pop(k, None)
+    if message_id in _seen_messages:
+        return True
+    _seen_messages[message_id] = now
+    return False
 
 
 # ── 工具：从 lark event 解析消息字段 ────────────────────────
@@ -138,6 +168,119 @@ async def _handle_restart_command(originating_bot: BotInstance) -> int:
     log(originating_bot.profile.name, "restart", "info",
         f"广播完毕（{affected} 个 active run），触发 detach + exit")
     return affected
+
+
+# ── /verify：审计当前 thread ─────────────────────────────────
+
+_VERIFY_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "prompts", "verify.md",
+)
+_verify_template_cache: Optional[str] = None
+
+
+def _load_verify_template() -> str:
+    """读 prompts/verify.md，简单内存缓存（模板基本不会改）"""
+    global _verify_template_cache
+    if _verify_template_cache is None:
+        with open(_VERIFY_TEMPLATE_PATH, encoding="utf-8") as f:
+            _verify_template_cache = f.read()
+    return _verify_template_cache
+
+
+async def _handle_verify_command(
+    bot: BotInstance,
+    user_id: str,
+    chat_id: str,
+    is_group: bool,
+    thread_id: str,
+    msg,
+    args: str,
+):
+    """/verify [关注点] — 在话题群里开新 session 审上方整段对话。
+
+    流程：
+      1. 校验必须在话题群（有 thread_id），否则一句话报错。
+      2. 拉整个 thread 的消息（build_thread_context 已经默认保留 bot 消息和附件）。
+      3. new_session + 强制 bypassPermissions（验证完可直接动手改）。
+      4. 拼 prompt = prompts/verify.md 替换 ${focus} ${history}。
+      5. 走 _run_and_display 流式审计。
+    """
+    tag = bot.profile.name
+
+    if not is_group or not thread_id:
+        try:
+            await bot.feishu.reply_card(
+                msg.message_id,
+                content="⚠️ `/verify` 只支持话题群里使用 —— 私聊 / 非话题群拉不到完整对话历史。",
+                loading=False,
+            )
+        except Exception:
+            pass
+        return
+
+    # 拉整个 thread（last_seen_message_id="" → 全量从头；current_message_id=本条 /verify
+    # 本身会被跳过，避免审计指令进入审计对象）
+    try:
+        context_block, ctx_paths = await build_thread_context(
+            bot.feishu, thread_id, "", msg.message_id,
+        )
+    except Exception as e:
+        log(tag, "verify", "error", f"拉 thread 失败: {e}")
+        try:
+            await bot.feishu.reply_card(
+                msg.message_id, content=f"❌ 拉 thread 失败：{e}", loading=False,
+            )
+        except Exception:
+            pass
+        return
+
+    if not context_block:
+        try:
+            await bot.feishu.reply_card(
+                msg.message_id,
+                content="⚠️ 这个 thread 里没有可审计的历史消息。",
+                loading=False,
+            )
+        except Exception:
+            pass
+        return
+
+    # 新 session + bypassPermissions（验证后可直接动手）
+    await bot.store.new_session(user_id, chat_id)
+    await bot.store.set_permission_mode(user_id, chat_id, "bypassPermissions")
+    session = await bot.store.get_current(user_id, chat_id)
+
+    focus = args.strip() if args.strip() else "（无指定，全面审）"
+    template = _load_verify_template()
+    user_msg = template.replace("${focus}", focus).replace("${history}", context_block)
+
+    log(tag, "verify", "info",
+        f"thread={thread_id[:12]}... history_len={len(context_block)} "
+        f"attachments={len(ctx_paths)} focus={focus[:30]!r}")
+
+    try:
+        card_msg_id = await bot.feishu.reply_card(msg.message_id, loading=True)
+    except Exception as e:
+        log(tag, "verify", "error", f"占位卡片失败: {e}")
+        try:
+            await bot.feishu.reply_text(msg.message_id, f"❌ 发送占位卡片失败：{e}")
+        except Exception:
+            pass
+        return
+
+    raw_chat_id = chat_id.split(":", 1)[0] if ":" in chat_id else chat_id
+    lark_sys = build_lark_system_prompt(
+        bot.profile, raw_chat_id, thread_id, msg.message_id, is_group=True,
+        asker_open_id=user_id,
+    )
+
+    await _run_and_display(
+        bot,
+        user_id, chat_id, True, user_msg,
+        card_msg_id, session, msg.message_id,
+        preview_text="/verify",
+        append_system_prompt=lark_sys,
+    )
 
 
 # ── Hung 自动重试黑名单 ────────────────────────────────────
@@ -230,6 +373,23 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
     log(tag, "msg", "info",
         f"user={user_id[:8]}... chat={raw_chat_id[:10]}... "
         f"thread={thread_id[:10] if thread_id else '-'} is_group={is_group}")
+
+    # ── WS at-least-once 去重：Lark WS 断线重连会把同一条 om_ 重投一次，
+    # 直接当新消息处理会跑两遍 claude。在最前面（inbox / trinity / ACL / lock 之前）
+    # 拦掉，重复事件完全无副作用。
+    if _is_duplicate_event(msg.message_id):
+        log(tag, "msg", "info",
+            f"重复事件忽略 mid={msg.message_id[:14]}... "
+            f"(WS at-least-once redelivery)")
+        return
+
+    # ── Inbox 旁路 hook（非阻塞）：把源群消息喂给 inbox_watcher 做派单判定。
+    # 故意放在 trinity / ACL 之前 — 源群里别的人发的消息可能不在 allowlist，
+    # 但 inbox 要看到。inbox_watcher.observe 内部静默 / 非阻塞，不影响主路径。
+    try:
+        inbox_watcher.observe(bot, event)
+    except Exception as e:
+        log(tag, "inbox", "warn", f"inbox observe 失败（已忽略）: {e}")
 
     # ── Trinity 三省体系入口（必须在 allowed_open_ids 检查之前）─────
     # trinity bot 间通信时 sender 是另一个 bot 的 open_id，不会在用户白名单里。
@@ -602,10 +762,11 @@ async def _run_and_display(
                 heartbeat_task.cancel()
 
         if not success:
+            clean = _format_run_error(last_exc)
             err_brief = (
-                f"❌ 自动重试 {retry_count} 次后仍失败：{type(last_exc).__name__}: {last_exc}"
+                f"❌ 自动重试 {retry_count} 次后仍失败：{clean}"
                 if retry_count > 0
-                else f"❌ Claude 执行出错：{type(last_exc).__name__}: {last_exc}"
+                else f"❌ Claude 执行出错：{clean}"
             )
             try:
                 await bot.feishu.update_card(card_msg_id, err_brief)
@@ -808,6 +969,12 @@ async def _process_message(
     parsed = parse_command(text)
     if parsed:
         cmd, args = parsed
+        if cmd == "verify":
+            log(tag, "cmd", "info", f"执行 /verify args={args!r}")
+            await _handle_verify_command(
+                bot, user_id, chat_id, is_group, thread_id, msg, args,
+            )
+            return
         log(tag, "cmd", "info", f"执行 {cmd}")
         reply = await handle_command(cmd, args, user_id, chat_id, bot.store, bot=bot)
         if reply is not None:
@@ -959,6 +1126,43 @@ def _format_usage_footer(usage: dict, model: str) -> str:
         return str(n)
 
     return f"— 📊 上下文 {fmt(total_context)} / {fmt(window)} ({pct:.1f}%)"
+
+
+# Claude CLI TUI 输出的 ANSI 控制序列（CSI / OSC / DEC private mode / 单字符）。
+# PTY runner 抛 RuntimeError 时 detail 里会原样夹带这些，不清洗的话直接 dump 到
+# Lark 卡片会变成"[22m [32m ▓▓ shift+tab"这种乱码淹没用户。
+_ANSI_RE = re.compile(
+    r"\x1b\[[?]?[0-9;]*[a-zA-Z]"           # CSI: ESC [ ... letter
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC: ESC ] ... BEL / ST
+    r"|\x1b[=>]"                            # 简单单字符
+)
+_CTRL_CHARS = "".join(chr(c) for c in range(32) if c not in (9, 10))  # 留 \t \n
+
+
+def _format_run_error(exc: Optional[BaseException]) -> str:
+    """把 PTY runner / Claude 子进程的异常清洗成给用户看的短文本。
+
+    - ANSI 控制序列 strip 掉（CSI / OSC / DEC private mode）
+    - 控制字符 strip（保留 \\t \\n）
+    - 折叠空白 / 多余空行
+    - 截断到 400 字符，给真正有用的报错头部留位置
+    - "new session jsonl never appeared" 加一句业务友好提示
+    """
+    if exc is None:
+        return "（未知错误）"
+    raw = f"{type(exc).__name__}: {exc}"
+    s = _ANSI_RE.sub("", raw)
+    s = s.translate({ord(c): None for c in _CTRL_CHARS})
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{2,}", "\n", s).strip()
+    if len(s) > 400:
+        s = s[:400] + "…"
+    if "new session jsonl never appeared" in s:
+        s += (
+            "\n💡 通常是 resume 旧 session 时 Claude 启动慢、jsonl 没在超时窗内落盘。"
+            "可以 `/new` 起新会话再试一次。"
+        )
+    return s
 
 
 def _extract_options(text: str) -> list[tuple[str, str]]:
@@ -1296,23 +1500,34 @@ async def handle_spawn(
     # 这样起的 session chat_key 是 oc_xxx:om_xxx，跟用户后续在该话题 @ bot 时构造的
     # oc_xxx:omt_xxx 不匹配，session 就丢了。识别出 om_xxx 形式 → 主动 mget 转成真 thread_id。
     if thread_id.startswith("om_") and not thread_id.startswith("omt_"):
-        try:
-            actual = await bot.feishu.get_message_thread_id(thread_id)
-        except Exception as e:
-            actual = ""
-            log(tag, "spawn", "warn", f"mget thread_id 失败 {thread_id[:14]}...: {e}")
+        # 网络瞬断 / SSL handshake 超时会让单次 mget 失败 → 必须重试。
+        # 退避：1s, 3s, 7s（总 11s 上限），3 次都失败再放弃。
+        actual = ""
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                actual = await bot.feishu.get_message_thread_id(thread_id)
+                if actual and actual.startswith("omt_"):
+                    break
+            except Exception as e:
+                last_err = e
+                log(tag, "spawn", "warn",
+                    f"mget thread_id 失败 (try {attempt+1}/3) {thread_id[:14]}...: {e}")
+            if attempt < 2:
+                await asyncio.sleep(1 + attempt * 2)
         if actual and actual.startswith("omt_"):
             log(tag, "spawn", "info",
                 f"自动修正 thread_id: {thread_id[:14]}... → {actual[:14]}...")
             thread_id = actual
         else:
+            reason = f"mget 三次失败: {last_err}" if last_err else "mget 返回空 thread_id"
             log(tag, "spawn", "warn",
-                f"拒绝：thread_id={thread_id[:14]}... 既非 omt_ 也无法 mget 成 omt_")
+                f"拒绝：thread_id={thread_id[:14]}... — {reason}")
             try:
                 await bot.feishu.reply_text(
                     anchor_message_id,
-                    f"⚠️ /spawn 收到的 thread_id 不是 omt_ 形式且无法转换（{thread_id[:14]}...）。"
-                    f"请检查派单代码是否把 message_id 误传成了 thread_id。",
+                    f"⚠️ /spawn 无法转换 thread_id（{thread_id[:14]}...）：{reason}。"
+                    f"通常是网络瞬断；下个 cron 会重试。",
                 )
             except Exception:
                 pass

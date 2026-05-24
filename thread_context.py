@@ -37,10 +37,13 @@ def _replace_mentions(text: str, mentions) -> str:
     return text.strip()
 
 
-def _extract(msg) -> tuple[str, list[dict]]:
+def _extract(msg, feishu: Optional["FeishuClient"] = None) -> tuple[str, list[dict]]:
     """
     从消息体提取纯文本和附件描述。
     attachments: [{"kind": "image"|"file"|"audio"|"media", "key": "...", "name": "..."}]
+
+    feishu: 传入则在 interactive 卡片解析为空 / 仅 loading 时，fallback 到 feishu
+    自己维护的卡片文本 cache（update_card 之后的真实内容）。
     """
     msg_type = msg.msg_type or ""
     body = msg.body
@@ -87,14 +90,55 @@ def _extract(msg) -> tuple[str, list[dict]]:
     if msg_type == "sticker":
         return "[表情]", []
 
+    if msg_type == "interactive":
+        # bot 自己发的卡片：解析 card JSON 提取 markdown 正文
+        try:
+            elements = (obj.get("body") or {}).get("elements") or obj.get("elements") or []
+        except Exception:
+            elements = []
+
+        def _walk(els):
+            parts = []
+            for el in els or []:
+                if not isinstance(el, dict):
+                    continue
+                tag = el.get("tag", "")
+                if tag == "markdown":
+                    c = (el.get("content") or "").strip()
+                    if c:
+                        parts.append(c)
+                elif tag == "div":
+                    inner = (el.get("text") or {}).get("content")
+                    if inner:
+                        parts.append(str(inner).strip())
+                elif tag in ("column_set", "column"):
+                    # 递归列布局；按钮文本无视，靠 markdown 拿到主要内容即可
+                    parts.extend(_walk(el.get("columns") or el.get("elements") or []))
+            return parts
+
+        chunks = _walk(elements)
+        text = "\n".join(chunks).strip()
+        # 飞书 im.v1.message.list 返回的 interactive content 是初始快照（多半是
+        # loading 占位），update_card 之后的内容拿不到 → fallback 到 bot 自己维护
+        # 的卡片文本 cache。两边都空才认为这条没内容。
+        if not text or text in ("⏳ 思考中...", "⏳ 思考中"):
+            if feishu is not None:
+                cached = feishu.get_card_text(msg.message_id or "")
+                if cached:
+                    return cached, []
+            return "", []
+        return text, []
+
     return f"[{msg_type}]", []
 
 
 def _sender_label(msg) -> str:
-    """给消息发送者取一个可读 label：优先 mention 里同 id 的 name，否则 open_id 末 6 位"""
+    """给消息发送者取一个可读 label：bot 自己 → "bot"；其它优先 mention 同 id 的 name，否则 open_id 末 6 位"""
     sender = msg.sender
     if not sender:
         return "unknown"
+    if (sender.sender_type or "") == "app":
+        return "bot"
     sid = sender.id or ""
     for m in (msg.mentions or []):
         mid = getattr(m, "id", "") or ""
@@ -140,9 +184,8 @@ async def build_thread_context(
             if mid == last_seen_message_id:
                 hit_last_seen = True
             continue
-        sender = m.sender
-        if sender and (sender.sender_type or "") == "app":
-            continue
+        # 注意：保留 bot (sender_type=="app") 自己的卡片消息，便于 /new 后让新 session
+        # 能看到 bot 之前的回复脉络。loading 占位卡和无正文的卡片会在 _extract 里被过滤。
         unseen.append(m)
 
     if not unseen:
@@ -155,7 +198,7 @@ async def build_thread_context(
 
     for m in unseen:
         att_indices = []
-        _text, atts = _extract(m)
+        _text, atts = _extract(m, feishu)
         for att in atts:
             if not att["key"]:
                 continue
@@ -179,7 +222,7 @@ async def build_thread_context(
     lines = []
     all_paths = []
     for seq, m in enumerate(unseen, 1):
-        text, _atts = _extract(m)
+        text, _atts = _extract(m, feishu)
         sender = _sender_label(m)
         time_str = _fmt_time(m.create_time)
         header = f"[{seq}] {sender}"

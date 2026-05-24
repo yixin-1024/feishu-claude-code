@@ -26,10 +26,51 @@ TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
 # ── 进程探测 ──────────────────────────────────────────────────────────────
 
 _wrapper_pid() {
-    # 只匹配 .app 里的 wrapper，避免误杀别的 cc-lark
-    pgrep -f "^bash ${WRAPPER_PATH}$" 2>/dev/null | head -1
+    # 兼容两种 .app 布局：
+    #   - cc-lark install 生成的：bash 直接是 Contents/MacOS/cc-lark
+    #   - Mach-O launcher（如 Platypus）：MacOS/cc-lark 是二进制，bash 跑
+    #     Contents/Resources/script
+    # 用任意 bash + .app 路径前缀都能命中，不会误杀别的 cc-lark。
+    pgrep -f "^/bin/bash ${APP_PATH}/" 2>/dev/null | head -1
 }
 _is_running() { [[ -n "$(_wrapper_pid)" ]]; }
+
+_ngrok_pid() {
+    # ngrok 由 wrapper 启，但有时会孤立到 PPID 1（之前 wrapper 异常退过又重启）
+    # ——按命令行直接找，不强求父进程关系。
+    pgrep -f '^ngrok http' 2>/dev/null | head -1
+}
+
+_print_ws_info() {
+    [[ -f "$LOG_FILE" ]] || return
+    local rows last_conn last_attempt
+    rows="$(tail -n 5000 "$LOG_FILE" 2>/dev/null \
+        | grep -E '\[Lark\] \[[^]]+\] \[(INFO|ERROR)\] (connected to wss://|trying to reconnect|connect failed)' \
+        || true)"
+    [[ -z "$rows" ]] && { printf "  %-12s %s\n" "WS 状态" "（log 中无 Lark WS 记录）"; return; }
+
+    last_conn="$(printf '%s\n' "$rows"    | grep 'connected to wss://' | tail -1)"
+    last_attempt="$(printf '%s\n' "$rows" | grep -E '(trying to reconnect|connect failed)' | tail -1)"
+
+    if [[ -n "$last_conn" ]]; then
+        local ts host
+        ts="$(printf '%s' "$last_conn"   | sed -E 's/.*\[Lark\] \[([^]]+)\].*/\1/')"
+        host="$(printf '%s' "$last_conn" | sed -E 's|.*connected to wss://([^/?]+).*|\1|')"
+        printf "  %-12s %s  (%s)\n" "WS 上次连上" "$ts" "$host"
+    else
+        printf "  %-12s %s\n" "WS 上次连上" "（最近 5000 行 log 里没看到 connected）"
+    fi
+
+    if [[ -n "$last_attempt" && -n "$last_conn" ]]; then
+        local att_ts conn_ts
+        att_ts="$(printf '%s'  "$last_attempt" | sed -E 's/.*\[Lark\] \[([^]]+)\].*/\1/')"
+        conn_ts="$(printf '%s' "$last_conn"    | sed -E 's/.*\[Lark\] \[([^]]+)\].*/\1/')"
+        # 时间戳是 YYYY-MM-DD HH:MM:SS,fff，字典序 = 时序
+        if [[ "$att_ts" > "$conn_ts" ]]; then
+            printf "  %-12s ⚠️  %s 之后仍在重连\n" "" "$att_ts"
+        fi
+    fi
+}
 
 _login_items_has() {
     osascript -e "tell application \"System Events\" to (login item \"${APP_NAME}\" exists)" 2>/dev/null \
@@ -293,7 +334,10 @@ cmd_status() {
         local wpid bpid npid
         wpid="$(_wrapper_pid)"
         bpid="$(pgrep -P "$wpid" -f main.py 2>/dev/null || true)"
-        npid="$(pgrep -P "$wpid" -f ngrok    2>/dev/null || true)"
+        # bot 也可能不是 wrapper 的直接子（重启后只换了 python，bash 仍是老 PID）
+        # ——直接按命令行兜底。
+        [[ -z "$bpid" ]] && bpid="$(pgrep -f 'python.* main\.py$' 2>/dev/null | head -1)"
+        npid="$(_ngrok_pid)"
         printf "  %-12s %s\n" "wrapper"  "运行中 (PID $wpid)"
         printf "  %-12s %s\n" "bot"      "${bpid:-未启动}"
         printf "  %-12s %s\n" "ngrok"    "${npid:-未启动}"
@@ -318,6 +362,8 @@ cmd_status() {
             printf "  %-12s %s\n" "TCC 授权" "（无；首次使用 peekaboo 时去系统设置加）"
         fi
     fi
+
+    _print_ws_info
 
     echo ""
     echo "  bot   日志: $LOG_FILE"

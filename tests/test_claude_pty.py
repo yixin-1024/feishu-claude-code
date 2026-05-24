@@ -471,6 +471,38 @@ def test_escape_for_pty_passes_through_compact():
     assert _escape_for_pty("/compactfoo") == " /compactfoo"
 
 
+# ────────────────── jsonl 归属匹配 (verify 模板回归) ──────────────────
+
+def test_jsonl_owns_message_ignores_collapsed_blank_lines(tmp_path):
+    """/verify 模板首行是 "# 任务...\\n\\n你是一个..."；Claude Code PTY 把 \\n\\n 压成
+    单 \\n 写进 jsonl。expected_prefix 不归一化空白就永远匹配不上，超时报"new
+    session jsonl never appeared"。这条用例锁住归一化路径。"""
+    from claude_pty import _expected_match_prefix, _jsonl_owns_message
+
+    message = "# 任务：审计上方这段对话\n\n你是一个**独立审计员**，从外部接入这个话题群。"
+    prefix = _expected_match_prefix(message)
+    assert prefix is not None
+    # 归一化后 \n\n 变成单空格
+    assert "  " not in prefix
+    assert "\n" not in prefix
+
+    # 模拟 PTY 压缩后 + 头部 [Image #N] 占位 的真实 jsonl 内容
+    jsonl = tmp_path / "fake.jsonl"
+    jsonl.write_text(
+        '{"type":"user","message":{"role":"user","content":'
+        '[{"type":"text","text":"[Image #1] [Image #2] # 任务：审计上方这段对话\\n你是一个**独立审计员**，从外部接入这个话题群。"}]}}\n'
+    )
+    assert _jsonl_owns_message(str(jsonl), prefix, only_candidate=True) is True
+
+    # 别的并发 spawn 写的不应被认领
+    other = tmp_path / "other.jsonl"
+    other.write_text(
+        '{"type":"user","message":{"role":"user","content":'
+        '[{"type":"text","text":"完全不相干的另一个用户输入"}]}}\n'
+    )
+    assert _jsonl_owns_message(str(other), prefix, only_candidate=False) is False
+
+
 # ────────────────── orphan-resume 修复回归 ──────────────────
 
 @pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
