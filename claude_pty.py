@@ -191,22 +191,32 @@ def _expected_match_prefix(message: str) -> Optional[str]:
 
 
 # _jsonl_owns_message 的三态返回：
-#   True  → 这个 jsonl 是本次 spawn 的（前缀匹配 / 单候选放行）
+#   True  → 这个 jsonl 是本次 spawn 的（content 已写且前缀匹配 / 短消息无 prefix 时单候选放行）
 #   False → 是别的并发 spawn 写的，跳过
 #   None  → user 事件还没写到 jsonl，等下次 poll 再说
+#
+# only_candidate 仅在 expected_prefix is None（消息太短，无前缀可匹配）时还有意义。
+# 一旦 expected_prefix 可用，**必须**等 content 落地再校验——否则在并发 spawn 场景下：
+# A 拍 before_uuids snapshot 后，B 比 A 先把 jsonl 写出来（A 自己 PTY init 慢半拍），
+# 此时 A 看到的 new_uuids = {B.uuid}、only_candidate=True，但 B 的 user 行还在 PTY
+# bracketed-paste 中（content=None）；旧逻辑直接 return True → A 错认 B 的 jsonl 为
+# 自己的，从此 tail 别人的输出，两个会话的卡片内容会完全串台（2026-05-24 真实事故：
+# spx_hourly_optimize 和 spx_e2e_patrol 17:45 同时触发，patrol 的卡片正文显示成
+# optimize 的内容）。修复：content==None 一律 return None，等 PTY 把 user 行落出来再判。
 def _jsonl_owns_message(
     path: str,
     expected_prefix: Optional[str],
     only_candidate: bool,
 ) -> Optional[bool]:
-    if expected_prefix is None:
-        # 没有可用前缀（消息太短）。单候选直接收，多候选无法分辨——保守也收最早那个。
-        return True
     content = _jsonl_first_user_content(path)
+    if expected_prefix is None:
+        # 短消息无 prefix 可匹配——单候选放行，多候选无法分辨保守等。
+        if content is None:
+            return True if only_candidate else None
+        return True
     if content is None:
-        # 文件已存在但还没写 user 事件。单候选场景下可以认；多候选必须等内容
-        # 落地再判，否则可能错选。
-        return True if only_candidate else None
+        # 见上面 docstring：必须等 content 写出来才能校验，不准走 only_candidate 捷径。
+        return None
     return expected_prefix in _normalize_for_match(content)
 
 
@@ -564,20 +574,30 @@ async def _send_user_input(
     [[project-pty-orphan-resume]] 相邻的"2 图必现 jsonl 不出"）。
 
     这版改成事件驱动：写完 paste-end 后 poll PTY 字节计数器，等连续
-    250ms 没新字节再发 \\r。TUI 渲染完输入框一定会安静下来，不安静就是
-    还在干活。max_wait=5s 兜超慢图片加载，再不行也兜底发 \\r 保留旧
-    行为。
+    quiet_seconds 没新字节再发 \\r。TUI 渲染完输入框一定会安静下来，不
+    安静就是还在干活。max_wait 兜超慢加载，再不行也兜底发 \\r 保留旧行为。
+
+    2026-05-24 加固：单行短消息走旧短窗（quiet=0.25/max=5）；多行 paste
+    走长窗（quiet=1.0/max=15）——超长 paste（如 spx_website_refactor 473
+    行）会被 Claude TUI fold 成占位符，同时 MCP server / claude.ai
+    connectors 异步 init 期间 PTY 持续 echo banner（30s+ 不会真正 quiet），
+    旧 5s 兜底太早发 \\r 时 Claude TUI 仍在 fold-paste + 等 init 状态，
+    会**吞掉**这次 Enter，input box 里挂着 fold paste 但永远不提交，外层
+    撞 _NEW_SESSION_WAIT=300s 报"new session jsonl never appeared"。
+    （wait-jsonl loop 里还有 resubmit \\r 兜底，见 _run_once。）
     """
     safe = _escape_for_pty(message)
     encoded = safe.encode("utf-8")
-    if b"\n" in encoded:
-        # 多行：用 bracketed paste 保护内部换行不被当作多次提交
+    is_multiline = b"\n" in encoded
+    if is_multiline:
         await _write_all_to_pty(master_fd, _BRACKETED_PASTE_START)
         await _write_all_to_pty(master_fd, encoded)
         await _write_all_to_pty(master_fd, _BRACKETED_PASTE_END)
+        # 大 paste + MCP init 期间 PTY 30s+ 不静——quiet/max 都加大
+        await _wait_pty_quiet(bytes_counter, quiet_seconds=1.0, max_wait=15.0)
     else:
         await _write_all_to_pty(master_fd, encoded)
-    await _wait_pty_quiet(bytes_counter, quiet_seconds=0.25, max_wait=5.0)
+        await _wait_pty_quiet(bytes_counter, quiet_seconds=0.25, max_wait=5.0)
     await _write_all_to_pty(master_fd, b"\r")
 
 
@@ -737,6 +757,17 @@ async def run_claude(
                 expected_prefix = _expected_match_prefix(message)
                 rejected: set[str] = set()
                 deadline = loop.time() + _NEW_SESSION_WAIT
+                # Submit-retry 兜底：超长 paste（如 spx_website_refactor 473
+                # 行）被 Claude TUI fold 成占位符，且 MCP server / claude.ai
+                # connectors 异步 init 期间 \\r 会被吞——首次 Enter 没生效，
+                # input box 里挂着 fold paste 但永远不提交。每 _RESUBMIT_INTERVAL
+                # 主动补一次 \\r：input box 有内容 → 触发提交；空 input box →
+                # 无 op，安全。最多 _RESUBMIT_MAX_ATTEMPTS 次，留 buffer 给真正
+                # 慢的 MCP init / Anthropic API first-token 时间。
+                _RESUBMIT_INTERVAL = 30.0
+                _RESUBMIT_MAX_ATTEMPTS = 3
+                last_resubmit = loop.time()
+                resubmit_attempts = 0
                 while loop.time() < deadline:
                     new_uuids = (
                         _snapshot_session_uuids(project_dir)
@@ -778,6 +809,23 @@ async def run_claude(
                         break
                     if proc.returncode is not None:
                         break
+                    # 超长 paste fold + MCP init race 兜底：周期性补 \\r
+                    if (
+                        resubmit_attempts < _RESUBMIT_MAX_ATTEMPTS
+                        and loop.time() - last_resubmit >= _RESUBMIT_INTERVAL
+                    ):
+                        try:
+                            await _write_all_to_pty(master_fd, b"\r")
+                            print(
+                                f"[run_claude_pty] jsonl 未出现 "
+                                f"{loop.time() - last_resubmit:.0f}s，补发 \\r "
+                                f"(attempt {resubmit_attempts + 1}/{_RESUBMIT_MAX_ATTEMPTS})",
+                                flush=True,
+                            )
+                        except OSError:
+                            pass
+                        last_resubmit = loop.time()
+                        resubmit_attempts += 1
                     # 没有"被接受"的候选——下次 poll；any_pending 提示我们至少
                     # 有一个文件存在但还没写 user 行，正常情况下马上就写完
                     _ = any_pending

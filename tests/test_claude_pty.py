@@ -151,12 +151,24 @@ def _make_fake_claude(
         except Exception:
             pass
 
+        # 还原真 claude 行为：把 bracketed-paste 包装去掉，拿到原始 prompt
+        paste_text = buf.decode("utf-8", errors="replace") \\
+            .replace("\\x1b[200~", "").replace("\\x1b[201~", "").strip("\\r\\n")
+
         # 写 jsonl
         sid = str(uuid.uuid4())
         path = os.path.join(PROJECT_DIR, sid + ".jsonl")
         os.makedirs(PROJECT_DIR, exist_ok=True)
         with open(path, "a", buffering=1, encoding="utf-8") as f:
             f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+            f.flush()
+            # 模拟真 claude：收到用户输入后立刻把它落到 jsonl 一条 user 行。
+            # PTY runner 的 jsonl 归属逻辑依赖这条行存在——少了它，runner 会
+            # 等不到自己的 jsonl（content==None → return None）然后超时。
+            f.write(json.dumps({{
+                "type": "user",
+                "message": {{"role": "user", "content": [{{"type": "text", "text": paste_text}}]}},
+            }}) + "\\n")
             f.flush()
             # 模拟一些工具调用
             for name, inp in TOOL_CALLS:
@@ -503,6 +515,38 @@ def test_jsonl_owns_message_ignores_collapsed_blank_lines(tmp_path):
     assert _jsonl_owns_message(str(other), prefix, only_candidate=False) is False
 
 
+def test_jsonl_owns_message_waits_when_content_unwritten(tmp_path):
+    """2026-05-24 真实事故回归：并发 spawn 时不准走 only_candidate 捷径。
+
+    场景：spx_hourly_optimize 和 spx_e2e_patrol 在 17:45 同时 fire。
+    patrol（A）spawn 后拍 before_uuids snapshot，optimize（B）的 jsonl 比 A 自己
+    的先落盘（A 的 PTY init 慢半拍），此时 B 还在 PTY bracketed-paste，user 行
+    没写出来。A 看到 new_uuids = {B.uuid}、only_candidate=True、content=None，
+    旧逻辑直接 return True → A 把 B 的 jsonl 认作自己的，从此 tail 别人的输出，
+    两个会话的卡片正文完全串台。
+
+    修复后：有 expected_prefix 时 content==None 一律 return None，必须等
+    content 落地再用 prefix 校验。
+    """
+    from claude_pty import _jsonl_owns_message
+
+    # 文件存在但还没写任何 user 行（只有 permission-mode / file-history-snapshot 类
+    # 系统事件，或者完全空文件）
+    fresh = tmp_path / "racing.jsonl"
+    fresh.write_text(
+        '{"type":"permission-mode","mode":"acceptEdits"}\n'
+        '{"type":"file-history-snapshot"}\n'
+    )
+
+    # 有 prefix + content 未写：必须等（None），不准因 only_candidate 而误认
+    assert _jsonl_owns_message(str(fresh), "你是 **SPX E2E 巡逻主 agent**", only_candidate=True) is None
+    assert _jsonl_owns_message(str(fresh), "你是 **SPX E2E 巡逻主 agent**", only_candidate=False) is None
+
+    # 短消息（无 prefix）保留 only_candidate 兜底：单候选可放行，多候选等
+    assert _jsonl_owns_message(str(fresh), None, only_candidate=True) is True
+    assert _jsonl_owns_message(str(fresh), None, only_candidate=False) is None
+
+
 # ────────────────── orphan-resume 修复回归 ──────────────────
 
 @pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
@@ -599,10 +643,17 @@ def test_pty_runner_orphan_resume_falls_back_to_fresh_session(tmp_path, monkeypa
             os._exit(0)
         else:
             # 全新 session：给个像样的回复
+            paste_text = buf.decode("utf-8", errors="replace") \\
+                .replace("\\x1b[200~", "").replace("\\x1b[201~", "").strip("\\r\\n")
             sid = str(uuid.uuid4())
             path = os.path.join(PROJECT_DIR, sid + ".jsonl")
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+                # 模拟真 claude：先把用户输入回写一条 user 行，再吐 assistant
+                f.write(json.dumps({{
+                    "type": "user",
+                    "message": {{"role": "user", "content": [{{"type": "text", "text": paste_text}}]}},
+                }}) + "\\n")
                 f.write(json.dumps({{
                     "type": "assistant",
                     "message": {{
