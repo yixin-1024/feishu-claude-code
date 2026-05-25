@@ -142,8 +142,15 @@ def main():
         target = config.PROFILES_BY_NAME.get(notify_profile) or config.PROFILES[0]
         notify_open_id = next(iter(target.allowed_open_ids), "")
     interval = int(os.getenv("QUOTA_WATCH_INTERVAL_SEC", "600"))
+    # ACCOUNT_AUTO_SWITCH=1 启用多账户智能切换；冷却默认 30 min
+    enable_switch = os.getenv("ACCOUNT_AUTO_SWITCH", "0").strip().lower() in ("1", "true", "yes", "on")
+    switch_cooldown = int(os.getenv("ACCOUNT_SWITCH_COOLDOWN_SEC", "1800"))
     try:
-        runtime.start_quota_watcher(notify_profile, notify_open_id, interval)
+        runtime.start_quota_watcher(
+            notify_profile, notify_open_id, interval,
+            enable_account_switcher=enable_switch,
+            switcher_cooldown_sec=switch_cooldown,
+        )
     except Exception as e:
         print(f"⚠️ quota_watcher 启动失败: {e}")
 

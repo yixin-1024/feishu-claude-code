@@ -354,6 +354,101 @@ def test_pty_runner_resume_existing_session(tmp_path, monkeypatch):
     assert "OLD TEXT" not in "".join(chunks)
 
 
+# ────────────────── 用量耗尽快速退出 ──────────────────
+
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
+def test_pty_runner_raises_on_api_error_message(tmp_path, monkeypatch):
+    """Claude Max 用量耗尽时 Claude CLI 会注入 synthetic assistant 事件
+    （isApiErrorMessage=true / apiErrorStatus=429 / error="rate_limit"），
+    runner 必须立刻抛 RuntimeError，而不是等 IDLE_TIMEOUT/STUCK_CHILD_TIMEOUT
+    超时退出（否则 dispatcher 卡片会一直转 5 分钟才报错）。
+    """
+    project_root = tmp_path / "projects"
+    project_root.mkdir()
+    cwd = tmp_path / "wd"
+    cwd.mkdir()
+    encoded = str(cwd).replace("/", "-")
+    project_dir = project_root / encoded
+    project_dir.mkdir(parents=True)
+
+    # fake claude: 收到 stdin 后写 system + user + 一条 isApiErrorMessage=true 的
+    # synthetic assistant，然后死等（模拟真实 CLI 不退出的行为）。
+    err_text = "You've hit your session limit · resets 6:40pm (Asia/Shanghai)"
+    script = textwrap.dedent(f"""
+        #!{sys.executable}
+        import json, os, sys, time, select, uuid
+        PROJECT_DIR = {str(project_dir)!r}
+        ERR_TEXT = {err_text!r}
+
+        sys.stdout.write("\\x1b[?1049h"); sys.stdout.write("ready\\n"); sys.stdout.flush()
+        buf = b""
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            r, _, _ = select.select([sys.stdin.fileno()], [], [], 0.3)
+            if r:
+                c = os.read(sys.stdin.fileno(), 4096)
+                if not c: break
+                buf += c
+                if b"\\x1b[201~" in buf or b"\\r" in buf:
+                    break
+
+        paste_text = buf.decode("utf-8", errors="replace") \\
+            .replace("\\x1b[200~", "").replace("\\x1b[201~", "").strip("\\r\\n")
+        sid = str(uuid.uuid4())
+        path = os.path.join(PROJECT_DIR, sid + ".jsonl")
+        os.makedirs(PROJECT_DIR, exist_ok=True)
+        with open(path, "a", buffering=1, encoding="utf-8") as f:
+            f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+            f.write(json.dumps({{
+                "type": "user",
+                "message": {{"role": "user", "content": [{{"type": "text", "text": paste_text}}]}},
+            }}) + "\\n")
+            f.flush()
+            time.sleep(0.2)
+            # 注入 synthetic rate_limit 事件——CLI 真实 schema 一致
+            f.write(json.dumps({{
+                "type": "assistant",
+                "message": {{
+                    "role": "assistant",
+                    "model": "<synthetic>",
+                    "content": [{{"type": "text", "text": ERR_TEXT}}],
+                    "stop_reason": "stop_sequence",
+                    "stop_sequence": "",
+                    "usage": {{"input_tokens": 0, "output_tokens": 0}},
+                }},
+                "error": "rate_limit",
+                "isApiErrorMessage": True,
+                "apiErrorStatus": 429,
+            }}) + "\\n")
+            f.flush()
+        # 模拟真 CLI：注入完不退出，挂在 prompt 上等用户。runner 必须主动 raise
+        time.sleep(60)
+    """)
+    fake = tmp_path / "fake-claude-ratelimit.py"
+    fake.write_text(script.lstrip())
+    fake.chmod(0o755)
+
+    monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
+    monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
+    monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
+
+    start = time.time()
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(
+            claude_pty.run_claude(
+                "hello",
+                cwd=str(cwd),
+                permission_mode="bypassPermissions",
+            )
+        )
+    elapsed = time.time() - start
+    # 必须远快于 NO_ASSISTANT_TIMEOUT=600s / IDLE_TIMEOUT=300s
+    assert elapsed < 30, f"应在几秒内退出，实际 {elapsed:.1f}s"
+    msg = str(exc_info.value)
+    assert "用量已达上限" in msg or "rate_limit" in msg
+    assert "session limit" in msg
+
+
 # ────────────────── 大消息 bracketed-paste 完整性 ──────────────────
 
 @pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")

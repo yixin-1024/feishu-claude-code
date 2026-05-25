@@ -352,11 +352,81 @@ def _wake_nudge_loop(scheduler: BackgroundScheduler) -> None:
             pass
 
 
+def _quota_skip_reason(q: dict) -> tuple[str, list[tuple[str, int | None]]] | None:
+    """根据 fetch_quota_headers() 返回判断是否要跳过派单。
+
+    返回 None = 用量正常可派；否则返回 (整体说明, [(窗口标签, reset_ts), ...])。
+    判据：status 字段非 "allowed"（Anthropic 直接告诉我们已耗尽），或
+    utilization >= 0.98（再派一次极可能立刻撞 limit、Claude CLI 会注入
+    synthetic rate_limit 事件，相当于派出去就死）。
+    """
+    if not q.get("ok"):
+        return None  # 拿不到 quota：不阻塞，让 spawn 正常跑
+    out: list[tuple[str, int | None]] = []
+    for label, util_key, reset_key, status_key in [
+        ("5h", "u5h", "r5h", "s5h"),
+        ("7d", "u7d", "r7d", "s7d"),
+    ]:
+        util = q.get(util_key)
+        status = q.get(status_key)
+        reset_ts = q.get(reset_key)
+        bad_status = bool(status) and status != "allowed" and status != "unknown"
+        near_full = util is not None and util >= 0.98
+        if bad_status or near_full:
+            out.append((label, reset_ts))
+    if not out:
+        return None
+    # 文案：列出每个窗口和它的 reset 时间
+    from datetime import datetime
+    lines: list[str] = []
+    for label, ts in out:
+        if ts:
+            try:
+                dt = datetime.fromtimestamp(int(ts))
+                diff = dt - datetime.now()
+                hh = int(diff.total_seconds() // 3600)
+                mm = int((diff.total_seconds() % 3600) // 60)
+                if diff.total_seconds() > 0:
+                    lines.append(f"{label} 重置：{dt.strftime('%m/%d %H:%M')}（{hh}h{mm}m 后）")
+                else:
+                    lines.append(f"{label} 已过重置时间，下次 poll 会刷新")
+            except Exception:
+                lines.append(f"{label} 重置：{ts}")
+        else:
+            lines.append(f"{label} 已耗尽（无 reset 时间）")
+    return ("Claude Max 用量已达上限", lines)
+
+
 def _make_async_fire(task: ScheduledTask, bot, spawn_fn: SpawnFn):
     """生成无参 async coroutine。fire_task_now 直接 await，sync wrapper 投到 bot_loop。"""
     async def _fire():
         tag = f"[scheduler/{task.name}]"
         try:
+            # ── 派单前预检 quota：用量耗尽时派出去也是死（Claude CLI 会立刻
+            # 注入 synthetic rate_limit 事件让 PTY runner 退出），不如直接跳过、
+            # 在群里发一条说明，等下次 cron 再试。
+            try:
+                from commands import fetch_quota_headers
+                q = await asyncio.to_thread(fetch_quota_headers)
+            except Exception as e:
+                print(f"{tag} ⚠️ quota 预检失败 {type(e).__name__}: {e}，继续派单", flush=True)
+                q = {"ok": False}
+            skip = _quota_skip_reason(q)
+            if skip is not None:
+                reason, detail_lines = skip
+                print(f"{tag} ⏸️ 跳过：{reason} | {' / '.join(detail_lines)}", flush=True)
+                body = "原因：" + reason + "\n" + "\n".join(detail_lines)
+                try:
+                    await bot.feishu.send_post_to_chat(
+                        chat_id=task.chat_id,
+                        title=f"⏸️ 跳过本轮 · {task.topic_title}",
+                        body_text=body,
+                        mention_open_id=task.user_id,
+                    )
+                except Exception as e:
+                    print(f"{tag} ⚠️ 发跳过通报失败: {type(e).__name__}: {e}", flush=True)
+                return
+
             print(f"{tag} fire → 在 chat={task.chat_id[:12]}... 发顶楼", flush=True)
             anchor_msg_id = await bot.feishu.send_post_to_chat(
                 chat_id=task.chat_id,

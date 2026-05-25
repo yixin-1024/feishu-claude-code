@@ -10,6 +10,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -59,6 +60,7 @@ HELP_TEXT = """\
 `/skills` — 列出已安装的 Claude Skills
 `/mcp` — 列出已配置的 MCP Servers
 `/usage` — 查看 Claude Max 订阅用量百分比和重置时间
+`/accounts` — 查看所有 Claude Max 账户全景 + 智能切换状态
 
 **审计：**
 `/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
@@ -95,7 +97,7 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 # Bot 自身处理的命令，其余 /xxx 转发给 Claude
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "model", "mode", "status", "cd", "ls",
-    "exec", "workspace", "ws", "skills", "mcp", "usage", "stop",
+    "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "stop",
     "restart", "group",
 }
 
@@ -396,19 +398,107 @@ def _fmt_reset_ts(ts) -> str:
         return str(ts)
 
 
-def _get_usage() -> str:
-    """渲染 /usage 命令的完整输出。"""
-    data = fetch_quota_headers()
-    if not data.get("ok"):
-        return f"❌ {data.get('error', '获取用量失败')}"
+def _usage_single_account_lines(data: dict, account_label: Optional[str] = None) -> list[str]:
+    """渲染单账户的 5h / 7d bar + reset 倒计时（共用片段）。"""
+    title = "📊 **Claude Max 用量**"
+    if account_label:
+        title += f" — 当前 `{account_label}`"
+    lines = [title, ""]
+    lines.append(f"**5小时窗口**（状态：{data.get('s5h', '?')}）")
+    lines.append(_fmt_pct_bar(data.get("u5h")))
+    lines.append(f"重置时间：{_fmt_reset_ts(data.get('r5h'))}")
+    lines.append("")
+    lines.append(f"**7天窗口**（状态：{data.get('s7d', '?')}）")
+    lines.append(_fmt_pct_bar(data.get("u7d")))
+    lines.append(f"重置时间：{_fmt_reset_ts(data.get('r7d'))}")
+    return lines
 
-    lines = ["📊 **Claude Max 用量**\n"]
-    lines.append(f"**5小时窗口**（状态：{data['s5h']}）")
-    lines.append(f"{_fmt_pct_bar(data['u5h'])}")
-    lines.append(f"重置时间：{_fmt_reset_ts(data['r5h'])}\n")
-    lines.append(f"**7天窗口**（状态：{data['s7d']}）")
-    lines.append(f"{_fmt_pct_bar(data['u7d'])}")
-    lines.append(f"重置时间：{_fmt_reset_ts(data['r7d'])}")
+
+def _get_usage() -> str:
+    """渲染 /usage 命令的完整输出。
+
+    保存了多个账户时：顶部展示当前 active 账户的详尽 bar/重置，下方列出
+    其他账户的一行简表（用量 / score / 是否可用），底部显示自动切换开关。
+    没保存任何账户时退回单账户老视图。
+    """
+    accounts: dict = {}
+    current: Optional[str] = None
+    try:
+        from account_switcher import probe_all, current_account_name, evaluate
+        accounts = probe_all()
+        current = current_account_name()
+        for a in accounts.values():
+            evaluate(a, current)
+    except Exception:
+        accounts = {}
+        current = None
+
+    # 没保存账户 → 老路径
+    if not accounts:
+        data = fetch_quota_headers()
+        if not data.get("ok"):
+            return f"❌ {data.get('error', '获取用量失败')}"
+        return "\n".join(_usage_single_account_lines(data))
+
+    # 顶部：当前 active 账户的详尽 bar
+    cur = accounts.get(current) if current else None
+    lines: list[str] = []
+    if cur and not cur.probe_error and cur.u5h is not None:
+        data = {
+            "u5h": cur.u5h, "u7d": cur.u7d, "r5h": cur.r5h, "r7d": cur.r7d,
+            "s5h": cur.s5h, "s7d": cur.s7d,
+        }
+        lines.extend(_usage_single_account_lines(data, account_label=cur.name))
+    else:
+        # current 探测失败 / 没识别 → 直接 fetch keychain 兜底
+        data = fetch_quota_headers()
+        if data.get("ok"):
+            label = current or "未识别"
+            lines.extend(_usage_single_account_lines(data, account_label=label))
+        else:
+            lines.append(f"⚠️ 当前账户用量获取失败：{data.get('error', '未知')}")
+
+    # 其他账户的一行简表（按 score 降序，可用的先排）
+    others = [a for a in accounts.values() if a.name != current]
+    if others:
+        # usable 在前；usable 段内按 score 降序；unusable 在后按 name
+        others.sort(key=lambda a: (0 if a.usable else 1, -a.score, a.name))
+        lines.append("")
+        lines.append("**其他账户：**")
+        best_other = max((a for a in others if a.usable), key=lambda a: a.score, default=None)
+        cur_score = cur.score if cur else 0.0
+        cur_usable = bool(cur and cur.usable)
+        now_ts = time.time()
+        for a in others:
+            if a.probe_error:
+                lines.append(f"  `{a.name}` — ⚠️ {a.probe_error}")
+                continue
+            u5 = f"{a.u5h*100:.0f}%" if a.u5h is not None else "?"
+            u7 = f"{a.u7d*100:.0f}%" if a.u7d is not None else "?"
+            mark = "✅" if a.usable else "❌"
+            r5_part = ""
+            if a.r5h:
+                secs = max(0, a.r5h - now_ts)
+                r5_part = f" (重置 {int(secs//3600)}h{int(secs%3600/60)}m)"
+            tail = ""
+            if a is best_other and cur_usable and (a.score - cur_score) >= 0.15:
+                tail = "（推荐切换）"
+            elif a is best_other and not cur_usable:
+                tail = "（当前不可用，候选）"
+            elif not a.usable and a.reasons:
+                tail = f"（{a.reasons[0]}）"
+            lines.append(
+                f"  `{a.name}` · 5h `{u5}`{r5_part} · 7d `{u7}` · score `{a.score:.2f}` {mark}{tail}"
+            )
+
+    # 自动切换开关状态
+    auto_on = os.getenv("ACCOUNT_AUTO_SWITCH", "0").strip().lower() in ("1", "true", "yes", "on")
+    cooldown = int(os.getenv("ACCOUNT_SWITCH_COOLDOWN_SEC", "1800"))
+    lines.append("")
+    if auto_on:
+        lines.append(f"自动切换：✅ 已启用（冷却 {cooldown // 60} min · `/accounts` 看全景）")
+    else:
+        lines.append("自动切换：⏸ 未启用（`.env` 设 `ACCOUNT_AUTO_SWITCH=1` 打开）")
     return "\n".join(lines)
 
 
@@ -511,6 +601,21 @@ def _get_quota_compact() -> str:
         except Exception:
             pass
     return f"Claude 配额: `{' · '.join(parts)}` {tail}".strip()
+
+
+def _get_accounts() -> str:
+    """渲染 /accounts 命令——展示所有保存账户的 5h/7d 用量、score、可用性。"""
+    try:
+        from account_switcher import AccountSwitcher, probe_all, current_account_name
+    except Exception as e:
+        return f"❌ account_switcher 加载失败：{e}"
+    try:
+        accounts = probe_all()
+        current = current_account_name()
+    except Exception as e:
+        return f"❌ 探测账户失败：{e}"
+    sw = AccountSwitcher()  # 无 send_fn、纯渲染
+    return sw.render_matrix(accounts, current)
 
 
 _EXEC_TIMEOUT_SEC = 30
@@ -1005,6 +1110,9 @@ async def handle_command(
 
     elif cmd == "usage":
         return _get_usage()
+
+    elif cmd == "accounts":
+        return await asyncio.to_thread(_get_accounts)
 
     elif cmd == "stop":
         return "⏹ /stop 命令在消息队列外处理，如果看到这条说明当前没有运行中的任务。"

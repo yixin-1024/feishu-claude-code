@@ -932,6 +932,26 @@ async def run_claude(
                         if ev_type == "assistant":
                             msg = ev.get("message", {}) or {}
                             content = msg.get("content", [])
+                            # Claude Max 用量耗尽时 Claude CLI 会注入一条 synthetic
+                            # assistant 事件（isApiErrorMessage=true / apiErrorStatus=429 /
+                            # error="rate_limit" / model="<synthetic>"），content 文本类似
+                            # "You've hit your session limit · resets 6:40pm"。CLI 自己不
+                            # 再重试也不退出，TUI 挂在 prompt 等用户——再等下去只会撞
+                            # IDLE_TIMEOUT/STUCK_CHILD_TIMEOUT。立刻 raise 让 dispatcher
+                            # 用错误卡片暴露给用户，比超时退出快得多。
+                            if ev.get("isApiErrorMessage") is True:
+                                api_err = ev.get("error") or "api_error"
+                                status_code = ev.get("apiErrorStatus")
+                                err_text = _extract_text_from_content(content)
+                                detail = err_text or f"{api_err} (HTTP {status_code})"
+                                # error="rate_limit" 专项措辞：用户能直接读懂是用量上限
+                                if str(api_err) == "rate_limit":
+                                    raise RuntimeError(
+                                        f"Claude Max 用量已达上限：{detail}"
+                                    )
+                                raise RuntimeError(
+                                    f"Claude API 错误（{api_err}, HTTP {status_code}）：{detail}"
+                                )
                             # Claude CLI 在 --resume 一个被中断的 session 时（上一轮
                             # tool_use/tool_result 之后没收到 end_turn 就被杀），会
                             # 自己注入一对 housekeeping 事件给上轮收尾：

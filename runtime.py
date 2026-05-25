@@ -141,12 +141,20 @@ def start_quota_watcher(
     notify_profile: str,
     notify_open_id: str,
     interval_sec: int = 600,
+    *,
+    enable_account_switcher: bool = False,
+    switcher_cooldown_sec: int = 1800,
 ) -> None:
     """启动 quota_watcher 后台线程。
 
     通报通过 `notify_profile` 这个 bot 的 send_text_to_user 发给 `notify_open_id`。
     watcher 跑在独立线程，所以 send_fn 用 run_coroutine_threadsafe 把异步发送
     投回 bot_loop。
+
+    enable_account_switcher：True 时同时启用多账户智能切换。每次 poll 之后
+    探测所有 ~/.claude/accounts/*.json、按 5h+7d headroom 打分、必要时调
+    claude-switch use <name> 切到更优账户。冷却 switcher_cooldown_sec 内不
+    连切。正在跑 claude 子进程时推迟到下一轮。
     """
     if _bot_loop is None or not _bots:
         raise RuntimeError("runtime not configured; call configure() first")
@@ -173,9 +181,37 @@ def start_quota_watcher(
             log(notify_profile, "quota", "error",
                 f"投递 quota 通报失败: {e}")
 
-    start_watcher_thread(_send, interval=interval_sec)
+    switcher = None
+    if enable_account_switcher:
+        try:
+            from account_switcher import AccountSwitcher
+
+            def _has_active_children() -> bool:
+                # 任意 profile 的 active_runs 非空 = 有正在跑的 claude 子进程
+                for b in _bots.values():
+                    runs = getattr(b, "active_runs", None)
+                    if runs is None:
+                        continue
+                    if getattr(runs, "_runs", None):
+                        return True
+                return False
+
+            switcher = AccountSwitcher(
+                send_fn=_send,
+                has_active_children_fn=_has_active_children,
+                cooldown_sec=switcher_cooldown_sec,
+                enabled=True,
+            )
+            log("global", "switcher", "info",
+                f"account_switcher 启用，冷却 {switcher_cooldown_sec}s")
+        except Exception as e:
+            log("global", "switcher", "error", f"account_switcher 启动失败: {e}")
+            switcher = None
+
+    start_watcher_thread(_send, interval=interval_sec, switcher=switcher)
     log(notify_profile, "quota", "info",
-        f"quota watcher 启动 → 通报到 {notify_open_id[:14]}... 每 {interval_sec}s")
+        f"quota watcher 启动 → 通报到 {notify_open_id[:14]}... 每 {interval_sec}s"
+        + ("，账户智能切换：开" if switcher is not None else ""))
 
 
 # ── 为 profile 启动 WebSocket 客户端 ─────────────────────────

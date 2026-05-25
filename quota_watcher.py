@@ -12,6 +12,9 @@ state 持久化到 ~/.feishu-claude/quota_state.json。
 
 接口：start_watcher_thread(send_fn, interval) 起后台线程；send_fn(text) 是同步可调用
 （被 watcher 线程直接调），实现者负责把消息投到 bot_loop 上发出去。
+
+可选挂账户智能切换器：start_watcher_thread(..., switcher=AccountSwitcher(...))。
+每次 poll 之后调 switcher.maybe_switch()——切换条件 / 冷却 / 防抖都在 switcher 内部。
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import json
 import os
 import threading
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 # 默认阈值（utilization 比例，0..1）。跨过即发。
 THRESHOLDS: tuple[float, ...] = (0.25, 0.50, 0.75, 0.95)
@@ -119,8 +122,13 @@ def _format_alert_lines(
     return lines
 
 
-def poll_once(send_fn: Callable[[str], None]) -> None:
-    """跑一次：拉 quota → 比对 state → 必要时调 send_fn。"""
+def poll_once(send_fn: Callable[[str], None], switcher: Optional[Any] = None) -> None:
+    """跑一次：拉 quota → 比对 state → 必要时调 send_fn。
+
+    switcher：可选 AccountSwitcher 实例。poll 完后调 switcher.maybe_switch()——
+    它内部会探测所有账户、判定是否要切、必要时切换并通报。即使没有发用量告警，
+    也会检查（候选明显更优时仍可主动切）。
+    """
     from commands import fetch_quota_headers  # 延迟 import 避免循环
 
     data = fetch_quota_headers()
@@ -181,19 +189,30 @@ def poll_once(send_fn: Callable[[str], None]) -> None:
         except Exception as e:
             print(f"[quota_watcher] send_fn 失败: {e}", flush=True)
 
+    # 账户智能切换：watcher 之外没人定期跑探测，借这条线程顺带做。失败不影响 watcher。
+    if switcher is not None:
+        try:
+            switcher.maybe_switch()
+        except Exception as e:
+            print(f"[quota_watcher] switcher.maybe_switch 异常: {e}", flush=True)
+
 
 def start_watcher_thread(
     send_fn: Callable[[str], None],
     interval: int = DEFAULT_INTERVAL_SEC,
+    switcher: Optional[Any] = None,
 ) -> threading.Thread:
-    """起后台线程定期 poll。send_fn 同步签名，内部自己 schedule 到 bot_loop。"""
+    """起后台线程定期 poll。send_fn 同步签名，内部自己 schedule 到 bot_loop。
+
+    switcher：可选 AccountSwitcher。每次 poll 顺带跑一次切换判定。
+    """
 
     def _loop():
         # 第一次 poll 延迟一点，让 bot 完全起来再发
         time.sleep(30)
         while True:
             try:
-                poll_once(send_fn)
+                poll_once(send_fn, switcher=switcher)
             except Exception as e:
                 print(f"[quota_watcher] 异常: {e}", flush=True)
             time.sleep(interval)
@@ -201,7 +220,8 @@ def start_watcher_thread(
     t = threading.Thread(target=_loop, daemon=True, name="quota-watcher")
     t.start()
     print(
-        f"[quota_watcher] 已启动，每 {interval}s 拉一次 quota（阈值 {THRESHOLDS}）",
+        f"[quota_watcher] 已启动，每 {interval}s 拉一次 quota（阈值 {THRESHOLDS}）"
+        + (f"；账户智能切换：开" if switcher is not None else ""),
         flush=True,
     )
     return t
