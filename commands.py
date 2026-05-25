@@ -310,11 +310,13 @@ def fetch_quota_headers() -> dict:
     import ssl
 
     try:
+        from account_switcher import decode_security_stdout, ensure_keychain_intact
+        ensure_keychain_intact()  # /restart 周期里 keychain 被写丢时自愈
         result = subprocess.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
             capture_output=True, text=True, timeout=5,
         )
-        creds = json.loads(result.stdout.strip())
+        creds = json.loads(decode_security_stdout(result.stdout))
         token = creds["claudeAiOauth"]["accessToken"]
     except Exception as e:
         return {"ok": False, "error": f"读取凭证失败：{e}"}

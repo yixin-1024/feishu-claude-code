@@ -175,6 +175,22 @@ def load_account(name: str) -> Optional[Account]:
     )
 
 
+def decode_security_stdout(raw: str) -> str:
+    """`security find-generic-password -w` 在 blob 含非可打印字符时会把整段
+    输出 hex 化（无 0x 前缀），否则原样输出。识别 hex-only + 偶数长度则反解，
+    其它情况原样返回。
+
+    合法 JSON 凭证一定含 `{` `"` `:` 等非 hex 字符，所以该判定不会误伤。
+    """
+    s = raw.strip()
+    if s and len(s) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in s):
+        try:
+            return bytes.fromhex(s).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return s
+    return s
+
+
 def _read_keychain_blob() -> Optional[str]:
     """读 macOS keychain 里当前 active 的凭证 blob 字符串。"""
     try:
@@ -185,7 +201,7 @@ def _read_keychain_blob() -> Optional[str]:
         )
         if r.returncode != 0:
             return None
-        return r.stdout.strip()
+        return decode_security_stdout(r.stdout)
     except Exception:
         return None
 
@@ -216,6 +232,89 @@ def current_account_name() -> Optional[str]:
         if blob and _token_fingerprint(blob) == active_fp:
             return name
     return None
+
+
+def _write_keychain_blob(blob: str) -> tuple[bool, str]:
+    """用 `security add-generic-password -U` 覆写 keychain 凭证项。返回 (ok, msg)。"""
+    try:
+        r = subprocess.run(
+            ["security", "add-generic-password", "-U",
+             "-s", "Claude Code-credentials",
+             "-a", os.environ.get("USER") or os.path.basename(os.path.expanduser("~")),
+             "-w", blob],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return False, (r.stderr or r.stdout or "security add-generic-password failed").strip()
+        return True, ""
+    except Exception as e:
+        return False, f"exec failed: {e}"
+
+
+def ensure_keychain_intact() -> tuple[str, Optional[str]]:
+    """检测 keychain 凭证 blob 是否含完整的 `claudeAiOauth.accessToken`，缺失则
+    从 saved 账户文件自动恢复。
+
+    背景：cc-lark `/restart` 周期里观察到 keychain blob 被覆写为只剩
+    `{"mcpOAuth": ...}`——`claudeAiOauth` top-level 整个写丢，导致 `/usage`
+    `'claudeAiOauth'` KeyError、`current_account_name()` 返回 None。怀疑是
+    Claude CLI 或 MCP 子系统在自己启动时 `add-generic-password -U` 用残缺
+    内存态覆盖，但根因在外部进程不可控，本函数是自愈兜底。
+
+    恢复优先级：
+    1. `state.last_switch_to`（最近一次主动切换的目标账户）
+    2. `~/.claude/accounts/*.json` 里 mtime 最新的（人工 `claude-switch save` 也算）
+
+    返回 (status, name)：
+        ("ok",        None)  keychain 完整，no-op
+        ("restored",  name)  blob 缺失，已从 saved 文件写回
+        ("no_active", None)  blob 缺失且没有可用 saved 文件
+        ("error",     msg)   写回过程异常
+    """
+    blob = _read_keychain_blob()
+    if blob:
+        try:
+            d = json.loads(blob)
+            if d.get("claudeAiOauth", {}).get("accessToken"):
+                return ("ok", None)
+        except Exception:
+            pass  # blob 解析失败也走恢复路径
+
+    # 收集候选 saved 文件，按优先级排序
+    candidates: list[str] = []
+    try:
+        last = _load_state().get("last_switch_to")
+    except Exception:
+        last = None
+    available = list_account_files()
+    if last and last in available:
+        candidates.append(last)
+    try:
+        others = sorted(
+            (n for n in available if n != last),
+            key=lambda n: os.path.getmtime(os.path.join(ACCOUNTS_DIR, f"{n}.json")),
+            reverse=True,
+        )
+        candidates.extend(others)
+    except OSError:
+        pass
+
+    for name in candidates:
+        path = os.path.join(ACCOUNTS_DIR, f"{name}.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            d = json.loads(raw)
+        except Exception:
+            continue
+        if not d.get("claudeAiOauth", {}).get("accessToken"):
+            continue
+        ok, msg = _write_keychain_blob(raw)
+        if ok:
+            return ("restored", name)
+        return ("error", msg)
+
+    return ("no_active", None)
 
 
 # ── 探测：用每个 token 各发一个 1-token 请求拿 headers ────────────

@@ -175,11 +175,13 @@ def _get_api_token() -> Optional[str]:
             with open(creds_path) as f:
                 creds = json.load(f)
             return creds["claudeAiOauth"]["accessToken"]
+        from account_switcher import decode_security_stdout, ensure_keychain_intact
+        ensure_keychain_intact()  # keychain 被外部进程写丢时自愈
         result = subprocess.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
             capture_output=True, text=True, timeout=5,
         )
-        creds = json.loads(result.stdout.strip())
+        creds = json.loads(decode_security_stdout(result.stdout))
         return creds["claudeAiOauth"]["accessToken"]
     except Exception:
         return None

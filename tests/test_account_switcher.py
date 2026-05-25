@@ -386,3 +386,175 @@ def test_get_usage_shows_recommend_switch_when_alt_clearly_better(monkeypatch):
     monkeypatch.setattr(accs, "current_account_name", lambda: "cur")
     out = commands._get_usage()
     assert "推荐切换" in out
+
+
+# ────────────────── decode_security_stdout (hex 兜底) ──────────────────
+
+def test_decode_security_stdout_passthrough_json():
+    raw = '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-abc"}}\n'
+    assert accs.decode_security_stdout(raw) == raw.strip()
+
+
+def test_decode_security_stdout_unhexes_when_hex_only():
+    """`security -w` 在 blob 含非可打印字符时会整段 hex 化（无 0x 前缀）。
+    若上游不反解，下游 `json.loads` 报 'Extra data: line 1 column 2 (char 1)'。
+    """
+    payload = '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-eW7Bfjhicpi"}}'
+    hexed = payload.encode("utf-8").hex()  # 全 0-9a-f，偶数长度
+    out = accs.decode_security_stdout(hexed + "\n")
+    assert out == payload
+    import json
+    assert json.loads(out)["claudeAiOauth"]["accessToken"].startswith("sk-ant-oat01-")
+
+
+def test_decode_security_stdout_odd_length_passthrough():
+    """奇数长度 hex 串不反解（避免误伤）。"""
+    assert accs.decode_security_stdout("abc") == "abc"
+
+
+def test_read_keychain_blob_handles_hex_output(monkeypatch):
+    """_read_keychain_blob 走 security hex 输出路径时应反解为 JSON 串。"""
+    payload = '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-via"}}'
+    hexed = payload.encode("utf-8").hex()
+
+    class FakeProc:
+        returncode = 0
+        stdout = hexed + "\n"
+
+    monkeypatch.setattr(accs.subprocess, "run", lambda *a, **kw: FakeProc())
+    blob = accs._read_keychain_blob()
+    assert blob == payload
+    assert accs._token_fingerprint(blob) == "sk-ant-oat01-via"
+
+
+# ────────────────── ensure_keychain_intact (自愈) ──────────────────
+
+
+def _make_account_dir(tmp_path, files: dict[str, dict]) -> str:
+    """在 tmp_path 下造 saved accounts 目录，返回目录路径。
+    files = {name: dict_to_dump_as_json}。
+    """
+    d = tmp_path / "accounts"
+    d.mkdir()
+    for name, payload in files.items():
+        (d / f"{name}.json").write_text(json.dumps(payload))
+    return str(d)
+
+
+def test_ensure_keychain_intact_no_op_when_blob_complete(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-ok"}}')
+    write_calls = []
+    monkeypatch.setattr(accs, "_write_keychain_blob",
+                        lambda blob: write_calls.append(blob) or (True, ""))
+    status, name = accs.ensure_keychain_intact()
+    assert status == "ok"
+    assert name is None
+    assert write_calls == []  # 完整时不应写
+
+
+def test_ensure_keychain_intact_restores_from_last_switch_to(monkeypatch, tmp_path):
+    """blob 缺 claudeAiOauth → 优先用 state.last_switch_to 恢复。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "reg": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-reg-tok"}, "mcpOAuth": {"x": 1}},
+        "via": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-via-tok"}},
+    }))
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"last_switch_to": "reg"}))
+    monkeypatch.setattr(accs, "STATE_FILE", str(state_file))
+    monkeypatch.setattr(accs, "STATE_DIR", str(tmp_path))
+
+    # 模拟 wiped keychain（只有 mcpOAuth）
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: '{"mcpOAuth": {"x": 1}}')
+    written = {}
+
+    def fake_write(blob):
+        written["blob"] = blob
+        return (True, "")
+    monkeypatch.setattr(accs, "_write_keychain_blob", fake_write)
+
+    status, name = accs.ensure_keychain_intact()
+    assert status == "restored"
+    assert name == "reg"
+    # 恢复用的 blob 应来自 reg.json
+    assert "sk-ant-oat01-reg-tok" in written["blob"]
+
+
+def test_ensure_keychain_intact_falls_back_to_newest_when_no_state(monkeypatch, tmp_path):
+    """state 里没有 last_switch_to → 用 mtime 最新的 saved 文件。"""
+    acc_dir = _make_account_dir(tmp_path, {
+        "old": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-old"}},
+        "new": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-new"}},
+    })
+    # 让 new.json 的 mtime 比 old.json 新
+    os.utime(os.path.join(acc_dir, "old.json"), (time.time() - 3600, time.time() - 3600))
+    os.utime(os.path.join(acc_dir, "new.json"), (time.time(), time.time()))
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", acc_dir)
+    monkeypatch.setattr(accs, "STATE_FILE", str(tmp_path / "no_state.json"))  # 不存在
+    monkeypatch.setattr(accs, "STATE_DIR", str(tmp_path))
+
+    monkeypatch.setattr(accs, "_read_keychain_blob", lambda: None)
+    written = {}
+
+    def _w(blob):
+        written.setdefault("blob", blob)
+        return (True, "")
+    monkeypatch.setattr(accs, "_write_keychain_blob", _w)
+
+    status, name = accs.ensure_keychain_intact()
+    assert status == "restored"
+    assert name == "new"
+    assert "sk-ant-oat01-new" in written["blob"]
+
+
+def test_ensure_keychain_intact_no_active_when_dir_empty(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", str(tmp_path / "empty"))
+    os.makedirs(str(tmp_path / "empty"))
+    monkeypatch.setattr(accs, "STATE_FILE", str(tmp_path / "s.json"))
+    monkeypatch.setattr(accs, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(accs, "_read_keychain_blob", lambda: None)
+    monkeypatch.setattr(accs, "_write_keychain_blob",
+                        lambda blob: (_ for _ in ()).throw(AssertionError("should not write")))
+    status, name = accs.ensure_keychain_intact()
+    assert status == "no_active"
+    assert name is None
+
+
+def test_ensure_keychain_intact_skips_saved_files_without_oauth(monkeypatch, tmp_path):
+    """saved 文件本身不含 claudeAiOauth 的应该被跳过。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "broken": {"mcpOAuth": {"x": 1}},  # 缺 claudeAiOauth
+        "good": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-good"}},
+    }))
+    # state 指向 broken，应该跳过去用 good
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"last_switch_to": "broken"}))
+    monkeypatch.setattr(accs, "STATE_FILE", str(state_file))
+    monkeypatch.setattr(accs, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(accs, "_read_keychain_blob", lambda: None)
+    written = {}
+
+    def _w(blob):
+        written.setdefault("blob", blob)
+        return (True, "")
+    monkeypatch.setattr(accs, "_write_keychain_blob", _w)
+    status, name = accs.ensure_keychain_intact()
+    assert status == "restored"
+    assert name == "good"
+    assert "sk-ant-oat01-good" in written["blob"]
+
+
+def test_ensure_keychain_intact_propagates_write_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "reg": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-reg"}},
+    }))
+    monkeypatch.setattr(accs, "STATE_FILE", str(tmp_path / "s.json"))
+    monkeypatch.setattr(accs, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(accs, "_read_keychain_blob", lambda: None)
+    monkeypatch.setattr(accs, "_write_keychain_blob",
+                        lambda blob: (False, "permission denied"))
+    status, msg = accs.ensure_keychain_intact()
+    assert status == "error"
+    assert "permission" in msg
+
