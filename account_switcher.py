@@ -1,14 +1,20 @@
 """
-多 Claude Max 账户智能切换。
+多 Claude Max 账户智能切换 + 内置账户管理（save / use / list / remove）。
 
 工作原理
 ========
 
-`claude-switch`（用户本机的 bash 脚本）已经把每个账户的 OAuth 凭证存到
-`~/.claude/accounts/<name>.json`，里面明文有 accessToken。**我们直接用每个
-账户的 token 各发一次 1-token haiku 请求**，从响应 header 读取那个账户的
+`save_current_account(name)` 把当前 keychain 凭证 + ~/.claude.json 的身份
+（`oauthAccount` + `userID`）一起 stash 到 `~/.claude/accounts/<name>.json`，
+里面明文有 accessToken。**我们直接用每个账户的 token 各发一次 1-token haiku
+请求**，从响应 header 读取那个账户的
 `anthropic-ratelimit-unified-5h-utilization` / `-7d-utilization` / `-5h-reset` /
 `-7d-reset`，就拿到了"全景"——不用真切到 keychain 就能比较所有账户。
+
+切换 (`use_account`) 必须同时换 keychain + ~/.claude.json.oauthAccount，否则
+Claude CLI 启动会发现 token 关联账户 ≠ oauthAccount.accountUuid → 触发 re-login
+把 keychain 写回旧账户（这是 2026-05-25 抓到的根因）。本模块取代了老的
+`~/bin/claude-switch` bash 脚本，全 Python，CLI 用法见文件末尾 `__main__`。
 
 打分（越高越优先）::
 
@@ -63,6 +69,18 @@ from typing import Callable, Optional
 ACCOUNTS_DIR = os.path.expanduser("~/.claude/accounts")
 STATE_DIR = os.path.expanduser("~/.feishu-claude")
 STATE_FILE = os.path.join(STATE_DIR, "account_switcher_state.json")
+
+# Claude CLI 的"当前身份"快照，跟 keychain token 是两份独立 state。
+# 切账户必须同步这俩，否则 CLI 启动会比对 oauthAccount.accountUuid vs token 关联的
+# 真实账户，发现 mismatch 触发 re-login 把 keychain 写回旧账户——
+# 表现为「切到 reg 之后又被打回 via」。
+IDENTITY_PATH = os.path.expanduser("~/.claude.json")
+# 需要跟着 keychain 一起搬的 ~/.claude.json top-level 字段
+_IDENTITY_KEYS = ("oauthAccount", "userID")
+# saved account 文件的 schema_version：v2 多了 _meta.identity，v1 = 纯 OAuth blob
+_SCHEMA_VERSION = 2
+# keychain 真正认的 top-level keys（写 keychain 前用 _strip_meta 过滤掉 _meta）
+_KEYCHAIN_TOPLEVEL = ("claudeAiOauth", "mcpOAuth")
 
 # 探测 API endpoint
 _API_URL = "https://api.anthropic.com/v1/messages"
@@ -148,6 +166,7 @@ def list_account_files() -> list[str]:
 
 
 def _load_account_blob(name: str) -> Optional[dict]:
+    """读 ~/.claude/accounts/<name>.json 全 dict（含 _meta）。"""
     path = os.path.join(ACCOUNTS_DIR, f"{name}.json")
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -156,6 +175,62 @@ def _load_account_blob(name: str) -> Optional[dict]:
         return None
     except json.JSONDecodeError:
         return None
+
+
+def _strip_meta(blob: dict) -> dict:
+    """剥掉 _meta，只保留 keychain 真正认的 top-level keys。
+    saved file 里 _meta.identity 是给 ~/.claude.json 用的，不应该塞进 keychain。"""
+    return {k: v for k, v in blob.items() if k in _KEYCHAIN_TOPLEVEL}
+
+
+def _account_identity(blob: dict) -> Optional[dict]:
+    """返回 saved file 里的 identity dict（含 oauthAccount / userID），无则 None。"""
+    meta = blob.get("_meta") or {}
+    ident = meta.get("identity") or {}
+    if not ident:
+        return None
+    return ident
+
+
+def _read_identity() -> Optional[dict]:
+    """从 ~/.claude.json 抠出 Claude CLI 关心的身份字段。"""
+    try:
+        with open(IDENTITY_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    out = {k: d.get(k) for k in _IDENTITY_KEYS if k in d}
+    return out or None
+
+
+def _patch_identity(ident: Optional[dict]) -> tuple[bool, str]:
+    """把 ident (含 oauthAccount + userID) atomic 写回 ~/.claude.json。
+
+    `~/.claude.json` 是 200KB+ 的 settings/cache 大文件，绝大部分字段必须保留——
+    只覆盖 _IDENTITY_KEYS 里的几个字段。
+    """
+    if not ident:
+        return True, "identity empty (no-op)"
+    try:
+        with open(IDENTITY_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return False, f"read {IDENTITY_PATH}: {e}"
+    changed = False
+    for k in _IDENTITY_KEYS:
+        if k in ident and d.get(k) != ident[k]:
+            d[k] = ident[k]
+            changed = True
+    if not changed:
+        return True, "identity already in sync"
+    try:
+        tmp = IDENTITY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, IDENTITY_PATH)
+        return True, "identity patched"
+    except OSError as e:
+        return False, f"write {IDENTITY_PATH}: {e}"
 
 
 def load_account(name: str) -> Optional[Account]:
@@ -303,16 +378,25 @@ def ensure_keychain_intact() -> tuple[str, Optional[str]]:
         path = os.path.join(ACCOUNTS_DIR, f"{name}.json")
         try:
             with open(path, "r", encoding="utf-8") as f:
-                raw = f.read()
-            d = json.loads(raw)
+                d = json.load(f)
         except Exception:
             continue
         if not d.get("claudeAiOauth", {}).get("accessToken"):
             continue
-        ok, msg = _write_keychain_blob(raw)
-        if ok:
-            return ("restored", name)
-        return ("error", msg)
+        # strip _meta（keychain 不认识，可能 confuse CLI）
+        kc_blob = json.dumps(_strip_meta(d))
+        ok, msg = _write_keychain_blob(kc_blob)
+        if not ok:
+            return ("error", msg)
+        # 同步 identity 到 ~/.claude.json，避免 CLI 启动 mismatch 触发 re-login
+        ident = _account_identity(d)
+        if ident:
+            ident_ok, ident_msg = _patch_identity(ident)
+            if not ident_ok:
+                # identity patch 失败不算致命——keychain 已恢复，CLI 顶多 re-login
+                # 一次。返回 restored 但带上 warn 信息。
+                return ("restored", f"{name} (identity patch warn: {ident_msg})")
+        return ("restored", name)
 
     return ("no_active", None)
 
@@ -611,31 +695,185 @@ def decide(
     return None
 
 
-# ── 切换执行（claude-switch use <name>）──────────────────────────
+# ── 内置账户管理：save / use / list / remove（替换老的 ~/bin/claude-switch）──
 
 
-def _run_claude_switch_use(name: str) -> tuple[bool, str]:
-    """调 claude-switch use <name>。返回 (success, message)。"""
-    # 走绝对路径——cc-lark 起 .app 时 PATH 可能没有 ~/bin
-    candidates = [
-        os.path.expanduser("~/bin/claude-switch"),
-        "/usr/local/bin/claude-switch",
-        "/opt/homebrew/bin/claude-switch",
-        "claude-switch",  # PATH 兜底
-    ]
-    cmd_path = next((c for c in candidates if c == "claude-switch" or os.path.isfile(c)), None)
-    if cmd_path is None:
-        return False, "claude-switch not found"
+_VALID_NAME_RE = __import__("re").compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_name(name: str) -> Optional[str]:
+    if not name:
+        return "name required"
+    if not _VALID_NAME_RE.match(name):
+        return "name must match [A-Za-z0-9._-]+"
+    return None
+
+
+def save_current_account(name: str, *, overwrite: bool = True) -> tuple[bool, str]:
+    """把当前 keychain 凭证 + ~/.claude.json identity 一起 stash 到
+    ~/.claude/accounts/<name>.json（schema v2）。
+
+    返回 (ok, message_or_summary)。
+    """
+    err = _validate_name(name)
+    if err:
+        return False, err
+    blob_str = _read_keychain_blob()
+    if not blob_str:
+        return False, "keychain has no Claude credentials (run `claude /login` first)"
     try:
-        r = subprocess.run(
-            [cmd_path, "use", name],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception as e:
-        return False, f"exec failed: {e}"
-    if r.returncode != 0:
-        return False, (r.stderr or r.stdout or "unknown error").strip()
-    return True, (r.stdout or "").strip()
+        kc = json.loads(blob_str)
+    except json.JSONDecodeError as e:
+        return False, f"keychain blob malformed: {e}"
+    if not kc.get("claudeAiOauth", {}).get("accessToken"):
+        return False, "keychain blob has no claudeAiOauth.accessToken"
+
+    target = os.path.join(ACCOUNTS_DIR, f"{name}.json")
+    if os.path.exists(target) and not overwrite:
+        return False, f"{name} already saved (pass overwrite=True to replace)"
+
+    payload = {k: v for k, v in kc.items() if k in _KEYCHAIN_TOPLEVEL}
+    ident = _read_identity()
+    payload["_meta"] = {
+        "schema_version": _SCHEMA_VERSION,
+        "saved_at": int(time.time()),
+        "identity": ident or None,
+    }
+
+    try:
+        os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+        os.chmod(ACCOUNTS_DIR, 0o700)
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except OSError as e:
+        return False, f"write {target}: {e}"
+
+    oa = (ident or {}).get("oauthAccount") or {}
+    summary_parts = []
+    sub = kc["claudeAiOauth"].get("subscriptionType")
+    tier = kc["claudeAiOauth"].get("rateLimitTier")
+    if sub:
+        summary_parts.append(sub)
+    if tier:
+        summary_parts.append(tier)
+    if oa.get("emailAddress"):
+        summary_parts.append(oa["emailAddress"])
+    if not ident:
+        summary_parts.append("⚠️ identity missing")
+    return True, f"saved {name}: {' / '.join(summary_parts) or '(no metadata)'}"
+
+
+def use_account(name: str) -> tuple[bool, str]:
+    """切换到 saved 账户。同步写 keychain + ~/.claude.json identity。
+
+    取代老 `claude-switch use <name>`——根因在 identity 也得跟着切，否则 Claude CLI
+    启动时 oauthAccount.accountUuid != token 关联账户 → 触发 re-login → 回滚 keychain。
+    """
+    err = _validate_name(name)
+    if err:
+        return False, err
+    blob = _load_account_blob(name)
+    if not blob:
+        return False, f"no saved account '{name}' (use `account_switcher.py list`)"
+    if not blob.get("claudeAiOauth", {}).get("accessToken"):
+        return False, f"{name} has no claudeAiOauth.accessToken"
+
+    # 1) 写 keychain（strip _meta）
+    kc_blob = json.dumps(_strip_meta(blob))
+    ok, msg = _write_keychain_blob(kc_blob)
+    if not ok:
+        return False, f"keychain write failed: {msg}"
+
+    # 2) 同步 identity 到 ~/.claude.json
+    ident = _account_identity(blob)
+    ident_warn = ""
+    if ident:
+        ident_ok, ident_msg = _patch_identity(ident)
+        if not ident_ok:
+            ident_warn = f" (identity patch warn: {ident_msg})"
+    else:
+        ident_warn = " (⚠️ identity missing — CLI may force re-login; save again from this account to fix)"
+
+    sub = blob["claudeAiOauth"].get("subscriptionType") or ""
+    tier = blob["claudeAiOauth"].get("rateLimitTier") or ""
+    return True, f"switched to {name} ({sub}/{tier}){ident_warn}"
+
+
+def remove_account(name: str) -> tuple[bool, str]:
+    err = _validate_name(name)
+    if err:
+        return False, err
+    target = os.path.join(ACCOUNTS_DIR, f"{name}.json")
+    if not os.path.exists(target):
+        return False, f"no saved account '{name}'"
+    try:
+        os.remove(target)
+    except OSError as e:
+        return False, f"remove {target}: {e}"
+    return True, f"removed {name}"
+
+
+def list_accounts_summary() -> list[dict]:
+    """返回每个账户的简单摘要，用于 CLI list / 调试。"""
+    out = []
+    active = current_account_name()
+    for n in list_account_files():
+        blob = _load_account_blob(n) or {}
+        oa = (_account_identity(blob) or {}).get("oauthAccount") or {}
+        kc = blob.get("claudeAiOauth", {})
+        out.append({
+            "name": n,
+            "active": n == active,
+            "subscription": kc.get("subscriptionType") or "",
+            "tier": kc.get("rateLimitTier") or "",
+            "email": oa.get("emailAddress") or "",
+            "has_identity": bool(_account_identity(blob)),
+        })
+    return out
+
+
+def auto_stash_identity_for_current() -> tuple[str, Optional[str]]:
+    """启动期补全：当前 keychain 指向哪个 saved 账户，如果它没存 identity，
+    把当前 ~/.claude.json 的 identity 抠出来补进去。
+    用户手动 login 切到 reg 干了一阵子，下次 cc-lark 启动就能自动把当时的
+    reg identity stash 回 reg.json，不需要用户手动 save。
+
+    返回 (status, name)：
+        ("noop", None)        没匹配 / 已有 identity
+        ("stashed", name)     补全成功
+        ("error", msg)        异常
+    """
+    name = current_account_name()
+    if not name:
+        return ("noop", None)
+    blob = _load_account_blob(name)
+    if not blob:
+        return ("noop", None)
+    if _account_identity(blob):
+        return ("noop", None)
+    ident = _read_identity()
+    if not ident or not (ident.get("oauthAccount") or {}).get("accountUuid"):
+        return ("noop", None)
+    # 写回（保留 keychain blob 原样 + 加 _meta.identity）
+    payload = {k: v for k, v in blob.items() if k in _KEYCHAIN_TOPLEVEL}
+    payload["_meta"] = {
+        "schema_version": _SCHEMA_VERSION,
+        "saved_at": int(time.time()),
+        "identity": ident,
+    }
+    path = os.path.join(ACCOUNTS_DIR, f"{name}.json")
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError as e:
+        return ("error", f"write {path}: {e}")
+    return ("stashed", name)
 
 
 # ── 状态持久化（仅冷却时间戳）─────────────────────────────────────
@@ -767,10 +1005,16 @@ class AccountSwitcher:
         if target is None or target == current:
             return None
 
-        # 5) 执行切换
+        # 5) 切换前先把当前账户的 identity stash 回 saved file（自动维持新鲜度）
+        if current:
+            stash_status, stash_msg = auto_stash_identity_for_current()
+            if stash_status == "error":
+                print(f"[switcher] identity auto-stash 失败: {stash_msg}", flush=True)
+
+        # 6) 执行切换（内置 use_account：keychain + ~/.claude.json identity 一起切）
         cur_acc = accounts.get(current) if current else None
         tgt_acc = accounts[target]
-        ok, msg = _run_claude_switch_use(target)
+        ok, msg = use_account(target)
         if not ok:
             self._notify(
                 f"⚠️ 账户切换失败：{current or '(unknown)'} → {target}\n  原因：{msg}"
@@ -782,8 +1026,10 @@ class AccountSwitcher:
         state["last_switch_to"] = target
         _save_state(state)
 
-        # 6) 通报
+        # 7) 通报
         reason_lines = self._switch_reason_lines(cur_acc, tgt_acc)
+        if "identity missing" in msg:
+            reason_lines.append(f"  ⚠️ {msg.split('(', 1)[1].rstrip(')')}")
         text = "🔁 **Claude 账户已自动切换**\n" + "\n".join(reason_lines)
         self._notify(text)
         return target
@@ -817,3 +1063,87 @@ class AccountSwitcher:
             self.send_fn(text)
         except Exception as e:
             print(f"[switcher] notify failed: {e}\n{text}", flush=True)
+
+
+# ── CLI 入口（取代 ~/bin/claude-switch）──────────────────────────
+
+
+def _cli_main(argv: list[str]) -> int:
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="claude-switch",
+        description="Manage Claude Max accounts (keychain + ~/.claude.json identity).",
+    )
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("save", help="Save current logged-in account as <name>")
+    sp.add_argument("name")
+    sp.add_argument("--no-overwrite", action="store_true")
+
+    su = sub.add_parser("use", help="Activate saved account <name>")
+    su.add_argument("name")
+    su.add_parser = sub.add_parser  # appease linters
+
+    sub.add_parser("list", help="List saved accounts (* = active)")
+    sub.add_parser("current", help="Show currently active saved account")
+    sub.add_parser("path", help="Print accounts storage directory")
+
+    sr = sub.add_parser("rm", help="Delete a saved account file")
+    sr.add_argument("name")
+
+    args = p.parse_args(argv)
+
+    if args.cmd in (None, "help"):
+        p.print_help()
+        return 0
+
+    if args.cmd == "save":
+        ok, msg = save_current_account(args.name, overwrite=not args.no_overwrite)
+        print(msg)
+        return 0 if ok else 1
+
+    if args.cmd == "use":
+        ok, msg = use_account(args.name)
+        print(msg)
+        if ok:
+            print("→ restart any running Claude Code session to pick up the new token.")
+        return 0 if ok else 1
+
+    if args.cmd == "list":
+        rows = list_accounts_summary()
+        if not rows:
+            print("(no saved accounts — use `save <name>` to add one)")
+            return 0
+        for r in rows:
+            mark = "*" if r["active"] else " "
+            parts = [r["subscription"], r["tier"], r["email"]]
+            tail = " / ".join(p_ for p_ in parts if p_)
+            warn = "" if r["has_identity"] else "  ⚠️ no identity (save again when this is the active account)"
+            print(f"{mark} {r['name']:<20} {tail}{warn}")
+        return 0
+
+    if args.cmd == "current":
+        cur = current_account_name()
+        if not cur:
+            print("(no active credentials / unsaved account)")
+            return 1
+        print(cur)
+        return 0
+
+    if args.cmd == "path":
+        print(ACCOUNTS_DIR)
+        return 0
+
+    if args.cmd == "rm":
+        ok, msg = remove_account(args.name)
+        print(msg)
+        return 0 if ok else 1
+
+    p.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_cli_main(sys.argv[1:]))
+

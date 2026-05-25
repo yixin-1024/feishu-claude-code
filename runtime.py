@@ -153,8 +153,9 @@ def start_quota_watcher(
 
     enable_account_switcher：True 时同时启用多账户智能切换。每次 poll 之后
     探测所有 ~/.claude/accounts/*.json、按 5h+7d headroom 打分、必要时调
-    claude-switch use <name> 切到更优账户。冷却 switcher_cooldown_sec 内不
-    连切。正在跑 claude 子进程时推迟到下一轮。
+    account_switcher.use_account(name) 切到更优账户（keychain + ~/.claude.json
+    identity 一起搬）。冷却 switcher_cooldown_sec 内不连切。正在跑 claude
+    子进程时推迟到下一轮。
     """
     if _bot_loop is None or not _bots:
         raise RuntimeError("runtime not configured; call configure() first")
@@ -210,9 +211,10 @@ def start_quota_watcher(
 
     # 启动期 keychain 自愈：cc-lark /restart 周期里观察到 Claude CLI / MCP 子系统
     # 偶发把 keychain blob 覆写为只剩 mcpOAuth，丢掉 claudeAiOauth。这里先自检
-    # 一次，缺失就从 saved 账户文件恢复，并 Lark 通报 owner。
+    # 一次，缺失就从 saved 账户文件恢复（同时 patch ~/.claude.json identity），
+    # 并 Lark 通报 owner。
     try:
-        from account_switcher import ensure_keychain_intact
+        from account_switcher import ensure_keychain_intact, auto_stash_identity_for_current
         status, name = ensure_keychain_intact()
         if status == "restored":
             log("global", "switcher", "warn",
@@ -228,6 +230,19 @@ def start_quota_watcher(
             _send("⚠️ keychain 缺 `claudeAiOauth` 且 `~/.claude/accounts/` 没有可用 saved 账户——请手动 `claude` 登录或 `claude-switch use <name>`")
         elif status == "error":
             log("global", "switcher", "error", f"keychain 自愈失败: {name}")
+
+        # 顺便：当前账户的 saved file 如果没存 identity，把 ~/.claude.json 抠一份补上。
+        # 用户手动 login 切到 reg 干了一阵子，cc-lark 启动时就能自动把当时的 reg
+        # identity stash 回 reg.json，下次切换才丝滑。
+        try:
+            st, nm = auto_stash_identity_for_current()
+            if st == "stashed":
+                log("global", "switcher", "info",
+                    f"identity 已从 ~/.claude.json 自动 stash 回 {nm!r}")
+            elif st == "error":
+                log("global", "switcher", "warn", f"identity auto-stash 失败: {nm}")
+        except Exception as e:
+            log("global", "switcher", "warn", f"identity auto-stash 异常: {e}")
     except Exception as e:
         log("global", "switcher", "error", f"keychain 自愈异常: {e}")
 

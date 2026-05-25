@@ -1,7 +1,6 @@
-"""account_switcher 单测：打分 / 硬筛 / 决策 / 冷却 / 切换执行。
+"""account_switcher 单测：打分 / 硬筛 / 决策 / 冷却 / 切换执行 / save / use / identity 同步。
 
-关键路径全部 mock 掉外部依赖（HTTP probe、keychain、claude-switch 子进程），
-跑纯函数 + 流程编排。
+关键路径全部 mock 掉外部依赖（HTTP probe、keychain、~/.claude.json），跑纯函数 + 流程编排。
 """
 
 import json
@@ -232,7 +231,7 @@ def test_maybe_switch_no_action_when_current_healthy(isolated_state):
     }
     with patch.object(accs, "probe_all", return_value=fake_probes), \
          patch.object(accs, "current_account_name", return_value="cur"), \
-         patch.object(accs, "_run_claude_switch_use") as sw_call:
+         patch.object(accs, "use_account") as sw_call:
         assert sw.maybe_switch() is None
         sw_call.assert_not_called()
     assert sent == []
@@ -247,7 +246,8 @@ def test_maybe_switch_executes_and_notifies(isolated_state):
     }
     with patch.object(accs, "probe_all", return_value=fake_probes), \
          patch.object(accs, "current_account_name", return_value="cur"), \
-         patch.object(accs, "_run_claude_switch_use", return_value=(True, "ok")) as sw_call:
+         patch.object(accs, "auto_stash_identity_for_current", return_value=("noop", None)), \
+         patch.object(accs, "use_account", return_value=(True, "switched to alt (team/default_claude_max_5x)")) as sw_call:
         out = sw.maybe_switch()
     assert out == "alt"
     sw_call.assert_called_once_with("alt")
@@ -267,7 +267,8 @@ def test_maybe_switch_handles_claude_switch_failure(isolated_state):
     }
     with patch.object(accs, "probe_all", return_value=fake_probes), \
          patch.object(accs, "current_account_name", return_value="cur"), \
-         patch.object(accs, "_run_claude_switch_use", return_value=(False, "boom")):
+         patch.object(accs, "auto_stash_identity_for_current", return_value=("noop", None)), \
+         patch.object(accs, "use_account", return_value=(False, "boom")):
         out = sw.maybe_switch()
     assert out is None
     assert any("失败" in t for t in sent)
@@ -557,4 +558,264 @@ def test_ensure_keychain_intact_propagates_write_error(monkeypatch, tmp_path):
     status, msg = accs.ensure_keychain_intact()
     assert status == "error"
     assert "permission" in msg
+
+
+def test_ensure_keychain_intact_strips_meta_before_writing_keychain(monkeypatch, tmp_path):
+    """v2 saved file 含 _meta，写 keychain 前必须 strip 掉，否则可能 confuse CLI。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "reg": {
+            "claudeAiOauth": {"accessToken": "sk-ant-oat01-reg-tok"},
+            "mcpOAuth": {"foo": "bar"},
+            "_meta": {"schema_version": 2, "identity": {
+                "oauthAccount": {"accountUuid": "uuid-reg", "emailAddress": "reg@example.com"},
+                "userID": "uid-reg",
+            }},
+        },
+    }))
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"last_switch_to": "reg"}))
+    monkeypatch.setattr(accs, "STATE_FILE", str(state_file))
+    monkeypatch.setattr(accs, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(accs, "_read_keychain_blob", lambda: None)
+
+    written = {}
+    monkeypatch.setattr(accs, "_write_keychain_blob",
+                        lambda blob: (written.setdefault("blob", blob), (True, ""))[1])
+
+    # patch_identity 也 mock，不真碰 ~/.claude.json
+    patched = {}
+    monkeypatch.setattr(accs, "_patch_identity",
+                        lambda ident: (patched.setdefault("ident", ident), (True, "ok"))[1])
+
+    status, name = accs.ensure_keychain_intact()
+    assert status == "restored"
+    # 写到 keychain 的 blob 不应含 _meta
+    parsed = json.loads(written["blob"])
+    assert "_meta" not in parsed
+    assert parsed["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-reg-tok"
+    assert parsed["mcpOAuth"] == {"foo": "bar"}
+    # identity 应该被传去 patch ~/.claude.json
+    assert patched["ident"]["oauthAccount"]["accountUuid"] == "uuid-reg"
+    assert patched["ident"]["userID"] == "uid-reg"
+
+
+# ────────────────── save_current_account / use_account / identity ──────────────────
+
+
+def test_save_current_account_writes_schema_v2_with_identity(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", str(tmp_path / "accounts"))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({
+                            "claudeAiOauth": {
+                                "accessToken": "sk-ant-oat01-foo",
+                                "subscriptionType": "team",
+                                "rateLimitTier": "default_claude_max_5x",
+                            },
+                            "mcpOAuth": {"x": 1},
+                        }))
+    ident = {
+        "oauthAccount": {"accountUuid": "uuid-foo", "emailAddress": "foo@example.com"},
+        "userID": "uid-foo",
+    }
+    monkeypatch.setattr(accs, "_read_identity", lambda: ident)
+
+    ok, msg = accs.save_current_account("foo")
+    assert ok, msg
+    path = os.path.join(accs.ACCOUNTS_DIR, "foo.json")
+    saved = json.loads(open(path).read())
+    assert saved["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-foo"
+    assert saved["mcpOAuth"] == {"x": 1}
+    assert saved["_meta"]["schema_version"] == 2
+    assert saved["_meta"]["identity"]["oauthAccount"]["accountUuid"] == "uuid-foo"
+    assert "foo@example.com" in msg
+
+
+def test_save_current_account_warns_when_identity_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", str(tmp_path / "accounts"))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-bar"}}))
+    monkeypatch.setattr(accs, "_read_identity", lambda: None)
+
+    ok, msg = accs.save_current_account("bar")
+    assert ok
+    assert "identity missing" in msg
+    saved = json.loads(open(os.path.join(accs.ACCOUNTS_DIR, "bar.json")).read())
+    assert saved["_meta"]["identity"] is None
+
+
+def test_save_current_account_rejects_invalid_name(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", str(tmp_path / "accounts"))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": "x"}}))
+    monkeypatch.setattr(accs, "_read_identity", lambda: None)
+    ok, msg = accs.save_current_account("bad name with spaces")
+    assert not ok and "name must" in msg
+
+
+def test_save_current_account_rejects_empty_keychain(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", str(tmp_path / "accounts"))
+    monkeypatch.setattr(accs, "_read_keychain_blob", lambda: None)
+    ok, msg = accs.save_current_account("foo")
+    assert not ok and "keychain" in msg
+
+
+def test_use_account_writes_keychain_and_patches_identity(monkeypatch, tmp_path):
+    """切到 reg：keychain 收 strip 过 _meta 的 blob；~/.claude.json 收 identity patch。"""
+    blob = {
+        "claudeAiOauth": {"accessToken": "sk-ant-oat01-reg", "subscriptionType": "team", "rateLimitTier": "t1"},
+        "mcpOAuth": {"a": 1},
+        "_meta": {"schema_version": 2, "identity": {
+            "oauthAccount": {"accountUuid": "uuid-reg"},
+            "userID": "uid-reg",
+        }},
+    }
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {"reg": blob}))
+    written_kc = {}
+    monkeypatch.setattr(accs, "_write_keychain_blob",
+                        lambda b: (written_kc.setdefault("blob", b), (True, ""))[1])
+    patched = {}
+    monkeypatch.setattr(accs, "_patch_identity",
+                        lambda ident: (patched.setdefault("ident", ident), (True, "ok"))[1])
+
+    ok, msg = accs.use_account("reg")
+    assert ok, msg
+    parsed = json.loads(written_kc["blob"])
+    assert "_meta" not in parsed
+    assert parsed["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-reg"
+    assert patched["ident"]["oauthAccount"]["accountUuid"] == "uuid-reg"
+
+
+def test_use_account_warns_when_identity_missing_in_saved_file(monkeypatch, tmp_path):
+    """v1 schema saved file 没 identity → use 仍写 keychain，但 msg 带 warn 且不 patch identity。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "old": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-old"}},
+    }))
+    monkeypatch.setattr(accs, "_write_keychain_blob", lambda b: (True, ""))
+    patch_calls = []
+    monkeypatch.setattr(accs, "_patch_identity",
+                        lambda ident: (patch_calls.append(ident), (True, "ok"))[1])
+    ok, msg = accs.use_account("old")
+    assert ok
+    assert "identity missing" in msg
+    assert patch_calls == []  # 没 identity 就不调 _patch_identity
+
+
+def test_use_account_unknown_name(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {}))
+    ok, msg = accs.use_account("ghost")
+    assert not ok and "no saved account" in msg
+
+
+def test_auto_stash_identity_writes_into_v1_file(monkeypatch, tmp_path):
+    """当前 keychain = 某 v1 saved 账户 + ~/.claude.json 有 identity → 自动 stash 回该文件。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "via": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-viatok"}},
+    }))
+    monkeypatch.setattr(accs, "current_account_name", lambda: "via")
+    monkeypatch.setattr(accs, "_read_identity", lambda: {
+        "oauthAccount": {"accountUuid": "uuid-via", "emailAddress": "via@example.com"},
+        "userID": "uid-via",
+    })
+    st, nm = accs.auto_stash_identity_for_current()
+    assert st == "stashed" and nm == "via"
+    saved = json.loads(open(os.path.join(accs.ACCOUNTS_DIR, "via.json")).read())
+    assert saved["_meta"]["identity"]["oauthAccount"]["accountUuid"] == "uuid-via"
+    # keychain blob 部分原样保留
+    assert saved["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-viatok"
+
+
+def test_auto_stash_identity_noop_when_already_has(monkeypatch, tmp_path):
+    """saved file 已带 identity → 不重复写。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "via": {
+            "claudeAiOauth": {"accessToken": "sk-ant-oat01-vtok"},
+            "_meta": {"identity": {"oauthAccount": {"accountUuid": "uuid-via"}, "userID": "uid"}},
+        },
+    }))
+    monkeypatch.setattr(accs, "current_account_name", lambda: "via")
+    monkeypatch.setattr(accs, "_read_identity", lambda: {"oauthAccount": {"accountUuid": "other"}})
+    st, _ = accs.auto_stash_identity_for_current()
+    assert st == "noop"
+    saved = json.loads(open(os.path.join(accs.ACCOUNTS_DIR, "via.json")).read())
+    # 没被覆盖
+    assert saved["_meta"]["identity"]["oauthAccount"]["accountUuid"] == "uuid-via"
+
+
+def test_auto_stash_identity_noop_when_no_current(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", str(tmp_path / "x"))
+    monkeypatch.setattr(accs, "current_account_name", lambda: None)
+    monkeypatch.setattr(accs, "_read_identity", lambda: {"oauthAccount": {"accountUuid": "u"}, "userID": "u"})
+    st, _ = accs.auto_stash_identity_for_current()
+    assert st == "noop"
+
+
+def test_patch_identity_atomic_partial_overwrite(monkeypatch, tmp_path):
+    """只覆盖 _IDENTITY_KEYS 这两个字段，其它字段原样保留。"""
+    ip = tmp_path / "claude.json"
+    ip.write_text(json.dumps({
+        "userID": "old-uid",
+        "oauthAccount": {"accountUuid": "old", "emailAddress": "old@x.com"},
+        "settings": {"theme": "dark"},   # 不该被动
+        "cachedStuff": [1, 2, 3],
+    }))
+    monkeypatch.setattr(accs, "IDENTITY_PATH", str(ip))
+    ok, msg = accs._patch_identity({
+        "oauthAccount": {"accountUuid": "new", "emailAddress": "new@x.com"},
+        "userID": "new-uid",
+    })
+    assert ok, msg
+    after = json.loads(ip.read_text())
+    assert after["userID"] == "new-uid"
+    assert after["oauthAccount"]["accountUuid"] == "new"
+    assert after["settings"] == {"theme": "dark"}  # 保留
+    assert after["cachedStuff"] == [1, 2, 3]
+
+
+def test_patch_identity_noop_when_already_in_sync(monkeypatch, tmp_path):
+    ip = tmp_path / "claude.json"
+    ip.write_text(json.dumps({"oauthAccount": {"accountUuid": "u"}, "userID": "uid"}))
+    monkeypatch.setattr(accs, "IDENTITY_PATH", str(ip))
+    mtime_before = os.path.getmtime(ip)
+    time.sleep(0.05)
+    ok, msg = accs._patch_identity({"oauthAccount": {"accountUuid": "u"}, "userID": "uid"})
+    assert ok and "in sync" in msg
+    # 文件没被重写
+    assert os.path.getmtime(ip) == mtime_before
+
+
+def test_strip_meta_keeps_only_keychain_keys():
+    blob = {
+        "claudeAiOauth": {"accessToken": "tok"},
+        "mcpOAuth": {"x": 1},
+        "_meta": {"identity": {"y": 2}},
+        "junk": "drop me",
+    }
+    out = accs._strip_meta(blob)
+    assert out == {"claudeAiOauth": {"accessToken": "tok"}, "mcpOAuth": {"x": 1}}
+
+
+def test_remove_account(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "foo": {"claudeAiOauth": {"accessToken": "t"}},
+    }))
+    ok, _ = accs.remove_account("foo")
+    assert ok
+    assert not os.path.exists(os.path.join(accs.ACCOUNTS_DIR, "foo.json"))
+    ok2, msg2 = accs.remove_account("foo")
+    assert not ok2 and "no saved" in msg2
+
+
+def test_list_accounts_summary_marks_active_and_identity(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "via": {
+            "claudeAiOauth": {"accessToken": "via-tok", "subscriptionType": "team", "rateLimitTier": "t1"},
+            "_meta": {"identity": {"oauthAccount": {"emailAddress": "via@x.com"}, "userID": "u"}},
+        },
+        "reg": {"claudeAiOauth": {"accessToken": "reg-tok"}},  # v1, no identity
+    }))
+    monkeypatch.setattr(accs, "current_account_name", lambda: "via")
+    rows = {r["name"]: r for r in accs.list_accounts_summary()}
+    assert rows["via"]["active"] is True and rows["via"]["has_identity"] is True
+    assert rows["via"]["email"] == "via@x.com"
+    assert rows["reg"]["active"] is False and rows["reg"]["has_identity"] is False
 
