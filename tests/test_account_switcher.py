@@ -110,6 +110,159 @@ def test_evaluate_probe_error_unusable():
     assert any("auth" in r for r in a.reasons)
 
 
+# ────────────────── probe 401 自愈 ──────────────────
+
+
+def _fake_urlopen_factory(responses):
+    """造一个 urlopen mock，依次按 responses 列表返回。
+
+    每项可以是：
+      dict {"headers": {...}}                          → 模拟成功响应
+      dict {"http_code": 401, "headers": {...}}       → 模拟 HTTPError
+    """
+    calls = {"n": 0}
+
+    class FakeResp:
+        def __init__(self, headers):
+            self.headers = headers
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return b'{"id":"x"}'
+
+    def _open(req, *_a, **_kw):
+        import urllib.error
+        idx = calls["n"]
+        calls["n"] += 1
+        if idx >= len(responses):
+            raise RuntimeError(f"unexpected extra urlopen call #{idx}")
+        r = responses[idx]
+        code = r.get("http_code")
+        if code is None:
+            return FakeResp(r["headers"])
+        # 模拟 HTTPError
+        err = urllib.error.HTTPError(
+            url="x", code=code, msg="err",
+            hdrs=r.get("headers") or {}, fp=None,
+        )
+        # urlopen 抛 HTTPError
+        raise err
+
+    return _open, calls
+
+
+def test_probe_one_force_refreshes_on_401(monkeypatch, tmp_path):
+    """access_token 本地未过期但服务端 401 → force refresh + retry probe 拿到 quota。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "reg": {"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-revoked",
+            "refreshToken": "rt-old",
+            "expiresAt": int((time.time() + 3 * 3600) * 1000),
+        }},
+    }))
+
+    # mock OAuth refresh endpoint → 返回新 token
+    def fake_refresh(name, *, force=False):
+        # 模拟 refresh 成功，写新 token 回 reg.json
+        import json as _json
+        path = os.path.join(accs.ACCOUNTS_DIR, "reg.json")
+        d = _json.load(open(path))
+        d["claudeAiOauth"]["accessToken"] = "sk-ant-oat01-fresh"
+        d["claudeAiOauth"]["refreshToken"] = "rt-new"
+        d["claudeAiOauth"]["expiresAt"] = int((time.time() + 8 * 3600) * 1000)
+        with open(path, "w") as f:
+            _json.dump(d, f)
+        return (True, "ok")
+    refresh_calls = []
+    def _track(name, *, force=False):
+        refresh_calls.append((name, force))
+        return fake_refresh(name, force=force)
+    monkeypatch.setattr(accs, "_refresh_account_inplace", _track)
+
+    # 第一次 urlopen 401，第二次 200 + ratelimit headers
+    fake_open, _ = _fake_urlopen_factory([
+        {"http_code": 401, "headers": {}},
+        {"headers": {
+            "anthropic-ratelimit-unified-5h-utilization": "0.10",
+            "anthropic-ratelimit-unified-7d-utilization": "0.20",
+            "anthropic-ratelimit-unified-5h-status": "allowed",
+            "anthropic-ratelimit-unified-7d-status": "allowed",
+        }},
+    ])
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_open)
+
+    acc = accs.load_account("reg")
+    out = accs._probe_one(acc)
+    assert out.probe_error is None
+    assert out.u5h == 0.1 and out.u7d == 0.2
+    # 强制 refresh 被调过一次，且 force=True
+    assert refresh_calls == [("reg", True)]
+
+
+def test_probe_one_401_then_refresh_also_fails_reports_relogin(monkeypatch, tmp_path):
+    """access_token 401 + refresh_token 也被服务端废 → probe_error 明示需要重 login。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "reg": {"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-dead",
+            "refreshToken": "rt-dead",
+            "expiresAt": int((time.time() + 3 * 3600) * 1000),
+        }},
+    }))
+    monkeypatch.setattr(accs, "_refresh_account_inplace",
+                        lambda name, *, force=False: (False, "HTTP 400: invalid_grant"))
+
+    fake_open, _ = _fake_urlopen_factory([{"http_code": 401, "headers": {}}])
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_open)
+
+    acc = accs.load_account("reg")
+    out = accs._probe_one(acc)
+    assert out.probe_error is not None
+    assert "re-login" in out.probe_error
+    assert "invalid_grant" in out.probe_error
+
+
+def test_refresh_account_force_bypasses_fast_path(monkeypatch, tmp_path):
+    """force=True 时不应因为 expiresAt 还远就 short-circuit。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "reg": {"claudeAiOauth": {
+            "accessToken": "old",
+            "refreshToken": "rt",
+            "expiresAt": int((time.time() + 10 * 3600) * 1000),  # 还远着呢
+        }},
+    }))
+
+    # 不真打网络 — mock urlopen 给个新 token 响应
+    class _R:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return json.dumps({
+                "access_token": "new",
+                "refresh_token": "new-rt",
+                "expires_in": 3600,
+                "scope": "user:inference",
+            }).encode()
+    import urllib.request
+    called = {"n": 0}
+    def _open(req, *a, **k):
+        called["n"] += 1
+        return _R()
+    monkeypatch.setattr(urllib.request, "urlopen", _open)
+
+    ok, msg = accs._refresh_account_inplace("reg", force=True)
+    assert ok, msg
+    assert called["n"] == 1  # 真打了 OAuth endpoint
+    # 不强制时同等 expiresAt 会 short-circuit 不打
+    called["n"] = 0
+    ok2, msg2 = accs._refresh_account_inplace("reg")  # 默认 force=False
+    assert ok2 and "already refreshed" in msg2
+    assert called["n"] == 0
+
+
 # ────────────────── decide ──────────────────
 
 def test_decide_keeps_current_when_no_clear_winner():

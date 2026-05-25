@@ -411,7 +411,7 @@ _REFRESH_LOCKS: dict[str, threading.Lock] = {}
 _REFRESH_LOCKS_GUARD = threading.Lock()
 
 
-def _refresh_account_inplace(name: str) -> tuple[bool, str]:
+def _refresh_account_inplace(name: str, *, force: bool = False) -> tuple[bool, str]:
     """直接调 platform.claude.com OAuth endpoint 用 refresh_token 续期。
     成功后**原子写回** ~/.claude/accounts/<name>.json（含轮换后的新 refresh_token）。
 
@@ -420,6 +420,11 @@ def _refresh_account_inplace(name: str) -> tuple[bool, str]:
 
     并发保护：同一 name 上锁，防止并发探测时两次 refresh 互相把对方刚换的 token
     作废。
+
+    force=True：跳过 "本地 expiresAt 还远着就视为已 refresh" 的 fast-path。
+    场景：访问 token 在本地看还没到期，但被 Anthropic 服务端单方面 revoke 了
+    （e.g. 用户在另一设备 login 了同账户、被人工 revoke），probe 收到 401 需要
+    强制 refresh 一次拿新 token；如果 refresh_token 也死了，让上层走重 login。
     """
     import urllib.request
     import urllib.error
@@ -437,10 +442,11 @@ def _refresh_account_inplace(name: str) -> tuple[bool, str]:
         if not old_rt:
             return False, "no refresh_token in account file"
 
-        # 已经被别的线程刷新过了？
-        exp = int(oauth.get("expiresAt") or 0)
-        if exp and exp / 1000 - time.time() > _TOKEN_FRESH_GRACE_SEC:
-            return True, "already refreshed by concurrent probe"
+        # 已经被别的线程刷新过了？（force=True 时跳过这个 fast-path）
+        if not force:
+            exp = int(oauth.get("expiresAt") or 0)
+            if exp and exp / 1000 - time.time() > _TOKEN_FRESH_GRACE_SEC:
+                return True, "already refreshed by concurrent probe"
 
         body = json.dumps({
             "grant_type": "refresh_token",
@@ -538,20 +544,54 @@ def _probe_one(acc: Account) -> Account:
         method="POST",
     )
 
-    headers: dict
-    try:
-        ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, context=ctx, timeout=_PROBE_TIMEOUT_SEC) as resp:
-            headers = dict(resp.headers)
-    except urllib.error.HTTPError as e:
-        headers = dict(e.headers or {})
-        if e.code in (401, 403):
-            acc.probe_error = f"auth {e.code}"
-            return acc
-        # 429 等仍可能带着 rate-limit headers——继续解析
-    except Exception as e:
-        acc.probe_error = f"probe failed: {e}"
+    def _send_probe(token: str) -> tuple[Optional[dict], Optional[int], Optional[str]]:
+        """返回 (headers, http_code_if_error, err_msg_if_other)。"""
+        req2 = urllib.request.Request(
+            _API_URL,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": "oauth-2025-04-20",
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            ctx2 = ssl.create_default_context()
+            with urllib.request.urlopen(req2, context=ctx2, timeout=_PROBE_TIMEOUT_SEC) as r:
+                return dict(r.headers), None, None
+        except urllib.error.HTTPError as e:
+            return dict(e.headers or {}), e.code, None
+        except Exception as e:
+            return None, None, f"probe failed: {e}"
+
+    headers, http_code, err = _send_probe(acc.access_token)
+    if err is not None:
+        acc.probe_error = err
         return acc
+    if http_code in (401, 403):
+        # access_token 还没到本地 expiresAt 但服务端已废（典型场景：用户在 Claude
+        # CLI 里 /login 切了别的账户，旧 session 被 OAuth revoke）。强制 refresh
+        # 一次，若 refresh_token 也死了让上层走重 login 提示。
+        ok, refresh_err = _refresh_account_inplace(acc.name, force=True)
+        if not ok:
+            acc.probe_error = f"auth {http_code} + refresh failed ({refresh_err}) — needs re-login"
+            return acc
+        refreshed = load_account(acc.name)
+        if refreshed is None:
+            acc.probe_error = f"auth {http_code}, refresh ok but reload failed"
+            return acc
+        acc.access_token = refreshed.access_token
+        acc.expires_at_ms = refreshed.expires_at_ms
+        headers, http_code, err = _send_probe(acc.access_token)
+        if err is not None:
+            acc.probe_error = err
+            return acc
+        if http_code in (401, 403):
+            acc.probe_error = f"auth {http_code} even after force refresh — needs re-login"
+            return acc
+    # 429 等仍可能带着 rate-limit headers——继续解析（headers 已填）
 
     def h(key):
         return headers.get(key) or headers.get(key.lower()) or headers.get(key.replace("-", "_"))
