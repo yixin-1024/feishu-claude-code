@@ -762,12 +762,29 @@ async def _run_and_display(
                 heartbeat_task.cancel()
 
         if not success:
+            # claude_pty 撞用量上限 / API 错误时，会把崩溃前的 session id 挂在异常上
+            # （cc_session_id）。这个 session 的 JSONL 完整、可 --resume，必须存进 store，
+            # 否则用户下一轮"继续"会 fresh 一个空 session，整段上下文丢失。
+            # watchdog hung 的异常不带这个属性（其服务端 conversation state 已脏，
+            # 故意不复用，见上方 hung-retry 分支清掉 session.session_id 的逻辑）。
+            resumable_sid = getattr(last_exc, "cc_session_id", None)
+            if resumable_sid:
+                try:
+                    await bot.store.on_claude_response(
+                        user_id, chat_id, resumable_sid, preview_text or text,
+                    )
+                    log(bot.profile.name, "claude", "info",
+                        f"崩溃前 session={resumable_sid[:8]} 已保存，下一轮『继续』可 resume")
+                except Exception:
+                    pass
             clean = _format_run_error(last_exc)
             err_brief = (
                 f"❌ 自动重试 {retry_count} 次后仍失败：{clean}"
                 if retry_count > 0
                 else f"❌ Claude 执行出错：{clean}"
             )
+            if resumable_sid:
+                err_brief += "\n\n💾 上下文已保留，配额恢复后发『继续』即可接着上次进度跑。"
             try:
                 await bot.feishu.update_card(card_msg_id, err_brief)
             except Exception:

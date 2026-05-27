@@ -946,12 +946,20 @@ async def run_claude(
                                 detail = err_text or f"{api_err} (HTTP {status_code})"
                                 # error="rate_limit" 专项措辞：用户能直接读懂是用量上限
                                 if str(api_err) == "rate_limit":
-                                    raise RuntimeError(
+                                    exc = RuntimeError(
                                         f"Claude Max 用量已达上限：{detail}"
                                     )
-                                raise RuntimeError(
-                                    f"Claude API 错误（{api_err}, HTTP {status_code}）：{detail}"
-                                )
+                                else:
+                                    exc = RuntimeError(
+                                        f"Claude API 错误（{api_err}, HTTP {status_code}）：{detail}"
+                                    )
+                                # 崩在配额墙 / API 错误上的 session JSONL 是完整、干净、
+                                # 可 --resume 的（不像 watchdog hung 那样服务端 conversation
+                                # state 已脏）。把崩溃前已知的 session id 挂在异常上带出去，
+                                # 让 dispatcher 存进 session store——否则用户下一轮"继续"
+                                # 会走 fresh session，整段上下文丢光（线上实测过的 bug）。
+                                exc.cc_session_id = new_session_id
+                                raise exc
                             # Claude CLI 在 --resume 一个被中断的 session 时（上一轮
                             # tool_use/tool_result 之后没收到 end_turn 就被杀），会
                             # 自己注入一对 housekeeping 事件给上轮收尾：
