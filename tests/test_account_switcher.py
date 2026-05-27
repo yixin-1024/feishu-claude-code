@@ -8,7 +8,7 @@ import os
 import sys
 import time
 import tempfile
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -357,22 +357,88 @@ def test_maybe_switch_skips_when_disabled(isolated_state):
 
 
 def test_maybe_switch_skips_when_cooldown_active(isolated_state):
-    # 写一个 5 分钟前的切换记录，冷却 1800s
+    # 优化切换场景（当前仍可用、候选明显更优）应被冷却挡住。
+    # 注：现在先 probe + decide 再判 gate，所以断言改成「没真切」(use_account 未调)。
     isolated_state.write_text(json.dumps({"last_switch_at": time.time() - 300}))
     sw = AccountSwitcher(enabled=True, cooldown_sec=1800)
-    with patch.object(accs, "probe_all") as p:
+    fake_probes = {
+        "cur": mk("cur", u5=0.75, u7=0.5),   # usable 但 5h 偏紧
+        "alt": mk("alt", u5=0.05, u7=0.05),  # 明显更优
+    }
+    with patch.object(accs, "probe_all", return_value=fake_probes), \
+         patch.object(accs, "current_account_name", return_value="cur"), \
+         patch.object(accs, "use_account") as sw_call:
         assert sw.maybe_switch() is None
-        p.assert_not_called()
+        sw_call.assert_not_called()
 
 
-def test_maybe_switch_skips_when_active_children(isolated_state):
+def test_maybe_switch_proceeds_despite_active_children(isolated_state):
+    # 活跃子进程不再阻挡切换——Claude 支持 keychain 热切换。
+    # 优化切换场景、冷却已过，即使此刻有 claude 子进程在跑，也应正常切。
+    sent = []
+    sw = AccountSwitcher(send_fn=lambda t: sent.append(t), enabled=True)
+    fake_probes = {
+        "cur": mk("cur", u5=0.75, u7=0.5),   # usable 但 5h 偏紧
+        "alt": mk("alt", u5=0.05, u7=0.05),  # 明显更优
+    }
+    with patch.object(accs, "probe_all", return_value=fake_probes), \
+         patch.object(accs, "current_account_name", return_value="cur"), \
+         patch.object(accs, "auto_stash_identity_for_current", return_value=("noop", None)), \
+         patch.object(accs, "use_account", return_value=(True, "switched to alt (team/default_claude_max_5x)")) as sw_call:
+        out = sw.maybe_switch()
+    assert out == "alt"
+    sw_call.assert_called_once_with("alt")
+
+
+def test_maybe_switch_emergency_bypasses_cooldown(isolated_state):
+    # 紧急切换：当前账户被硬筛淘汰（5h 满 + reset 远），即使冷却未过也必须切——
+    # 这是修复「当前账户挂了一直不换」的核心保证。
+    isolated_state.write_text(json.dumps({"last_switch_at": time.time() - 60}))
+    sent = []
     sw = AccountSwitcher(
+        send_fn=lambda t: sent.append(t),
         enabled=True,
-        has_active_children_fn=lambda: True,
+        cooldown_sec=1800,
     )
-    with patch.object(accs, "probe_all") as p:
-        assert sw.maybe_switch() is None
-        p.assert_not_called()
+    fake_probes = {
+        "cur": mk("cur", u5=1.01, u7=0.1, r5_in=50 * 60),  # 5h 爆、50min 后才 reset → unusable
+        "alt": mk("alt", u5=0.06, u7=0.1),
+    }
+    with patch.object(accs, "probe_all", return_value=fake_probes), \
+         patch.object(accs, "current_account_name", return_value="cur"), \
+         patch.object(accs, "auto_stash_identity_for_current", return_value=("noop", None)), \
+         patch.object(accs, "use_account", return_value=(True, "switched to alt (team/default_claude_max_5x)")) as sw_call:
+        out = sw.maybe_switch()
+    assert out == "alt"
+    sw_call.assert_called_once_with("alt")
+
+
+def test_maybe_switch_before_spawn_noop_without_default():
+    # 没注册 default switcher → no-op，绝不抛、不 probe。
+    accs.set_default_switcher(None)
+    accs._last_spawn_probe_at = 0.0
+    assert accs.maybe_switch_before_spawn() is None
+
+
+def test_maybe_switch_before_spawn_invokes_and_throttles():
+    # spawn 前触发：第一次调 maybe_switch；节流窗口内第二次不再调。
+    fake_sw = MagicMock()
+    fake_sw.enabled = True
+    fake_sw.maybe_switch.return_value = "alt"
+    accs.set_default_switcher(fake_sw)
+    accs._last_spawn_probe_at = 0.0
+    try:
+        assert accs.maybe_switch_before_spawn() == "alt"
+        assert fake_sw.maybe_switch.call_count == 1
+        # 节流窗口内（默认 45s）再调一次 → 直接 no-op，不再触达 maybe_switch
+        assert accs.maybe_switch_before_spawn() is None
+        assert fake_sw.maybe_switch.call_count == 1
+        # force=True 跳过节流
+        assert accs.maybe_switch_before_spawn(force=True) == "alt"
+        assert fake_sw.maybe_switch.call_count == 2
+    finally:
+        accs.set_default_switcher(None)
+        accs._last_spawn_probe_at = 0.0
 
 
 def test_maybe_switch_no_action_when_current_healthy(isolated_state):

@@ -133,7 +133,14 @@ def poll_once(send_fn: Callable[[str], None], switcher: Optional[Any] = None) ->
 
     data = fetch_quota_headers()
     if not data.get("ok"):
-        print(f"[quota_watcher] poll 失败: {data.get('error')}", flush=True)
+        # 当前账户 poll 失败本身就是「当前账户可能不健康」的强信号——不能因此
+        # 跳过切换判定，否则当前账户限流/挂掉时永远轮不到 maybe_switch()（循环依赖）。
+        print(f"[quota_watcher] poll 失败: {data.get('error')}（仍跑账户切换判定）", flush=True)
+        if switcher is not None:
+            try:
+                switcher.maybe_switch()
+            except Exception as e:
+                print(f"[quota_watcher] switcher.maybe_switch 异常: {e}", flush=True)
         return
 
     state = _load_state()

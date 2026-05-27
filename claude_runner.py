@@ -94,6 +94,15 @@ async def run_claude(
     Returns:
         (full_response_text, new_session_id, used_fresh_session_fallback)
     """
+    # spawn 前按需切账户：当前账户烧穿时在这一拍就切到好账户，不必等 quota_watcher
+    # 10min 轮询。内部带探测节流（默认 45s 一次）+ 冷却防抖，健康路径几乎零开销；
+    # probe 走网络，丢到 executor 跑别堵事件循环。失败/未启用时静默 no-op。
+    try:
+        from account_switcher import maybe_switch_before_spawn
+        await asyncio.get_event_loop().run_in_executor(None, maybe_switch_before_spawn)
+    except Exception:
+        pass
+
     if _RUNNER_BACKEND == "print":
         return await _run_claude_print(
             message=message,

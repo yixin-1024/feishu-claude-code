@@ -39,13 +39,15 @@ Claude CLI 启动会发现 token 关联账户 ≠ oauthAccount.accountUuid → �
 
 防抖::
 
-    - 冷却 30 min（默认，可配）：上次切换后这段时间内不切第二次
-    - 正在跑 claude 子进程时推迟（has_active_children_fn）
+    - 冷却 30 min（默认，可配）：上次切换后这段时间内不切第二次（仅约束"优化切换"，
+      当前账户被硬筛淘汰时的紧急切换绕过冷却）
     - is_current 加 0.05 bonus，临界差距下不抖动
+    （注：不再因"有正在跑的 claude 子进程"而推迟——Claude 支持 keychain 热切换，
+     正在跑的子进程读的是 spawn 时的 token，不受影响，新 spawn 自动用新账户。）
 
 接口::
 
-    AccountSwitcher(send_fn, has_active_children_fn, ...)
+    AccountSwitcher(send_fn, ...)
       .probe_all() -> dict[name, Account]
       .decide(accounts) -> Optional[str]   # 目标账户名 / None
       .maybe_switch() -> Optional[str]     # 完整流程：探测 + 决策 + 切换
@@ -941,6 +943,58 @@ def _save_state(state: dict) -> None:
         print(f"[switcher] save state 失败: {e}", flush=True)
 
 
+# ── 模块级默认 switcher + spawn 前按需切换 ─────────────────────────
+#
+# 背景：后台 quota_watcher 每 10min 才跑一次切换判定，对"当前账户刚烧穿、下一条
+# 消息就想立刻切到好账户"不够跟手。这里暴露一个 spawn claude 前调用的入口——
+# 让切换"按需触发"而不是等下一拍轮询。
+#
+# 关键约束：maybe_switch() 内部会 probe_all（给每个账户发探测请求），不能每条消息
+# 都跑、否则给 spawn 加延迟。所以加探测节流：默认 45s 内最多探测一次。紧急情况
+# （429 事件 force=True）跳过节流。真正的切换决策 / 冷却 / 紧急绕过仍全在
+# maybe_switch() 内部，这里只管"要不要现在去问一次"。
+
+_DEFAULT_SWITCHER: Optional["AccountSwitcher"] = None
+_SPAWN_PROBE_THROTTLE_SEC = 45
+_last_spawn_probe_at = 0.0
+_spawn_probe_lock = threading.Lock()
+
+
+def set_default_switcher(sw: Optional["AccountSwitcher"]) -> None:
+    """runtime 启动时把配置好的 AccountSwitcher 注册成模块级默认实例，
+    供 spawn 路径（claude_runner.run_claude）按需触发。"""
+    global _DEFAULT_SWITCHER
+    _DEFAULT_SWITCHER = sw
+
+
+def maybe_switch_before_spawn(*, force: bool = False) -> Optional[str]:
+    """spawn claude 前按需切换。带探测节流，避免连发消息把 probe 打爆给每次
+    spawn 加延迟。无注册的 default switcher 时 no-op。返回切到的新账户名 / None。
+
+    force=True：跳过节流（例如 PTY 抓到 rate_limit_error / 429 后立即触发）。
+
+    这是同步阻塞调用（内部 probe_all 走网络）——调用方若在 asyncio loop 里，
+    应丢到 executor 跑，别堵事件循环。"""
+    global _last_spawn_probe_at
+    sw = _DEFAULT_SWITCHER
+    if sw is None or not getattr(sw, "enabled", False):
+        return None
+    now = time.time()
+    if not force:
+        with _spawn_probe_lock:
+            if (now - _last_spawn_probe_at) < _SPAWN_PROBE_THROTTLE_SEC:
+                return None
+            _last_spawn_probe_at = now
+    else:
+        with _spawn_probe_lock:
+            _last_spawn_probe_at = now
+    try:
+        return sw.maybe_switch()
+    except Exception as e:
+        print(f"[switcher] maybe_switch_before_spawn 异常: {e}", flush=True)
+        return None
+
+
 # ── Orchestrator ─────────────────────────────────────────────────
 
 
@@ -950,13 +1004,11 @@ class AccountSwitcher:
     def __init__(
         self,
         send_fn: Optional[Callable[[str], None]] = None,
-        has_active_children_fn: Optional[Callable[[], bool]] = None,
         *,
         cooldown_sec: int = _DEFAULT_COOLDOWN_SEC,
         enabled: bool = True,
     ):
         self.send_fn = send_fn
-        self.has_active_children_fn = has_active_children_fn
         self.cooldown_sec = cooldown_sec
         self.enabled = enabled
         self._lock = threading.Lock()
@@ -1017,33 +1069,32 @@ class AccountSwitcher:
             self._lock.release()
 
     def _maybe_switch_locked(self) -> Optional[str]:
-        # 1) 冷却
-        state = _load_state()
-        last_switch = float(state.get("last_switch_at") or 0)
-        cooldown_left = (last_switch + self.cooldown_sec) - time.time()
-        if cooldown_left > 0:
-            return None
-
-        # 2) 有正在跑的 claude 子进程 → 推迟
-        if self.has_active_children_fn is not None:
-            try:
-                if self.has_active_children_fn():
-                    return None
-            except Exception as e:
-                # 探针炸了不应该挡切换决策——但保守起见推迟一轮
-                print(f"[switcher] has_active_children_fn raised: {e}", flush=True)
-                return None
-
-        # 3) 探测
+        # 先探测 + 决策，再决定要不要受冷却 / 活跃子进程约束。
+        # 关键：gate 放到 decide 之后，才能区分「紧急切换」(当前账户已不可用) 和
+        # 「优化切换」(候选只是略优)。否则当前账户限流/挂掉时，冷却 + 活跃子进程
+        # 这俩 gate 会把救命的切换一起挡掉——这正是「一直不换」的根因之一。
         accounts = probe_all()
         if not accounts:
             return None
         current = current_account_name()
-
-        # 4) 决策
         target = decide(accounts, current)
         if target is None or target == current:
             return None
+
+        cur_acc = accounts.get(current) if current else None
+        # 紧急：当前账户不存在 / 被硬筛淘汰（限流满、blocked、token 失效）。keychain
+        # 只影响下一个新 spawn 的 claude，正在跑的子进程不受影响，没理由再等——
+        # 直接绕过冷却 + 活跃子进程 gate。
+        emergency = (cur_acc is None) or (not cur_acc.usable)
+
+        state = _load_state()
+        if not emergency:
+            # 优化切换：只尊重冷却防抖（避免临界差距下来回抖）。
+            # 不再因"有正在跑的 claude 子进程"而推迟——Claude 支持 keychain 热切换，
+            # 正在跑的子进程不受影响，新 spawn 的自动用新账户。
+            last_switch = float(state.get("last_switch_at") or 0)
+            if (last_switch + self.cooldown_sec) - time.time() > 0:
+                return None
 
         # 5) 切换前先把当前账户的 identity stash 回 saved file（自动维持新鲜度）
         if current:

@@ -185,24 +185,18 @@ def start_quota_watcher(
     switcher = None
     if enable_account_switcher:
         try:
-            from account_switcher import AccountSwitcher
+            from account_switcher import AccountSwitcher, set_default_switcher
 
-            def _has_active_children() -> bool:
-                # 任意 profile 的 active_runs 非空 = 有正在跑的 claude 子进程
-                for b in _bots.values():
-                    runs = getattr(b, "active_runs", None)
-                    if runs is None:
-                        continue
-                    if getattr(runs, "_runs", None):
-                        return True
-                return False
-
+            # 注：不再传 has_active_children_fn——Claude 支持 keychain 热切换，正在跑的
+            # claude 子进程不受影响，没必要因"有活跃子进程"而推迟切换。
             switcher = AccountSwitcher(
                 send_fn=_send,
-                has_active_children_fn=_has_active_children,
                 cooldown_sec=switcher_cooldown_sec,
                 enabled=True,
             )
+            # 注册成模块级默认实例：spawn claude 前（claude_runner.run_claude）按需
+            # 触发 maybe_switch_before_spawn，不必等 quota_watcher 10min 轮询。
+            set_default_switcher(switcher)
             log("global", "switcher", "info",
                 f"account_switcher 启用，冷却 {switcher_cooldown_sec}s")
         except Exception as e:
