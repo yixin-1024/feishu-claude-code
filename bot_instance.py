@@ -45,6 +45,8 @@ class BotInstance:
             profile=profile.name,
             default_cwd=profile.default_cwd,
             chat_default_cwd=profile.chat_default_cwd,
+            default_runner=profile.runner,
+            default_model=profile.default_model,
         )
         self.active_runs = ActiveRunRegistry()
         # per-chat 消息队列锁：同一 chat 串行，跨 chat 并行

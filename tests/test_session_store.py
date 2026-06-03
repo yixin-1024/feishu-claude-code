@@ -57,6 +57,75 @@ async def test_get_current_with_chat_id_group(temp_store):
 
 
 @pytest.mark.asyncio
+async def test_profile_default_runner_and_model(tmp_path, monkeypatch):
+    monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
+    store = SessionStore(
+        profile="codexbot",
+        default_cwd="/tmp",
+        default_runner="codex",
+        default_model="gpt-5.1-codex-max",
+    )
+
+    session = await store.get_current("user_1", "oc_codex")
+
+    assert session.runner == "codex"
+    assert session.model == "gpt-5.1-codex-max"
+
+
+@pytest.mark.asyncio
+async def test_reset_current_to_profile_defaults(tmp_path, monkeypatch):
+    monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
+    store = SessionStore(
+        profile="codexbot",
+        default_cwd="/tmp/default",
+        default_runner="codex",
+        default_model="gpt-5.5",
+    )
+    user_id = "user_1"
+    chat_id = "oc_codex"
+
+    await store.set_model(user_id, chat_id, "claude-sonnet-4-6")
+    await store.set_cwd(user_id, chat_id, "/tmp/other")
+    await store.set_permission_mode(user_id, chat_id, "default")
+    cur = await store.get_current_raw(user_id, chat_id)
+    cur["runner"] = "claude"
+    cur["session_id"] = "old_sid"
+
+    await store.reset_current_to_defaults(user_id, chat_id)
+    session = await store.get_current(user_id, chat_id)
+
+    assert session.session_id is None
+    assert session.runner == "codex"
+    assert session.model == "gpt-5.5"
+    assert session.cwd == "/tmp/default"
+    assert session.permission_mode == PERMISSION_MODE
+
+
+@pytest.mark.asyncio
+async def test_codex_profile_clears_stale_claude_model(tmp_path, monkeypatch):
+    monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
+    store = SessionStore(
+        profile="codexbot",
+        default_cwd="/tmp/default",
+        default_runner="codex",
+        default_model="gpt-5.5",
+    )
+    user_id = "user_1"
+    chat_id = "oc_codex"
+    cur = await store.get_current_raw(user_id, chat_id)
+    cur["runner"] = "codex"
+    cur["model"] = "claude-opus-4-8[1m]"
+    cur["session_id"] = "old_claude_sid"
+    await store._save_async()
+
+    session = await store.get_current(user_id, chat_id)
+
+    assert session.runner == "codex"
+    assert session.model == "gpt-5.5"
+    assert session.session_id is None
+
+
+@pytest.mark.asyncio
 async def test_session_isolation_between_chats(temp_store):
     """Test that private and group sessions are isolated"""
     user_id = "user_123"

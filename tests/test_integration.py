@@ -28,6 +28,7 @@ os.environ.setdefault("FEISHU_APP_SECRET", "test_app_secret")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import session_store as session_store_module
+import dispatcher
 from bot_config import Profile
 from bot_instance import BotInstance
 from dispatcher import handle_message_async
@@ -41,6 +42,7 @@ def isolated_sessions(tmp_path, monkeypatch):
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
     monkeypatch.setattr(session_store_module, "SESSIONS_DIR", str(sessions_dir))
+    dispatcher._seen_messages.clear()
     return sessions_dir
 
 
@@ -194,6 +196,40 @@ async def test_stop_command_handled_out_of_lock(isolated_sessions):
     proc.assert_not_awaited()
     # /stop 私聊会发卡片
     bot.feishu.send_card_to_user.assert_awaited()
+
+
+async def test_group_stop_ignores_mentions_for_other_bot(isolated_sessions):
+    bot = _make_bot(allowed_groups={"oc_a"}, bot_open_id="ou_this_bot")
+    bot.active_runs.get_run.return_value = None
+    other = _make_mention(key="@Other", open_id="ou_other_bot")
+    event = _make_event(
+        chat_id="oc_a",
+        chat_type="group",
+        text="/stop @Other",
+        mentions=[other],
+    )
+    with patch("dispatcher._process_message", new_callable=AsyncMock) as proc:
+        await handle_message_async(bot, event)
+
+    proc.assert_not_awaited()
+    bot.feishu.reply_card.assert_not_awaited()
+
+
+async def test_group_stop_handles_current_bot_mention(isolated_sessions):
+    bot = _make_bot(allowed_groups={"oc_a"}, bot_open_id="ou_this_bot")
+    bot.active_runs.get_run.return_value = None
+    self_mention = _make_mention(key="@This", open_id="ou_this_bot")
+    event = _make_event(
+        chat_id="oc_a",
+        chat_type="group",
+        text="/stop @This",
+        mentions=[self_mention],
+    )
+    with patch("dispatcher._process_message", new_callable=AsyncMock) as proc:
+        await handle_message_async(bot, event)
+
+    proc.assert_not_awaited()
+    bot.feishu.reply_card.assert_awaited()
 
 
 # ── per-chat 锁 ─────────────────────────────────────────────

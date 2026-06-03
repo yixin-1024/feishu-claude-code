@@ -615,12 +615,20 @@ async def run_claude(
     on_usage: Optional[Callable[[dict], None]] = None,
     on_status: Optional[Callable[[str, str], None]] = None,
     append_system_prompt: Optional[str] = None,
+    extra_env: Optional[dict] = None,
 ) -> tuple[str, Optional[str], bool]:
     """drop-in 替代 claude_runner.run_claude。内部走 PTY + tail JSONL。
+
+    extra_env: 注入 spawn 子进程的额外环境变量（覆盖 os.environ），用于把某个
+    profile/bot 路由到不同模型供应商。含 ANTHROPIC_MODEL 时覆盖命令行 --model。
 
     Returns:
         (full_response_text, new_session_id, used_fresh_session_fallback)
     """
+
+    # extra_env 里的 ANTHROPIC_MODEL 覆盖命令行 --model（供应商路由用）：
+    # 否则会把 claude-opus-4-x 这种 Anthropic 模型名发去 deepseek 端点导致 404。
+    effective_model = (extra_env or {}).get("ANTHROPIC_MODEL") or model
 
     async def _run_once(active_session_id: Optional[str]):
         run_cwd = cwd or os.path.expanduser("~")
@@ -649,8 +657,8 @@ async def run_claude(
         cmd = [CLAUDE_CLI]
         if active_session_id:
             cmd += ["--resume", active_session_id]
-        if model:
-            cmd += ["--model", model]
+        if effective_model:
+            cmd += ["--model", effective_model]
         if append_system_prompt:
             cmd += ["--append-system-prompt", append_system_prompt]
         cmd += ["--permission-mode", permission_mode or PERMISSION_MODE]
@@ -683,6 +691,9 @@ async def run_claude(
             env.setdefault("TERM", "xterm-256color")
             env["COLUMNS"] = "160"
             env["LINES"] = "40"
+            # 供应商路由：profile 配的 .env.<x> 覆盖 ANTHROPIC_BASE_URL/AUTH_TOKEN 等
+            if extra_env:
+                env.update(extra_env)
 
             # spawn_at 紧贴 spawn 动作记录——用于过滤 birth_time 早于自己 spawn
             # 的 jsonl。wall-clock（time.time），与 st_birthtime/st_ctime 对齐。

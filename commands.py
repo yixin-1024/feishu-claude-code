@@ -35,9 +35,12 @@ MODE_ALIASES = {
 }
 
 MODEL_ALIASES = {
-    "opus": "claude-opus-4-6",
+    "opus": "claude-opus-4-8[1m]",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
+    "codex-max": "gpt-5.1-codex-max",
+    "codex": "gpt-5.1-codex",
+    "gpt5": "gpt-5.1",
 }
 
 HELP_TEXT = """\
@@ -47,8 +50,10 @@ HELP_TEXT = """\
 `/help` — 显示此帮助
 `/stop` — 停止当前正在运行的任务
 `/new` 或 `/clear` — 开始新 session
+`/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
-`/model [名称]` — 切换模型（opus / sonnet / haiku 或完整 ID）
+`/runner [codex|claude]` — 切换当前 chat 使用 Codex 或 Claude Code
+`/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
 `/status` — 显示当前 session 信息
 `/cd [路径]` — 切换工具执行的工作目录
@@ -59,7 +64,7 @@ HELP_TEXT = """\
 **查看能力：**
 `/skills` — 列出已安装的 Claude Skills
 `/mcp` — 列出已配置的 MCP Servers
-`/usage` — 查看 Claude Max 订阅用量百分比和重置时间
+`/usage` — 查看当前 runner 的上下文/用量信息
 `/accounts` — 查看所有 Claude Max 账户全景 + 智能切换状态
 
 **审计：**
@@ -76,7 +81,7 @@ HELP_TEXT = """\
 
 **MCP 工具：** 已配置的 MCP servers 自动可用，直接对话即可调用。
 
-**发送任意普通消息即可与 Claude 对话。**\
+**发送任意普通消息即可与当前 runner 对话。**\
 """
 
 
@@ -96,9 +101,9 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 
 # Bot 自身处理的命令，其余 /xxx 转发给 Claude
 BOT_COMMANDS = {
-    "help", "h", "new", "clear", "resume", "model", "mode", "status", "cd", "ls",
+    "help", "h", "new", "clear", "resume", "runner", "model", "mode", "status", "cd", "ls",
     "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "stop",
-    "restart", "group",
+    "restart", "group", "defaults",
 }
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -526,6 +531,8 @@ def _context_window_for(model: str) -> int:
     m = (model or "").lower()
     if "1m" in m:
         return 1_000_000
+    if m.startswith("gpt-5") or "codex" in m:
+        return 258_400
     return 200_000
 
 
@@ -537,11 +544,39 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def _read_last_usage(session_id: Optional[str]) -> dict:
-    """从 session 的 .jsonl 倒着找最后一条 assistant 消息的 usage。"""
+def _find_codex_session_file(session_id: str) -> str:
+    if not session_id:
+        return ""
+    root = os.path.expanduser("~/.codex/sessions")
+    if not os.path.isdir(root):
+        return ""
+    suffix = f"{session_id}.jsonl"
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            if name.endswith(suffix):
+                return os.path.join(dirpath, name)
+    return ""
+
+
+def _normalize_codex_usage(raw: dict) -> dict:
+    input_tokens = int(raw.get("input_tokens", 0) or 0)
+    cached = int(raw.get("cached_input_tokens", 0) or 0)
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": int(raw.get("output_tokens", 0) or 0),
+        "reasoning_output_tokens": int(raw.get("reasoning_output_tokens", 0) or 0),
+    }
+    if cached:
+        usage["_cached_input_tokens"] = cached
+    return usage
+
+
+def _read_last_usage(session_id: Optional[str], runner: str = "claude") -> dict:
+    """从 runner session 文件倒着找最后一次 usage。"""
     if not session_id:
         return {}
-    fpath = _find_session_file(session_id)
+    runner = (runner or "claude").lower()
+    fpath = _find_codex_session_file(session_id) if runner == "codex" else _find_session_file(session_id)
     if not fpath:
         return {}
     try:
@@ -557,16 +592,28 @@ def _read_last_usage(session_id: Optional[str]) -> dict:
             d = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if d.get("type") != "assistant":
-            continue
-        usage = (d.get("message") or {}).get("usage") or {}
-        if usage:
-            return usage
+        if runner == "codex":
+            payload = d.get("payload") or {}
+            if d.get("type") == "event_msg" and payload.get("type") == "token_count":
+                info = payload.get("info") or {}
+                usage = _normalize_codex_usage(info.get("last_token_usage") or {})
+                window = int(info.get("model_context_window") or 0)
+                if window:
+                    usage["_context_window"] = window
+                return usage
+            if d.get("type") == "turn.completed" and isinstance(d.get("usage"), dict):
+                return _normalize_codex_usage(d["usage"])
+        else:
+            if d.get("type") != "assistant":
+                continue
+            usage = (d.get("message") or {}).get("usage") or {}
+            if usage:
+                return usage
     return {}
 
 
-def _format_context_line(session_id: Optional[str], model: str) -> str:
-    usage = _read_last_usage(session_id)
+def _format_context_line(session_id: Optional[str], model: str, runner: str = "claude", current_usage: Optional[dict] = None) -> str:
+    usage = current_usage or _read_last_usage(session_id, runner=runner)
     if not usage:
         return "上下文: （暂无数据，发一条消息后可见）"
     total = (
@@ -577,9 +624,47 @@ def _format_context_line(session_id: Optional[str], model: str) -> str:
     )
     if total <= 0:
         return "上下文: （无）"
-    window = _context_window_for(model)
+    window = int(usage.get("_context_window") or 0) or _context_window_for(model)
     pct = total / window * 100
     return f"上下文: `{_fmt_tokens(total)} / {_fmt_tokens(window)} ({pct:.1f}%)`"
+
+
+def _format_codex_rate_line(session_id: Optional[str]) -> str:
+    fpath = _find_codex_session_file(session_id or "")
+    if not fpath:
+        return ""
+    try:
+        with open(fpath, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines):
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        payload = d.get("payload") or {}
+        if d.get("type") != "event_msg" or payload.get("type") != "token_count":
+            continue
+        rate_limits = payload.get("rate_limits") or {}
+        primary = rate_limits.get("primary") or {}
+        secondary = rate_limits.get("secondary") or {}
+        parts = []
+        if primary.get("used_percent") is not None:
+            parts.append(f"5h {float(primary['used_percent']):.1f}%")
+        if secondary.get("used_percent") is not None:
+            parts.append(f"7d {float(secondary['used_percent']):.1f}%")
+        if not parts:
+            return ""
+        return f"Codex 配额: `{' · '.join(parts)}`"
+    return ""
+
+
+def _runner_default_model(bot, runner: str) -> str:
+    profile = getattr(bot, "profile", None)
+    if profile and getattr(profile, "runner", "") == runner and getattr(profile, "default_model", ""):
+        return profile.default_model
+    return "gpt-5.5" if runner == "codex" else "claude-sonnet-4-6"
 
 
 def _get_quota_compact() -> str:
@@ -991,6 +1076,8 @@ async def handle_command(
             parts.append(f"✅ 已开始新 session。\n上个会话：「{old_title}」")
         else:
             parts.append("✅ 已开始新 session。")
+        parts.append(f"Runner：**{cur.runner}**")
+        parts.append(f"模型：**{cur.model}**")
         parts.append(f"当前模式：**{cur.permission_mode}**")
         return {
             "text": "\n".join(parts),
@@ -1001,6 +1088,20 @@ async def handle_command(
                 {"text": "🔒 需确认", "value": {"action": "set_mode", "mode": "default", "cid": chat_id}},
             ],
         }
+
+    elif cmd == "defaults":
+        old_title = await store.reset_current_to_defaults(user_id, chat_id)
+        cur = await store.get_current(user_id, chat_id)
+        lines = ["✅ 已重置为配置默认参数，并开始新 session。"]
+        if old_title:
+            lines.append(f"上个会话：「{old_title}」")
+        lines.extend([
+            f"Runner: `{cur.runner}`",
+            f"模型: `{cur.model}`",
+            f"权限模式: `{cur.permission_mode}`",
+            f"工作目录: `{cur.cwd}`",
+        ])
+        return "\n".join(lines)
 
     elif cmd == "resume":
         if not args:
@@ -1025,43 +1126,84 @@ async def handle_command(
             reply += f"\n上个会话：「{old_title}」"
         return reply
 
+    elif cmd == "runner":
+        cur = await store.get_current(user_id, chat_id)
+        if not args:
+            runner = (cur.runner or "claude").lower()
+            return {
+                "text": f"当前 runner：**{runner}**\n当前模型：**{cur.model}**",
+                "buttons": [
+                    {"text": "Codex", "value": {"action": "run_cmd", "cmd": "/runner codex", "cid": chat_id}},
+                    {"text": "Claude Code", "value": {"action": "run_cmd", "cmd": "/runner claude", "cid": chat_id}},
+                ],
+            }
+        requested = args.strip().lower().replace("_", "-")
+        if requested in {"claude-code", "claudecode"}:
+            requested = "claude"
+        if requested not in {"codex", "claude"}:
+            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）".format(args)
+        model = _runner_default_model(bot, requested)
+        await store.set_runner(user_id, chat_id, requested, model=model)
+        return f"✅ 已切换 runner 为 `{requested}`，模型 `{model}`。已开始新 session。"
+
     elif cmd == "model":
         if not args:
             cur = await store.get_current(user_id, chat_id)
-            return {
-                "text": f"当前模型：**{cur.model}**",
-                "buttons": [
+            runner = (getattr(cur, "runner", "") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
+            if runner == "codex":
+                buttons = [
+                    {"text": "Codex Max", "value": {"action": "run_cmd", "cmd": "/model codex-max", "cid": chat_id}},
+                    {"text": "Codex", "value": {"action": "run_cmd", "cmd": "/model codex", "cid": chat_id}},
+                    {"text": "GPT-5.1", "value": {"action": "run_cmd", "cmd": "/model gpt5", "cid": chat_id}},
+                ]
+            else:
+                buttons = [
                     {"text": "🧠 Opus", "value": {"action": "run_cmd", "cmd": "/model opus", "cid": chat_id}},
                     {"text": "⚡ Sonnet", "value": {"action": "run_cmd", "cmd": "/model sonnet", "cid": chat_id}},
                     {"text": "🐇 Haiku", "value": {"action": "run_cmd", "cmd": "/model haiku", "cid": chat_id}},
-                ],
+                ]
+            return {
+                "text": f"当前 runner：**{runner}**\n当前模型：**{cur.model}**",
+                "buttons": buttons,
             }
         model = MODEL_ALIASES.get(args.lower(), args)
         await store.set_model(user_id, chat_id, model)
-        return f"✅ 已切换模型为 `{model}`"
+        return f"✅ 已切换模型为 `{model}`。已开始新 session。"
 
     elif cmd == "status":
         cur = await store.get_current_raw(user_id, chat_id)
         sid = cur.get("session_id") or "（新 session）"
+        runner = cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")
         model = cur.get("model", "未知")
         cwd = cur.get("cwd", "~")
         workspace = cur.get("workspace") or "（未绑定）"
         started = cur.get("started_at", "")[:16].replace("T", " ")
         mode = cur.get("permission_mode") or "bypassPermissions"
 
-        context_line = _format_context_line(cur.get("session_id"), model)
-        quota_line = await asyncio.to_thread(_get_quota_compact)
+        runner = str(runner).lower()
+        context_line = _format_context_line(
+            cur.get("session_id"),
+            model,
+            runner=runner,
+            current_usage=cur.get("last_usage") or None,
+        )
+        quota_line = (
+            _format_codex_rate_line(cur.get("session_id"))
+            if runner == "codex" else await asyncio.to_thread(_get_quota_compact)
+        )
 
         lines = [
             "📊 **当前 Session 状态**",
             f"Session ID: `{sid}`",
+            f"Runner: `{runner}`",
             f"模型: `{model}`",
             f"权限模式: `{mode}`",
             f"工作空间: `{workspace}`",
             f"工作目录: `{cwd}`",
             f"开始时间: {started}",
-            context_line,
         ]
+        if context_line:
+            lines.append(context_line)
         if quota_line:
             lines.append(quota_line)
         return "\n".join(lines)
@@ -1111,6 +1253,23 @@ async def handle_command(
         return _list_mcp()
 
     elif cmd == "usage":
+        cur = await store.get_current_raw(user_id, chat_id)
+        runner = str(cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
+        if runner == "codex":
+            model = cur.get("model", "gpt-5.5")
+            lines = ["📈 **Codex 用量**"]
+            lines.append(_format_context_line(
+                cur.get("session_id"),
+                model,
+                runner="codex",
+                current_usage=cur.get("last_usage") or None,
+            ))
+            rate_line = _format_codex_rate_line(cur.get("session_id"))
+            if rate_line:
+                lines.append(rate_line)
+            lines.append(f"Runner: `codex`")
+            lines.append(f"模型: `{model}`")
+            return "\n".join(lines)
         return _get_usage()
 
     elif cmd == "accounts":

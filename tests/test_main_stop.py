@@ -92,14 +92,14 @@ async def test_heartbeat_does_not_overwrite_error_card_on_watchdog_kill():
     bot.active_runs.start_run.return_value = active_run
 
     session = mock.Mock(session_id=None, model="claude-opus-4-7[1m]", cwd="/tmp",
-                       permission_mode="bypassPermissions")
+                       permission_mode="bypassPermissions", runner="claude")
 
-    async def fake_run_claude(**kwargs):
+    async def fake_run_agent(**kwargs):
         # 让心跳跑几轮再抛 watchdog 异常
         await asyncio.sleep(2.5)
         raise RuntimeError("Claude 客户端疑似 hung：90s 三信号全 0 增长")
 
-    with mock.patch.object(dispatcher, "run_claude", fake_run_claude):
+    with mock.patch.object(dispatcher, "run_agent", fake_run_agent):
         await dispatcher._run_and_display(
             bot,
             user_id="u1", chat_id="c1", is_group=True,

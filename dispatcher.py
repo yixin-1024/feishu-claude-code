@@ -26,7 +26,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 
 from bot_config import Profile
 from bot_instance import BotInstance
-from claude_runner import run_claude
+from agent_runner import run_agent
 from commands import parse_command, handle_command
 from feishu_post import parse_post_content, extract_post_image_keys
 from lark_prompts import render_lark_prompt
@@ -60,25 +60,26 @@ def configure(
 # 否则用户看到的就是"一条消息收到两次回复"（实际案例：2026-05-22 16:43，
 # 16:43:52 WS 断开 → 16:43:59 同事件复推 → 两次完整翻译 + 一次"排队中"）。
 #
-# 实现：module-level dict (message_id -> first_seen_ts)。所有 handler 都跑在
+# 实现：module-level dict (dedupe_key -> first_seen_ts)。所有 handler 都跑在
 # 同一个 bot_loop 上（runtime.py:_on_message 用 run_coroutine_threadsafe 投递），
 # 单线程访问，不需要锁。TTL 120s 足够覆盖 Lark 重连窗口，又不会无界增长。
 _SEEN_MSG_TTL_SEC = 120
 _seen_messages: dict[str, float] = {}
 
 
-def _is_duplicate_event(message_id: str) -> bool:
-    """同一 message_id 在 TTL 内重复送达返回 True；顺手清理过期项。"""
+def _is_duplicate_event(message_id: str, profile_name: str = "") -> bool:
+    """同一 profile 的同一 message_id 在 TTL 内重复送达返回 True。"""
     if not message_id:
         return False
+    dedupe_key = f"{profile_name}:{message_id}" if profile_name else message_id
     now = time.time()
     if _seen_messages:
         expired = [k for k, t in _seen_messages.items() if now - t > _SEEN_MSG_TTL_SEC]
         for k in expired:
             _seen_messages.pop(k, None)
-    if message_id in _seen_messages:
+    if dedupe_key in _seen_messages:
         return True
-    _seen_messages[message_id] = now
+    _seen_messages[dedupe_key] = now
     return False
 
 
@@ -101,6 +102,20 @@ def extract_chat_info(event: P2ImMessageReceiveV1) -> tuple[str, str, bool, str,
         chat_id = user_id
 
     return user_id, chat_id, is_group, chat_id_raw, thread_id
+
+
+async def _is_current_bot_mentioned(bot: BotInstance, msg) -> bool:
+    """Return True when a group message explicitly mentions this bot."""
+    mentions = getattr(msg, "mentions", None) or []
+    if not mentions:
+        return False
+    bot_open_id = await bot.feishu.get_bot_open_id()
+    if not bot_open_id:
+        return False
+    return any(
+        getattr(getattr(m, "id", None), "open_id", "") == bot_open_id
+        for m in mentions
+    )
 
 
 # ── /stop 命令处理 ───────────────────────────────────────────
@@ -377,7 +392,7 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
     # ── WS at-least-once 去重：Lark WS 断线重连会把同一条 om_ 重投一次，
     # 直接当新消息处理会跑两遍 claude。在最前面（inbox / trinity / ACL / lock 之前）
     # 拦掉，重复事件完全无副作用。
-    if _is_duplicate_event(msg.message_id):
+    if _is_duplicate_event(msg.message_id, tag):
         log(tag, "msg", "info",
             f"重复事件忽略 mid={msg.message_id[:14]}... "
             f"(WS at-least-once redelivery)")
@@ -433,6 +448,8 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
                     _text = _text.replace(k, '').strip()
 
         if _text.lower() == "/stop" or _text.strip().endswith("/stop"):
+            if is_group and not await _is_current_bot_mentioned(bot, msg):
+                return
             reply = await _handle_stop_command(bot, user_id, chat_id)
             if is_group:
                 await bot.feishu.reply_card(msg.message_id, content=reply, loading=False)
@@ -441,6 +458,8 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
             return
 
         if _text.lower() == "/restart" or _text.strip().endswith("/restart"):
+            if is_group and not await _is_current_bot_mentioned(bot, msg):
+                return
             from commands import _trigger_restart
             affected = await _handle_restart_command(bot)
             ack = f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— ~5s 后回来。"
@@ -455,22 +474,15 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
             return
 
         if _text == "/":
+            if is_group and not await _is_current_bot_mentioned(bot, msg):
+                return
             await _show_command_menu(bot, user_id, chat_id, is_group, msg.message_id)
             return
 
     # 群聊只响应 @机器人 的消息
     if is_group:
-        mentions = getattr(msg, 'mentions', None) or []
-        if not mentions:
+        if not await _is_current_bot_mentioned(bot, msg):
             return
-        bot_open_id = await bot.feishu.get_bot_open_id()
-        if bot_open_id:
-            mentioned_bot = any(
-                getattr(getattr(m, 'id', None), 'open_id', '') == bot_open_id
-                for m in mentions
-            )
-            if not mentioned_bot:
-                return
 
     lock = bot._ensure_chat_lock(chat_id)
 
@@ -678,11 +690,15 @@ async def _run_and_display(
             while True:
                 try:
                     if retry_count == 0:
-                        log(bot.profile.name, "claude", "info", "开始调用...")
+                        log(bot.profile.name, "agent", "info", "开始调用...")
                     else:
-                        log(bot.profile.name, "claude", "info",
+                        log(bot.profile.name, "agent", "info",
                             f"重试调用 ({retry_count}/{_AUTO_RETRY_MAX})...")
-                    full_text, new_session_id, used_fresh_session_fallback = await run_claude(
+                    log(bot.profile.name, "agent", "info",
+                        f"开始调用 runner={session.runner} model={session.model}")
+                    full_text, new_session_id, used_fresh_session_fallback = await run_agent(
+                        profile=bot.profile,
+                        runner=session.runner,
                         message=claude_msg,
                         session_id=session.session_id,
                         model=session.model,
@@ -695,7 +711,8 @@ async def _run_and_display(
                         on_status=on_status,
                         append_system_prompt=append_system_prompt or None,
                     )
-                    log(bot.profile.name, "claude", "info", f"完成, session={new_session_id}")
+                    log(bot.profile.name, "agent", "info",
+                        f"完成 runner={session.runner} session={new_session_id}")
                     success = True
                     break
                 except Exception as e:
@@ -770,7 +787,7 @@ async def _run_and_display(
             resumable_sid = getattr(last_exc, "cc_session_id", None)
             if resumable_sid:
                 try:
-                    await bot.store.on_claude_response(
+                    await bot.store.on_agent_response(
                         user_id, chat_id, resumable_sid, preview_text or text,
                     )
                     log(bot.profile.name, "claude", "info",
@@ -781,7 +798,7 @@ async def _run_and_display(
             err_brief = (
                 f"❌ 自动重试 {retry_count} 次后仍失败：{clean}"
                 if retry_count > 0
-                else f"❌ Claude 执行出错：{clean}"
+                else f"❌ Agent 执行出错：{clean}"
             )
             if resumable_sid:
                 err_brief += "\n\n💾 上下文已保留，配额恢复后发『继续』即可接着上次进度跑。"
@@ -845,8 +862,9 @@ async def _run_and_display(
                 pass
 
         if new_session_id:
-            await bot.store.on_claude_response(
+            await bot.store.on_agent_response(
                 user_id, chat_id, new_session_id, preview_text or text,
+                usage=final_usage or None,
             )
 
         if plan_exited and session.permission_mode == "plan":
@@ -1022,9 +1040,10 @@ async def _process_message(
                     await bot.feishu.send_card_to_user(user_id, content=reply_text, loading=False)
             return
 
-    # ── 普通消息 → 调用 Claude ──────────────────────────────
+    # ── 普通消息 → 调用当前 profile 的 agent ─────────────────
     session = await bot.store.get_current(user_id, chat_id)
-    log(tag, "claude", "info", f"session={session.session_id} model={session.model}")
+    log(tag, "agent", "info",
+        f"runner={session.runner} session={session.session_id} model={session.model}")
 
     if thread_id:
         try:
@@ -1091,6 +1110,8 @@ def _context_window_for(model: str) -> int:
     m = (model or "").lower()
     if "[1m]" in m or "1m" in m:
         return 1_000_000
+    if m.startswith("gpt-5") or "codex" in m:
+        return 258_400
     return 200_000
 
 
@@ -1220,6 +1241,12 @@ def _format_tool(name: str, inp: dict) -> str:
         cmd = inp.get("command", "")
         if len(cmd) > 80:
             cmd = cmd[:77] + "..."
+        status = str(inp.get("status") or "").lower()
+        exit_code = inp.get("exit_code")
+        if status == "completed":
+            prefix = "✅" if exit_code in (0, "0", None) else "⚠️"
+            suffix = "" if exit_code in (0, "0", None) else f"（exit {exit_code}）"
+            return f"{prefix} **执行命令：** `{cmd}`{suffix}" if cmd else f"{prefix} **执行命令完成**{suffix}"
         return f"🔧 **执行命令：** `{cmd}`" if cmd else f"🔧 **执行命令...**"
     elif n in ("read_file", "read"):
         return f"📄 **读取：** `{inp.get('file_path', inp.get('path', ''))}`"

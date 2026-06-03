@@ -51,7 +51,7 @@ _bots: dict[str, BotInstance] = {}
 
 
 def main():
-    print("🚀 飞书/Lark Claude Bot 启动中...")
+    print("🚀 飞书/Lark Agent Bot 启动中...")
     print(f"   已加载 {len(config.PROFILES)} 个 profile")
     for p in config.PROFILES:
         allow_desc = f"{len(p.allowed_open_ids)} 人" if p.allowed_open_ids else "⚠️ 所有人"
@@ -61,10 +61,12 @@ def main():
         role_desc = f"role={p.role}" if p.role else "—"
         print(
             f"   · {p.name:<10} {p.brand_label}  "
-            f"app={p.app_id}  cwd={p.default_cwd}  "
+            f"app={p.app_id}  runner={p.runner} model={p.default_model or config.DEFAULT_MODEL}  "
+            f"cwd={p.default_cwd}  "
             f"allow={allow_desc}  groups={group_desc}  "
             f"lark-cli profile={p.lark_cli_profile}  {role_desc}"
         )
+    print(f"   默认后端    : {config.DEFAULT_RUNNER}")
     print(f"   默认模型    : {config.DEFAULT_MODEL}")
     print(f"   权限模式    : {config.PERMISSION_MODE}")
     if config.TRINITY_ENABLED:

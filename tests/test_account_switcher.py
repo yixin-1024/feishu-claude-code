@@ -164,7 +164,7 @@ def test_probe_one_force_refreshes_on_401(monkeypatch, tmp_path):
     }))
 
     # mock OAuth refresh endpoint → 返回新 token
-    def fake_refresh(name, *, force=False):
+    def fake_refresh(name, *, force=False, sync_keychain=False):
         # 模拟 refresh 成功，写新 token 回 reg.json
         import json as _json
         path = os.path.join(accs.ACCOUNTS_DIR, "reg.json")
@@ -176,9 +176,9 @@ def test_probe_one_force_refreshes_on_401(monkeypatch, tmp_path):
             _json.dump(d, f)
         return (True, "ok")
     refresh_calls = []
-    def _track(name, *, force=False):
+    def _track(name, *, force=False, sync_keychain=False):
         refresh_calls.append((name, force))
-        return fake_refresh(name, force=force)
+        return fake_refresh(name, force=force, sync_keychain=sync_keychain)
     monkeypatch.setattr(accs, "_refresh_account_inplace", _track)
 
     # 第一次 urlopen 401，第二次 200 + ratelimit headers
@@ -212,7 +212,7 @@ def test_probe_one_401_then_refresh_also_fails_reports_relogin(monkeypatch, tmp_
         }},
     }))
     monkeypatch.setattr(accs, "_refresh_account_inplace",
-                        lambda name, *, force=False: (False, "HTTP 400: invalid_grant"))
+                        lambda name, *, force=False, sync_keychain=False: (False, "HTTP 400: invalid_grant"))
 
     fake_open, _ = _fake_urlopen_factory([{"http_code": 401, "headers": {}}])
     import urllib.request
@@ -1037,4 +1037,164 @@ def test_list_accounts_summary_marks_active_and_identity(monkeypatch, tmp_path):
     assert rows["via"]["active"] is True and rows["via"]["has_identity"] is True
     assert rows["via"]["email"] == "via@x.com"
     assert rows["reg"]["active"] is False and rows["reg"]["has_identity"] is False
+
+
+# ───────── current_account_name: 指纹优先 + accountUuid 回退（脱节修复）─────────
+
+def test_current_account_name_fingerprint_takes_priority(monkeypatch, tmp_path):
+    """keychain token 跟某快照指纹一致 → 直接匹配（identity 缺失也行）。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "cha": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-LIVEtoken-aaaaaa"},
+                "_meta": {"identity": {"oauthAccount": {"accountUuid": "uuid-boss"}}}},
+    }))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-LIVEtoken-aaaaaa"}}))
+    monkeypatch.setattr(accs, "_read_identity", lambda: None)
+    assert accs.current_account_name() == "cha"
+
+
+def test_current_account_name_uuid_fallback_when_fingerprint_misses(monkeypatch, tmp_path):
+    """token 被 CLI 轮换、指纹全 miss 时，用 ~/.claude.json 的 accountUuid 兜底识别。
+    这是消除状态栏「未识别」的核心。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "cha": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-stale-boss"},
+                "_meta": {"identity": {"oauthAccount": {"accountUuid": "uuid-boss"}}}},
+        "reg": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-stale-yixin"},
+                "_meta": {"identity": {"oauthAccount": {"accountUuid": "uuid-yixin"}}}},
+    }))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-LIVE-rotated-token"}}))
+    monkeypatch.setattr(accs, "_read_identity",
+                        lambda: {"oauthAccount": {"accountUuid": "uuid-boss"}})
+    assert accs.current_account_name() == "cha"
+
+
+def test_current_account_name_uuid_ambiguous_prefers_last_switch_to(monkeypatch, tmp_path):
+    """同一 uuid 命中多档（迁移/串号期）→ 优先 last_switch_to。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "cha": {"claudeAiOauth": {"accessToken": "a"}, "_meta": {"identity": {"oauthAccount": {"accountUuid": "dup"}}}},
+        "spx": {"claudeAiOauth": {"accessToken": "b"}, "_meta": {"identity": {"oauthAccount": {"accountUuid": "dup"}}}},
+    }))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": "live-rotated"}}))
+    monkeypatch.setattr(accs, "_read_identity", lambda: {"oauthAccount": {"accountUuid": "dup"}})
+    monkeypatch.setattr(accs, "_load_state", lambda: {"last_switch_to": "spx"})
+    assert accs.current_account_name() == "spx"
+
+
+# ───────── save_current_account: 身份守卫（防串号）─────────
+
+def test_save_current_account_identity_guard_refuses_cross_account(monkeypatch, tmp_path):
+    """目标档已绑 info，当前 keychain 是 boss → 拒绝覆盖，文件不动。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "spx": {"claudeAiOauth": {"accessToken": "old-info"},
+                "_meta": {"identity": {"oauthAccount": {"accountUuid": "uuid-info"}}}},
+    }))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": "sk-boss"}}))
+    monkeypatch.setattr(accs, "_read_identity",
+                        lambda: {"oauthAccount": {"accountUuid": "uuid-boss"}})
+    ok, msg = accs.save_current_account("spx")
+    assert not ok and "refuse" in msg
+    saved = json.loads(open(os.path.join(accs.ACCOUNTS_DIR, "spx.json")).read())
+    assert saved["claudeAiOauth"]["accessToken"] == "old-info"  # 没被串号覆盖
+
+
+def test_save_current_account_guard_allows_same_account(monkeypatch, tmp_path):
+    """同账号刷新覆盖自己的档 → 放行。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "cha": {"claudeAiOauth": {"accessToken": "old-boss"},
+                "_meta": {"identity": {"oauthAccount": {"accountUuid": "uuid-boss"}}}},
+    }))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": "sk-new-boss", "subscriptionType": "team"}}))
+    monkeypatch.setattr(accs, "_read_identity",
+                        lambda: {"oauthAccount": {"accountUuid": "uuid-boss", "emailAddress": "boss@x.com"}, "userID": "u"})
+    ok, msg = accs.save_current_account("cha")
+    assert ok, msg
+    saved = json.loads(open(os.path.join(accs.ACCOUNTS_DIR, "cha.json")).read())
+    assert saved["claudeAiOauth"]["accessToken"] == "sk-new-boss"
+
+
+def test_save_current_account_force_bypasses_guard(monkeypatch, tmp_path):
+    """guard_identity=False 时允许改绑（手动 --force 场景）。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "spx": {"claudeAiOauth": {"accessToken": "old-info"},
+                "_meta": {"identity": {"oauthAccount": {"accountUuid": "uuid-info"}}}},
+    }))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": "sk-boss"}}))
+    monkeypatch.setattr(accs, "_read_identity",
+                        lambda: {"oauthAccount": {"accountUuid": "uuid-boss"}})
+    ok, _ = accs.save_current_account("spx", guard_identity=False)
+    assert ok
+
+
+# ───────── resync_current_from_keychain（回收 CLI 轮换）─────────
+
+def test_resync_current_from_keychain_captures_rotation(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "cha": {"claudeAiOauth": {"accessToken": "sk-ant-oat01-stale"},
+                "_meta": {"identity": {"oauthAccount": {"accountUuid": "uuid-boss"}}}},
+    }))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-FRESH-rotated"}}))
+    monkeypatch.setattr(accs, "_read_identity",
+                        lambda: {"oauthAccount": {"accountUuid": "uuid-boss"}})
+    status, name = accs.resync_current_from_keychain()
+    assert status == "resynced" and name == "cha"
+    saved = json.loads(open(os.path.join(accs.ACCOUNTS_DIR, "cha.json")).read())
+    assert saved["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-FRESH-rotated"
+
+
+def test_resync_current_noop_when_already_synced(monkeypatch, tmp_path):
+    same = "sk-ant-oat01-samesame-token-here"
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "cha": {"claudeAiOauth": {"accessToken": same},
+                "_meta": {"identity": {"oauthAccount": {"accountUuid": "uuid-boss"}}}},
+    }))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: json.dumps({"claudeAiOauth": {"accessToken": same}}))
+    monkeypatch.setattr(accs, "_read_identity",
+                        lambda: {"oauthAccount": {"accountUuid": "uuid-boss"}})
+    status, name = accs.resync_current_from_keychain()
+    assert status == "noop" and name == "cha"
+
+
+def test_resync_current_noop_when_no_current(monkeypatch, tmp_path):
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {}))
+    monkeypatch.setattr(accs, "_read_keychain_blob", lambda: None)
+    status, name = accs.resync_current_from_keychain()
+    assert status == "noop" and name is None
+
+
+# ───────── 跨进程凭证锁 ~/.claude.lock ─────────
+
+def test_claude_dir_lock_acquires_and_releases(monkeypatch, tmp_path):
+    lock_dir = str(tmp_path / "claude.lock")
+    monkeypatch.setattr(accs, "_CLAUDE_LOCK_DIR", lock_dir)
+    with accs._claude_dir_lock() as got:
+        assert got is True
+        assert os.path.isdir(lock_dir)
+    assert not os.path.exists(lock_dir)  # 释放
+
+
+def test_claude_dir_lock_reclaims_stale(monkeypatch, tmp_path):
+    lock_dir = str(tmp_path / "claude.lock")
+    os.mkdir(lock_dir)
+    old = time.time() - 999
+    os.utime(lock_dir, (old, old))
+    monkeypatch.setattr(accs, "_CLAUDE_LOCK_DIR", lock_dir)
+    with accs._claude_dir_lock(budget_sec=0.2) as got:
+        assert got is True  # 死锁被回收
+    assert not os.path.exists(lock_dir)
+
+
+def test_claude_dir_lock_proceeds_when_held_fresh(monkeypatch, tmp_path):
+    lock_dir = str(tmp_path / "claude.lock")
+    os.mkdir(lock_dir)  # 新鲜 mtime = 别人正持有
+    monkeypatch.setattr(accs, "_CLAUDE_LOCK_DIR", lock_dir)
+    with accs._claude_dir_lock(budget_sec=0.15) as got:
+        assert got is False  # 抢不到但继续，不阻塞
+    assert os.path.isdir(lock_dir)  # 别人的锁没被动
 

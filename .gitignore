@@ -1,5 +1,9 @@
 .env
 .env.test
+.env.deepseek
+# 任何 .env.<provider> 覆盖文件都含密钥，统一忽略（保留 .env.example）
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.pyc

@@ -30,14 +30,25 @@
 当 PROFILES 缺省时退回到旧版单实例行为（读 FEISHU_APP_ID / FEISHU_APP_SECRET）。
 """
 
+import io
+import json
 import os
 import shutil
 from dataclasses import dataclass, field
 from typing import Optional
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
-load_dotenv()
+# override=True：让 .env 文件成为唯一事实源。
+# 必须 override —— /restart 是以"当前运行进程"为父进程跑 `open .app` 拉起新实例，
+# 新进程会继承老进程的环境变量；而老进程启动时 load_dotenv 已把 .env 的值灌进了
+# os.environ。若用默认 override=False，下次重启时这些"上一代灌进来的旧值"会粘住，
+# 改了 .env 也读不到（实测 BOTB_CLAUDE_ENV_FILE 跨重启一直卡在旧文件）。
+# override=True 强制每次启动都以磁盘上的 .env 为准，根治这个跨重启粘滞。
+load_dotenv(override=not bool(os.getenv("PYTEST_CURRENT_TEST")))
+
+# cc-lark 代码目录——用于解析相对路径的 claude env 覆盖文件
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _DOMAIN_MAP = {
     "feishu": "https://open.feishu.cn",
@@ -58,12 +69,25 @@ class Profile:
     platform: str
     domain: str
     default_cwd: str
+    # 执行后端：claude（默认）或 codex。按 profile 绑定，用于让不同 bot
+    # 走不同 agent；后续可在 chat 维度继续覆盖。
+    runner: str = "claude"
+    default_model: str = ""
     # 可选：chat_id -> cwd 映射。新群初次进入时按此初始化 cwd（缺省回退到 default_cwd）。
     # 不影响 sessions.json 已记录的群——那些走持久化值，可被 /ws set / /ws use 继续覆盖。
     chat_default_cwd: dict[str, str] = field(default_factory=dict)
     allowed_open_ids: set[str] = field(default_factory=set)
     allowed_group_chat_ids: set[str] = field(default_factory=set)
     lark_cli_profile: str = ""  # 告诉 Claude 用 `lark-cli --profile <name>` 发消息
+    # 可选：该 profile spawn claude 时额外注入的 env 覆盖文件（相对 cc-lark 目录或绝对路径）。
+    # 用于把某个 bot 路由到不同的模型供应商（如 .env.deepseek 走 DeepSeek 的 Anthropic 兼容端点）。
+    # 文件格式见 load_claude_extra_env：支持 JSON {"env":{...}} 或 dotenv KEY=VALUE。
+    claude_env_file: str = ""
+    codex_bin: str = ""
+    codex_sandbox_mode: str = ""
+    codex_approval_policy: str = ""
+    codex_dangerous_bypass: int = 0
+    codex_idle_timeout_sec: int = 3600
     # "会话群" chat_id：bot 在其它群被 @ 时（=调度 session），会被指引把任务派单到
     # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
     dispatch_chat_id: str = ""
@@ -144,6 +168,20 @@ def _load_profile(name: str) -> Profile:
                 chat_default_cwd[chat_id] = os.path.expanduser(env_val)
 
     role = env("ROLE").strip().lower()
+    runner = env("RUNNER", "claude").strip().lower()
+    if runner not in {"claude", "codex"}:
+        raise ValueError(
+            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude 或 codex，当前: {runner}"
+        )
+    try:
+        codex_bypass = int(env("CODEX_DANGEROUS_BYPASS", os.getenv("CODEX_DANGEROUS_BYPASS", "2")) or "2")
+    except ValueError:
+        codex_bypass = 0
+    codex_bypass = max(0, min(2, codex_bypass))
+    try:
+        codex_idle = int(env("CODEX_IDLE_TIMEOUT_SEC", os.getenv("CODEX_IDLE_TIMEOUT_SEC", "3600")) or "3600")
+    except ValueError:
+        codex_idle = 3600
     return Profile(
         name=name,
         app_id=app_id,
@@ -151,10 +189,18 @@ def _load_profile(name: str) -> Profile:
         platform=platform,
         domain=_DOMAIN_MAP[platform],
         default_cwd=default_cwd,
+        runner=runner,
+        default_model=env("DEFAULT_MODEL", os.getenv("DEFAULT_MODEL", "")),
         chat_default_cwd=chat_default_cwd,
         allowed_open_ids=_split_csv(env("ALLOWED_OPEN_IDS")),
         allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),
+        claude_env_file=env("CLAUDE_ENV_FILE").strip(),
+        codex_bin=env("CODEX_BIN", os.getenv("CODEX_BIN", "")).strip(),
+        codex_sandbox_mode=env("CODEX_SANDBOX_MODE", os.getenv("CODEX_SANDBOX_MODE", "")).strip(),
+        codex_approval_policy=env("CODEX_APPROVAL_POLICY", os.getenv("CODEX_APPROVAL_POLICY", "")).strip(),
+        codex_dangerous_bypass=codex_bypass,
+        codex_idle_timeout_sec=max(0, codex_idle),
         dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
         role=role,
         court_chat_id=env("COURT_CHAT_ID").strip(),
@@ -180,6 +226,14 @@ def _load_legacy_profile() -> Optional[Profile]:
     if platform not in _DOMAIN_MAP:
         raise ValueError(f"LARK_PLATFORM 必须是 feishu 或 lark，当前: {platform}")
     legacy_name = os.getenv("LEGACY_PROFILE_NAME", "default")
+    try:
+        codex_bypass = int(os.getenv("CODEX_DANGEROUS_BYPASS", "2") or "2")
+    except ValueError:
+        codex_bypass = 0
+    try:
+        codex_idle = int(os.getenv("CODEX_IDLE_TIMEOUT_SEC", "3600") or "3600")
+    except ValueError:
+        codex_idle = 3600
     return Profile(
         name=legacy_name,
         app_id=app_id,
@@ -187,9 +241,17 @@ def _load_legacy_profile() -> Optional[Profile]:
         platform=platform,
         domain=_DOMAIN_MAP[platform],
         default_cwd=os.path.expanduser(os.getenv("DEFAULT_CWD", "~")),
+        runner=os.getenv("RUNNER", "claude").strip().lower() or "claude",
+        default_model=os.getenv("DEFAULT_MODEL", ""),
         allowed_open_ids=_split_csv(os.getenv("ALLOWED_OPEN_IDS", "")),
         allowed_group_chat_ids=_split_csv(os.getenv("ALLOWED_GROUP_CHAT_IDS", "")),
         lark_cli_profile=os.getenv("LARK_CLI_PROFILE", legacy_name),
+        claude_env_file=os.getenv("CLAUDE_ENV_FILE", "").strip(),
+        codex_bin=os.getenv("CODEX_BIN", "").strip(),
+        codex_sandbox_mode=os.getenv("CODEX_SANDBOX_MODE", "").strip(),
+        codex_approval_policy=os.getenv("CODEX_APPROVAL_POLICY", "").strip(),
+        codex_dangerous_bypass=max(0, min(2, codex_bypass)),
+        codex_idle_timeout_sec=max(0, codex_idle),
     )
 
 
@@ -252,6 +314,7 @@ PROFILES_BY_ROLE: dict[str, Profile] = (
 CLAUDE_CLI = os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude") or "claude"
 
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-opus-4-6")
+DEFAULT_RUNNER = os.getenv("RUNNER", "claude").strip().lower() or "claude"
 PERMISSION_MODE = os.getenv("PERMISSION_MODE", "bypassPermissions")
 
 # session 数据目录（每个 profile 写一个独立 json 文件）
@@ -262,6 +325,66 @@ CALLBACK_PORT = int(os.getenv("CALLBACK_PORT", "9981"))
 
 # 流式卡片更新：每积累多少字符推送一次
 STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "20"))
+
+
+# ── 按 profile 注入 claude env 覆盖（多供应商路由）────────────────
+#
+# 某些 bot（如 bot-b）可以走非 Anthropic 的模型供应商：在 .env 里给该 profile
+# 配 <PREFIX>_CLAUDE_ENV_FILE=.env.deepseek，spawn claude 时这个文件里的 env
+# 会 update 进子进程环境，从而覆盖 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN /
+# ANTHROPIC_MODEL 等，把这一路 bot 整体路由到别的端点。
+
+# claude_env_file 解析缓存：abspath -> (mtime, parsed_dict)
+_CLAUDE_ENV_CACHE: dict[str, tuple[float, dict[str, str]]] = {}
+
+
+def _parse_claude_env_text(text: str) -> dict[str, str]:
+    """解析 claude env 覆盖文件文本。支持两种写法，value 一律转成 str：
+
+    1) JSON —— 直接粘贴 settings.json 的 ``{"env": {...}}`` 块，或扁平 ``{"K":"V"}``
+    2) dotenv —— 逐行 ``KEY=VALUE``
+    """
+    text = (text or "").strip()
+    if not text:
+        return {}
+    # 先按 JSON 解析（兼容用户直接粘 settings.json 的 env 块）
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict):
+        env_obj = obj["env"] if isinstance(obj.get("env"), dict) else obj
+        return {str(k): str(v) for k, v in env_obj.items()}
+    # 回退 dotenv（KEY=VALUE 逐行）
+    vals = dotenv_values(stream=io.StringIO(text))
+    return {str(k): str(v) for k, v in vals.items() if v is not None}
+
+
+def load_claude_extra_env(profile: "Profile") -> dict[str, str]:
+    """读取某 profile 配置的 claude env 覆盖文件，返回要注入 spawn 的环境变量。
+
+    - 没配置 / 文件不存在 / 解析失败 → 返回 {}（绝不抛，避免拖垮 bot）。
+    - 按 mtime 缓存：编辑覆盖文件后，下次 spawn 自动生效，无需重启 cc-lark。
+    """
+    rel = (getattr(profile, "claude_env_file", "") or "").strip()
+    if not rel:
+        return {}
+    path = rel if os.path.isabs(rel) else os.path.join(_BASE_DIR, rel)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        _CLAUDE_ENV_CACHE.pop(path, None)
+        return {}
+    cached = _CLAUDE_ENV_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            parsed = _parse_claude_env_text(f.read())
+    except Exception:
+        parsed = {}
+    _CLAUDE_ENV_CACHE[path] = (mtime, parsed)
+    return parsed
 
 # ── 旧代码兼容：有些模块可能仍读这些名字，保留向后兼容 ─────────
 # 取第一个 profile 作为"默认"值，仅用于没有 profile 上下文的场景

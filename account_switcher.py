@@ -57,6 +57,7 @@ state 持久化到 ~/.feishu-claude/account_switcher_state.json（仅冷却时�
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -194,6 +195,18 @@ def _account_identity(blob: dict) -> Optional[dict]:
     return ident
 
 
+def _identity_uuid(blob_or_ident: Optional[dict]) -> str:
+    """取 oauthAccount.accountUuid。入参可以是整个 saved blob（identity 在 _meta 下）
+    或已经抠出来的 identity dict。取不到返回 ""。"""
+    if not blob_or_ident:
+        return ""
+    ident = blob_or_ident
+    if "_meta" in blob_or_ident:  # 整个 saved blob
+        ident = _account_identity(blob_or_ident) or {}
+    oa = (ident or {}).get("oauthAccount") or {}
+    return oa.get("accountUuid") or ""
+
+
 def _read_identity() -> Optional[dict]:
     """从 ~/.claude.json 抠出 Claude CLI 关心的身份字段。"""
     try:
@@ -297,17 +310,44 @@ def _token_fingerprint(blob_or_dict) -> str:
 
 
 def current_account_name() -> Optional[str]:
-    """读 keychain → 跟 ~/.claude/accounts/*.json 比对，返回当前账户名。"""
+    """读 keychain → 找出它对应哪个 saved 账户名。
+
+    匹配优先级：
+      1. accessToken 指纹精确匹配——最强信号：keychain 里的活 token 就是该快照的 token。
+      2. accountUuid 回退——keychain 刚被 Claude CLI 自行轮换过时，活 token 已不在任何
+         快照里（指纹全 miss → 旧逻辑直接返回 None = 状态栏「未识别」）。这时改用
+         ~/.claude.json 的 oauthAccount.accountUuid 跟各快照 _meta.identity 比对救场。
+         多个快照命中同一 uuid（迁移/串号期）→ 优先 last_switch_to，否则取 mtime 最新。
+    """
     active_blob = _read_keychain_blob()
     if not active_blob:
         return None
+    names = list_account_files()
+    # 1) 指纹精确匹配（健康路径，行为与旧版完全一致）
     active_fp = _token_fingerprint(active_blob)
-    if not active_fp:
-        return None
-    for name in list_account_files():
-        blob = _load_account_blob(name)
-        if blob and _token_fingerprint(blob) == active_fp:
-            return name
+    if active_fp:
+        for name in names:
+            blob = _load_account_blob(name)
+            if blob and _token_fingerprint(blob) == active_fp:
+                return name
+    # 2) accountUuid 回退（CLI 轮换后指纹全 miss 时兜底，消除「未识别」）
+    cur_uuid = _identity_uuid(_read_identity())
+    if cur_uuid:
+        matches = [
+            name for name in names
+            if _identity_uuid(_load_account_blob(name) or {}) == cur_uuid
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            last = (_load_state() or {}).get("last_switch_to")
+            if last in matches:
+                return last
+            try:
+                return max(matches, key=lambda n: os.path.getmtime(
+                    os.path.join(ACCOUNTS_DIR, f"{n}.json")))
+            except OSError:
+                return matches[0]
     return None
 
 
@@ -326,6 +366,53 @@ def _write_keychain_blob(blob: str) -> tuple[bool, str]:
         return True, ""
     except Exception as e:
         return False, f"exec failed: {e}"
+
+
+# ── 跨进程凭证锁（与官方 Claude CLI 的 proper-lockfile 互通）──────────
+#
+# 官方 CLI 刷新 / 写 keychain 前会 `proper-lockfile.lock(~/.claude)`，落地成目录
+# `~/.claude.lock`（靠 mkdir 原子性 + mtime 判 stale）。cc-lark 写 keychain 时用
+# **同一把锁、同一路径**，就不会和正在刷新的 CLI 互相把对方的 token 轮废。
+# 严格 best-effort：抢不到就照常继续（绝不阻塞 bot），只为缩小竞态窗口。
+_CLAUDE_LOCK_DIR = os.path.expanduser("~/.claude") + ".lock"
+# proper-lockfile 默认 stale=10s，活着的持有者每 ~5s 刷一次 mtime；取 12s 只回收真死锁。
+_CLAUDE_LOCK_STALE_SEC = 12.0
+
+
+@contextlib.contextmanager
+def _claude_dir_lock(budget_sec: float = 2.0):
+    """best-effort 抢 ~/.claude.lock。yield True=拿到锁 / False=没拿到但继续。"""
+    acquired = False
+    deadline = time.time() + budget_sec
+    while True:
+        try:
+            os.mkdir(_CLAUDE_LOCK_DIR)
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(_CLAUDE_LOCK_DIR)
+            except OSError:
+                age = 0.0
+            if age > _CLAUDE_LOCK_STALE_SEC:
+                try:
+                    os.rmdir(_CLAUDE_LOCK_DIR)
+                    continue  # 回收死锁后立刻重试
+                except OSError:
+                    pass
+            if time.time() >= deadline:
+                break
+            time.sleep(0.05)
+        except OSError:
+            break  # 父目录异常等 → 放弃锁，继续
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                os.rmdir(_CLAUDE_LOCK_DIR)
+            except OSError:
+                pass
 
 
 def ensure_keychain_intact() -> tuple[str, Optional[str]]:
@@ -413,9 +500,14 @@ _REFRESH_LOCKS: dict[str, threading.Lock] = {}
 _REFRESH_LOCKS_GUARD = threading.Lock()
 
 
-def _refresh_account_inplace(name: str, *, force: bool = False) -> tuple[bool, str]:
+def _refresh_account_inplace(name: str, *, force: bool = False,
+                             sync_keychain: bool = False) -> tuple[bool, str]:
     """直接调 platform.claude.com OAuth endpoint 用 refresh_token 续期。
     成功后**原子写回** ~/.claude/accounts/<name>.json（含轮换后的新 refresh_token）。
+
+    sync_keychain=True（仅当 name 是当前活跃账户时传）：刷新轮换 refresh_token 后，
+    keychain 里那份立刻服务端作废——把新 blob 也写回 keychain，否则正在用该账户的
+    Claude CLI 下次刷新就 invalid_grant。对齐官方「锁 ~/.claude → 刷 → 写 keychain」。
 
     Rolling refresh token：每次成功 refresh，旧 refresh_token 立刻在服务端作废，
     必须把响应里的新 refresh_token 写回去，否则下次就 invalid_grant。
@@ -499,11 +591,22 @@ def _refresh_account_inplace(name: str, *, force: bool = False) -> tuple[bool, s
             json.dump(blob, f, indent=2)
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+
+        if sync_keychain:
+            # 当前活跃账户：keychain 旧 RT 已被这次轮换作废，必须同步新 blob 回 keychain。
+            with _claude_dir_lock():
+                ok_kc, msg_kc = _write_keychain_blob(json.dumps(_strip_meta(blob)))
+            if not ok_kc:
+                return True, f"ok (snapshot written; keychain sync warn: {msg_kc})"
         return True, "ok"
 
 
-def _probe_one(acc: Account) -> Account:
-    """同步阻塞探测单个账户。失败时填 probe_error，不抛。"""
+def _probe_one(acc: Account, is_current: bool = False) -> Account:
+    """同步阻塞探测单个账户。失败时填 probe_error，不抛。
+
+    is_current=True（该账户 == 当前 keychain 活跃账户）：任何 refresh 都带
+    sync_keychain，把轮换后的新 token 同步回 keychain，避免 cc-lark 在 CLI 背后
+    把活账户的 token 轮废。"""
     import urllib.request
     import urllib.error
     import ssl
@@ -517,7 +620,7 @@ def _probe_one(acc: Account) -> Account:
     if acc.expires_at_ms:
         secs_left = acc.expires_at_ms / 1000 - time.time()
         if secs_left < _TOKEN_FRESH_GRACE_SEC:
-            ok, err = _refresh_account_inplace(acc.name)
+            ok, err = _refresh_account_inplace(acc.name, sync_keychain=is_current)
             if not ok:
                 acc.probe_error = f"refresh failed: {err}"
                 return acc
@@ -576,7 +679,7 @@ def _probe_one(acc: Account) -> Account:
         # access_token 还没到本地 expiresAt 但服务端已废（典型场景：用户在 Claude
         # CLI 里 /login 切了别的账户，旧 session 被 OAuth revoke）。强制 refresh
         # 一次，若 refresh_token 也死了让上层走重 login 提示。
-        ok, refresh_err = _refresh_account_inplace(acc.name, force=True)
+        ok, refresh_err = _refresh_account_inplace(acc.name, force=True, sync_keychain=is_current)
         if not ok:
             acc.probe_error = f"auth {http_code} + refresh failed ({refresh_err}) — needs re-login"
             return acc
@@ -625,6 +728,14 @@ def _probe_one(acc: Account) -> Account:
 
 def probe_all(parallel: int = 4) -> dict[str, Account]:
     """并行探测所有保存的账户。返回 {name: Account}。"""
+    # 探测前先把当前账户从 keychain 回收进快照——Claude CLI 可能刚自行轮换过 token，
+    # 不回收的话当前账户会拿快照里的旧 RT 去刷 → invalid_grant 400。best-effort。
+    try:
+        resync_current_from_keychain()
+    except Exception as e:
+        print(f"[switcher] probe 前 resync 异常: {e}", flush=True)
+
+    current = current_account_name()
     names = list_account_files()
     accounts: list[Account] = []
     for n in names:
@@ -638,7 +749,7 @@ def probe_all(parallel: int = 4) -> dict[str, Account]:
     out: dict[str, Account] = {}
     workers = max(1, min(parallel, len(accounts)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="acc-probe") as ex:
-        futs = {ex.submit(_probe_one, a): a for a in accounts}
+        futs = {ex.submit(_probe_one, a, a.name == current): a for a in accounts}
         for fut in as_completed(futs):
             try:
                 acc = fut.result()
@@ -751,9 +862,14 @@ def _validate_name(name: str) -> Optional[str]:
     return None
 
 
-def save_current_account(name: str, *, overwrite: bool = True) -> tuple[bool, str]:
+def save_current_account(name: str, *, overwrite: bool = True,
+                         guard_identity: bool = True) -> tuple[bool, str]:
     """把当前 keychain 凭证 + ~/.claude.json identity 一起 stash 到
     ~/.claude/accounts/<name>.json（schema v2）。
+
+    guard_identity=True（默认）：若目标档已绑定某 accountUuid，而当前 keychain 是
+    另一个账号，拒绝覆盖以防串号（历史上 `spx` 档被误存成 boss 就是这么来的）。
+    手动确要改绑同名档时传 guard_identity=False。
 
     返回 (ok, message_or_summary)。
     """
@@ -773,6 +889,17 @@ def save_current_account(name: str, *, overwrite: bool = True) -> tuple[bool, st
     target = os.path.join(ACCOUNTS_DIR, f"{name}.json")
     if os.path.exists(target) and not overwrite:
         return False, f"{name} already saved (pass overwrite=True to replace)"
+
+    # 身份守卫：目标档已绑 A 账号、当前 keychain 是 B 账号 → 拒绝（防串号）。
+    if guard_identity and os.path.exists(target):
+        existing_uuid = _identity_uuid(_load_account_blob(name) or {})
+        incoming_uuid = _identity_uuid(_read_identity())
+        if existing_uuid and incoming_uuid and existing_uuid != incoming_uuid:
+            return False, (
+                f"refuse: 档 '{name}' 已绑账号 {existing_uuid[:8]}…，"
+                f"当前 keychain 是另一个账号 {incoming_uuid[:8]}… — "
+                f"不覆盖以防串号（确要改绑传 guard_identity=False / CLI 加 --force）"
+            )
 
     payload = {k: v for k, v in kc.items() if k in _KEYCHAIN_TOPLEVEL}
     ident = _read_identity()
@@ -808,6 +935,40 @@ def save_current_account(name: str, *, overwrite: bool = True) -> tuple[bool, st
     return True, f"saved {name}: {' / '.join(summary_parts) or '(no metadata)'}"
 
 
+def resync_current_from_keychain() -> tuple[str, Optional[str]]:
+    """把 keychain 当前活 token + ~/.claude.json identity 回写进它对应的 saved 快照。
+
+    目的：捕获 Claude CLI 在 spawn 期间自行轮换的 token，使快照始终镜像 keychain。
+    不做这步，快照会与 keychain 脱节 → `current_account_name()` 指纹对不上（状态栏
+    「未识别」）+ 下次拿快照里的旧 refresh_token 去刷 → invalid_grant 400。
+
+    幂等：指纹已一致就不写盘。受身份守卫保护，绝不串号。best-effort，绝不抛。
+
+    返回 (status, name)：
+        ("noop", name|None)   无需回收 / 没有可识别的当前账户
+        ("resynced", name)    已回收
+        ("skip", reason)      守卫拦下 / save 失败（带原因）
+        ("error", msg)        异常
+    """
+    try:
+        name = current_account_name()
+    except Exception as e:
+        return ("error", f"current lookup: {e}")
+    if not name:
+        return ("noop", None)
+    try:
+        kc = _read_keychain_blob()
+        snap = _load_account_blob(name)
+        if kc and snap and _token_fingerprint(kc) == _token_fingerprint(snap):
+            return ("noop", name)  # 已同步
+    except Exception:
+        pass
+    ok, msg = save_current_account(name, overwrite=True, guard_identity=True)
+    if not ok:
+        return ("skip", msg)
+    return ("resynced", name)
+
+
 def use_account(name: str) -> tuple[bool, str]:
     """切换到 saved 账户。同步写 keychain + ~/.claude.json identity。
 
@@ -823,9 +984,10 @@ def use_account(name: str) -> tuple[bool, str]:
     if not blob.get("claudeAiOauth", {}).get("accessToken"):
         return False, f"{name} has no claudeAiOauth.accessToken"
 
-    # 1) 写 keychain（strip _meta）
+    # 1) 写 keychain（strip _meta）——进 ~/.claude.lock，避免和正在刷新的 CLI 抢写
     kc_blob = json.dumps(_strip_meta(blob))
-    ok, msg = _write_keychain_blob(kc_blob)
+    with _claude_dir_lock():
+        ok, msg = _write_keychain_blob(kc_blob)
     if not ok:
         return False, f"keychain write failed: {msg}"
 
@@ -1170,6 +1332,10 @@ def _cli_main(argv: list[str]) -> int:
     sp = sub.add_parser("save", help="Save current logged-in account as <name>")
     sp.add_argument("name")
     sp.add_argument("--no-overwrite", action="store_true")
+    sp.add_argument("--force", action="store_true",
+                    help="bypass identity guard (allow re-binding this slot to a different account)")
+
+    sub.add_parser("resync", help="Re-capture current keychain token into its matching saved slot")
 
     su = sub.add_parser("use", help="Activate saved account <name>")
     su.add_argument("name")
@@ -1189,9 +1355,17 @@ def _cli_main(argv: list[str]) -> int:
         return 0
 
     if args.cmd == "save":
-        ok, msg = save_current_account(args.name, overwrite=not args.no_overwrite)
+        ok, msg = save_current_account(
+            args.name, overwrite=not args.no_overwrite,
+            guard_identity=not args.force,
+        )
         print(msg)
         return 0 if ok else 1
+
+    if args.cmd == "resync":
+        status, name = resync_current_from_keychain()
+        print(f"{status}: {name}")
+        return 0 if status in ("noop", "resynced") else 1
 
     if args.cmd == "use":
         ok, msg = use_account(args.name)

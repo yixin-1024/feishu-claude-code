@@ -29,6 +29,13 @@ def test_second_seen_returns_true():
     assert dispatcher._is_duplicate_event("om_aaa") is True
 
 
+def test_same_message_id_different_profiles_both_pass():
+    assert dispatcher._is_duplicate_event("om_aaa", "spx") is False
+    assert dispatcher._is_duplicate_event("om_aaa", "bot-b") is False
+    assert dispatcher._is_duplicate_event("om_aaa", "spx") is True
+    assert dispatcher._is_duplicate_event("om_aaa", "bot-b") is True
+
+
 def test_different_ids_both_pass():
     assert dispatcher._is_duplicate_event("om_aaa") is False
     assert dispatcher._is_duplicate_event("om_bbb") is False

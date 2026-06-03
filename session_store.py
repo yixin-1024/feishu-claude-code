@@ -8,7 +8,7 @@ import urllib.error
 from datetime import datetime
 from typing import Optional
 
-from bot_config import SESSIONS_DIR, DEFAULT_MODEL, DEFAULT_CWD, PERMISSION_MODE
+from bot_config import SESSIONS_DIR, DEFAULT_MODEL, DEFAULT_CWD, PERMISSION_MODE, DEFAULT_RUNNER
 
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
@@ -285,12 +285,14 @@ class Session:
         cwd: str,
         permission_mode: str,
         workspace: str = "",
+        runner: str = "claude",
     ):
         self.session_id = session_id
         self.model = model
         self.cwd = cwd
         self.permission_mode = permission_mode
         self.workspace = workspace
+        self.runner = runner
 
 
 class SessionStore:
@@ -299,6 +301,8 @@ class SessionStore:
         profile: str = "default",
         default_cwd: Optional[str] = None,
         chat_default_cwd: Optional[dict[str, str]] = None,
+        default_runner: Optional[str] = None,
+        default_model: Optional[str] = None,
     ):
         """
         每个 profile 独占一个 SessionStore 实例和一份 json 文件。
@@ -310,6 +314,10 @@ class SessionStore:
         os.makedirs(SESSIONS_DIR, exist_ok=True)
         self.profile = profile
         self._default_cwd = default_cwd or DEFAULT_CWD
+        self._default_runner = (default_runner or DEFAULT_RUNNER or "claude").strip().lower()
+        if self._default_runner not in {"claude", "codex"}:
+            self._default_runner = "claude"
+        self._default_model = default_model or DEFAULT_MODEL
         self._chat_default_cwd = chat_default_cwd or {}
         self._sessions_file = _sessions_file_for(profile)
         self._save_lock = asyncio.Lock()  # 保护 _save() 的全局锁
@@ -395,7 +403,8 @@ class SessionStore:
                 cwd = self._chat_default_cwd.get(raw_chat_id, self._default_cwd)
         return {
             "session_id": None,
-            "model": DEFAULT_MODEL,
+            "runner": self._default_runner,
+            "model": self._default_model,
             "cwd": cwd,
             "permission_mode": PERMISSION_MODE,
             "started_at": datetime.now().isoformat(),
@@ -403,6 +412,7 @@ class SessionStore:
             "workspace": "",
             # 话题群：上一次处理过的 thread 消息 id，用于增量拉取新评论
             "last_seen_message_id": "",
+            "last_usage": {},
         }
 
     def _normalize_chat_key(self, user_id: str, chat_id: str) -> str:
@@ -411,6 +421,20 @@ class SessionStore:
     def _ensure_current_defaults(self, current: dict, chat_key: Optional[str] = None) -> bool:
         changed = False
         defaults = self._default_current(chat_key=chat_key)
+        stored_runner = current.get("runner")
+        if stored_runner != self._default_runner:
+            current["runner"] = self._default_runner
+            current["model"] = self._default_model
+            current["session_id"] = None
+            current["preview"] = ""
+            current["started_at"] = datetime.now().isoformat()
+            changed = True
+        elif self._default_runner == "codex" and str(current.get("model") or "").startswith("claude-"):
+            current["model"] = self._default_model
+            current["session_id"] = None
+            current["preview"] = ""
+            current["started_at"] = datetime.now().isoformat()
+            changed = True
         for key, value in defaults.items():
             if key not in current:
                 current[key] = value
@@ -483,13 +507,21 @@ class SessionStore:
         cur = await self.get_current_raw(user_id, chat_id)
         return Session(
             session_id=cur.get("session_id"),
-            model=cur.get("model", DEFAULT_MODEL),
+            model=cur.get("model", self._default_model),
             cwd=cur.get("cwd", self._default_cwd),
             permission_mode=cur.get("permission_mode", PERMISSION_MODE),
             workspace=cur.get("workspace", ""),
+            runner=cur.get("runner", self._default_runner),
         )
 
-    async def on_claude_response(self, user_id: str, chat_id: str, new_session_id: str, first_message: str):
+    async def on_claude_response(
+        self,
+        user_id: str,
+        chat_id: str,
+        new_session_id: str,
+        first_message: str,
+        usage: Optional[dict] = None,
+    ):
         """Claude 回复后用返回的 session_id 更新状态"""
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
@@ -500,6 +532,7 @@ class SessionStore:
             chat_data["history"] = [h for h in chat_data["history"] if h["session_id"] != old_id]
             chat_data["history"].append({
                 "session_id": old_id,
+                "runner": cur.get("runner", self._default_runner),
                 "started_at": cur.get("started_at", ""),
                 "preview": cur.get("preview", ""),
             })
@@ -511,9 +544,22 @@ class SessionStore:
                 asyncio.create_task(self._bg_generate_summary(user_id, old_id))
 
         cur["session_id"] = new_session_id
+        if usage:
+            cur["last_usage"] = usage
         if not cur.get("preview"):
             cur["preview"] = _clean_preview(first_message)[:40]
         await self._save_async()
+
+    async def on_agent_response(
+        self,
+        user_id: str,
+        chat_id: str,
+        new_session_id: str,
+        first_message: str,
+        usage: Optional[dict] = None,
+    ):
+        """Agent 回复后用返回的 session/thread id 更新状态。"""
+        await self.on_claude_response(user_id, chat_id, new_session_id, first_message, usage=usage)
 
     async def new_session(self, user_id: str, chat_id: str) -> str:
         """Start a new session for a specific chat, return old session title"""
@@ -527,6 +573,7 @@ class SessionStore:
             chat_data["history"] = [h for h in chat_data.get("history", []) if h["session_id"] != old_id]
             chat_data["history"].append({
                 "session_id": old_id,
+                "runner": cur.get("runner", self._default_runner),
                 "started_at": cur.get("started_at", ""),
                 "preview": cur.get("preview", ""),
             })
@@ -541,21 +588,96 @@ class SessionStore:
         # Create new session
         chat_data["current"] = {
             "session_id": None,
-            "model": cur.get("model", DEFAULT_MODEL),
+            "runner": cur.get("runner", self._default_runner),
+            "model": cur.get("model", self._default_model),
             "cwd": cur.get("cwd", self._default_cwd),
             "permission_mode": cur.get("permission_mode", PERMISSION_MODE),
             "started_at": datetime.now().isoformat(),
             "preview": "",
             "workspace": cur.get("workspace", ""),
             "last_seen_message_id": "",
+            "last_usage": {},
         }
+        await self._save_async()
+        return old_title
+
+    async def reset_current_to_defaults(self, user_id: str, chat_id: str) -> str:
+        """Start a fresh session and reset current chat config to profile defaults."""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        cur = chat_data["current"]
+        old_title = ""
+
+        if cur.get("session_id"):
+            old_id = cur["session_id"]
+            chat_data["history"] = [
+                h for h in chat_data.get("history", []) if h["session_id"] != old_id
+            ]
+            chat_data["history"].append({
+                "session_id": old_id,
+                "runner": cur.get("runner", self._default_runner),
+                "started_at": cur.get("started_at", ""),
+                "preview": cur.get("preview", ""),
+            })
+            chat_data["history"] = chat_data["history"][-20:]
+            summaries = self._data[user_id].get("summaries", {})
+            old_title = summaries.get(old_id, "")
+            if not old_title:
+                asyncio.create_task(self._bg_generate_summary(user_id, old_id))
+
+        chat_key = self._normalize_chat_key(user_id, chat_id)
+        chat_data["current"] = self._default_current(chat_key=chat_key)
         await self._save_async()
         return old_title
 
     async def set_model(self, user_id: str, chat_id: str, model: str):
         """Set model for a specific chat"""
         chat_data = await self._ensure_chat_data(user_id, chat_id)
-        chat_data["current"]["model"] = model
+        cur = chat_data["current"]
+        if cur.get("session_id"):
+            chat_data["history"] = [
+                h for h in chat_data.get("history", []) if h["session_id"] != cur["session_id"]
+            ]
+            chat_data["history"].append({
+                "session_id": cur["session_id"],
+                "runner": cur.get("runner", self._default_runner),
+                "started_at": cur.get("started_at", ""),
+                "preview": cur.get("preview", ""),
+            })
+            chat_data["history"] = chat_data["history"][-20:]
+        cur["model"] = model
+        cur["session_id"] = None
+        cur["preview"] = ""
+        cur["last_usage"] = {}
+        cur["started_at"] = datetime.now().isoformat()
+        await self._save_async()
+
+    async def set_runner(self, user_id: str, chat_id: str, runner: str, model: str = ""):
+        """Set agent runner for a specific chat and start a fresh session."""
+        normalized = (runner or "").strip().lower().replace("_", "-")
+        if normalized in {"claude-code", "claudecode"}:
+            normalized = "claude"
+        if normalized not in {"claude", "codex"}:
+            raise ValueError("runner must be 'claude' or 'codex'")
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        cur = chat_data["current"]
+        if cur.get("session_id"):
+            chat_data["history"] = [
+                h for h in chat_data.get("history", []) if h["session_id"] != cur["session_id"]
+            ]
+            chat_data["history"].append({
+                "session_id": cur["session_id"],
+                "runner": cur.get("runner", self._default_runner),
+                "started_at": cur.get("started_at", ""),
+                "preview": cur.get("preview", ""),
+            })
+            chat_data["history"] = chat_data["history"][-20:]
+        cur["runner"] = normalized
+        if model:
+            cur["model"] = model
+        cur["session_id"] = None
+        cur["preview"] = ""
+        cur["last_usage"] = {}
+        cur["started_at"] = datetime.now().isoformat()
         await self._save_async()
 
     async def set_cwd(self, user_id: str, chat_id: str, cwd: str, workspace_name: Optional[str] = None):
@@ -600,6 +722,7 @@ class SessionStore:
             chat_data["history"] = [h for h in chat_data["history"] if h["session_id"] != old_id]
             chat_data["history"].append({
                 "session_id": old_id,
+                "runner": cur.get("runner", self._default_runner),
                 "started_at": cur.get("started_at", ""),
                 "preview": cur.get("preview", ""),
             })
@@ -617,6 +740,12 @@ class SessionStore:
             if h["session_id"] == session_id:
                 original_preview = h.get("preview", "")
                 original_started = h.get("started_at", "")
+                break
+        for h in chat_data["history"]:
+            if h["session_id"] == session_id:
+                runner = h.get("runner")
+                if runner and runner != cur.get("runner", self._default_runner):
+                    return None, ""
                 break
         cur["session_id"] = session_id
         cur["preview"] = original_preview
@@ -685,6 +814,7 @@ class SessionStore:
             chat_data["history"] = [h for h in chat_data["history"] if h["session_id"] != old_sid]
             chat_data["history"].append({
                 "session_id": old_sid,
+                "runner": cur.get("runner", self._default_runner),
                 "started_at": cur.get("started_at", ""),
                 "preview": cur.get("preview", ""),
             })

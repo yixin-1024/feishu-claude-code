@@ -83,9 +83,15 @@ async def run_claude(
     on_usage: Optional[Callable[[dict], None]] = None,
     on_status: Optional[Callable[[str, str], None]] = None,
     append_system_prompt: Optional[str] = None,
+    extra_env: Optional[dict] = None,
 ) -> tuple[str, Optional[str], bool]:
     """
     调用 Claude Code CLI 并流式解析输出。
+
+    extra_env: 注入 spawn 子进程的额外环境变量（覆盖 os.environ）。用于把某个
+    profile/bot 路由到不同模型供应商（如 DeepSeek 的 Anthropic 兼容端点）。
+    若其中含 ANTHROPIC_MODEL，会用它覆盖命令行 --model（否则把 deepseek bot
+    用 claude-opus-4-x 这种 Anthropic 模型名发去 deepseek 会 404）。
 
     后端由 CLAUDE_RUNNER 环境变量决定：
         pty   (默认) → PTY + JSONL tail，保留交互式 Claude Code 完整体验
@@ -103,8 +109,25 @@ async def run_claude(
     except Exception:
         pass
 
-    if _RUNNER_BACKEND == "print":
-        return await _run_claude_print(
+    try:
+        runner_backend = os.getenv("CLAUDE_RUNNER", _RUNNER_BACKEND).strip().lower()
+        if runner_backend == "print":
+            return await _run_claude_print(
+                message=message,
+                session_id=session_id,
+                model=model,
+                cwd=cwd,
+                permission_mode=permission_mode,
+                on_text_chunk=on_text_chunk,
+                on_tool_use=on_tool_use,
+                on_process_start=on_process_start,
+                on_usage=on_usage,
+                append_system_prompt=append_system_prompt,
+                extra_env=extra_env,
+            )
+        # 默认 PTY 后端：延迟 import 避免 print-only 部署没装 termios 的奇怪环境出错
+        from claude_pty import run_claude as _run_claude_pty
+        return await _run_claude_pty(
             message=message,
             session_id=session_id,
             model=model,
@@ -114,23 +137,20 @@ async def run_claude(
             on_tool_use=on_tool_use,
             on_process_start=on_process_start,
             on_usage=on_usage,
+            on_status=on_status,
             append_system_prompt=append_system_prompt,
+            extra_env=extra_env,
         )
-    # 默认 PTY 后端：延迟 import 避免 print-only 部署没装 termios 的奇怪环境出错
-    from claude_pty import run_claude as _run_claude_pty
-    return await _run_claude_pty(
-        message=message,
-        session_id=session_id,
-        model=model,
-        cwd=cwd,
-        permission_mode=permission_mode,
-        on_text_chunk=on_text_chunk,
-        on_tool_use=on_tool_use,
-        on_process_start=on_process_start,
-        on_usage=on_usage,
-        on_status=on_status,
-        append_system_prompt=append_system_prompt,
-    )
+    finally:
+        # spawn 结束后（含异常）：Claude CLI 这一轮可能自行轮换过 keychain token，
+        # 把它回收进对应 saved 快照，否则快照与 keychain 脱节 →「未识别」+ 下次拿旧
+        # refresh_token 刷新 invalid_grant 400。best-effort，丢 executor 别堵事件循环。
+        try:
+            from account_switcher import resync_current_from_keychain
+            await asyncio.get_event_loop().run_in_executor(
+                None, resync_current_from_keychain)
+        except Exception:
+            pass
 
 
 async def _run_claude_print(
@@ -144,8 +164,12 @@ async def _run_claude_print(
     on_process_start: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
     on_usage: Optional[Callable[[dict], None]] = None,
     append_system_prompt: Optional[str] = None,
+    extra_env: Optional[dict] = None,
 ) -> tuple[str, Optional[str], bool]:
     """`claude --print --output-format stream-json` 模式（兼容/兜底后端）。"""
+
+    # extra_env 里的 ANTHROPIC_MODEL 覆盖命令行 --model（供应商路由用）
+    effective_model = (extra_env or {}).get("ANTHROPIC_MODEL") or model
 
     async def _run_once(active_session_id: Optional[str]) -> tuple[str, Optional[str], int, str]:
         cmd = [
@@ -158,13 +182,15 @@ async def _run_claude_print(
         ]
         if active_session_id:
             cmd += ["--resume", active_session_id]
-        if model:
-            cmd += ["--model", model]
+        if effective_model:
+            cmd += ["--model", effective_model]
         if append_system_prompt:
             cmd += ["--append-system-prompt", append_system_prompt]
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
+        if extra_env:
+            env.update(extra_env)
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
