@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import os
 import subprocess
@@ -8,7 +9,14 @@ import urllib.error
 from datetime import datetime
 from typing import Optional
 
-from bot_config import SESSIONS_DIR, DEFAULT_MODEL, DEFAULT_CWD, PERMISSION_MODE, DEFAULT_RUNNER
+from bot_config import (
+    SESSIONS_DIR, DEFAULT_MODEL, DEFAULT_CWD, PERMISSION_MODE, DEFAULT_RUNNER,
+    THREAD_SHARED_SESSION,
+)
+
+# 话题群共享 session 的哨兵用户桶：thread 复合 chat_id（"oc_xxx:omt_yyy"）
+# 在共享模式下统一记到这个桶下，让同一话题里所有人共享同一个 session。
+SHARED_THREAD_UID = "__thread__"
 
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
@@ -303,6 +311,7 @@ class SessionStore:
         chat_default_cwd: Optional[dict[str, str]] = None,
         default_runner: Optional[str] = None,
         default_model: Optional[str] = None,
+        shared_thread_sessions: Optional[bool] = None,
     ):
         """
         每个 profile 独占一个 SessionStore 实例和一份 json 文件。
@@ -313,6 +322,10 @@ class SessionStore:
         """
         os.makedirs(SESSIONS_DIR, exist_ok=True)
         self.profile = profile
+        self._shared_threads = (
+            THREAD_SHARED_SESSION if shared_thread_sessions is None
+            else shared_thread_sessions
+        )
         self._default_cwd = default_cwd or DEFAULT_CWD
         self._default_runner = (default_runner or DEFAULT_RUNNER or "claude").strip().lower()
         if self._default_runner not in {"claude", "codex"}:
@@ -392,6 +405,45 @@ class SessionStore:
     def _user(self, user_id: str) -> dict:
         return self._data.setdefault(user_id, {})
 
+    def _effective_uid(self, user_id: str, chat_id: Optional[str]) -> str:
+        """话题群共享模式下，thread 复合 chat_id（"oc_xxx:omt_yyy"）统一归到
+        哨兵桶 SHARED_THREAD_UID —— 同一话题里所有人共享同一个 session。
+        私聊（chat_id == user_id）和非话题群聊（无 ":"）保持按发送人分桶。
+        幂等：传入哨兵 uid 再映射一次仍是哨兵。"""
+        if self._shared_threads and chat_id and ":" in chat_id and chat_id != user_id:
+            return SHARED_THREAD_UID
+        return user_id
+
+    def _adopt_thread_data(self, chat_key: str) -> Optional[dict]:
+        """共享模式下首次访问某话题时，从旧的按用户分桶数据里收养最近的会话，
+        让开启共享前已有的话题能无缝续上原 session。取 started_at 最新的一份，
+        连带把相关摘要复制到哨兵桶（/resume 列表显示标题用）。"""
+        best_uid = None
+        best_data = None
+        best_ts = ""
+        for uid, user_data in self._data.items():
+            if uid == SHARED_THREAD_UID or not isinstance(user_data, dict):
+                continue
+            chat_data = user_data.get(chat_key)
+            if not isinstance(chat_data, dict) or not isinstance(chat_data.get("current"), dict):
+                continue
+            ts = str(chat_data["current"].get("started_at", "") or "")
+            if best_data is None or ts > best_ts:
+                best_uid, best_data, best_ts = uid, chat_data, ts
+        if best_data is None:
+            return None
+        adopted = copy.deepcopy(best_data)
+        src_summaries = self._data.get(best_uid, {}).get("summaries", {})
+        if src_summaries:
+            sids = {adopted.get("current", {}).get("session_id")}
+            sids.update(h.get("session_id") for h in adopted.get("history", []))
+            picked = {s: src_summaries[s] for s in sids if s and s in src_summaries}
+            if picked:
+                self._data.setdefault(SHARED_THREAD_UID, {}).setdefault(
+                    "summaries", {}
+                ).update(picked)
+        return adopted
+
     def _default_current(self, chat_key: Optional[str] = None) -> dict:
         # chat_key 在话题群里是 "oc_xxx:omt_yyy" 复合形式，env 里配置的 CHAT_CWD_<id>
         # 用的是裸 chat_id，所以先按完整 key 查，未命中再剥掉 thread 后缀查一次。
@@ -442,6 +494,7 @@ class SessionStore:
         return changed
 
     async def _ensure_chat_data(self, user_id: str, chat_id: str) -> dict:
+        user_id = self._effective_uid(user_id, chat_id)
         user = self._user(user_id)
         chat_key = self._normalize_chat_key(user_id, chat_id)
         changed = False
@@ -454,7 +507,12 @@ class SessionStore:
                     "history": user.pop("history", []),
                 }
             else:
-                user[chat_key] = {
+                # 共享话题桶首次访问：先尝试收养旧的按用户分桶数据（无缝续 session）
+                adopted = (
+                    self._adopt_thread_data(chat_key)
+                    if user_id == SHARED_THREAD_UID else None
+                )
+                user[chat_key] = adopted or {
                     "current": self._default_current(chat_key=chat_key),
                     "history": [],
                 }
@@ -476,8 +534,16 @@ class SessionStore:
         return chat_data
 
     def get_summary(self, user_id: str, session_id: str) -> str:
-        """获取缓存的摘要"""
-        return self._user(user_id).get("summaries", {}).get(session_id, "")
+        """获取缓存的摘要。共享话题模式下回落查哨兵桶（调用方常拿真实
+        sender uid 来查，而共享话题的摘要存在 SHARED_THREAD_UID 下）。"""
+        summary = self._user(user_id).get("summaries", {}).get(session_id, "")
+        if not summary and self._shared_threads and user_id != SHARED_THREAD_UID:
+            summary = (
+                self._data.get(SHARED_THREAD_UID, {})
+                .get("summaries", {})
+                .get(session_id, "")
+            )
+        return summary
 
     def get_all_unsummarized(self) -> list[tuple[str, str]]:
         """返回所有缺摘要的 (user_id, session_id) 列表"""
@@ -523,6 +589,7 @@ class SessionStore:
         usage: Optional[dict] = None,
     ):
         """Claude 回复后用返回的 session_id 更新状态"""
+        user_id = self._effective_uid(user_id, chat_id)
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
         old_id = cur.get("session_id")
@@ -563,6 +630,7 @@ class SessionStore:
 
     async def new_session(self, user_id: str, chat_id: str) -> str:
         """Start a new session for a specific chat, return old session title"""
+        user_id = self._effective_uid(user_id, chat_id)
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
         old_title = ""
@@ -603,6 +671,7 @@ class SessionStore:
 
     async def reset_current_to_defaults(self, user_id: str, chat_id: str) -> str:
         """Start a fresh session and reset current chat config to profile defaults."""
+        user_id = self._effective_uid(user_id, chat_id)
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
         old_title = ""
@@ -695,6 +764,7 @@ class SessionStore:
 
     async def resume_session(self, user_id: str, chat_id: str, index_or_id: str) -> tuple[Optional[str], str]:
         """按序号（1-based）或 session_id 恢复 session，返回 (session_id, old_title)"""
+        user_id = self._effective_uid(user_id, chat_id)
         if user_id not in self._data:
             return None, ""
 
@@ -755,6 +825,7 @@ class SessionStore:
 
     async def list_sessions(self, user_id: str, chat_id: str) -> list:
         """List all sessions for a specific chat"""
+        user_id = self._effective_uid(user_id, chat_id)
         if user_id not in self._data:
             return []
 
@@ -804,6 +875,7 @@ class SessionStore:
     ) -> dict:
         """CLI handover: 将指定 session_id 设为当前会话。
         返回 {"old_session_id", "old_summary"} 供通知使用。"""
+        user_id = self._effective_uid(user_id, chat_id)
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
         old_sid = cur.get("session_id")

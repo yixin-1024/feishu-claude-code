@@ -4,6 +4,8 @@ import signal
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
+from bot_config import THREAD_SHARED_SESSION
+
 
 def _kill_pgroup(proc, sig: int) -> bool:
     """杀 proc 所在进程组（spawn 时 start_new_session=True，proc 是 pgid leader）。
@@ -26,11 +28,17 @@ class ActiveRun:
 
 
 def _key(user_id: str, chat_id: str) -> str:
+    # 话题群共享模式：thread 复合 chat_id（"oc_xxx:omt_yyy"）按话题聚合，
+    # 与 SessionStore 的共享 session 语义一致 —— 同话题里任何人都能 /stop
+    # 正在跑的任务（不管是谁发起的）。
+    if THREAD_SHARED_SESSION and ":" in chat_id and chat_id != user_id:
+        return f"__thread__::{chat_id}"
     return f"{user_id}::{chat_id}"
 
 
 class ActiveRunRegistry:
-    """按 (user_id, chat_id) 索引 — 同一用户在不同 chat/话题里的任务互不干扰。"""
+    """按 (user_id, chat_id) 索引 — 同一用户在不同 chat/话题里的任务互不干扰。
+    话题群共享模式下话题维度聚合（见 _key）。"""
 
     def __init__(self):
         self._runs: dict[str, ActiveRun] = {}

@@ -289,6 +289,16 @@ PROFILES_BY_NAME: dict[str, Profile] = {p.name: p for p in PROFILES}
 _TRUTHY = {"true", "1", "yes", "on", "y"}
 TRINITY_ENABLED: bool = os.getenv("ENABLE_TRINITY", "").strip().lower() in _TRUTHY
 
+# ── 话题群共享 session ─────────────────────────────────────────
+#
+# 默认开启：同一话题群的同一个话题（thread）里，不管谁 @ bot，都续同一个
+# claude/codex session（SessionStore 把 "oc_xxx:omt_yyy" 复合 chat_id 归到
+# 哨兵用户桶；ActiveRunRegistry 同样按话题聚合，任何人都能 /stop 话题内任务）。
+# 设 THREAD_SHARED_SESSION=0 恢复旧版"每人各自一个 session"行为。
+THREAD_SHARED_SESSION: bool = (
+    os.getenv("THREAD_SHARED_SESSION", "1").strip().lower() in _TRUTHY
+)
+
 
 # 关闭时把 trinity 相关属性置零，让 Profile.is_trinity / PROFILES_BY_ROLE 等
 # 全部"看不见"角色配置，dispatcher/lark_prompts 走遗留路径。
