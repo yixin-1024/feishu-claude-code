@@ -480,10 +480,17 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
             await _show_command_menu(bot, user_id, chat_id, is_group, msg.message_id)
             return
 
-    # 群聊只响应 @机器人 的消息
+    # 群聊只响应 @机器人 的消息。
+    # 例外：语音消息没法 @ 人，在已有会话记录的话题 thread 里直接放行
+    # （新 thread 首条消息仍要求文字 @，和 text 行为一致）。
     if is_group:
         if not await _is_current_bot_mentioned(bot, msg):
-            return
+            if not (
+                msg.message_type == "audio"
+                and thread_id
+                and bot.store.has_chat_record(user_id, chat_id)
+            ):
+                return
 
     lock = bot._ensure_chat_lock(chat_id)
 
@@ -932,6 +939,36 @@ async def _process_message(
                     pass
             else:
                 await bot.feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
+            return
+
+    elif msg.message_type == "audio":
+        try:
+            content_obj = json.loads(msg.content)
+            file_key = content_obj.get("file_key", "")
+            if not file_key:
+                return
+            duration_ms = int(content_obj.get("duration") or 0)
+            audio_path = await bot.feishu.download_file(
+                msg.message_id, file_key, msg_type="audio", file_name="voice.opus",
+            )
+            transcript = await bot.feishu.speech_to_text(audio_path, file_id=msg.message_id)
+            if not transcript:
+                raise RuntimeError("识别结果为空（可能没说话或环境噪音过大）")
+            text = (
+                f"[用户发送了一条语音消息（{duration_ms // 1000}s），以下为自动转写，"
+                f"可能存在同音字/分词误差，请按口语理解]\n{transcript}"
+            )
+            preview_text = f"🎤 {transcript[:40]}"
+            log(tag, "audio", "info", f"转写 {duration_ms}ms → {transcript[:50]}")
+        except Exception as e:
+            log(tag, "audio", "error", f"语音转写失败: {e}")
+            if is_group:
+                try:
+                    await bot.feishu.reply_card(msg.message_id, content=f"❌ 语音转写失败：{e}", loading=False)
+                except Exception:
+                    pass
+            else:
+                await bot.feishu.send_text_to_user(user_id, f"❌ 语音转写失败：{e}")
             return
 
     elif msg.message_type == "file":

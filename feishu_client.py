@@ -336,6 +336,86 @@ class FeishuClient:
 
         return tmp_path
 
+    async def speech_to_text(self, audio_path: str, file_id: str = "") -> str:
+        """调飞书语音识别 API 把语音文件（≤60s）转成文字。
+
+        file_recognize 只接受 16kHz s16le 单声道裸 pcm，所以先用 ffmpeg 把
+        Lark 语音消息的 opus 解码成 pcm 再上传。需要 app 具备
+        speech_to_text:speech 权限。file_id 要求恰好 16 位字母数字下划线。
+        """
+        return await asyncio.to_thread(self._speech_to_text_sync, audio_path, file_id)
+
+    @staticmethod
+    def _find_ffmpeg() -> str:
+        import shutil
+        # launchd 环境的 PATH 往往没有 homebrew，按常见安装位置兜底
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+        for cand in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+            if os.path.exists(cand):
+                return cand
+        raise RuntimeError("未找到 ffmpeg（语音转写需要它把 opus 解码成 pcm）")
+
+    def _speech_to_text_sync(self, audio_path: str, file_id: str) -> str:
+        import base64
+        import re
+        import ssl
+        import subprocess
+        import urllib.request
+        import uuid
+
+        proc = subprocess.run(
+            [self._find_ffmpeg(), "-y", "-loglevel", "error",
+             "-i", audio_path, "-f", "s16le", "-ar", "16000", "-ac", "1", "-"],
+            capture_output=True, timeout=30,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            raise RuntimeError(f"ffmpeg 解码失败: {proc.stderr.decode(errors='replace')[:200]}")
+        speech_b64 = base64.b64encode(proc.stdout).decode()
+
+        ctx = ssl.create_default_context()
+
+        token_body = json.dumps({"app_id": self._app_id, "app_secret": self._app_secret}).encode()
+        token_req = urllib.request.Request(
+            f"{self._domain}/open-apis/auth/v3/tenant_access_token/internal",
+            data=token_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(token_req, context=ctx, timeout=10) as r:
+            token = json.loads(r.read())["tenant_access_token"]
+
+        fid = re.sub(r"[^A-Za-z0-9_]", "", file_id or "")
+        if len(fid) < 16:
+            fid = (fid + uuid.uuid4().hex)[:16]
+        else:
+            fid = fid[:16]
+
+        body = json.dumps({
+            "speech": {"speech": speech_b64},
+            "config": {
+                "file_id": fid,
+                "format": "pcm",
+                "engine_type": "16k_auto",
+            },
+        }).encode()
+        req = urllib.request.Request(
+            f"{self._domain}/open-apis/speech_to_text/v1/speech/file_recognize",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+            data = json.loads(r.read())
+
+        if data.get("code") != 0:
+            raise RuntimeError(f"语音识别失败 code={data.get('code')} msg={data.get('msg')}")
+        return ((data.get("data") or {}).get("recognition_text") or "").strip()
+
     async def get_message_thread_id(self, message_id: str) -> str:
         """通过 GET /im/v1/messages/{id} 拿这条消息所在的 thread_id（话题群里专用）。
         用于 /spawn 兜底：dispatcher Claude 偶尔会把 anchor 的 message_id 当 thread_id 传过来，

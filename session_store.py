@@ -533,6 +533,23 @@ class SessionStore:
 
         return chat_data
 
+    def has_chat_record(self, user_id: str, chat_id: str) -> bool:
+        """只读检查：这个 chat（含话题复合 key "oc_xxx:omt_yyy"）是否已有会话记录。
+        不创建任何数据。扫所有桶——共享话题模式的哨兵桶和旧的按用户分桶都算，
+        与 _adopt_thread_data 的收养语义保持一致。"""
+        uid = self._effective_uid(user_id, chat_id)
+        chat_key = self._normalize_chat_key(uid, chat_id)
+        for user_data in self._data.values():
+            if not isinstance(user_data, dict):
+                continue
+            chat_data = user_data.get(chat_key)
+            if not isinstance(chat_data, dict):
+                continue
+            cur = chat_data.get("current") or {}
+            if cur.get("session_id") or chat_data.get("history"):
+                return True
+        return False
+
     def get_summary(self, user_id: str, session_id: str) -> str:
         """获取缓存的摘要。共享话题模式下回落查哨兵桶（调用方常拿真实
         sender uid 来查，而共享话题的摘要存在 SHARED_THREAD_UID 下）。"""
