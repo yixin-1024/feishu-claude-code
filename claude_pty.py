@@ -444,22 +444,12 @@ async def _wait_for_ready(ready_event: asyncio.Event, timeout: float) -> bool:
 
 # 白名单：真正想透传给 claude 内置 slash 的命令。其他 / 开头的会被前置空格降级
 # 成普通文本，避免误触发 claude 内置（用户的"/pwd"通常是想让模型执行 pwd）。
-_CLAUDE_BUILTIN_PASSTHROUGH = ("/compact",)
-
-
-def _is_builtin_passthrough(message: str) -> bool:
-    """消息是不是命中 _CLAUDE_BUILTIN_PASSTHROUGH 的精确命令（带参数也算）。
-
-    `startswith` 直接对 tuple 会误中 `/compactfoo`，得严格匹配 cmd 本身或 cmd
-    后面跟空白。
-    """
-    if not message:
-        return False
-    stripped = message.lstrip()
-    for cmd in _CLAUDE_BUILTIN_PASSTHROUGH:
-        if stripped == cmd or stripped.startswith(cmd + " ") or stripped.startswith(cmd + "\n"):
-            return True
-    return False
+# 定义抽到零依赖的 passthrough 模块，让 dispatcher（不能 import 带 termios 的本
+# 文件）也能共享同一份白名单——话题群注入上下文前要先识别这类控制命令。
+from passthrough import (  # noqa: E402
+    CLAUDE_BUILTIN_PASSTHROUGH as _CLAUDE_BUILTIN_PASSTHROUGH,
+    is_builtin_passthrough as _is_builtin_passthrough,
+)
 
 
 def _escape_for_pty(message: str) -> str:

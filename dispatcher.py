@@ -30,6 +30,7 @@ from agent_runner import run_agent
 from commands import parse_command, handle_command
 from feishu_post import parse_post_content, extract_post_image_keys
 from lark_prompts import render_lark_prompt
+from passthrough import is_builtin_passthrough
 from log_util import log
 from run_control import ActiveRun, stop_run
 from thread_context import build_thread_context
@@ -1045,7 +1046,13 @@ async def _process_message(
     log(tag, "agent", "info",
         f"runner={session.runner} session={session.session_id} model={session.model}")
 
-    if thread_id:
+    # 透传给 claude 内置的控制命令（如 /compact）：绝不能在前面拼话题上下文，否则
+    # 消息不再以 /compact 开头，_escape_for_pty 不透传、claude 当普通文本，内置命令
+    # 不触发 = 没效果。同时跳过 set_last_seen——这条命令并没有真正"读"话题内容，
+    # 把未读上下文留给下一条真实消息。
+    if thread_id and is_builtin_passthrough(text):
+        log(tag, "thread", "info", "透传内置命令，跳过话题上下文注入")
+    elif thread_id:
         try:
             last_seen = await bot.store.get_last_seen(user_id, chat_id)
             context_block, ctx_paths = await build_thread_context(
