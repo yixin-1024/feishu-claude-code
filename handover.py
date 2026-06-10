@@ -60,7 +60,7 @@ def main():
     query = {
         "session_id": session_id,
         "cwd": cwd,
-        "model": os.environ.get("CLAUDE_MODEL", "claude-opus-4-6"),
+        "model": os.environ.get("CLAUDE_MODEL", "claude-fable-5[1m]"),
     }
     if len(sys.argv) >= 3:
         query["profile"] = sys.argv[2]

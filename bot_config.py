@@ -323,7 +323,7 @@ PROFILES_BY_ROLE: dict[str, Profile] = (
 
 CLAUDE_CLI = os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude") or "claude"
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-opus-4-6")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-fable-5[1m]")
 DEFAULT_RUNNER = os.getenv("RUNNER", "claude").strip().lower() or "claude"
 PERMISSION_MODE = os.getenv("PERMISSION_MODE", "bypassPermissions")
 

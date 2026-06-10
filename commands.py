@@ -35,6 +35,7 @@ MODE_ALIASES = {
 }
 
 MODEL_ALIASES = {
+    "fable": "claude-fable-5[1m]",
     "opus": "claude-opus-4-8[1m]",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
@@ -1158,6 +1159,7 @@ async def handle_command(
                 ]
             else:
                 buttons = [
+                    {"text": "📖 Fable", "value": {"action": "run_cmd", "cmd": "/model fable", "cid": chat_id}},
                     {"text": "🧠 Opus", "value": {"action": "run_cmd", "cmd": "/model opus", "cid": chat_id}},
                     {"text": "⚡ Sonnet", "value": {"action": "run_cmd", "cmd": "/model sonnet", "cid": chat_id}},
                     {"text": "🐇 Haiku", "value": {"action": "run_cmd", "cmd": "/model haiku", "cid": chat_id}},
