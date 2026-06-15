@@ -88,11 +88,31 @@ def create_bot_loop() -> asyncio.AbstractEventLoop:
 
 last_event_ts = time.time()
 
+# 按 profile 的最近活跃时间戳。全局 last_event_ts 会被「任意一个 bot 收到事件」
+# 刷新，所以无法判断「某一条 WS 单独死了」——曾经 hermes 的 WS 静默挂掉，但
+# spx/bot-b 照常收事件把全局时间戳喂饱，于是没有任何监控发现 hermes 变哑。
+# 这里按 profile 名分开记，供 WS 看门狗 / 状态查询用。
+_profile_last_event: dict[str, float] = {}
+_profile_last_event_lock = threading.Lock()
+
 
 def touch_event() -> None:
     """每收到一次 Lark event 调一次，刷新最近活跃时间。"""
     global last_event_ts
     last_event_ts = time.time()
+
+
+def _touch_profile_event(name: str) -> None:
+    """刷新某个 profile 的最近活跃时间（每收到一次该 bot 的事件调一次）。"""
+    with _profile_last_event_lock:
+        _profile_last_event[name] = time.time()
+
+
+def profile_idle_seconds() -> dict[str, float]:
+    """返回每个 profile 距上次收到事件的秒数（用于状态查询 / 调试）。"""
+    now = time.time()
+    with _profile_last_event_lock:
+        return {name: now - ts for name, ts in _profile_last_event.items()}
 
 
 # ── 后台定时摘要生成 ────────────────────────────────────────
@@ -249,12 +269,22 @@ def start_quota_watcher(
 # ── 为 profile 启动 WebSocket 客户端 ─────────────────────────
 
 def start_profile_ws(bot: BotInstance) -> None:
-    """为一个 profile 启动独立 WS 客户端（跑在单独线程，阻塞）。"""
+    """为一个 profile 启动独立 WS 客户端（跑在单独线程，监督式自愈）。
+
+    历史坑：lark_oapi 的 ws.Client.start() 内部虽有无限 _reconnect()，但若重连
+    期间 _try_connect 抛出 ClientException（凭证错误 / 服务端某些返回码），异常会
+    一路冒泡冲出 start() 把线程结束掉。旧实现只调一次 start()、不监督，于是这条
+    WS 永久变哑（进程不崩、其它 profile 照常、launchd 不重启、lark_oapi 自身的
+    日志又不进 cc-lark 日志 → 完全静默）。这里用监督循环包住：start() 一旦返回
+    或抛异常，就退避后**重建 client 重连**，让单条 WS 死亡可自愈而无需整进程重启。
+    """
     if _bindings is None or _bot_loop is None:
         raise RuntimeError("runtime not configured; call configure() first")
+    name = bot.profile.name
 
     def _on_message(data) -> None:
         touch_event()
+        _touch_profile_event(name)
         asyncio.run_coroutine_threadsafe(
             _bindings.on_lark_message(bot, data),
             _bot_loop,
@@ -262,34 +292,52 @@ def start_profile_ws(bot: BotInstance) -> None:
 
     def _on_card(data):
         touch_event()
+        _touch_profile_event(name)
         return _bindings.on_card_action(data)
 
-    handler = (
-        lark.EventDispatcherHandler.builder("", "")
-        .register_p2_im_message_receive_v1(_on_message)
-        .register_p2_card_action_trigger(_on_card)
-        .register_p2_im_message_message_read_v1(lambda _e: None)
-        .build()
-    )
-
-    ws_client = lark.ws.Client(
-        bot.profile.app_id,
-        bot.profile.app_secret,
-        event_handler=handler,
-        domain=bot.profile.domain,
-        log_level=lark.LogLevel.INFO,
-    )
+    def _build_client():
+        handler = (
+            lark.EventDispatcherHandler.builder("", "")
+            .register_p2_im_message_receive_v1(_on_message)
+            .register_p2_card_action_trigger(_on_card)
+            .register_p2_im_message_message_read_v1(lambda _e: None)
+            .build()
+        )
+        return lark.ws.Client(
+            bot.profile.app_id,
+            bot.profile.app_secret,
+            event_handler=handler,
+            domain=bot.profile.domain,
+            log_level=lark.LogLevel.INFO,
+        )
 
     def _run():
-        # 给这条 WS 线程分配独立 asyncio 事件循环；lark_oapi 模块级 loop 代理
-        # 据此分发，不同 profile 的 ws.Client 互不打架。
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        ws_client.start()
+        backoff = 5
+        while True:
+            started = time.time()
+            try:
+                # 每次都换一个全新的事件循环 + 全新 client：重连后旧 client 的内部
+                # 状态（_connected/_ws）已脏，复用会卡死。lark_oapi 模块级 loop 代理
+                # 按当前线程默认 loop 分发，不同 profile 的 WS 互不打架。
+                asyncio.set_event_loop(asyncio.new_event_loop())
+                _build_client().start()
+                reason = "start() 正常返回（SDK 已放弃内部重连）"
+            except Exception as e:  # noqa: BLE001 — 任何异常都不能让监督线程退出
+                reason = f"{type(e).__name__}: {e}"
+            lived = int(time.time() - started)
+            # 连得久（>2min）说明是新一次断线，退避重置；短时间反复失败才指数退避。
+            if lived > 120:
+                backoff = 5
+            log(name, "ws", "warn",
+                f"WS 断开（存活 {lived}s）：{reason}；{backoff}s 后重连")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
+    _touch_profile_event(name)  # 启动即视为「刚活跃」，避免看门狗误判
     threading.Thread(
-        target=_run, daemon=True, name=f"ws-{bot.profile.name}",
+        target=_run, daemon=True, name=f"ws-{name}",
     ).start()
-    log(bot.profile.name, "ws", "info",
+    log(name, "ws", "info",
         f"WS 客户端已启动 ({bot.profile.brand_label} · {bot.profile.domain})")
 
 

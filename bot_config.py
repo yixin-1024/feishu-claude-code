@@ -88,6 +88,15 @@ class Profile:
     codex_approval_policy: str = ""
     codex_dangerous_bypass: int = 0
     codex_idle_timeout_sec: int = 3600
+    # opencode runner 配置。opencode 走 provider/model 形式；裸 model 名按
+    # opencode_provider 补前缀。api_key 注入到子进程的 opencode_api_key_env
+    # 环境变量（google provider 默认读 GOOGLE_GENERATIVE_AI_API_KEY）。
+    opencode_bin: str = ""
+    opencode_provider: str = "google"
+    opencode_api_key: str = ""
+    opencode_api_key_env: str = "GOOGLE_GENERATIVE_AI_API_KEY"
+    opencode_dangerous_skip: int = 1
+    opencode_idle_timeout_sec: int = 300
     # "会话群" chat_id：bot 在其它群被 @ 时（=调度 session），会被指引把任务派单到
     # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
     dispatch_chat_id: str = ""
@@ -169,9 +178,9 @@ def _load_profile(name: str) -> Profile:
 
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
-    if runner not in {"claude", "codex"}:
+    if runner not in {"claude", "codex", "opencode"}:
         raise ValueError(
-            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude 或 codex，当前: {runner}"
+            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode，当前: {runner}"
         )
     try:
         codex_bypass = int(env("CODEX_DANGEROUS_BYPASS", os.getenv("CODEX_DANGEROUS_BYPASS", "2")) or "2")
@@ -182,6 +191,14 @@ def _load_profile(name: str) -> Profile:
         codex_idle = int(env("CODEX_IDLE_TIMEOUT_SEC", os.getenv("CODEX_IDLE_TIMEOUT_SEC", "3600")) or "3600")
     except ValueError:
         codex_idle = 3600
+    try:
+        oc_skip = int(env("OPENCODE_DANGEROUS_SKIP", os.getenv("OPENCODE_DANGEROUS_SKIP", "1")) or "1")
+    except ValueError:
+        oc_skip = 1
+    try:
+        oc_idle = int(env("OPENCODE_IDLE_TIMEOUT_SEC", os.getenv("OPENCODE_IDLE_TIMEOUT_SEC", "300")) or "300")
+    except ValueError:
+        oc_idle = 300
     return Profile(
         name=name,
         app_id=app_id,
@@ -201,6 +218,12 @@ def _load_profile(name: str) -> Profile:
         codex_approval_policy=env("CODEX_APPROVAL_POLICY", os.getenv("CODEX_APPROVAL_POLICY", "")).strip(),
         codex_dangerous_bypass=codex_bypass,
         codex_idle_timeout_sec=max(0, codex_idle),
+        opencode_bin=env("OPENCODE_BIN", os.getenv("OPENCODE_BIN", "")).strip(),
+        opencode_provider=env("OPENCODE_PROVIDER", os.getenv("OPENCODE_PROVIDER", "google")).strip() or "google",
+        opencode_api_key=env("OPENCODE_API_KEY", os.getenv("OPENCODE_API_KEY", "")).strip(),
+        opencode_api_key_env=env("OPENCODE_API_KEY_ENV", os.getenv("OPENCODE_API_KEY_ENV", "GOOGLE_GENERATIVE_AI_API_KEY")).strip() or "GOOGLE_GENERATIVE_AI_API_KEY",
+        opencode_dangerous_skip=max(0, min(1, oc_skip)),
+        opencode_idle_timeout_sec=max(0, oc_idle),
         dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
         role=role,
         court_chat_id=env("COURT_CHAT_ID").strip(),
@@ -234,6 +257,14 @@ def _load_legacy_profile() -> Optional[Profile]:
         codex_idle = int(os.getenv("CODEX_IDLE_TIMEOUT_SEC", "3600") or "3600")
     except ValueError:
         codex_idle = 3600
+    try:
+        oc_skip = int(os.getenv("OPENCODE_DANGEROUS_SKIP", "1") or "1")
+    except ValueError:
+        oc_skip = 1
+    try:
+        oc_idle = int(os.getenv("OPENCODE_IDLE_TIMEOUT_SEC", "300") or "300")
+    except ValueError:
+        oc_idle = 300
     return Profile(
         name=legacy_name,
         app_id=app_id,
@@ -252,6 +283,12 @@ def _load_legacy_profile() -> Optional[Profile]:
         codex_approval_policy=os.getenv("CODEX_APPROVAL_POLICY", "").strip(),
         codex_dangerous_bypass=max(0, min(2, codex_bypass)),
         codex_idle_timeout_sec=max(0, codex_idle),
+        opencode_bin=os.getenv("OPENCODE_BIN", "").strip(),
+        opencode_provider=os.getenv("OPENCODE_PROVIDER", "google").strip() or "google",
+        opencode_api_key=os.getenv("OPENCODE_API_KEY", "").strip(),
+        opencode_api_key_env=os.getenv("OPENCODE_API_KEY_ENV", "GOOGLE_GENERATIVE_AI_API_KEY").strip() or "GOOGLE_GENERATIVE_AI_API_KEY",
+        opencode_dangerous_skip=max(0, min(1, oc_skip)),
+        opencode_idle_timeout_sec=max(0, oc_idle),
     )
 
 
@@ -323,7 +360,7 @@ PROFILES_BY_ROLE: dict[str, Profile] = (
 
 CLAUDE_CLI = os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude") or "claude"
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-fable-5[1m]")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-opus-4-8[1m]")
 DEFAULT_RUNNER = os.getenv("RUNNER", "claude").strip().lower() or "claude"
 PERMISSION_MODE = os.getenv("PERMISSION_MODE", "bypassPermissions")
 

@@ -7,6 +7,7 @@ from typing import Callable, Optional
 from bot_config import Profile, load_claude_extra_env
 from claude_runner import run_claude
 from codex_runner import run_codex
+from opencode_runner import run_opencode
 
 
 async def run_agent(
@@ -26,6 +27,27 @@ async def run_agent(
     append_system_prompt: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
     backend = (runner or profile.runner or "claude").strip().lower()
+    if backend == "opencode":
+        return await run_opencode(
+            message=message,
+            session_id=session_id,
+            model=model,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            on_usage=on_usage,
+            on_status=on_status,
+            append_system_prompt=append_system_prompt,
+            opencode_bin=profile.opencode_bin,
+            provider=profile.opencode_provider,
+            api_key=profile.opencode_api_key,
+            api_key_env=profile.opencode_api_key_env,
+            dangerously_skip_permissions=bool(profile.opencode_dangerous_skip),
+            idle_timeout_sec=profile.opencode_idle_timeout_sec,
+        )
+
     if backend == "codex":
         return await run_codex(
             message=message,

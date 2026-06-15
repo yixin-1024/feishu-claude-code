@@ -461,9 +461,23 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
         if _text.lower() == "/restart" or _text.strip().endswith("/restart"):
             if is_group and not await _is_current_bot_mentioned(bot, msg):
                 return
-            from commands import _trigger_restart
+            from commands import _trigger_restart, restart_strategy
+            strat = restart_strategy()
+            if strat == "bare":
+                ack = ("❌ 没找到 supervisor（非 launchd 任务、无 .app），"
+                       "直接退出会停服，已取消重启。")
+                try:
+                    if is_group:
+                        await bot.feishu.reply_card(msg.message_id, content=ack, loading=False)
+                    else:
+                        await bot.feishu.send_card_to_user(user_id, content=ack, loading=False)
+                except Exception:
+                    pass
+                return
             affected = await _handle_restart_command(bot)
-            ack = f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— ~5s 后回来。"
+            via = "launchd kickstart" if strat == "launchd" else "open .app"
+            ack = (f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— "
+                   f"{via}，~3-5s 后回来。")
             try:
                 if is_group:
                     await bot.feishu.reply_card(msg.message_id, content=ack, loading=False)
@@ -1415,9 +1429,22 @@ async def handle_menu_command(bot: BotInstance, user_id: str, chat_id: str, cmd_
         return
 
     if cmd == "restart":
-        from commands import _trigger_restart
+        from commands import _trigger_restart, restart_strategy
+        strat = restart_strategy()
+        if strat == "bare":
+            if card_msg_id:
+                try:
+                    await bot.feishu.update_card(
+                        card_msg_id,
+                        "❌ 没找到 supervisor（非 launchd 任务、无 .app），"
+                        "直接退出会停服，已取消重启。")
+                except Exception:
+                    pass
+            return
         affected = await _handle_restart_command(bot)
-        ack = f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— ~5s 后回来。"
+        via = "launchd kickstart" if strat == "launchd" else "open .app"
+        ack = (f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— "
+               f"{via}，~3-5s 后回来。")
         if card_msg_id:
             try:
                 await bot.feishu.update_card(card_msg_id, ack)
@@ -1575,6 +1602,7 @@ async def handle_spawn(
     thread_id: str,
     anchor_message_id: str,
     prompt: str,
+    model: str = "",
 ):
     """在 (user, chat_id_raw:thread_id) 这一格强制开新 session 跑 prompt。
 
@@ -1639,6 +1667,8 @@ async def handle_spawn(
     async with lock:
         try:
             await bot.store.new_session(user_id, chat_id)
+            if model:
+                await bot.store.set_model(user_id, chat_id, model)
             session = await bot.store.get_current(user_id, chat_id)
 
             try:

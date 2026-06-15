@@ -42,6 +42,26 @@ MODEL_ALIASES = {
     "codex-max": "gpt-5.1-codex-max",
     "codex": "gpt-5.1-codex",
     "gpt5": "gpt-5.1",
+    "gemini": "google/gemini-3.1-pro-preview-customtools",
+    "gemini-pro": "google/gemini-3.1-pro-preview",
+    "customtools": "google/gemini-3.1-pro-preview-customtools",
+    "gemini-ct": "google/gemini-3.1-pro-preview-customtools",
+    "gemini-pro-ct": "google/gemini-3.1-pro-preview-customtools",
+    "ct": "google/gemini-3.1-pro-preview-customtools",
+    "gemini31": "google/gemini-3.1-pro-preview",
+    "gemini31pro": "google/gemini-3.1-pro-preview",
+    "gemini-3.1-pro": "google/gemini-3.1-pro-preview",
+    "g31": "google/gemini-3.1-pro-preview",
+    "gemini3": "google/gemini-3-pro-preview",
+    "gemini3pro": "google/gemini-3-pro-preview",
+    "gemini-3-pro": "google/gemini-3-pro-preview",
+    "g3": "google/gemini-3-pro-preview",
+    "gemini25pro": "google/gemini-2.5-pro",
+    "gemini-2.5-pro": "google/gemini-2.5-pro",
+    "gemini-flash": "google/gemini-2.5-flash",
+    "gemini25flash": "google/gemini-2.5-flash",
+    "gemini-2.5-flash": "google/gemini-2.5-flash",
+    "flash": "google/gemini-2.5-flash",
 }
 
 HELP_TEXT = """\
@@ -53,7 +73,7 @@ HELP_TEXT = """\
 `/new` 或 `/clear` — 开始新 session
 `/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
-`/runner [codex|claude]` — 切换当前 chat 使用 Codex 或 Claude Code
+`/runner [codex|claude|opencode]` — 切换当前 chat 使用 Codex / Claude Code / opencode
 `/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
 `/status` — 显示当前 session 信息
@@ -76,9 +96,9 @@ HELP_TEXT = """\
 `/group add <chat_id> [cwd]` — 把群加白名单并设默认 cwd（实时生效 + 持久化到 .env）
 
 
-**Claude Skills（直接转发给 Claude 执行）：**
+**Runner Skills / Slash 透传：**
 `/commit` — 提交代码
-其他 `/xxx` — 自动转发给 Claude 处理
+其他 `/xxx` — 自动转发给当前 runner 处理
 
 **MCP 工具：** 已配置的 MCP servers 自动可用，直接对话即可调用。
 
@@ -530,6 +550,8 @@ def _list_mcp() -> str:
 
 def _context_window_for(model: str) -> int:
     m = (model or "").lower()
+    if "gemini" in m:
+        return 1_048_576
     if "1m" in m:
         return 1_000_000
     if m.startswith("gpt-5") or "codex" in m:
@@ -665,7 +687,11 @@ def _runner_default_model(bot, runner: str) -> str:
     profile = getattr(bot, "profile", None)
     if profile and getattr(profile, "runner", "") == runner and getattr(profile, "default_model", ""):
         return profile.default_model
-    return "gpt-5.5" if runner == "codex" else "claude-sonnet-4-6"
+    if runner == "codex":
+        return "gpt-5.5"
+    if runner == "opencode":
+        return "google/gemini-3.1-pro-preview"
+    return "claude-sonnet-4-6"
 
 
 def _get_quota_compact() -> str:
@@ -1006,38 +1032,91 @@ async def _handle_group_command(args: str, bot) -> str:
     return "\n".join(lines)
 
 
+# launchd 托管时的服务 label（可用 env 覆盖）。生产部署是 `launchctl submit`
+# 出来的 KeepAlive 任务，进程退出即被拉起 —— 这才是当前真实的重启入口。
+LAUNCHD_LABEL = os.getenv("CC_LARK_LAUNCHD_LABEL", "cc-lark-main")
+
+
+def _launchd_target() -> Optional[str]:
+    """若当前进程由 launchd KeepAlive 托管，返回 `gui/<uid>/<label>`，否则 None。
+
+    判定：label 在 launchd 里可查到（`launchctl print` 成功）。生产部署下
+    main.py 由该任务 exec 出来，父进程是 launchd(PID 1)；这里以 label 可查为准，
+    PPID 仅作辅助信号（exec 部署下为 1）。
+    """
+    target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+    try:
+        r = subprocess.run(
+            ["launchctl", "print", target],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        )
+        return target if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def restart_strategy() -> str:
+    """返回当前会走哪条重启路径，给 /restart 文案 + 自检用：launchd / app / bare。"""
+    if _launchd_target():
+        return "launchd"
+    if os.path.isdir(APP_PATH):
+        return "app"
+    return "bare"
+
+
 def _trigger_restart() -> None:
-    """
-    在新进程组里调度"清残留 + open .app"重启，然后让当前 bot 退出。
-    - start_new_session=True 让 sh 脱离 wrapper 进程组，trap cleanup 杀不到它。
-    - bash 退出后 Mach-O launcher（LSUIElement agent）不会自动退；不先 kill
-      掉它，`open .app` 会判定 app 在跑、不重新拉起。所以 sleep 3s 等 bot
-      exit + bash cleanup 跑完，再 pkill 整个 .app 进程树，最后 open。
-    """
-    quoted_app = shlex.quote(APP_PATH)
-    # 匹配带 trailing slash 路径，避免误伤其他同名进程
-    match = f"{APP_PATH}/"
-    script = (
-        f"sleep 3; "
-        f"pkill -TERM -f {shlex.quote(match)} 2>/dev/null; "
-        f"sleep 1; "
-        f"pkill -KILL -f {shlex.quote(match)} 2>/dev/null; "
-        f"sleep 0.5; "
-        f"open {quoted_app}"
-    )
-    subprocess.Popen(
-        ["sh", "-c", script],
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-    )
+    """重启当前 cc-lark 进程，按部署形态自动选路径：
 
-    def _die():
-        os._exit(0)
+    1. **launchd**（当前生产形态）：`launchctl kickstart -k <target>` 让 launchd
+       原子地杀掉当前进程并重新拉起。**绝不 `open .app`** —— 老逻辑同时 open .app
+       又被 KeepAlive 拉起会变双实例抢 9981 端口（历史 bug 根源）。kickstart 没
+       生效时 3s 兜底 os._exit，由 KeepAlive 补拉。
+    2. **app**（旧 .app 部署）：清 .app 残留进程树再 open，保留兼容。
+    3. **bare**（手动 `python main.py`，无 supervisor）：直接退出（无人拉起，
+       仅作降级；此形态下 /restart 等于停服，调用方应已在文案里提示）。
+    """
+    target = _launchd_target()
+    if target:
+        # detached：先等我们把 ack 发完，再 kickstart -k（kill + relaunch 原子）。
+        script = f"sleep 1; launchctl kickstart -k {shlex.quote(target)}"
+        subprocess.Popen(
+            ["sh", "-c", script],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        # 兜底：kickstart 若未能杀掉我们，自退让 KeepAlive 拉起（不会双实例：
+        # KeepAlive 只维持一个；kickstart 已把旧的杀掉时这个 _die 不会触发）。
+        asyncio.get_event_loop().call_later(3.0, lambda: os._exit(0))
+        return
 
-    asyncio.get_event_loop().call_later(2.0, _die)
+    if os.path.isdir(APP_PATH):
+        quoted_app = shlex.quote(APP_PATH)
+        # 匹配带 trailing slash 路径，避免误伤其他同名进程
+        match = f"{APP_PATH}/"
+        script = (
+            f"sleep 3; "
+            f"pkill -TERM -f {shlex.quote(match)} 2>/dev/null; "
+            f"sleep 1; "
+            f"pkill -KILL -f {shlex.quote(match)} 2>/dev/null; "
+            f"sleep 0.5; "
+            f"open {quoted_app}"
+        )
+        subprocess.Popen(
+            ["sh", "-c", script],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        asyncio.get_event_loop().call_later(2.0, lambda: os._exit(0))
+        return
+
+    # bare：无 supervisor，尽力退出（外部若有 wrapper 会拉起）。
+    asyncio.get_event_loop().call_later(2.0, lambda: os._exit(0))
 
 
 async def handle_command(
@@ -1136,13 +1215,14 @@ async def handle_command(
                 "buttons": [
                     {"text": "Codex", "value": {"action": "run_cmd", "cmd": "/runner codex", "cid": chat_id}},
                     {"text": "Claude Code", "value": {"action": "run_cmd", "cmd": "/runner claude", "cid": chat_id}},
+                    {"text": "opencode", "value": {"action": "run_cmd", "cmd": "/runner opencode", "cid": chat_id}},
                 ],
             }
         requested = args.strip().lower().replace("_", "-")
         if requested in {"claude-code", "claudecode"}:
             requested = "claude"
-        if requested not in {"codex", "claude"}:
-            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）".format(args)
+        if requested not in {"codex", "claude", "opencode"}:
+            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`".format(args)
         model = _runner_default_model(bot, requested)
         await store.set_runner(user_id, chat_id, requested, model=model)
         return f"✅ 已切换 runner 为 `{requested}`，模型 `{model}`。已开始新 session。"
@@ -1156,6 +1236,14 @@ async def handle_command(
                     {"text": "Codex Max", "value": {"action": "run_cmd", "cmd": "/model codex-max", "cid": chat_id}},
                     {"text": "Codex", "value": {"action": "run_cmd", "cmd": "/model codex", "cid": chat_id}},
                     {"text": "GPT-5.1", "value": {"action": "run_cmd", "cmd": "/model gpt5", "cid": chat_id}},
+                ]
+            elif runner == "opencode":
+                buttons = [
+                    {"text": "🛠 3.1 Pro CustomTools", "value": {"action": "run_cmd", "cmd": "/model customtools", "cid": chat_id}},
+                    {"text": "💎 Gemini 3.1 Pro", "value": {"action": "run_cmd", "cmd": "/model gemini-pro", "cid": chat_id}},
+                    {"text": "Gemini 3 Pro", "value": {"action": "run_cmd", "cmd": "/model gemini3", "cid": chat_id}},
+                    {"text": "Gemini 2.5 Pro", "value": {"action": "run_cmd", "cmd": "/model gemini25pro", "cid": chat_id}},
+                    {"text": "⚡ Gemini 2.5 Flash", "value": {"action": "run_cmd", "cmd": "/model gemini-flash", "cid": chat_id}},
                 ]
             else:
                 buttons = [
@@ -1191,7 +1279,9 @@ async def handle_command(
         )
         quota_line = (
             _format_codex_rate_line(cur.get("session_id"))
-            if runner == "codex" else await asyncio.to_thread(_get_quota_compact)
+            if runner == "codex"
+            else "" if runner == "opencode"
+            else await asyncio.to_thread(_get_quota_compact)
         )
 
         lines = [
@@ -1272,6 +1362,20 @@ async def handle_command(
             lines.append(f"Runner: `codex`")
             lines.append(f"模型: `{model}`")
             return "\n".join(lines)
+        if runner == "opencode":
+            model = cur.get("model") or "google/gemini-3.1-pro-preview"
+            lines = ["📈 **opencode 用量**"]
+            ctx_line = _format_context_line(
+                cur.get("session_id"),
+                model,
+                runner="opencode",
+                current_usage=cur.get("last_usage") or None,
+            )
+            if ctx_line:
+                lines.append(ctx_line)
+            lines.append(f"Runner: `opencode`")
+            lines.append(f"模型: `{model}`")
+            return "\n".join(lines)
         return _get_usage()
 
     elif cmd == "accounts":
@@ -1281,10 +1385,21 @@ async def handle_command(
         return "⏹ /stop 命令在消息队列外处理，如果看到这条说明当前没有运行中的任务。"
 
     elif cmd == "restart":
-        if not os.path.isdir(APP_PATH):
-            return f"❌ 未找到 {APP_PATH}，先 `deploy/cc-lark install`"
+        strat = restart_strategy()
+        if strat == "bare":
+            return (
+                "❌ 没找到任何 supervisor（既不是 launchd 任务也没有 "
+                f"{APP_PATH}），无法自动重启 —— 直接退出会停服。"
+                f"\n请用 `launchctl submit -l {LAUNCHD_LABEL} ...` 托管，"
+                "或 `deploy/cc-lark install` 装 .app 后再用 /restart。"
+            )
         _trigger_restart()
-        return "♻️ 服务重启中 — wrapper 退出 ~2s 后由 `open .app` 拉起，全部就绪约 5s。"
+        if strat == "launchd":
+            return (
+                f"♻️ 服务重启中 — launchd（`{LAUNCHD_LABEL}`）kickstart 杀+拉，"
+                "约 3-5s 回来。"
+            )
+        return "♻️ 服务重启中 — 清 .app 残留后 `open .app` 拉起，全部就绪约 5s。"
 
     elif cmd == "group":
         return await _handle_group_command(args, bot)

@@ -101,6 +101,7 @@ def _resolve_spawn_request(
     prompt = params.get("prompt") or ""
     profile_name = (params.get("profile") or "").strip()
     user_id_in = (params.get("user_id") or "").strip()
+    model = (params.get("model") or "").strip()
 
     missing = [
         n for n, v in (
@@ -145,6 +146,7 @@ def _resolve_spawn_request(
         "thread_id": thread_id,
         "anchor_message_id": anchor_message_id,
         "prompt": prompt,
+        "model": model,
     }, None
 
 
