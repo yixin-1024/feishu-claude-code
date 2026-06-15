@@ -1230,6 +1230,8 @@ async def handle_command(
     elif cmd == "model":
         if not args:
             cur = await store.get_current(user_id, chat_id)
+            raw = await store.get_current_raw(user_id, chat_id)
+            overridden = bool(raw.get("model_override"))
             runner = (getattr(cur, "runner", "") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
             if runner == "codex":
                 buttons = [
@@ -1252,19 +1254,31 @@ async def handle_command(
                     {"text": "⚡ Sonnet", "value": {"action": "run_cmd", "cmd": "/model sonnet", "cid": chat_id}},
                     {"text": "🐇 Haiku", "value": {"action": "run_cmd", "cmd": "/model haiku", "cid": chat_id}},
                 ]
+            # 清除 override、回到 profile 默认（仅在已覆盖时给按钮）
+            if overridden:
+                buttons.append({"text": "↩️ 跟随默认", "value": {"action": "run_cmd", "cmd": "/model default", "cid": chat_id}})
+            status = "（本 session 覆盖）" if overridden else "（跟随默认）"
             return {
-                "text": f"当前 runner：**{runner}**\n当前模型：**{cur.model}**",
+                "text": (
+                    f"当前 runner：**{runner}**\n"
+                    f"当前模型：**{cur.model}** {status}\n"
+                    f"profile 默认：**{store.default_model}**"
+                ),
                 "buttons": buttons,
             }
+        # /model default|reset|clear|默认 → 清除 override，回落 profile 默认
+        if args.strip().lower() in {"default", "reset", "clear", "默认", "跟随默认"}:
+            await store.set_model(user_id, chat_id, "")
+            return f"✅ 已清除模型覆盖，跟随 profile 默认 `{store.default_model}`。已开始新 session。"
         model = MODEL_ALIASES.get(args.lower(), args)
         await store.set_model(user_id, chat_id, model)
-        return f"✅ 已切换模型为 `{model}`。已开始新 session。"
+        return f"✅ 已切换模型为 `{model}`（仅本 session 覆盖，/model default 可清除）。已开始新 session。"
 
     elif cmd == "status":
         cur = await store.get_current_raw(user_id, chat_id)
         sid = cur.get("session_id") or "（新 session）"
         runner = cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")
-        model = cur.get("model", "未知")
+        model = cur.get("model_override") or store.default_model
         cwd = cur.get("cwd", "~")
         workspace = cur.get("workspace") or "（未绑定）"
         started = cur.get("started_at", "")[:16].replace("T", " ")
@@ -1348,7 +1362,7 @@ async def handle_command(
         cur = await store.get_current_raw(user_id, chat_id)
         runner = str(cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
         if runner == "codex":
-            model = cur.get("model", "gpt-5.5")
+            model = cur.get("model_override") or store.default_model
             lines = ["📈 **Codex 用量**"]
             lines.append(_format_context_line(
                 cur.get("session_id"),
@@ -1363,7 +1377,7 @@ async def handle_command(
             lines.append(f"模型: `{model}`")
             return "\n".join(lines)
         if runner == "opencode":
-            model = cur.get("model") or "google/gemini-3.1-pro-preview"
+            model = cur.get("model_override") or store.default_model
             lines = ["📈 **opencode 用量**"]
             ctx_line = _format_context_line(
                 cur.get("session_id"),

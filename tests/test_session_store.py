@@ -118,7 +118,9 @@ async def test_reset_current_to_profile_defaults(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_codex_profile_clears_stale_claude_model(tmp_path, monkeypatch):
+async def test_stale_pinned_model_ignored_follows_default_codex(tmp_path, monkeypatch):
+    """旧 session 里残留的 current['model'] 已不再权威：实际模型一律跟随 profile
+    默认（model_override 缺省时）。哪怕残留的是个 claude 模型也不会泄漏出去。"""
     monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
     store = SessionStore(
         profile="codexbot",
@@ -130,19 +132,17 @@ async def test_codex_profile_clears_stale_claude_model(tmp_path, monkeypatch):
     chat_id = "oc_codex"
     cur = await store.get_current_raw(user_id, chat_id)
     cur["runner"] = "codex"
-    cur["model"] = "claude-opus-4-8[1m]"
-    cur["session_id"] = "old_claude_sid"
+    cur["model"] = "claude-opus-4-8[1m]"   # 旧版残留的钉死字段
     await store._save_async()
 
     session = await store.get_current(user_id, chat_id)
 
     assert session.runner == "codex"
-    assert session.model == "gpt-5.5"
-    assert session.session_id is None
+    assert session.model == "gpt-5.5"      # 残留字段被忽略，跟随 profile 默认
 
 
 @pytest.mark.asyncio
-async def test_opencode_profile_clears_stale_claude_model(tmp_path, monkeypatch):
+async def test_stale_pinned_model_ignored_follows_default_opencode(tmp_path, monkeypatch):
     monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
     store = SessionStore(
         profile="hermes",
@@ -154,15 +154,45 @@ async def test_opencode_profile_clears_stale_claude_model(tmp_path, monkeypatch)
     chat_id = "oc_hermes"
     cur = await store.get_current_raw(user_id, chat_id)
     cur["runner"] = "opencode"
-    cur["model"] = "claude-opus-4-8[1m]"
-    cur["session_id"] = "old_claude_sid"
+    cur["model"] = "claude-opus-4-8[1m]"   # 旧版残留的钉死字段
     await store._save_async()
 
     session = await store.get_current(user_id, chat_id)
 
     assert session.runner == "opencode"
     assert session.model == "google/gemini-3.1-pro-preview"
-    assert session.session_id is None
+
+
+@pytest.mark.asyncio
+async def test_default_model_change_propagates_to_old_session(tmp_path, monkeypatch):
+    """核心诉求：改 config 默认模型 + 重启，旧 session（无显式 override）立即跟随。"""
+    monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
+    # 旧进程：默认 opus，建了个 session
+    store1 = SessionStore(profile="spx", default_cwd="/tmp", default_runner="claude",
+                          default_model="claude-opus-4-8[1m]")
+    cur = await store1.get_current_raw("u1", "oc_x")
+    cur["model"] = "claude-opus-4-8[1m]"      # 模拟旧版残留
+    cur["session_id"] = "sid_keep"
+    await store1._save_async()
+
+    # 新进程：config 默认换成 opus-4-9，同一份持久化文件
+    store2 = SessionStore(profile="spx", default_cwd="/tmp", default_runner="claude",
+                          default_model="claude-opus-4-9[1m]")
+    session = await store2.get_current("u1", "oc_x")
+    assert session.model == "claude-opus-4-9[1m]"   # 旧 session 跟随新默认
+    assert session.session_id == "sid_keep"          # 仅换模型，不打断会话
+
+
+@pytest.mark.asyncio
+async def test_model_override_set_and_clear(tmp_path, monkeypatch):
+    """/model 显式覆盖生效；/model default（set_model 空串）清回默认。"""
+    monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
+    store = SessionStore(profile="spx", default_cwd="/tmp", default_runner="claude",
+                         default_model="claude-opus-4-8[1m]")
+    await store.set_model("u1", "oc_x", "claude-sonnet-4-6")
+    assert (await store.get_current("u1", "oc_x")).model == "claude-sonnet-4-6"
+    await store.set_model("u1", "oc_x", "")          # 清除 override
+    assert (await store.get_current("u1", "oc_x")).model == "claude-opus-4-8[1m]"
 
 
 @pytest.mark.asyncio

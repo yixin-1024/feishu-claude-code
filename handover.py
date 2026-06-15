@@ -60,8 +60,11 @@ def main():
     query = {
         "session_id": session_id,
         "cwd": cwd,
-        "model": os.environ.get("CLAUDE_MODEL", "claude-opus-4-8[1m]"),
     }
+    # 只有显式设了 CLAUDE_MODEL 才带模型；否则接管后跟随 profile 默认模型
+    _model = os.environ.get("CLAUDE_MODEL", "").strip()
+    if _model:
+        query["model"] = _model
     if len(sys.argv) >= 3:
         query["profile"] = sys.argv[2]
     params = urllib.parse.urlencode(query)

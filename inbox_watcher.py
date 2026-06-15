@@ -39,6 +39,7 @@ from typing import Optional
 
 import yaml
 
+from bot_config import DEFAULT_MODEL
 from bot_instance import BotInstance
 from feishu_post import extract_post_image_keys, parse_post_content
 from log_util import log
@@ -58,7 +59,7 @@ class SourceConfig:
 class InboxConfig:
     enabled: bool = False
     profile: str = "spx"
-    claude_model: str = "claude-opus-4-8[1m]"
+    claude_model: str = field(default_factory=lambda: DEFAULT_MODEL)
     dispatch_chat_id: str = ""
     owner_open_id: str = ""
     owner_name: str = ""
@@ -138,7 +139,7 @@ class InboxConfig:
         return cls(
             enabled=bool(raw.get("enabled", False)),
             profile=str(raw.get("profile", "spx")).strip(),
-            claude_model=str(raw.get("claude_model", "claude-opus-4-8[1m]")).strip(),
+            claude_model=str(raw.get("claude_model", DEFAULT_MODEL)).strip(),
             dispatch_chat_id=str(raw.get("dispatch_chat_id", "")).strip(),
             owner_open_id=owner_id,
             owner_name=str(raw.get("owner_name", "")).strip(),

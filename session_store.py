@@ -474,7 +474,10 @@ class SessionStore:
         return {
             "session_id": None,
             "runner": self._default_runner,
-            "model": self._default_model,
+            # model 不再钉死在 session 里。实际用的模型 = model_override（用户用
+            # /model 显式选的，缺省 None）or profile 默认（运行时实时取）。这样改
+            # config 的默认模型 + 重启，新旧 session 都跟随，不用动代码。
+            "model_override": None,
             "cwd": cwd,
             "permission_mode": PERMISSION_MODE,
             "started_at": datetime.now().isoformat(),
@@ -493,14 +496,10 @@ class SessionStore:
         defaults = self._default_current(chat_key=chat_key)
         stored_runner = current.get("runner")
         if stored_runner != self._default_runner:
+            # runner 跟 profile 配置不一致（多为改了配置）：回到 profile 默认 runner，
+            # 并清掉为旧 runner 选的模型 override，让模型回落到 profile 默认。
             current["runner"] = self._default_runner
-            current["model"] = self._default_model
-            current["session_id"] = None
-            current["preview"] = ""
-            current["started_at"] = datetime.now().isoformat()
-            changed = True
-        elif self._default_runner in ("codex", "opencode") and str(current.get("model") or "").startswith("claude-"):
-            current["model"] = self._default_model
+            current["model_override"] = None
             current["session_id"] = None
             current["preview"] = ""
             current["started_at"] = datetime.now().isoformat()
@@ -603,12 +602,18 @@ class SessionStore:
         user.setdefault("summaries", {}).update(summaries)
         await self._save_async()
 
+    @property
+    def default_model(self) -> str:
+        """profile 当前默认模型（来自 config，重启即生效的唯一真相源）"""
+        return self._default_model
+
     async def get_current(self, user_id: str, chat_id: str) -> Session:
         """Get current session config for a specific chat"""
         cur = await self.get_current_raw(user_id, chat_id)
         return Session(
             session_id=cur.get("session_id"),
-            model=cur.get("model", self._default_model),
+            # 没有显式 override 就用 profile 默认（实时取，配置变了即生效）
+            model=cur.get("model_override") or self._default_model,
             cwd=cur.get("cwd", self._default_cwd),
             permission_mode=cur.get("permission_mode", PERMISSION_MODE),
             workspace=cur.get("workspace", ""),
@@ -692,7 +697,8 @@ class SessionStore:
         chat_data["current"] = {
             "session_id": None,
             "runner": cur.get("runner", self._default_runner),
-            "model": cur.get("model", self._default_model),
+            # 沿用显式 override（若有）；没有就继续跟随 profile 默认
+            "model_override": cur.get("model_override"),
             "cwd": cur.get("cwd", self._default_cwd),
             "permission_mode": cur.get("permission_mode", PERMISSION_MODE),
             "started_at": datetime.now().isoformat(),
@@ -748,7 +754,8 @@ class SessionStore:
                 "preview": cur.get("preview", ""),
             })
             chat_data["history"] = chat_data["history"][-20:]
-        cur["model"] = model
+        # model 为空 → 清除 override，回落 profile 默认
+        cur["model_override"] = model or None
         cur["session_id"] = None
         cur["preview"] = ""
         cur["last_usage"] = {}
@@ -776,8 +783,9 @@ class SessionStore:
             })
             chat_data["history"] = chat_data["history"][-20:]
         cur["runner"] = normalized
+        # 切 runner 时带的模型作为显式 override（不同 runner 模型不通用）
         if model:
-            cur["model"] = model
+            cur["model_override"] = model
         cur["session_id"] = None
         cur["preview"] = ""
         cur["last_usage"] = {}
@@ -936,7 +944,7 @@ class SessionStore:
         if cwd:
             cur["cwd"] = cwd
         if model:
-            cur["model"] = model
+            cur["model_override"] = model
         # preview 留空，等飞书第一条消息时再更新
         cur["preview"] = ""
         await self._save_async()

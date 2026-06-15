@@ -1569,7 +1569,7 @@ async def handle_handover(
 
     cur = await bot.store.get_current_raw(user_id, chat_id)
     display_cwd = cur.get("cwd", "~")
-    display_model = cur.get("model", "unknown")
+    display_model = cur.get("model_override") or bot.store.default_model
     display_mode = cur.get("permission_mode", "bypassPermissions")
     old_summary = result.get("old_summary", "")
     old_note = f"\n上个会话：「{old_summary}」" if old_summary else ""
