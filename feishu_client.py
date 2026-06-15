@@ -30,9 +30,70 @@ def _sanitize_filename(name: str) -> str:
     return cleaned[:100] or "file"
 
 
-def _card_json(content: str, loading: bool = False) -> str:
+# ── 卡片 schema 兼容层 ────────────────────────────────────────
+# 调用方一律按 Card JSON 2.0 构造卡片；当 Lark 的 2.0 渲染服务故障
+# （报 230099 Failed to create card content / Server Internal Error）时，
+# 设环境变量 LARK_CARD_SCHEMA=1.0 即可把卡片临时降级成 v1 schema 顶着，
+# 等官方修好 2.0 再把开关切回 "2.0"（默认），业务代码零改动。
+
+def _use_v1_card() -> bool:
+    """是否把卡片降级成 v1 schema（默认否，用 2.0）"""
+    return (os.getenv("LARK_CARD_SCHEMA", "2.0") or "2.0").strip() in ("1", "1.0", "v1")
+
+
+def _downgrade_button(btn: dict) -> dict:
+    """Card 2.0 button → v1 button（保留 value 供点击回调 action.value 读取）"""
+    out = {
+        "tag": "button",
+        "text": btn.get("text", {"tag": "plain_text", "content": ""}),
+        "type": btn.get("type", "default"),
+    }
+    if "size" in btn:
+        out["size"] = btn["size"]
+    if "value" in btn:
+        out["value"] = btn["value"]
+    return out
+
+
+def _downgrade_element(el: dict) -> list:
+    """把单个 2.0 元素降级成 0..n 个 v1 元素"""
+    tag = el.get("tag")
+    if tag == "markdown":
+        return [{"tag": "div", "text": {"tag": "lark_md", "content": el.get("content", "")}}]
+    if tag == "button":
+        return [{"tag": "action", "actions": [_downgrade_button(el)]}]
+    if tag == "column_set":
+        # v1 无 flow 列布局：列里的 button 收拢成一个 action 行，其余元素逐个降级
+        actions, others = [], []
+        for col in el.get("columns", []):
+            for sub in (col.get("elements") or []):
+                if sub.get("tag") == "button":
+                    actions.append(_downgrade_button(sub))
+                else:
+                    others.extend(_downgrade_element(sub))
+        result = list(others)
+        if actions:
+            result.append({"tag": "action", "actions": actions})
+        return result
+    if tag == "hr":
+        return [{"tag": "hr"}]
+    return [el]  # div/lark_md/img 等 v1 也认，原样保留
+
+
+def _serialize_card(card: dict) -> str:
+    """序列化卡片 dict；LARK_CARD_SCHEMA=1.0 时把 2.0 卡片降级成 v1"""
+    if _use_v1_card():
+        elements = (card.get("body") or {}).get("elements", [])
+        v1_elements = []
+        for el in elements:
+            v1_elements.extend(_downgrade_element(el))
+        card = {"config": {"wide_screen_mode": True}, "elements": v1_elements}
+    return json.dumps(card, ensure_ascii=False)
+
+
+def _card_dict(content: str, loading: bool = False) -> dict:
     """
-    生成卡片 JSON 字符串（Card JSON 2.0）
+    构造卡片 Card JSON 2.0 dict（未序列化、未降级）。
 
     飞书卡片 markdown 元素有长度限制（约 3000 字符），
     超过限制时自动分段为多个 markdown 元素。
@@ -93,10 +154,12 @@ def _card_json(content: str, loading: bool = False) -> str:
                     chunk = f"**（续 {i}）**\n\n{chunk}"
                 elements.append({"tag": "markdown", "content": chunk})
 
-    return json.dumps({
-        "schema": "2.0",
-        "body": {"elements": elements},
-    }, ensure_ascii=False)
+    return {"schema": "2.0", "body": {"elements": elements}}
+
+
+def _card_json(content: str, loading: bool = False) -> str:
+    """生成卡片 JSON 字符串（默认 Card JSON 2.0；LARK_CARD_SCHEMA=1.0 时降级 v1）"""
+    return _serialize_card(_card_dict(content, loading=loading))
 
 
 class FeishuClient:
@@ -477,7 +540,7 @@ class FeishuClient:
     async def update_card_with_buttons(self, message_id: str, content: str, buttons: list[dict],
                                       flow: bool = False):
         """更新卡片内容并附加操作按钮。flow=True 时横排自动换行，False 时竖排。"""
-        base = json.loads(_card_json(content))
+        base = _card_dict(content)
         btn_elements = []
         for i, btn in enumerate(buttons):
             btn_elements.append({
@@ -496,7 +559,7 @@ class FeishuClient:
         else:
             # 竖排: 每个按钮独占一行
             base["body"]["elements"].extend(btn_elements)
-        card_content = json.dumps(base, ensure_ascii=False)
+        card_content = _serialize_card(base)
 
         async def _update():
             req = (
@@ -518,10 +581,10 @@ class FeishuClient:
 
     async def update_card_elements(self, message_id: str, elements: list[dict]):
         """用自定义 elements 列表更新卡片（支持 markdown + button 混排）"""
-        card_content = json.dumps({
+        card_content = _serialize_card({
             "schema": "2.0",
             "body": {"elements": elements},
-        }, ensure_ascii=False)
+        })
 
         async def _update():
             req = (
