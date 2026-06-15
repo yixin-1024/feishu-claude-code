@@ -73,6 +73,22 @@ async def test_profile_default_runner_and_model(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_opencode_profile_default_runner_and_model(tmp_path, monkeypatch):
+    monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
+    store = SessionStore(
+        profile="hermes",
+        default_cwd="/tmp",
+        default_runner="opencode",
+        default_model="google/gemini-3.1-pro-preview",
+    )
+
+    session = await store.get_current("user_1", "oc_hermes")
+
+    assert session.runner == "opencode"
+    assert session.model == "google/gemini-3.1-pro-preview"
+
+
+@pytest.mark.asyncio
 async def test_reset_current_to_profile_defaults(tmp_path, monkeypatch):
     monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
     store = SessionStore(
@@ -122,6 +138,30 @@ async def test_codex_profile_clears_stale_claude_model(tmp_path, monkeypatch):
 
     assert session.runner == "codex"
     assert session.model == "gpt-5.5"
+    assert session.session_id is None
+
+
+@pytest.mark.asyncio
+async def test_opencode_profile_clears_stale_claude_model(tmp_path, monkeypatch):
+    monkeypatch.setattr("session_store.SESSIONS_DIR", str(tmp_path))
+    store = SessionStore(
+        profile="hermes",
+        default_cwd="/tmp/default",
+        default_runner="opencode",
+        default_model="google/gemini-3.1-pro-preview",
+    )
+    user_id = "user_1"
+    chat_id = "oc_hermes"
+    cur = await store.get_current_raw(user_id, chat_id)
+    cur["runner"] = "opencode"
+    cur["model"] = "claude-opus-4-8[1m]"
+    cur["session_id"] = "old_claude_sid"
+    await store._save_async()
+
+    session = await store.get_current(user_id, chat_id)
+
+    assert session.runner == "opencode"
+    assert session.model == "google/gemini-3.1-pro-preview"
     assert session.session_id is None
 
 

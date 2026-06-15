@@ -175,22 +175,40 @@ def _extract_conversation_context(fpath: str, max_chars: int = 2000) -> str:
     return "\n".join(parts)
 
 
+def _token_if_valid(creds: dict) -> Optional[str]:
+    """从 credentials dict 取未过期的 accessToken；过期或缺失返回 None"""
+    oauth = creds.get("claudeAiOauth", {})
+    token = oauth.get("accessToken")
+    if not token:
+        return None
+    exp = oauth.get("expiresAt")
+    # 留 60s 余量；无 expiresAt 时保守认为可用
+    if exp and exp < int(datetime.now().timestamp() * 1000) + 60_000:
+        return None
+    return token
+
+
 def _get_api_token() -> Optional[str]:
-    """获取 Claude API token，先试 credentials 文件，再试 keychain"""
+    """获取 Claude API token：优先用未过期的，文件过期则回落到 keychain（CLI 维护的新鲜副本）"""
+    # 1) credentials 文件（可能是过期的陈旧残留，需校验 expiresAt）
     try:
         creds_path = os.path.expanduser("~/.claude/.credentials.json")
         if os.path.isfile(creds_path):
             with open(creds_path) as f:
-                creds = json.load(f)
-            return creds["claudeAiOauth"]["accessToken"]
+                token = _token_if_valid(json.load(f))
+            if token:
+                return token
+    except Exception:
+        pass
+    # 2) keychain（文件缺失或 token 过期时回落）
+    try:
         from account_switcher import decode_security_stdout, ensure_keychain_intact
         ensure_keychain_intact()  # keychain 被外部进程写丢时自愈
         result = subprocess.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
             capture_output=True, text=True, timeout=5,
         )
-        creds = json.loads(decode_security_stdout(result.stdout))
-        return creds["claudeAiOauth"]["accessToken"]
+        return _token_if_valid(json.loads(decode_security_stdout(result.stdout)))
     except Exception:
         return None
 
@@ -328,7 +346,7 @@ class SessionStore:
         )
         self._default_cwd = default_cwd or DEFAULT_CWD
         self._default_runner = (default_runner or DEFAULT_RUNNER or "claude").strip().lower()
-        if self._default_runner not in {"claude", "codex"}:
+        if self._default_runner not in {"claude", "codex", "opencode"}:
             self._default_runner = "claude"
         self._default_model = default_model or DEFAULT_MODEL
         self._chat_default_cwd = chat_default_cwd or {}
@@ -481,7 +499,7 @@ class SessionStore:
             current["preview"] = ""
             current["started_at"] = datetime.now().isoformat()
             changed = True
-        elif self._default_runner == "codex" and str(current.get("model") or "").startswith("claude-"):
+        elif self._default_runner in ("codex", "opencode") and str(current.get("model") or "").startswith("claude-"):
             current["model"] = self._default_model
             current["session_id"] = None
             current["preview"] = ""
@@ -742,8 +760,8 @@ class SessionStore:
         normalized = (runner or "").strip().lower().replace("_", "-")
         if normalized in {"claude-code", "claudecode"}:
             normalized = "claude"
-        if normalized not in {"claude", "codex"}:
-            raise ValueError("runner must be 'claude' or 'codex'")
+        if normalized not in {"claude", "codex", "opencode"}:
+            raise ValueError("runner must be 'claude', 'codex' or 'opencode'")
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
         if cur.get("session_id"):
