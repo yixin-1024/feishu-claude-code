@@ -166,6 +166,27 @@ async def test_group_chat_mention_self_processed(isolated_sessions):
     proc.assert_awaited_once()
 
 
+async def test_group_text_removes_mentions_before_agent(isolated_sessions):
+    bot = _make_bot(allowed_groups={"oc_group_1"})
+    bot.feishu.reply_card.return_value = "card_1"
+    mention = _make_mention(key="@_user_1", open_id="ou_bot_self")
+    event = _make_event(
+        user_id="ou_u1",
+        chat_id="oc_group_1",
+        chat_type="group",
+        text="@_user_1 你去看看",
+        mentions=[mention],
+    )
+
+    with patch("dispatcher._run_and_display", new_callable=AsyncMock) as run:
+        await dispatcher._process_message(
+            bot, "ou_u1", "oc_group_1", True, "", event.event.message,
+        )
+
+    run.assert_awaited_once()
+    assert run.await_args.args[4] == "你去看看"
+
+
 # ── 白名单 ─────────────────────────────────────────────────
 
 async def test_group_not_in_whitelist_ignored(isolated_sessions):

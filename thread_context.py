@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Optional
 
 from feishu_client import FeishuClient
-from feishu_post import parse_post_content, extract_post_image_keys
+from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
 
 
 def _fmt_time(create_time: Optional[str]) -> str:
@@ -23,18 +23,6 @@ def _fmt_time(create_time: Optional[str]) -> str:
         return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
     except Exception:
         return ""
-
-
-def _replace_mentions(text: str, mentions) -> str:
-    """把 @xx_y 占位符换成 @姓名（保留可读性）"""
-    if not text:
-        return ""
-    for m in (mentions or []):
-        key = getattr(m, "key", "") or ""
-        name = getattr(m, "name", "") or ""
-        if key:
-            text = text.replace(key, f"@{name}" if name else "")
-    return text.strip()
 
 
 def _extract(msg, feishu: Optional["FeishuClient"] = None) -> tuple[str, list[dict]]:
@@ -56,11 +44,11 @@ def _extract(msg, feishu: Optional["FeishuClient"] = None) -> tuple[str, list[di
         return "", []
 
     if msg_type == "text":
-        text = _replace_mentions(obj.get("text", ""), msg.mentions)
+        text = strip_lark_mentions(obj.get("text", ""), msg.mentions)
         return text, []
 
     if msg_type == "post":
-        text = _replace_mentions(parse_post_content(content), msg.mentions)
+        text = strip_lark_mentions(parse_post_content(content), msg.mentions)
         image_keys = extract_post_image_keys(content)
         atts = [{"kind": "image", "key": k, "name": ""} for k in image_keys]
         return text, atts

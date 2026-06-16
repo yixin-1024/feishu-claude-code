@@ -28,7 +28,7 @@ from bot_config import Profile
 from bot_instance import BotInstance
 from agent_runner import run_agent
 from commands import parse_command, handle_command
-from feishu_post import parse_post_content, extract_post_image_keys
+from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
 from lark_prompts import render_lark_prompt
 from passthrough import is_builtin_passthrough
 from log_util import log
@@ -473,10 +473,7 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
         except Exception:
             _text = ""
         if is_group:
-            for m in (getattr(msg, 'mentions', None) or []):
-                k = getattr(m, 'key', '')
-                if k:
-                    _text = _text.replace(k, '').strip()
+            _text = strip_lark_mentions(_text, getattr(msg, 'mentions', None))
 
         if _text.lower() == "/stop" or _text.strip().endswith("/stop"):
             if is_group and not await _is_current_bot_mentioned(bot, msg):
@@ -955,11 +952,7 @@ async def _process_message(
             return
 
         if is_group:
-            mentions = getattr(msg, 'mentions', None) or []
-            for mention in mentions:
-                key = getattr(mention, 'key', '')
-                if key:
-                    text = text.replace(key, '').strip()
+            text = strip_lark_mentions(text, getattr(msg, 'mentions', None))
             if not text and not thread_id:
                 return
 
@@ -1046,10 +1039,7 @@ async def _process_message(
         image_keys = extract_post_image_keys(msg.content)
 
         if is_group:
-            for mention in (getattr(msg, 'mentions', None) or []):
-                key = getattr(mention, 'key', '')
-                if key:
-                    post_text = post_text.replace(key, '').strip()
+            post_text = strip_lark_mentions(post_text, getattr(msg, 'mentions', None))
 
         img_paths: list[str] = []
         for ik in image_keys:

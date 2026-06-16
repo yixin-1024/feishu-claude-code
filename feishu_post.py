@@ -8,7 +8,21 @@
 """
 
 import json
+import re
 from typing import Any
+
+
+def strip_lark_mentions(text: str, mentions) -> str:
+    """Remove Lark mention placeholders from text before sending it to agents."""
+    if not text:
+        return ""
+    for m in (mentions or []):
+        key = getattr(m, "key", "") or ""
+        if key:
+            text = text.replace(key, "")
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return text.strip()
 
 
 def _flatten_post_block(node: Any) -> str:
@@ -35,7 +49,7 @@ def _flatten_post_block(node: Any) -> str:
         if tag == "a":
             return str(node.get("text") or node.get("href") or "")
         if tag == "at":
-            return str(node.get("user_name") or node.get("name") or "")
+            return ""
         if tag in ("img", "media"):
             return "[图片]"
         return "".join(_flatten_post_block(v) for v in node.values())
