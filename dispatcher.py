@@ -203,6 +203,26 @@ def _load_verify_template() -> str:
     return _verify_template_cache
 
 
+def _thread_ctx_error_hint(err: str) -> str:
+    """话题历史拉取失败时给用户的兜底提示。
+
+    识别权限类错误（230027 / 缺 scope）给出可操作建议，否则原样带上原因。
+    目的：避免新 bot 因读不到历史而"看起来很蠢"——明确告诉用户是读不到，
+    不是没内容。
+    """
+    e = (err or "").lower()
+    if "230027" in e or "scope" in e or "permission" in e:
+        return (
+            "⚠️ 我读不到这个话题的历史消息——本应用缺少群消息读取权限 "
+            "`im:message.group_msg`。请到 Lark 开发者后台给本应用加上该权限并发布新版本。\n"
+            "在那之前，请把要我做的事**直接贴在消息里**，我就能处理。"
+        )
+    return (
+        f"⚠️ 我读不到这个话题的历史消息（拉取失败：{err}）。"
+        "请把要我做的事直接贴在消息里。"
+    )
+
+
 async def _handle_verify_command(
     bot: BotInstance,
     user_id: str,
@@ -237,7 +257,7 @@ async def _handle_verify_command(
     # 拉整个 thread（last_seen_message_id="" → 全量从头；current_message_id=本条 /verify
     # 本身会被跳过，避免审计指令进入审计对象）
     try:
-        context_block, ctx_paths = await build_thread_context(
+        context_block, ctx_paths, ctx_err = await build_thread_context(
             bot.feishu, thread_id, "", msg.message_id,
         )
     except Exception as e:
@@ -245,6 +265,16 @@ async def _handle_verify_command(
         try:
             await bot.feishu.reply_card(
                 msg.message_id, content=f"❌ 拉 thread 失败：{e}", loading=False,
+            )
+        except Exception:
+            pass
+        return
+
+    if ctx_err:
+        log(tag, "verify", "error", f"拉 thread 历史失败（缺权限？）: {ctx_err}")
+        try:
+            await bot.feishu.reply_card(
+                msg.message_id, content=_thread_ctx_error_hint(ctx_err), loading=False,
             )
         except Exception:
             pass
@@ -1106,18 +1136,36 @@ async def _process_message(
     elif thread_id:
         try:
             last_seen = await bot.store.get_last_seen(user_id, chat_id)
-            context_block, ctx_paths = await build_thread_context(
+            context_block, ctx_paths, ctx_err = await build_thread_context(
                 bot.feishu, thread_id, last_seen, msg.message_id,
             )
-            if context_block:
-                log(tag, "thread", "info",
-                    f"注入上下文 last_seen={last_seen[:12] if last_seen else '-'}, "
-                    f"附件={len(ctx_paths)}")
+            if ctx_err:
+                # 拉历史失败（多半缺 im:message.group_msg 权限）。不再静默吞掉：
+                # 结构化告警 + 告诉用户读不到历史。失败时【不推进 last_seen】，
+                # 权限修好后下次仍能补全这段 backlog。
+                log(tag, "thread", "warn", f"拉取话题历史失败（缺权限？）: {ctx_err}")
+                hint = _thread_ctx_error_hint(ctx_err)
                 if text.strip():
-                    text = f"{context_block}\n\n【用户刚刚 @ 你并说】\n{text}"
+                    text = f"{hint}\n\n【用户说】\n{text}"
                 else:
-                    text = f"{context_block}\n\n【用户刚刚 @ 你，没有新正文，请基于上方内容回复】"
-            await bot.store.set_last_seen(user_id, chat_id, msg.message_id)
+                    # 只 @ 没正文，本来就指望历史 → 直接回提示，不浪费一次 runner 调用
+                    try:
+                        await bot.feishu.reply_card(
+                            msg.message_id, content=hint, loading=False,
+                        )
+                    except Exception:
+                        pass
+                    return
+            else:
+                if context_block:
+                    log(tag, "thread", "info",
+                        f"注入上下文 last_seen={last_seen[:12] if last_seen else '-'}, "
+                        f"附件={len(ctx_paths)}")
+                    if text.strip():
+                        text = f"{context_block}\n\n【用户刚刚 @ 你并说】\n{text}"
+                    else:
+                        text = f"{context_block}\n\n【用户刚刚 @ 你，没有新正文，请基于上方内容回复】"
+                await bot.store.set_last_seen(user_id, chat_id, msg.message_id)
         except Exception as e:
             log(tag, "thread", "warn", f"构建上下文失败（继续处理当前消息）: {e}")
 

@@ -155,23 +155,26 @@ async def build_thread_context(
     thread_id: str,
     last_seen_message_id: str,
     current_message_id: str,
-) -> tuple[str, list[str]]:
+) -> tuple[str, list[str], Optional[str]]:
     """
     构建话题上下文文本块，并下载历史消息里的附件。
 
     Returns:
-        (context_text, downloaded_paths)
+        (context_text, downloaded_paths, error)
         context_text: 空字符串表示没有新增未见过的消息
         downloaded_paths: 历史消息里附件下载到本地的路径列表
+        error: None 表示拉取成功（无论是否有新消息）；非空字符串表示拉取
+               话题历史失败的原因（如缺权限），调用方据此区分"真没历史"与
+               "读不到历史"，避免静默把缺权限当成没内容。
     """
     try:
         msgs = await feishu.list_thread_messages(thread_id)
     except Exception as e:
         print(f"[thread] 拉取话题消息失败 thread={thread_id[:12]}...: {e}", flush=True)
-        return "", []
+        return "", [], str(e)
 
     if not msgs:
-        return "", []
+        return "", [], None
 
     # 筛选未处理过的消息：跳过当前消息、bot 自己的消息、last_seen 及之前的消息
     unseen = []
@@ -189,7 +192,7 @@ async def build_thread_context(
         unseen.append(m)
 
     if not unseen:
-        return "", []
+        return "", [], None
 
     # 并发下载所有附件
     download_tasks = []
@@ -249,4 +252,4 @@ async def build_thread_context(
         else f"【话题新增 · {len(unseen)} 条（距上次处理后）】"
     )
     context = prefix + "\n" + "\n".join(lines)
-    return context, all_paths
+    return context, all_paths, None
