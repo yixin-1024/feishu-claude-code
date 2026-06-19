@@ -1293,8 +1293,8 @@ def _format_run_error(exc: Optional[BaseException]) -> str:
         s = s[:400] + "…"
     if "new session jsonl never appeared" in s:
         s += (
-            "\n💡 通常是 resume 旧 session 时 Claude 启动慢、jsonl 没在超时窗内落盘。"
-            "可以 `/new` 起新会话再试一次。"
+            "\n💡 Claude Code TUI 已启动，但没有接收本轮输入或没有创建会话 JSONL。"
+            "请重试；如果连续出现，先用 Codex/bot-b 承接或重启 bot。"
         )
     return s
 

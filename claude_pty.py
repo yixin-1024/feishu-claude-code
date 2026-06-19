@@ -64,6 +64,8 @@ WATCHDOG_CPU_MIN_INC = 0.5     # 30s 窗口里累计 CPU 增长少于 0.5s 视�
 # PTY / JSONL 轮询参数
 _JSONL_POLL_INTERVAL = 0.2    # 200ms 拉一次 jsonl 增量
 _NEW_SESSION_WAIT = 300.0     # 起新 session 时，最多等多久 jsonl 文件出现（MCP 冷启动 / 大 paste / URL detect 都可能 >90s）
+_RESUBMIT_INTERVAL = 30.0     # fresh session 没有 JSONL 时，多久重发一次输入
+_RESUBMIT_MAX_ATTEMPTS = 3
 _PTY_INIT_GRACE = 2.0         # 看到 TUI 第一字节后再等多久才发输入（MCP 启动期 stdin 会被吞）
 _PTY_READY_TIMEOUT = 4.0      # 等 TUI 起来的硬上限
 _DONE_QUIET_PERIOD = 1.2      # stop_reason=end_turn 后再静默这么久才算彻底完事
@@ -591,6 +593,24 @@ async def _send_user_input(
     await _write_all_to_pty(master_fd, b"\r")
 
 
+async def _clear_and_resend_user_input(
+    master_fd: int,
+    message: str,
+    bytes_counter: list,
+) -> None:
+    """Clear Claude Code's input box, then send the whole message again.
+
+    This is used only before a fresh session JSONL exists. At that point Claude
+    has not accepted the user input, so re-sending is safer than repeatedly
+    pressing Enter against an empty prompt.
+    """
+    # Ctrl-U clears the current input line in the TUI. If the first paste is
+    # still sitting in the box, this prevents duplicate concatenation.
+    await _write_all_to_pty(master_fd, b"\x15")
+    await asyncio.sleep(0.1)
+    await _send_user_input(master_fd, message, bytes_counter)
+
+
 # ────────────────── 主入口 ──────────────────
 
 async def run_claude(
@@ -758,15 +778,10 @@ async def run_claude(
                 expected_prefix = _expected_match_prefix(message)
                 rejected: set[str] = set()
                 deadline = loop.time() + _NEW_SESSION_WAIT
-                # Submit-retry 兜底：超长 paste（如 spx_website_refactor 473
-                # 行）被 Claude TUI fold 成占位符，且 MCP server / claude.ai
-                # connectors 异步 init 期间 \\r 会被吞——首次 Enter 没生效，
-                # input box 里挂着 fold paste 但永远不提交。每 _RESUBMIT_INTERVAL
-                # 主动补一次 \\r：input box 有内容 → 触发提交；空 input box →
-                # 无 op，安全。最多 _RESUBMIT_MAX_ATTEMPTS 次，留 buffer 给真正
-                # 慢的 MCP init / Anthropic API first-token 时间。
-                _RESUBMIT_INTERVAL = 30.0
-                _RESUBMIT_MAX_ATTEMPTS = 3
+                # Submit-retry 兜底：Claude Code v2.1.x 偶发 TUI 已显示 prompt
+                # 但最初写入 PTY 的 paste 整段被吞，最后停在空输入框，只显示
+                # Try "..." 占位提示。只补 \r 对空输入框无效，所以在 fresh
+                # session JSONL 尚未出现时，周期性 Ctrl-U 清空并重发整段消息。
                 last_resubmit = loop.time()
                 resubmit_attempts = 0
                 while loop.time() < deadline:
@@ -810,16 +825,18 @@ async def run_claude(
                         break
                     if proc.returncode is not None:
                         break
-                    # 超长 paste fold + MCP init race 兜底：周期性补 \\r
+                    # 超长 paste fold + MCP init race 兜底：周期性清空并重发
                     if (
                         resubmit_attempts < _RESUBMIT_MAX_ATTEMPTS
                         and loop.time() - last_resubmit >= _RESUBMIT_INTERVAL
                     ):
                         try:
-                            await _write_all_to_pty(master_fd, b"\r")
+                            await _clear_and_resend_user_input(
+                                master_fd, message, pty_bytes_counter
+                            )
                             print(
                                 f"[run_claude_pty] jsonl 未出现 "
-                                f"{loop.time() - last_resubmit:.0f}s，补发 \\r "
+                                f"{loop.time() - last_resubmit:.0f}s，清空输入框并重发消息 "
                                 f"(attempt {resubmit_attempts + 1}/{_RESUBMIT_MAX_ATTEMPTS})",
                                 flush=True,
                             )

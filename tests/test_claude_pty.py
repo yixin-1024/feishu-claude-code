@@ -545,6 +545,98 @@ def test_send_user_input_large_paste_not_truncated(tmp_path, monkeypatch):
     assert len(captured) >= len(big_message.encode())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
+def test_fresh_session_resends_full_input_when_first_paste_is_swallowed(tmp_path, monkeypatch):
+    """如果 Claude TUI 吞掉第一次输入，runner 应清空输入框并重发整段消息。"""
+    project_root = tmp_path / "projects"
+    project_root.mkdir()
+    cwd = tmp_path / "wd"
+    cwd.mkdir()
+
+    encoded = str(cwd).replace("/", "-")
+    project_dir = project_root / encoded
+    project_dir.mkdir(parents=True)
+    sidecar = tmp_path / "stdin-capture.bin"
+
+    script = textwrap.dedent(f"""
+        #!{sys.executable}
+        import json, os, select, sys, time, uuid
+        PROJECT_DIR = {str(project_dir)!r}
+        SIDECAR = {str(sidecar)!r}
+
+        sys.stdout.write("\\x1b[?1049hfake claude ready\\n"); sys.stdout.flush()
+
+        buf = b""
+        saw_first_enter = False
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            r, _, _ = select.select([sys.stdin.fileno()], [], [], 0.3)
+            if not r:
+                continue
+            chunk = os.read(sys.stdin.fileno(), 65536)
+            if not chunk:
+                break
+            buf += chunk
+            if b"\\n" not in buf and b"\\r" not in buf:
+                continue
+            if not saw_first_enter:
+                # 第一次输入被 TUI 吞掉：不写 JSONL，继续等 runner 重发。
+                saw_first_enter = True
+                buf = b""
+                continue
+            break
+
+        with open(SIDECAR, "wb") as f:
+            f.write(buf)
+
+        paste_text = buf.decode("utf-8", errors="replace") \\
+            .replace("\\x15", "") \\
+            .replace("\\x1b[200~", "").replace("\\x1b[201~", "").strip("\\r\\n")
+        sid = str(uuid.uuid4())
+        path = os.path.join(PROJECT_DIR, sid + ".jsonl")
+        with open(path, "a", buffering=1, encoding="utf-8") as f:
+            f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+            f.write(json.dumps({{
+                "type": "user",
+                "message": {{"role": "user", "content": [{{"type": "text", "text": paste_text}}]}},
+            }}) + "\\n")
+            f.write(json.dumps({{
+                "type": "assistant",
+                "message": {{
+                    "role": "assistant",
+                    "content": [{{"type": "text", "text": "resend worked"}}],
+                    "stop_reason": "end_turn",
+                    "usage": {{"input_tokens": 1, "output_tokens": 1}},
+                }},
+            }}) + "\\n")
+        time.sleep(30)
+    """)
+    fake = tmp_path / "fake-claude-resend.py"
+    fake.write_text(script.lstrip())
+    fake.chmod(0o755)
+
+    monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
+    monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
+    monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
+    monkeypatch.setattr(claude_pty, "_RESUBMIT_INTERVAL", 0.5)
+    monkeypatch.setattr(claude_pty, "_NEW_SESSION_WAIT", 5.0)
+    monkeypatch.setattr(claude_pty, "_PTY_INIT_GRACE", 0.1)
+
+    text, sid, used_fallback = asyncio.run(
+        claude_pty.run_claude(
+            "hello after swallowed paste",
+            cwd=str(cwd),
+            permission_mode="bypassPermissions",
+        )
+    )
+
+    assert text == "resend worked"
+    assert sid is not None
+    assert used_fallback is False
+    captured = sidecar.read_bytes()
+    assert b"hello after swallowed paste" in captured
+
+
 # ────────────────── slash 转义单测 ──────────────────
 
 def test_escape_for_pty_passes_through_normal_text():
