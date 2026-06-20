@@ -20,6 +20,39 @@ SHARED_THREAD_UID = "__thread__"
 
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
+# 无缝衔接：claude_session_mirror 的守护进程把"被镜像的本机终端 session"对应的
+# Lark thread 落成 ~/.claude/session_mirror/threads/<thread_id>.json。get_current
+# 读它，把"在 Lark 这个 thread 里回复"绑到终端 session_id + cwd（--resume）。
+_MIRROR_THREADS_DIR = os.path.expanduser("~/.claude/session_mirror/threads")
+_MIRROR_ACTIVE_DIR = os.path.expanduser("~/.claude/session_mirror/active")
+
+
+def _lookup_mirror_thread(thread_id: str) -> Optional[dict]:
+    """查 thread_id 是否对应一个被镜像的本机终端 session。返回 {session_id,cwd,...}
+    或 None。任何异常都吞掉，回落到原有行为。"""
+    if not thread_id:
+        return None
+    try:
+        with open(os.path.join(_MIRROR_THREADS_DIR, f"{thread_id}.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if d.get("session_id") else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _release_mirror_session(session_id: str, thread_id: str) -> None:
+    """交接完成：让镜像守护进程停止跟踪这个 session（删 active marker），并清掉
+    一次性的 thread link。否则 bot resume 后自己回复，镜像会把同一 session 的新
+    事件又推一遍，thread 里出现重复卡片。全 best-effort。"""
+    for path in (
+        os.path.join(_MIRROR_ACTIVE_DIR, f"{session_id}.json"),
+        os.path.join(_MIRROR_THREADS_DIR, f"{thread_id}.json"),
+    ):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
 
 def scan_cli_sessions(limit: int = 30) -> list[dict]:
     """
@@ -610,6 +643,24 @@ class SessionStore:
     async def get_current(self, user_id: str, chat_id: str) -> Session:
         """Get current session config for a specific chat"""
         cur = await self.get_current_raw(user_id, chat_id)
+        # 无缝衔接：thread 还没绑定 session 时，若它对应一个被镜像的本机终端会话，
+        # 就把它绑到那个 session_id + cwd——于是在 Lark 这个 thread 里回复会直接
+        # --resume 终端会话。只绑一次（绑完落盘 session_id+cwd，之后正常续）。
+        if not cur.get("session_id") and chat_id and ":" in chat_id:
+            try:
+                thread_id = chat_id.split(":", 1)[1]
+                bound = _lookup_mirror_thread(thread_id)
+                if bound:
+                    cur["session_id"] = bound["session_id"]
+                    if bound.get("cwd"):
+                        cur["cwd"] = bound["cwd"]
+                    if not cur.get("preview"):
+                        cur["preview"] = (bound.get("preview") or "")[:40]
+                    await self._save_async()
+                    # 交接给 cc-lark 后，停掉镜像对该 session 的跟踪，避免重复卡片
+                    _release_mirror_session(bound["session_id"], thread_id)
+            except Exception:
+                pass
         return Session(
             session_id=cur.get("session_id"),
             # 没有显式 override 就用 profile 默认（实时取，配置变了即生效）

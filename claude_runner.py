@@ -189,6 +189,9 @@ async def _run_claude_print(
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)
+        # 让 session-mirror 的 UserPromptSubmit hook 自我排除 bot spawn 的 claude，
+        # 否则 bot 自己的会话也会被镜像进 Lark。见 claude_session_mirror.py。
+        env["CC_LARK_MIRROR_OFF"] = "1"
         if extra_env:
             env.update(extra_env)
 

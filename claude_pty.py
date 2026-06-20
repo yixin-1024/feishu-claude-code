@@ -698,6 +698,8 @@ async def run_claude(
         try:
             env = os.environ.copy()
             env.pop("CLAUDECODE", None)
+            # session-mirror 自我排除：bot spawn 的 claude 不镜像。见 claude_session_mirror.py。
+            env["CC_LARK_MIRROR_OFF"] = "1"
             env.setdefault("TERM", "xterm-256color")
             env["COLUMNS"] = "160"
             env["LINES"] = "40"
