@@ -63,6 +63,11 @@ def load_config(path: str) -> dict:
     cfg.setdefault("routes", [])
     cfg.setdefault("exclude_prefixes", [])
     cfg.setdefault("default_chat_id", "")
+    # backfill：首次镜像一个 session 时，把它"注册之前"的历史轮次也补成卡片
+    # （banner + 每轮一张已完成卡）。默认关。
+    cfg.setdefault("backfill", False)
+    cfg.setdefault("backfill_max_turns", 50)
+    cfg.setdefault("backfill_send_interval", 0.25)
     return cfg
 
 
@@ -375,6 +380,103 @@ class Mirror:
         except Exception as e:  # noqa: BLE001
             log(f"write_thread_link failed: {e}")
 
+    def _parse_all_turns(self, tpath: str):
+        """读整个 jsonl，按真实 user prompt 切成 turns。返回 (turns, title)。
+        每个 turn：{prompt, reply, artifacts, uuids, ts}。"""
+        turns, cur, title = [], None, ""
+        try:
+            with open(tpath, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("isSidechain"):
+                        continue
+                    etype = ev.get("type")
+                    if etype == "ai-title":
+                        t = ev.get("aiTitle")
+                        if t:
+                            title = t
+                        continue
+                    if etype == "user":
+                        text = _user_text(ev)
+                        if _is_command_or_meta(text):
+                            continue
+                        if cur:
+                            turns.append(cur)
+                        cur = {"prompt": text, "reply": "", "artifacts": [],
+                               "uuids": [ev.get("uuid")], "ts": _ts_epoch(ev)}
+                    elif etype == "assistant":
+                        if not cur:
+                            continue
+                        for b in _assistant_blocks(ev):
+                            bt = b.get("type")
+                            if bt == "text":
+                                cur["reply"] += b.get("text", "")
+                            elif bt == "tool_use" and b.get("name") in WRITE_TOOLS:
+                                fp = (b.get("input") or {}).get("file_path") \
+                                    or (b.get("input") or {}).get("notebook_path")
+                                if fp and fp not in cur["artifacts"]:
+                                    cur["artifacts"].append(fp)
+                        if ev.get("uuid"):
+                            cur["uuids"].append(ev.get("uuid"))
+            if cur:
+                turns.append(cur)
+        except OSError:
+            pass
+        return turns, title
+
+    def _backfill(self, sid, marker, chat_id, st, tpath) -> None:
+        """首次镜像该 session 时，把"注册之前"的历史轮次补成卡片：先发一个 banner 当
+        thread 根，再每轮一张已完成卡（thread reply）。当前 in-flight 轮（ts>=min_ts）
+        留给正常 live 逻辑。历史轮的 uuid 全记进 seen，避免后续 live 读到时重复推。"""
+        turns, title = self._parse_all_turns(tpath)
+        hist = [t for t in turns if t["ts"] < st["min_ts"]]
+        if not hist:
+            return
+        cap = int(self.cfg.get("backfill_max_turns", 50) or 50)
+        omitted = max(0, len(hist) - cap)
+        hist = hist[-cap:]
+        cwd = marker.get("cwd", "")
+        proj = os.path.basename(cwd.rstrip("/")) or "?"
+        title_part = f" · {title}" if title else ""
+        note = f"（更早 {omitted} 轮已省略）" if omitted else ""
+        banner = {"schema": "2.0", "body": {"elements": [
+            {"tag": "markdown", "content": f"📜 **历史会话回放** · `{proj}`{title_part}"},
+            {"tag": "markdown", "content": f"session `{sid[:8]}` · 共 {len(hist)} 轮{note}"},
+        ]}}
+        try:
+            root = self.lark.send_card(chat_id, banner)
+        except Exception as e:  # noqa: BLE001
+            log(f"backfill banner failed: {e}")
+            return
+        st["root_message_id"] = root
+        tid = self.lark.get_thread_id(root)
+        if tid:
+            st["thread_id"] = tid
+            self._write_thread_link(tid, sid, cwd, chat_id, hist[-1]["prompt"][:40])
+        seen = list(st.get("seen_uuids", []))
+        interval = float(self.cfg.get("backfill_send_interval", 0.25) or 0)
+        for t in hist:
+            turn = {"session_id": sid, "cwd": cwd, "title": title,
+                    "prompt": t["prompt"], "reply": t["reply"],
+                    "artifacts": t["artifacts"], "finalized": True}
+            try:
+                self.lark.reply_card(root, render_card(turn, self.cfg), in_thread=True)
+            except Exception as e:  # noqa: BLE001
+                log(f"backfill turn failed: {e}")
+            seen.extend(u for u in t["uuids"] if u)
+            if interval:
+                time.sleep(interval)
+        st["seen_uuids"] = seen
+        st["title"] = title
+        st["backfilled"] = True
+        log(f"backfilled session={sid[:8]} {len(hist)} turns (omitted {omitted}) -> {root}")
+
     # ---- 单个会话处理 ----
     def process_session(self, marker: dict) -> None:
         sid = marker.get("session_id")
@@ -398,6 +500,11 @@ class Mirror:
                 "cwd": marker.get("cwd", ""),
                 "chat_id": chat_id,
             }
+            if self.cfg.get("backfill"):
+                try:
+                    self._backfill(sid, marker, chat_id, st, tpath)
+                except Exception as e:  # noqa: BLE001
+                    log(f"backfill error: {e}")
         seen = set(st.get("seen_uuids", []))
         turn = st.get("turn")
 

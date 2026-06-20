@@ -110,3 +110,18 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cclark.session-mirro
 - 群里**首条**回复仍要 `@ bot`（cc-lark 对"新 thread 首条"要求 @）；绑定+建会话记录后续不用再 @。
 - 假设该 profile 的 runner 是 `claude`（镜像只处理 claude 会话，spx 默认就是 claude）。
 - resume 的是同一个 jsonl：别在终端那边同时还开着同一 session 跑，避免两个进程并发写。
+
+## 历史回放 backfill ✅ 已实现
+
+默认这是个「从现在起」的镜像——只镜像 hook 触发之后的轮次。开了 `backfill` 后，**首次**
+镜像一个 session 时，会把它"注册之前"的历史轮次也补成卡片：先发一个「📜 历史会话回放」
+banner 当 thread 根，再每轮一张已完成卡（thread reply），然后转入正常 live tail。
+
+- 配置：`"backfill": true`（默认 false）、`"backfill_max_turns": 50`（超过只取最近 N 轮，
+  banner 标注省略数）、`"backfill_send_interval": 0.25`（每张卡间隔，限流友好）。
+- 只补 `ts < min_ts` 的**历史**轮；当前 in-flight 轮（你 resume 时刚发的那条）仍走正常
+  streaming。历史轮的 event uuid 全记进 seen，避免 live 读到时重复推。
+- 触发时机：还是靠 hook——你 `claude --resume <旧sid>` 发一条消息，该老会话才首次被
+  镜像，此刻连同它全部历史一起灌进新 thread。没人碰的老会话不动。
+- 注意：resume 一个几十轮的大会话会一次性刷出几十张卡（受 `backfill_max_turns` 上限约束），
+  且会把旧内容（可能含敏感信息）推到群里——按需开关。
