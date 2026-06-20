@@ -97,6 +97,17 @@ class Profile:
     opencode_api_key_env: str = "GOOGLE_GENERATIVE_AI_API_KEY"
     opencode_dangerous_skip: int = 1
     opencode_idle_timeout_sec: int = 300
+    # mimo runner 配置（MiMo Code，小米 fork 自 opencode）。走 provider/model 形式，
+    # 裸 model 名按 mimo_provider 补前缀（默认 quotio）。自定义 OpenAI 兼容 provider
+    # 写在 ~/.config/mimocode/mimocode.json；若给定 mimo_base_url + mimo_api_key，
+    # runner 启动时会幂等地把该 provider 合并进配置（已存在则不动）。
+    mimo_bin: str = ""
+    mimo_provider: str = "quotio"
+    mimo_base_url: str = ""
+    mimo_api_key: str = ""
+    mimo_variant: str = ""  # 推理强度：high / max / minimal（provider 相关）
+    mimo_dangerous_skip: int = 1
+    mimo_idle_timeout_sec: int = 600
     # "会话群" chat_id：bot 在其它群被 @ 时（=调度 session），会被指引把任务派单到
     # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
     dispatch_chat_id: str = ""
@@ -178,9 +189,9 @@ def _load_profile(name: str) -> Profile:
 
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
-    if runner not in {"claude", "codex", "opencode"}:
+    if runner not in {"claude", "codex", "opencode", "mimo"}:
         raise ValueError(
-            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode，当前: {runner}"
+            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo，当前: {runner}"
         )
     try:
         codex_bypass = int(env("CODEX_DANGEROUS_BYPASS", os.getenv("CODEX_DANGEROUS_BYPASS", "2")) or "2")
@@ -199,6 +210,14 @@ def _load_profile(name: str) -> Profile:
         oc_idle = int(env("OPENCODE_IDLE_TIMEOUT_SEC", os.getenv("OPENCODE_IDLE_TIMEOUT_SEC", "300")) or "300")
     except ValueError:
         oc_idle = 300
+    try:
+        mimo_skip = int(env("MIMO_DANGEROUS_SKIP", os.getenv("MIMO_DANGEROUS_SKIP", "1")) or "1")
+    except ValueError:
+        mimo_skip = 1
+    try:
+        mimo_idle = int(env("MIMO_IDLE_TIMEOUT_SEC", os.getenv("MIMO_IDLE_TIMEOUT_SEC", "600")) or "600")
+    except ValueError:
+        mimo_idle = 600
     return Profile(
         name=name,
         app_id=app_id,
@@ -224,6 +243,13 @@ def _load_profile(name: str) -> Profile:
         opencode_api_key_env=env("OPENCODE_API_KEY_ENV", os.getenv("OPENCODE_API_KEY_ENV", "GOOGLE_GENERATIVE_AI_API_KEY")).strip() or "GOOGLE_GENERATIVE_AI_API_KEY",
         opencode_dangerous_skip=max(0, min(1, oc_skip)),
         opencode_idle_timeout_sec=max(0, oc_idle),
+        mimo_bin=env("MIMO_BIN", os.getenv("MIMO_BIN", "")).strip(),
+        mimo_provider=env("MIMO_PROVIDER", os.getenv("MIMO_PROVIDER", "quotio")).strip() or "quotio",
+        mimo_base_url=env("MIMO_BASE_URL", os.getenv("MIMO_BASE_URL", "")).strip(),
+        mimo_api_key=env("MIMO_API_KEY", os.getenv("MIMO_API_KEY", "")).strip(),
+        mimo_variant=env("MIMO_VARIANT", os.getenv("MIMO_VARIANT", "")).strip(),
+        mimo_dangerous_skip=max(0, min(1, mimo_skip)),
+        mimo_idle_timeout_sec=max(0, mimo_idle),
         dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
         role=role,
         court_chat_id=env("COURT_CHAT_ID").strip(),
@@ -265,6 +291,14 @@ def _load_legacy_profile() -> Optional[Profile]:
         oc_idle = int(os.getenv("OPENCODE_IDLE_TIMEOUT_SEC", "300") or "300")
     except ValueError:
         oc_idle = 300
+    try:
+        mimo_skip = int(os.getenv("MIMO_DANGEROUS_SKIP", "1") or "1")
+    except ValueError:
+        mimo_skip = 1
+    try:
+        mimo_idle = int(os.getenv("MIMO_IDLE_TIMEOUT_SEC", "600") or "600")
+    except ValueError:
+        mimo_idle = 600
     return Profile(
         name=legacy_name,
         app_id=app_id,
@@ -289,6 +323,13 @@ def _load_legacy_profile() -> Optional[Profile]:
         opencode_api_key_env=os.getenv("OPENCODE_API_KEY_ENV", "GOOGLE_GENERATIVE_AI_API_KEY").strip() or "GOOGLE_GENERATIVE_AI_API_KEY",
         opencode_dangerous_skip=max(0, min(1, oc_skip)),
         opencode_idle_timeout_sec=max(0, oc_idle),
+        mimo_bin=os.getenv("MIMO_BIN", "").strip(),
+        mimo_provider=os.getenv("MIMO_PROVIDER", "quotio").strip() or "quotio",
+        mimo_base_url=os.getenv("MIMO_BASE_URL", "").strip(),
+        mimo_api_key=os.getenv("MIMO_API_KEY", "").strip(),
+        mimo_variant=os.getenv("MIMO_VARIANT", "").strip(),
+        mimo_dangerous_skip=max(0, min(1, mimo_skip)),
+        mimo_idle_timeout_sec=max(0, mimo_idle),
     )
 
 

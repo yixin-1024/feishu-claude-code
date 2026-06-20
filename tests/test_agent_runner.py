@@ -86,3 +86,41 @@ def test_run_agent_dispatches_to_opencode(monkeypatch):
     assert captured["message"] == "hi"
     assert captured["model"] == "google/gemini-3.1-pro-preview"
     assert captured["provider"] == profile.opencode_provider
+
+
+def test_run_agent_dispatches_to_mimo(monkeypatch):
+    captured = {}
+
+    async def fake_mimo(**kwargs):
+        captured.update(kwargs)
+        return "ok", "ses_mimo_1", False
+
+    async def fake_claude(**kwargs):
+        raise AssertionError("claude runner should not be called")
+
+    async def fake_codex(**kwargs):
+        raise AssertionError("codex runner should not be called")
+
+    monkeypatch.setattr("agent_runner.run_mimo", fake_mimo)
+    monkeypatch.setattr("agent_runner.run_claude", fake_claude)
+    monkeypatch.setattr("agent_runner.run_codex", fake_codex)
+
+    profile = _profile("mimo")
+    profile.mimo_provider = "quotio"
+    profile.mimo_base_url = "http://127.0.0.1:8317/v1"
+    profile.mimo_api_key = "k"
+    text, sid, fallback = asyncio.run(run_agent(
+        profile=profile,
+        runner="mimo",
+        message="hi",
+        model="quotio/claude-opus-4-8",
+        cwd="/tmp",
+    ))
+
+    assert text == "ok"
+    assert sid == "ses_mimo_1"
+    assert fallback is False
+    assert captured["message"] == "hi"
+    assert captured["model"] == "quotio/claude-opus-4-8"
+    assert captured["provider"] == "quotio"
+    assert captured["base_url"] == "http://127.0.0.1:8317/v1"

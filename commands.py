@@ -62,6 +62,10 @@ MODEL_ALIASES = {
     "gemini25flash": "google/gemini-2.5-flash",
     "gemini-2.5-flash": "google/gemini-2.5-flash",
     "flash": "google/gemini-2.5-flash",
+    # MiMo Code（quotio 本地 OpenAI 兼容中转）
+    "mimo": "quotio/claude-opus-4-8",
+    "mimo-opus": "quotio/claude-opus-4-8",
+    "mimo-sonnet": "quotio/claude-sonnet-4-6",
 }
 
 HELP_TEXT = """\
@@ -73,7 +77,7 @@ HELP_TEXT = """\
 `/new` 或 `/clear` — 开始新 session
 `/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
-`/runner [codex|claude|opencode]` — 切换当前 chat 使用 Codex / Claude Code / opencode
+`/runner [codex|claude|opencode|mimo]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code
 `/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
 `/status` — 显示当前 session 信息
@@ -691,6 +695,8 @@ def _runner_default_model(bot, runner: str) -> str:
         return "gpt-5.5"
     if runner == "opencode":
         return "google/gemini-3.1-pro-preview"
+    if runner == "mimo":
+        return "quotio/claude-opus-4-8"
     return "claude-sonnet-4-6"
 
 
@@ -1216,13 +1222,16 @@ async def handle_command(
                     {"text": "Codex", "value": {"action": "run_cmd", "cmd": "/runner codex", "cid": chat_id}},
                     {"text": "Claude Code", "value": {"action": "run_cmd", "cmd": "/runner claude", "cid": chat_id}},
                     {"text": "opencode", "value": {"action": "run_cmd", "cmd": "/runner opencode", "cid": chat_id}},
+                    {"text": "MiMo Code", "value": {"action": "run_cmd", "cmd": "/runner mimo", "cid": chat_id}},
                 ],
             }
         requested = args.strip().lower().replace("_", "-")
         if requested in {"claude-code", "claudecode"}:
             requested = "claude"
-        if requested not in {"codex", "claude", "opencode"}:
-            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`".format(args)
+        if requested in {"mimo-code", "mimocode"}:
+            requested = "mimo"
+        if requested not in {"codex", "claude", "opencode", "mimo"}:
+            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）".format(args)
         model = _runner_default_model(bot, requested)
         await store.set_runner(user_id, chat_id, requested, model=model)
         return f"✅ 已切换 runner 为 `{requested}`，模型 `{model}`。已开始新 session。"
@@ -1246,6 +1255,11 @@ async def handle_command(
                     {"text": "Gemini 3 Pro", "value": {"action": "run_cmd", "cmd": "/model gemini3", "cid": chat_id}},
                     {"text": "Gemini 2.5 Pro", "value": {"action": "run_cmd", "cmd": "/model gemini25pro", "cid": chat_id}},
                     {"text": "⚡ Gemini 2.5 Flash", "value": {"action": "run_cmd", "cmd": "/model gemini-flash", "cid": chat_id}},
+                ]
+            elif runner == "mimo":
+                buttons = [
+                    {"text": "🧠 Opus 4.8", "value": {"action": "run_cmd", "cmd": "/model mimo-opus", "cid": chat_id}},
+                    {"text": "⚡ Sonnet 4.6", "value": {"action": "run_cmd", "cmd": "/model mimo-sonnet", "cid": chat_id}},
                 ]
             else:
                 buttons = [
@@ -1294,7 +1308,7 @@ async def handle_command(
         quota_line = (
             _format_codex_rate_line(cur.get("session_id"))
             if runner == "codex"
-            else "" if runner == "opencode"
+            else "" if runner in {"opencode", "mimo"}
             else await asyncio.to_thread(_get_quota_compact)
         )
 
@@ -1388,6 +1402,20 @@ async def handle_command(
             if ctx_line:
                 lines.append(ctx_line)
             lines.append(f"Runner: `opencode`")
+            lines.append(f"模型: `{model}`")
+            return "\n".join(lines)
+        if runner == "mimo":
+            model = cur.get("model_override") or store.default_model
+            lines = ["📈 **MiMo Code 用量**"]
+            ctx_line = _format_context_line(
+                cur.get("session_id"),
+                model,
+                runner="mimo",
+                current_usage=cur.get("last_usage") or None,
+            )
+            if ctx_line:
+                lines.append(ctx_line)
+            lines.append(f"Runner: `mimo`")
             lines.append(f"模型: `{model}`")
             return "\n".join(lines)
         return _get_usage()

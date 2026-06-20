@@ -8,6 +8,7 @@ from bot_config import Profile, load_claude_extra_env
 from claude_runner import run_claude
 from codex_runner import run_codex
 from opencode_runner import run_opencode
+from mimo_runner import run_mimo
 
 
 async def run_agent(
@@ -46,6 +47,28 @@ async def run_agent(
             api_key_env=profile.opencode_api_key_env,
             dangerously_skip_permissions=bool(profile.opencode_dangerous_skip),
             idle_timeout_sec=profile.opencode_idle_timeout_sec,
+        )
+
+    if backend == "mimo":
+        return await run_mimo(
+            message=message,
+            session_id=session_id,
+            model=model,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            on_usage=on_usage,
+            on_status=on_status,
+            append_system_prompt=append_system_prompt,
+            mimo_bin=profile.mimo_bin,
+            provider=profile.mimo_provider,
+            base_url=profile.mimo_base_url,
+            api_key=profile.mimo_api_key,
+            variant=profile.mimo_variant,
+            dangerously_skip_permissions=bool(profile.mimo_dangerous_skip),
+            idle_timeout_sec=profile.mimo_idle_timeout_sec,
         )
 
     if backend == "codex":

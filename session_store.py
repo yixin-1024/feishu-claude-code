@@ -24,6 +24,8 @@ CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 # Lark thread 落成 ~/.claude/session_mirror/threads/<thread_id>.json。get_current
 # 读它，把"在 Lark 这个 thread 里回复"绑到终端 session_id + cwd（--resume）。
 _MIRROR_THREADS_DIR = os.path.expanduser("~/.claude/session_mirror/threads")
+
+
 _MIRROR_ACTIVE_DIR = os.path.expanduser("~/.claude/session_mirror/active")
 
 
@@ -379,7 +381,7 @@ class SessionStore:
         )
         self._default_cwd = default_cwd or DEFAULT_CWD
         self._default_runner = (default_runner or DEFAULT_RUNNER or "claude").strip().lower()
-        if self._default_runner not in {"claude", "codex", "opencode"}:
+        if self._default_runner not in {"claude", "codex", "opencode", "mimo"}:
             self._default_runner = "claude"
         self._default_model = default_model or DEFAULT_MODEL
         self._chat_default_cwd = chat_default_cwd or {}
@@ -818,8 +820,10 @@ class SessionStore:
         normalized = (runner or "").strip().lower().replace("_", "-")
         if normalized in {"claude-code", "claudecode"}:
             normalized = "claude"
-        if normalized not in {"claude", "codex", "opencode"}:
-            raise ValueError("runner must be 'claude', 'codex' or 'opencode'")
+        if normalized in {"mimo-code", "mimocode"}:
+            normalized = "mimo"
+        if normalized not in {"claude", "codex", "opencode", "mimo"}:
+            raise ValueError("runner must be 'claude', 'codex', 'opencode' or 'mimo'")
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
         if cur.get("session_id"):
