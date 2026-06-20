@@ -872,8 +872,8 @@ async def _run_and_display(
         final = full_text or accumulated or "（无输出）"
         if used_fresh_session_fallback:
             final = (
-                "⚠️ 检测到工作目录已变化，旧会话无法继续。"
-                "本次已自动切换到新 session。\n\n" + final
+                "⚠️ 无法接续上一轮会话（resume 失败），已自动开新会话继续"
+                "——之前的上下文没有带过来。\n\n" + final
             )
         footer = _format_usage_footer(final_usage, session.model)
         if footer:

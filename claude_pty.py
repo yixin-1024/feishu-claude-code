@@ -1161,8 +1161,12 @@ async def run_claude(
             reason = "orphaned"
         else:
             reason = "failed without stderr"
+        # 带上 code/sid/cwd 才能在 cc-lark.log 里直接看清真因（cwd 通常根本没变，
+        # 主因是上一轮被 watchdog 杀掉 / orphan）——这是线上真正在跑的热路径，
+        # 诊断必须打在这里，-p 版本那条平时不跑。
         print(
-            f"[run_claude_pty] resume {reason}, retrying fresh session",
+            f"[run_claude_pty] resume {reason}, retrying fresh session "
+            f"(code={rc}, sid={session_id}, cwd={run_cwd})",
             flush=True,
         )
         final_text, new_session_id, rc, stderr_text = await _run_once(None)

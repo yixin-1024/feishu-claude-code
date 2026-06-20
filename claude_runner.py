@@ -345,12 +345,18 @@ async def _run_claude_print(
     final_text, new_session_id, returncode, stderr_text = await _run_once(session_id)
     used_fresh_session_fallback = False
 
-    # Claude 的 session 与 cwd 不兼容时，CLI 有时直接 code=1 且 stderr 为空。
-    # 这种场景自动退回新 session，避免用户必须手动 /new。
+    # resume 旧 session "哑失败"的兜底：code>0 + stderr 空 + 无输出。
+    # 成因不止 cwd 变（那只是其一）：上一轮被杀致 JSONL 写一半、session 被 CLI 清掉、
+    # resume 瞬时报错等都会撞这个签名。统一退回新 session，避免用户必须手动 /new。
+    # 注意：用户文案别再写死"工作目录已变化"，那是误判（见 dispatcher fallback 提示）。
     # returncode 为负数 = 被信号杀（如 /stop 的 SIGTERM/SIGKILL），不能 fallback——
     # 否则用户 /stop 后会立刻在 lock 内拉起新进程，造成"队列说在跑、/stop 杀不死"的死循环。
     if session_id and returncode is not None and returncode > 0 and not stderr_text and not final_text:
-        print("[run_claude] resume failed without stderr, retrying with fresh session", flush=True)
+        print(
+            f"[run_claude] resume failed (code={returncode}, empty stderr/output), "
+            f"retrying with fresh session; sid={session_id} cwd={cwd}",
+            flush=True,
+        )
         final_text, new_session_id, returncode, stderr_text = await _run_once(None)
         used_fresh_session_fallback = True
 
