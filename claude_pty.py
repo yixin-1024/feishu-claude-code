@@ -1166,7 +1166,7 @@ async def run_claude(
         # 诊断必须打在这里，-p 版本那条平时不跑。
         print(
             f"[run_claude_pty] resume {reason}, retrying fresh session "
-            f"(code={rc}, sid={session_id}, cwd={run_cwd})",
+            f"(code={rc}, sid={session_id}, cwd={cwd or os.path.expanduser('~')})",
             flush=True,
         )
         final_text, new_session_id, rc, stderr_text = await _run_once(None)
