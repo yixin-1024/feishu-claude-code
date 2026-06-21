@@ -855,6 +855,8 @@ async def _run_and_display(
                 await bot.feishu.update_card(card_msg_id, err_brief)
             except Exception:
                 pass
+            # 流式卡若开着，关掉它恢复交互（非流式/未登记则 no-op，且永不抛）
+            await bot.feishu.finalize_streaming_card(card_msg_id)
             # 卡片是 in-place patch，不会触发 Lark 新消息通知。异常退出时额外发一条独立
             # ❌ 短消息，与成功路径下的独立 ✅ 对齐，让用户能在消息列表里直接看到出错。
             err_notify = "❌ 异常退出" + (
@@ -887,12 +889,17 @@ async def _run_and_display(
                     for display, value in options
                 ]
                 short = all(len(b["text"]) <= 10 for b in buttons)
+                # 流式卡：update_card_with_buttons 内部会推最终文本 + 关流式 + 加按钮
                 await bot.feishu.update_card_with_buttons(card_msg_id, final, buttons, flow=short)
             else:
                 await bot.feishu.update_card(card_msg_id, final)
+                # 无按钮的流式卡推完最终文本后需手动关流式（非流式则 no-op）
+                await bot.feishu.finalize_streaming_card(card_msg_id)
             card_patched = True
         except Exception as e:
             log(bot.profile.name, "card", "error", f"卡片更新失败，回退发文本: {e}")
+            # 卡片更新失败时流式卡可能仍开着，先收尾
+            await bot.feishu.finalize_streaming_card(card_msg_id)
             try:
                 if is_group and notify_msg_id:
                     await bot.feishu.reply_card(notify_msg_id, content=final, loading=False)
@@ -900,6 +907,14 @@ async def _run_and_display(
                     await bot.feishu.send_text_to_user(user_id, final)
             except Exception as fallback_err:
                 log(bot.profile.name, "card", "error", f"文本回退也失败: {fallback_err}")
+                # 卡片 + 文本回退都失败（额度耗尽 / 渲染故障等）：结果落 outbox，绝不丢
+                saved = bot.feishu.save_outbox(
+                    final, kind="result", error=str(fallback_err),
+                    meta={"chat_id": chat_id, "user": user_id,
+                          "card_msg_id": card_msg_id, "session": new_session_id or ""},
+                )
+                if saved:
+                    log(bot.profile.name, "outbox", "warn", f"结果已落 outbox: {saved}")
 
         if card_patched:
             try:

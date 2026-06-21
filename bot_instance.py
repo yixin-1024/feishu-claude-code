@@ -40,6 +40,7 @@ class BotInstance:
             app_id=profile.app_id,
             app_secret=profile.app_secret,
             domain=profile.domain,
+            label=profile.name,
         )
         self.store = SessionStore(
             profile=profile.name,

@@ -1,6 +1,13 @@
 """
 飞书 API 异步封装。
-流式方案：发送内联卡片消息 → 用 patch 逐步更新内容（比 cardkit 流式卡片更简单可靠）。
+
+默认流式方案：发送内联卡片消息 → 用 patch 逐步更新内容（简单可靠，且带
+LARK_CARD_SCHEMA v1 降级兜底，是线上保命路径）。
+
+可选流式方案（LARK_CARD_STREAMING=1 开启）：CardKit 流式卡片，客户端本地
+打字机效果、增量推送更顺滑。按 message_id 在 FeishuClient 内部路由——只有
+loading=True 的占位卡会建成 CardKit 流式卡，后续 update_card /
+update_card_with_buttons 自动走 CardKit；flag 关闭时一切照旧走 PATCH。
 """
 
 import asyncio
@@ -20,6 +27,45 @@ from lark_oapi.api.im.v1.model import (
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
+
+import outbox
+
+
+class FeishuApiError(RuntimeError):
+    """飞书 API 返回非成功码。携带结构化 code，供 _retry_with_backoff 判定是否可重试。
+
+    str() 输出沿用旧的 "<action>: <code> <msg>" 格式，对现有 except/日志零影响。
+    """
+
+    def __init__(self, action: str, code, msg: str):
+        self.code = code
+        self.msg = msg
+        super().__init__(f"{action}: {code} {msg}")
+
+
+def _load_non_retryable_codes() -> frozenset:
+    """不可重试的错误码集合。
+
+    默认含 99991403（Lark 发送额度耗尽）——这类错误重试只会白烧 2~3 倍额度，
+    应立即放弃并转 outbox。可用 LARK_NO_RETRY_CODES="99991403,230020" 覆盖。
+    """
+    raw = os.getenv("LARK_NO_RETRY_CODES", "").strip()
+    if not raw:
+        return frozenset({99991403})
+    codes = set()
+    for tok in raw.replace("，", ",").split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            codes.add(int(tok))
+    return frozenset(codes or {99991403})
+
+
+NON_RETRYABLE_CODES = _load_non_retryable_codes()
+
+
+def _streaming_enabled() -> bool:
+    """是否启用 CardKit 流式卡片（默认否，走 PATCH）。"""
+    return (os.getenv("LARK_CARD_STREAMING", "") or "").strip() in ("1", "true", "on", "yes")
 
 
 def _sanitize_filename(name: str) -> str:
@@ -164,12 +210,19 @@ def _card_json(content: str, loading: bool = False) -> str:
 
 class FeishuClient:
     def __init__(self, client: lark.Client, app_id: str = "", app_secret: str = "",
-                 domain: str = "https://open.feishu.cn"):
+                 domain: str = "https://open.feishu.cn", label: str = ""):
         self.client = client
         self._app_id = app_id
         self._app_secret = app_secret
         self._domain = domain.rstrip("/")
+        # bot/profile 标识，用于发送彻底失败时落 outbox 文件名
+        self.label = label or (app_id[-6:] if app_id else "bot")
         self._bot_open_id: Optional[str] = None
+        # CardKit 流式卡登记表：message_id → {"card_id", "seq", "element_id"}。
+        # 仅 LARK_CARD_STREAMING=1 且 loading 占位卡才会登记；update_card 等据此
+        # 决定走 CardKit 还是 PATCH。重启即丢，只服务进行中的 run。
+        self._streaming_cards: dict[str, dict] = {}
+        self._STREAMING_MAX = 200
         # interactive 卡片的最终文本快照（message_id → markdown 内容）。
         # 飞书 im.v1.message.list 拿到的 interactive content 是初始快照（loading 状态），
         # update_card 流式 patch 上去的内容拿不到；thread_context 解析历史 bot 卡片时
@@ -191,6 +244,28 @@ class FeishuClient:
     def get_card_text(self, message_id: str) -> str:
         """查这条 interactive 消息 update_card 之后的最终文本（没有则空串）。"""
         return self._card_text_cache.get(message_id, "")
+
+    def save_outbox(self, content: str, *, kind: str = "result", error: str = "",
+                    meta: Optional[dict] = None) -> Optional[str]:
+        """发送彻底失败时，把内容落到本 bot 的 outbox 文件，避免结果丢失。永不抛异常。"""
+        return outbox.record(self.label, content, kind=kind, error=error, meta=meta)
+
+    # ── CardKit 流式卡登记 ────────────────────────────────────
+    def _register_streaming(self, message_id: str, card_id: str, element_id: str) -> None:
+        if not message_id or not card_id:
+            return
+        if len(self._streaming_cards) >= self._STREAMING_MAX:
+            for k in list(self._streaming_cards.keys())[: self._STREAMING_MAX // 4 or 1]:
+                self._streaming_cards.pop(k, None)
+        self._streaming_cards[message_id] = {"card_id": card_id, "seq": 0, "element_id": element_id}
+
+    def _next_seq(self, message_id: str) -> Optional[tuple[str, str, int]]:
+        """取流式卡 (card_id, element_id, 递增后的 sequence)；非流式卡返回 None。"""
+        st = self._streaming_cards.get(message_id)
+        if not st:
+            return None
+        st["seq"] += 1
+        return st["card_id"], st["element_id"], st["seq"]
 
     async def get_bot_open_id(self) -> Optional[str]:
         """查询机器人自己的 open_id（首次调用时请求 /bot/v3/info 并缓存）。"""
@@ -248,6 +323,11 @@ class FeishuClient:
                 return await coro_func()
             except Exception as e:
                 last_error = e
+                # 额度耗尽等不可重试码：重试纯属白烧额度，立即放弃
+                code = getattr(e, "code", None)
+                if code is not None and code in NON_RETRYABLE_CODES:
+                    print(f"[retry] 错误码 {code} 不可重试（如额度耗尽），立即放弃: {e}", flush=True)
+                    raise
                 if attempt < max_retries:
                     print(f"[retry] 第 {attempt + 1} 次失败，{delay:.1f}s 后重试: {e}", flush=True)
                     await asyncio.sleep(delay)
@@ -260,7 +340,16 @@ class FeishuClient:
     # ── 发送消息 ──────────────────────────────────────────────
 
     async def send_card_to_user(self, open_id: str, content: str = "", loading: bool = True) -> str:
-        """向用户发送卡片消息，返回 message_id（带重试）"""
+        """向用户发送卡片消息，返回 message_id（带重试）。
+
+        LARK_CARD_STREAMING=1 且 loading 占位卡时，改建 CardKit 流式卡。
+        """
+        if loading and _streaming_enabled():
+            try:
+                return await self._create_streaming_card(open_id=open_id)
+            except Exception as e:
+                print(f"[cardkit] 创建流式卡失败，回退普通卡: {e}", flush=True)
+
         async def _send():
             req = (
                 CreateMessageRequest.builder()
@@ -276,7 +365,7 @@ class FeishuClient:
             )
             resp = await self.client.im.v1.message.acreate(req)
             if not resp.success():
-                raise RuntimeError(f"发送卡片消息失败: {resp.code} {resp.msg}")
+                raise FeishuApiError("发送卡片消息失败", resp.code, resp.msg)
             return resp.data.message_id
 
         mid = await self._retry_with_backoff(_send, max_retries=3)
@@ -285,7 +374,16 @@ class FeishuClient:
         return mid
 
     async def reply_card(self, message_id: str, content: str = "", loading: bool = True) -> str:
-        """回复用户消息（卡片形式），触发通知。返回回复消息的 message_id（带重试）"""
+        """回复用户消息（卡片形式），触发通知。返回回复消息的 message_id（带重试）。
+
+        LARK_CARD_STREAMING=1 且 loading 占位卡时，改建 CardKit 流式卡。
+        """
+        if loading and _streaming_enabled():
+            try:
+                return await self._create_streaming_card(reply_to=message_id)
+            except Exception as e:
+                print(f"[cardkit] 创建流式卡失败，回退普通卡: {e}", flush=True)
+
         async def _reply():
             req = (
                 ReplyMessageRequest.builder()
@@ -300,7 +398,7 @@ class FeishuClient:
             )
             resp = await self.client.im.v1.message.areply(req)
             if not resp.success():
-                raise RuntimeError(f"回复卡片消息失败: {resp.code} {resp.msg}")
+                raise FeishuApiError("回复卡片消息失败", resp.code, resp.msg)
             return resp.data.message_id
 
         mid = await self._retry_with_backoff(_reply, max_retries=3)
@@ -309,7 +407,12 @@ class FeishuClient:
         return mid
 
     async def update_card(self, message_id: str, content: str):
-        """用 patch 更新已发送的卡片内容（带重试）"""
+        """更新已发送的卡片内容（带重试）。流式卡走 CardKit 增量推送，否则 PATCH。"""
+        if message_id in self._streaming_cards:
+            await self._stream_update_text(message_id, content)
+            self._remember_card_text(message_id, content)
+            return
+
         async def _update():
             req = (
                 PatchMessageRequest.builder()
@@ -323,10 +426,205 @@ class FeishuClient:
             )
             resp = await self.client.im.v1.message.apatch(req)
             if not resp.success():
-                raise RuntimeError(f"patch 卡片失败: {resp.code} {resp.msg}")
+                raise FeishuApiError("patch 卡片失败", resp.code, resp.msg)
 
         await self._retry_with_backoff(_update, max_retries=3)
         self._remember_card_text(message_id, content)
+
+    # ── CardKit 流式卡片（LARK_CARD_STREAMING=1 时启用）──────────
+    # 语义：建卡片实体 → 用消息 API 发"卡片引用" → card_element.content 传全量文本
+    # + 递增 sequence（客户端本地打字机）→ card.settings 关流式恢复交互。
+    # 参考 GabrielZhu123456/feishu-claude-code 的实现，适配本仓库的 message_id 路由。
+
+    async def _create_streaming_card(self, open_id: str = "", reply_to: str = "",
+                                     element_id: str = "md_stream") -> str:
+        """建 CardKit 流式卡并发送/回复，登记后返回 message_id。"""
+        from lark_oapi.api.cardkit.v1.model import CreateCardRequest, CreateCardRequestBody
+
+        card_json = json.dumps({
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "streaming_config": {
+                    "print_frequency_ms": {"default": 30},
+                    "print_step": {"default": 2},
+                    "print_strategy": "fast",
+                },
+            },
+            "body": {"elements": [
+                {"tag": "markdown", "element_id": element_id, "content": "⏳ 思考中..."},
+            ]},
+        }, ensure_ascii=False)
+
+        async def _create():
+            req = (
+                CreateCardRequest.builder()
+                .request_body(
+                    CreateCardRequestBody.builder().type("card_json").data(card_json).build()
+                )
+                .build()
+            )
+            resp = await self.client.cardkit.v1.card.acreate(req)
+            if not resp.success():
+                raise FeishuApiError("创建流式卡失败", resp.code, resp.msg)
+            return resp.data.card_id
+
+        card_id = await self._retry_with_backoff(_create, max_retries=2)
+        card_ref = json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
+
+        if reply_to:
+            msg_id = await self._retry_with_backoff(
+                lambda: self._send_card_entity(card_ref, reply_to=reply_to), max_retries=2)
+        else:
+            msg_id = await self._retry_with_backoff(
+                lambda: self._send_card_entity(card_ref, open_id=open_id), max_retries=2)
+
+        self._register_streaming(msg_id, card_id, element_id)
+        return msg_id
+
+    async def _send_card_entity(self, card_ref: str, open_id: str = "", reply_to: str = "") -> str:
+        """把已建好的卡片实体作为消息发出（主动发或回复）。"""
+        if reply_to:
+            req = (
+                ReplyMessageRequest.builder()
+                .message_id(reply_to)
+                .request_body(
+                    ReplyMessageRequestBody.builder().msg_type("interactive").content(card_ref).build()
+                )
+                .build()
+            )
+            resp = await self.client.im.v1.message.areply(req)
+            if not resp.success():
+                raise FeishuApiError("回复流式卡实体失败", resp.code, resp.msg)
+            return resp.data.message_id
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("open_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(open_id).msg_type("interactive").content(card_ref).build()
+            )
+            .build()
+        )
+        resp = await self.client.im.v1.message.acreate(req)
+        if not resp.success():
+            raise FeishuApiError("发送流式卡实体失败", resp.code, resp.msg)
+        return resp.data.message_id
+
+    async def _stream_update_text(self, message_id: str, content: str):
+        """流式更新文本（全量内容 + 递增 sequence）。"""
+        from lark_oapi.api.cardkit.v1.model import (
+            ContentCardElementRequest, ContentCardElementRequestBody,
+        )
+        nxt = self._next_seq(message_id)
+        if not nxt:
+            return
+        card_id, element_id, seq = nxt
+
+        async def _update():
+            req = (
+                ContentCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(element_id)
+                .request_body(
+                    ContentCardElementRequestBody.builder().content(content).sequence(seq).build()
+                )
+                .build()
+            )
+            resp = await self.client.cardkit.v1.card_element.acontent(req)
+            if not resp.success():
+                raise FeishuApiError("流式更新失败", resp.code, resp.msg)
+
+        await self._retry_with_backoff(_update, max_retries=1)
+
+    async def finalize_streaming_card(self, message_id: str, buttons: Optional[list[dict]] = None,
+                                      flow: bool = False):
+        """关闭流式模式（恢复交互/转发），可选追加按钮，然后注销登记。
+
+        非流式卡或未登记的 message_id：no-op。永不抛异常——收尾失败不该影响主流程。
+        """
+        st = self._streaming_cards.get(message_id)
+        if not st:
+            return
+        card_id = st["card_id"]
+        try:
+            from lark_oapi.api.cardkit.v1.model import SettingsCardRequest, SettingsCardRequestBody
+            st["seq"] += 1
+            seq = st["seq"]
+
+            async def _finish():
+                req = (
+                    SettingsCardRequest.builder()
+                    .card_id(card_id)
+                    .request_body(
+                        SettingsCardRequestBody.builder()
+                        .settings(json.dumps({"streaming_mode": False}))
+                        .sequence(seq)
+                        .build()
+                    )
+                    .build()
+                )
+                resp = await self.client.cardkit.v1.card.asettings(req)
+                if not resp.success():
+                    raise FeishuApiError("关闭流式模式失败", resp.code, resp.msg)
+
+            await self._retry_with_backoff(_finish, max_retries=2)
+
+            if buttons:
+                st["seq"] += 1
+                await self._streaming_add_buttons(card_id, buttons, flow=flow, sequence=st["seq"])
+        except Exception as e:
+            print(f"[cardkit] finalize 失败 msg={message_id[:12]}: {e}", flush=True)
+        finally:
+            self._streaming_cards.pop(message_id, None)
+
+    async def _streaming_add_buttons(self, card_id: str, buttons: list[dict], flow: bool = False,
+                                     sequence: int = 1):
+        """流式结束后给卡片追加按钮元素。sequence 为必填（缺则 99992402 校验失败）。"""
+        from lark_oapi.api.cardkit.v1.model import (
+            CreateCardElementRequest, CreateCardElementRequestBody,
+        )
+        btn_elements = []
+        for i, btn in enumerate(buttons):
+            btn_elements.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": btn["text"]},
+                "type": "default",
+                "size": "small",
+                "name": f"btn_{i}",
+                "value": btn["value"],
+                "behaviors": [{"type": "callback", "value": btn["value"]}],
+            })
+        if not btn_elements:
+            return
+        if len(btn_elements) == 1 and not flow:
+            new_elements = [btn_elements[0]]
+        else:
+            new_elements = [{
+                "tag": "column_set", "flex_mode": "flow",
+                "columns": [{"tag": "column", "width": "auto", "elements": [b]} for b in btn_elements],
+            }]
+        # SDK 1.5.3：elements 是「元素列表的 JSON 字符串」，type=append 追加到卡片末尾
+        elements_json = json.dumps(new_elements, ensure_ascii=False)
+
+        async def _add():
+            req = (
+                CreateCardElementRequest.builder()
+                .card_id(card_id)
+                .request_body(
+                    CreateCardElementRequestBody.builder()
+                    .type("append")
+                    .elements(elements_json)
+                    .sequence(sequence)
+                    .build()
+                )
+                .build()
+            )
+            resp = await self.client.cardkit.v1.card_element.acreate(req)
+            if not resp.success():
+                raise FeishuApiError("流式卡追加按钮失败", resp.code, resp.msg)
+
+        await self._retry_with_backoff(_add, max_retries=2)
 
     async def download_image(self, message_id: str, image_key: str) -> str:
         """下载飞书图片到临时文件，返回本地路径（不阻塞事件循环）"""
@@ -539,7 +837,17 @@ class FeishuClient:
 
     async def update_card_with_buttons(self, message_id: str, content: str, buttons: list[dict],
                                       flow: bool = False):
-        """更新卡片内容并附加操作按钮。flow=True 时横排自动换行，False 时竖排。"""
+        """更新卡片内容并附加操作按钮。flow=True 时横排自动换行，False 时竖排。
+
+        流式卡：先推最终全量文本，再关流式 + 用 CardKit 追加按钮（按钮必须等
+        streaming_mode 关掉后才能交互），最后注销登记。
+        """
+        if message_id in self._streaming_cards:
+            await self._stream_update_text(message_id, content)
+            self._remember_card_text(message_id, content)
+            await self.finalize_streaming_card(message_id, buttons=buttons, flow=flow)
+            return
+
         base = _card_dict(content)
         btn_elements = []
         for i, btn in enumerate(buttons):
@@ -574,7 +882,7 @@ class FeishuClient:
             )
             resp = await self.client.im.v1.message.apatch(req)
             if not resp.success():
-                raise RuntimeError(f"patch 卡片失败: {resp.code} {resp.msg}")
+                raise FeishuApiError("patch 卡片失败", resp.code, resp.msg)
 
         await self._retry_with_backoff(_update, max_retries=3)
         self._remember_card_text(message_id, content)
@@ -599,7 +907,7 @@ class FeishuClient:
             )
             resp = await self.client.im.v1.message.apatch(req)
             if not resp.success():
-                raise RuntimeError(f"patch 卡片失败: {resp.code} {resp.msg}")
+                raise FeishuApiError("patch 卡片失败", resp.code, resp.msg)
 
         await self._retry_with_backoff(_update, max_retries=3)
 
@@ -636,7 +944,7 @@ class FeishuClient:
             )
             resp = await self.client.im.v1.message.areply(req)
             if not resp.success():
-                raise RuntimeError(f"回复文本消息失败: {resp.code} {resp.msg}")
+                raise FeishuApiError("回复文本消息失败", resp.code, resp.msg)
             return resp.data.message_id
 
         return await self._retry_with_backoff(_reply, max_retries=2)
@@ -672,7 +980,7 @@ class FeishuClient:
             )
             resp = await self.client.im.v1.message.areply(req)
             if not resp.success():
-                raise RuntimeError(f"reply post 失败: {resp.code} {resp.msg}")
+                raise FeishuApiError("reply post 失败", resp.code, resp.msg)
             return resp.data.message_id
 
         return await self._retry_with_backoff(_do, max_retries=2)
@@ -711,7 +1019,7 @@ class FeishuClient:
         )
         resp = await self.client.im.v1.message.acreate(req)
         if not resp.success():
-            raise RuntimeError(f"发送 post 消息失败: {resp.code} {resp.msg}")
+            raise FeishuApiError("发送 post 消息失败", resp.code, resp.msg)
         return resp.data.message_id
 
     async def send_text_to_user(self, open_id: str, text: str) -> str:
@@ -730,5 +1038,5 @@ class FeishuClient:
         )
         resp = await self.client.im.v1.message.acreate(req)
         if not resp.success():
-            raise RuntimeError(f"发送文本消息失败: {resp.code} {resp.msg}")
+            raise FeishuApiError("发送文本消息失败", resp.code, resp.msg)
         return resp.data.message_id
