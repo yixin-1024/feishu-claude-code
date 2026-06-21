@@ -20,6 +20,8 @@ claude_session_mirror.py — 把本机 Claude Code 的终端/IDE 会话单向镜
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import sys
@@ -200,6 +202,38 @@ class Lark:
         if out.get("code") != 0:
             raise RuntimeError(f"patch_card failed: {out}")
 
+    # multipart/form-data 上传图片，拿 image_key 给卡片 img 元素用（纯 stdlib）。
+    _IMG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+                "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp"}
+
+    def upload_image(self, raw: bytes, content_type: str = "image/png") -> str:
+        if self.dry_run:
+            return f"img_dry_{len(raw)}"
+        ext = self._IMG_EXT.get(content_type, "png")
+        boundary = "----ccmirror" + hashlib.md5(raw[:64] + str(len(raw)).encode()).hexdigest()[:16]
+        bb = boundary.encode()
+        body = b""
+        body += b"--" + bb + b"\r\n"
+        body += b'Content-Disposition: form-data; name="image_type"\r\n\r\nmessage\r\n'
+        body += b"--" + bb + b"\r\n"
+        body += (f'Content-Disposition: form-data; name="image"; filename="image.{ext}"\r\n'
+                 f"Content-Type: {content_type}\r\n\r\n").encode()
+        body += raw + b"\r\n"
+        body += b"--" + bb + b"--\r\n"
+        url = f"{self.domain}/open-apis/im/v1/images"
+        headers = {"Authorization": f"Bearer {self._tenant_token()}",
+                   "Content-Type": f"multipart/form-data; boundary={boundary}"}
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                out = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")
+            raise RuntimeError(f"upload_image HTTP {e.code}: {detail}") from None
+        if out.get("code") != 0:
+            raise RuntimeError(f"upload_image failed: {out}")
+        return out["data"]["image_key"]
+
 
 # ── 卡片渲染 ─────────────────────────────────────────────────────────────
 
@@ -247,6 +281,11 @@ def render_card(turn: dict, cfg: dict) -> dict:
     if prompt:
         quoted = "\n".join("> " + ln for ln in prompt.split("\n"))
         elements.append({"tag": "markdown", "content": quoted})
+    for ik in turn.get("prompt_images", []):
+        if ik:
+            elements.append({"tag": "img", "img_key": ik,
+                             "alt": {"tag": "plain_text", "content": "image"},
+                             "preview": True})
     elements.append({"tag": "hr"})
     elements.append({"tag": "markdown", "content": f"🤖 **Claude** · {status}"})
 
@@ -300,6 +339,27 @@ def _user_text(ev: dict) -> str:
     return text
 
 
+def _user_images(ev: dict) -> list[dict]:
+    """真实用户 prompt 里粘贴的图片（base64 块）。tool_result 里的图片是工具输出，跳过。
+    返回 [{media_type, data(base64)}]。"""
+    msg = ev.get("message", {}) or {}
+    if msg.get("role") not in (None, "user"):
+        return []
+    content = msg.get("content", "")
+    if not isinstance(content, list):
+        return []
+    if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+        return []
+    out = []
+    for b in content:
+        if isinstance(b, dict) and b.get("type") == "image":
+            src = b.get("source", {}) or {}
+            if src.get("type") == "base64" and src.get("data"):
+                out.append({"media_type": src.get("media_type", "image/png"),
+                            "data": src["data"]})
+    return out
+
+
 def _is_command_or_meta(text: str) -> bool:
     """跳过 slash 命令注入 / 系统注入这类非真实输入。"""
     if not text:
@@ -327,9 +387,32 @@ class Mirror:
     def __init__(self, cfg: dict, lark: Lark):
         self.cfg = cfg
         self.lark = lark
+        self._img_cache: dict[str, str] = {}  # md5(raw) -> image_key，进程内去重避免重复上传
         os.makedirs(ACTIVE_DIR, exist_ok=True)
         os.makedirs(STATE_DIR, exist_ok=True)
         os.makedirs(THREADS_DIR, exist_ok=True)
+
+    def _upload_images(self, imgs: list[dict]) -> list[str]:
+        """把 [{media_type,data(base64)}] 上传成 image_key 列表，失败的跳过。"""
+        keys = []
+        for im in imgs or []:
+            try:
+                raw = base64.b64decode(im.get("data", ""))
+            except Exception:  # noqa: BLE001
+                continue
+            if not raw:
+                continue
+            h = hashlib.md5(raw).hexdigest()
+            key = self._img_cache.get(h)
+            if not key:
+                try:
+                    key = self.lark.upload_image(raw, im.get("media_type", "image/png"))
+                except Exception as e:  # noqa: BLE001
+                    log(f"upload_image failed: {e}")
+                    continue
+                self._img_cache[h] = key
+            keys.append(key)
+        return keys
 
     # ---- 路由 ----
     def resolve_chat_id(self, cwd: str) -> str:
@@ -406,11 +489,13 @@ class Mirror:
                         continue
                     if etype == "user":
                         text = _user_text(ev)
-                        if _is_command_or_meta(text):
+                        imgs = _user_images(ev)
+                        if _is_command_or_meta(text) and not imgs:
                             continue
                         if cur:
                             turns.append(cur)
                         cur = {"prompt": text, "reply": "", "artifacts": [],
+                               "images": imgs,
                                "uuids": [ev.get("uuid")], "ts": _ts_epoch(ev)}
                     elif etype == "assistant":
                         if not cur:
@@ -464,9 +549,11 @@ class Mirror:
         seen = list(st.get("seen_uuids", []))
         interval = float(self.cfg.get("backfill_send_interval", 0.25) or 0)
         for t in hist:
+            img_keys = self._upload_images(t.get("images")) if t.get("images") else []
             turn = {"session_id": sid, "cwd": cwd, "title": title,
                     "prompt": t["prompt"], "reply": t["reply"],
-                    "artifacts": t["artifacts"], "finalized": True}
+                    "artifacts": t["artifacts"], "prompt_images": img_keys,
+                    "finalized": True}
             try:
                 self.lark.reply_card(root, render_card(turn, self.cfg), in_thread=True)
             except Exception as e:  # noqa: BLE001
@@ -545,7 +632,8 @@ class Mirror:
 
             if etype == "user":
                 text = _user_text(ev)
-                if _is_command_or_meta(text):
+                imgs = _user_images(ev)
+                if _is_command_or_meta(text) and not imgs:
                     if uid:
                         seen.add(uid)
                     continue
@@ -556,7 +644,8 @@ class Mirror:
                 # 新一轮：先结算上一轮
                 if turn and not turn.get("finalized"):
                     self._finalize(turn)
-                turn = self._start_turn(sid, marker, chat_id, st, text)
+                img_keys = self._upload_images(imgs) if imgs else []
+                turn = self._start_turn(sid, marker, chat_id, st, text, img_keys)
                 any_event = True
             elif etype == "assistant":
                 if not turn:
@@ -623,13 +712,14 @@ class Mirror:
         except OSError:
             return [], offset
 
-    def _start_turn(self, sid, marker, chat_id, st, prompt_text) -> dict:
+    def _start_turn(self, sid, marker, chat_id, st, prompt_text, prompt_images=None) -> dict:
         turn = {
             "session_id": sid,
             "cwd": marker.get("cwd", ""),
             "title": st.get("title") or marker.get("title", ""),
             "chat_id": chat_id,
             "prompt": prompt_text,
+            "prompt_images": prompt_images or [],
             "reply": "",
             "artifacts": [],
             "finalized": False,
