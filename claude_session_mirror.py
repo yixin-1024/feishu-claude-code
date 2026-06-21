@@ -58,8 +58,8 @@ def load_config(path: str) -> dict:
     cfg.setdefault("lark_domain", "https://open.larksuite.com")
     cfg.setdefault("poll_interval_sec", 1.5)
     cfg.setdefault("idle_finalize_sec", 8)
-    cfg.setdefault("max_reply_chars", 2500)
-    cfg.setdefault("max_prompt_chars", 320)
+    cfg.setdefault("max_reply_chars", 0)   # 0 = 不截断，完整镜像（仍按 _chunk_markdown 分元素）
+    cfg.setdefault("max_prompt_chars", 0)  # 0 = 不截断用户原文
     cfg.setdefault("routes", [])
     cfg.setdefault("exclude_prefixes", [])
     cfg.setdefault("default_chat_id", "")
@@ -230,12 +230,14 @@ def render_card(turn: dict, cfg: dict) -> dict:
     title = turn.get("title") or ""
     title_part = f" · {title}" if title else ""
     prompt = turn.get("prompt", "").strip()
-    if len(prompt) > cfg["max_prompt_chars"]:
-        prompt = prompt[:cfg["max_prompt_chars"]] + " …"
+    mpc = cfg.get("max_prompt_chars", 0)
+    if mpc and len(prompt) > mpc:
+        prompt = prompt[:mpc] + " …"
     reply = turn.get("reply", "").strip()
     truncated = False
-    if len(reply) > cfg["max_reply_chars"]:
-        reply = reply[:cfg["max_reply_chars"]]
+    mrc = cfg.get("max_reply_chars", 0)
+    if mrc and len(reply) > mrc:
+        reply = reply[:mrc]
         truncated = True
 
     status = "✅ 完成" if turn.get("finalized") else "⏳ 工作中…"
