@@ -60,6 +60,14 @@ NO_ASSISTANT_TIMEOUT = 600
 WATCHDOG_INTERVAL = 30.0       # 每 30s 检查一次
 WATCHDOG_MAX_STALL = 90.0      # 任何信号没动这么久 → 判 hung
 WATCHDOG_CPU_MIN_INC = 0.5     # 30s 窗口里累计 CPU 增长少于 0.5s 视为 0 增长
+# resume 大上下文的「首响应等待期」专用 stall 阈值：--resume 几百 KB~MB 的 session
+# 后，CLI 把整段对话发给 Anthropic、在等第一个 token 落地，这段 CPU/PTY/JSONL 全 0
+# 的纯静默单独就能 >90s（long-context first-token 实测 1-2 min）。base 90s 会误杀，
+# 触发 fresh 兜底开新会话、上下文全丢（线上「9 次 resume 撞穿被迫开新会话」就是这个）。
+# 给到 300s（与 IDLE_TIMEOUT 同量级）。注意这里仍走 watchdog 判定+fresh 兜底——真卡死
+# 的 resume（PID 46588「只发 2.5KB 就停摆」那种）照样被抓、照样自动恢复，只是慢到 300s；
+# 第一条真实 assistant 事件一落地，阈值立刻回落到 base 90s。
+WATCHDOG_RESUME_FIRST_STALL = 300.0
 
 # PTY / JSONL 轮询参数
 _JSONL_POLL_INTERVAL = 0.2    # 200ms 拉一次 jsonl 增量
@@ -664,6 +672,11 @@ async def run_claude(
             before_uuids = set()
 
         # ── 构造命令 ─────────────────────────────────────
+        # 本次 spawn 是否带 --resume——必须在这里捕获成稳定标志：active_session_id
+        # 在 fresh 路径（L824 发现新 jsonl 后）会被改写成新 session id，循环里再读就
+        # 分不清「resume 大上下文」还是「fresh 会话」了。watchdog 的 resume 首响应
+        # 豁免只认这个原始意图，绝不能误放行 fresh-init-hang（PID 24808 那种）。
+        started_as_resume = bool(active_session_id)
         cmd = [CLAUDE_CLI]
         if active_session_id:
             cmd += ["--resume", active_session_id]
@@ -890,8 +903,17 @@ async def run_claude(
                         break
 
                     # Watchdog: CPU + tail + JSONL 三信号 0 增长 → client 端 hung
-                    # /compact 类内置命令期间会发巨型 API 请求，CPU/PTY/JSONL 都可能
-                    # 长时间静止——这里跳过 watchdog，靠 WALL_CLOCK_LIMIT 兜底
+                    # /compact 类内置 slash 整段豁免（claude 内部消化大上下文，三信号都
+                    # 可能长时间静止，靠 WALL_CLOCK_LIMIT 兜底）。其余情况 watchdog 全程跑，
+                    # 只是 stall 阈值分级：resume 大上下文的「首响应等待期」用更宽松的
+                    # WATCHDOG_RESUME_FIRST_STALL（300s），其余用 base 90s。注意这里不是
+                    # 「豁免」而是「放宽阈值」——真卡死的 resume 仍由 watchdog 抓（抛
+                    # "客户端疑似 hung" → 走 fresh 兜底自动恢复），只是慢到 300s；第一条真实
+                    # assistant 事件一落地（announce_assistant_started=True）阈值即回落 90s。
+                    # 只认 started_as_resume，fresh-init-hang 不在宽限内，仍 90s 抓。
+                    resume_first_response_pending = (
+                        started_as_resume and not announce_assistant_started
+                    )
                     if not is_builtin_slash and now - wd_last_check >= WATCHDOG_INTERVAL:
                         cur_cpu = _get_proc_cpu_seconds(proc.pid)
                         cur_tail_size = len(tail_buffer)
@@ -907,10 +929,15 @@ async def run_claude(
                         wd_last_tail_size = cur_tail_size
                         wd_last_check = now
                         wd_progressed_in_window = False
-                        if now - last_progress_time >= WATCHDOG_MAX_STALL:
+                        stall_limit = (
+                            WATCHDOG_RESUME_FIRST_STALL
+                            if resume_first_response_pending
+                            else WATCHDOG_MAX_STALL
+                        )
+                        if now - last_progress_time >= stall_limit:
                             raise RuntimeError(
                                 f"Claude 客户端疑似 hung：CPU/PTY/JSONL 三信号 "
-                                f"{WATCHDOG_MAX_STALL:.0f}s 全 0 增长，已终止进程。"
+                                f"{stall_limit:.0f}s 全 0 增长，已终止进程。"
                                 f"常见原因：API request 发到一半 client 端 stuck、"
                                 f"内部 promise/state machine 死锁、TLS 池握手挂掉。"
                             )

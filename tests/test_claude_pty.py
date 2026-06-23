@@ -968,9 +968,12 @@ def test_pty_runner_resume_hung_by_watchdog_falls_back_to_fresh_session(tmp_path
     monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
     monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
     monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
-    # 缩短 watchdog 让测试在秒级触发
+    # 缩短 watchdog 让测试在秒级触发。这个假 resume 永远静默、从不产出 assistant
+    # → resume_first_response_pending 全程为真 → 走 WATCHDOG_RESUME_FIRST_STALL 阈值，
+    # 必须一并 patch 小，否则要等 300s 才被抓（验证的是「真卡死 resume 仍走 fresh 兜底」）
     monkeypatch.setattr(claude_pty, "WATCHDOG_INTERVAL", 0.5)
     monkeypatch.setattr(claude_pty, "WATCHDOG_MAX_STALL", 1.5)
+    monkeypatch.setattr(claude_pty, "WATCHDOG_RESUME_FIRST_STALL", 1.5)
 
     text, returned_sid, used_fallback = asyncio.run(
         claude_pty.run_claude(
@@ -987,4 +990,126 @@ def test_pty_runner_resume_hung_by_watchdog_falls_back_to_fresh_session(tmp_path
     assert used_fallback is True
     assert returned_sid is not None and returned_sid != broken_sid, (
         f"应该是 fresh 起的新 sid，实际 returned_sid={returned_sid}"
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
+def test_pty_runner_slow_resume_first_response_not_killed(tmp_path, monkeypatch):
+    """正向回归：合法的「大上下文 resume 首响应等待期」不能被 watchdog 误杀。
+
+    线上真因：--resume 几百 KB~MB 的 session 后，CLI 把整段对话发给 Anthropic、在等
+    第一个 token，这段 CPU/PTY/JSONL 全 0 的纯静默单独就能 >90s。base 90s 阈值会把它
+    当 hung 杀掉 → fresh 兜底开新会话、上下文全丢（「9 次 resume 撞穿被迫开新会话」）。
+
+    修复后：resume 首响应期用更宽松的 WATCHDOG_RESUME_FIRST_STALL，静默熬过 base 阈值
+    后第一条真实 assistant 落地 → 正常返回真实回复，不走 fresh 兜底、sid 不变。
+
+    这里把 base=0.8s（会杀） < 静默 1.5s < resume=4.0s（放行）卡在中间，证明正是
+    「resume 宽限阈值」在起作用。
+    """
+    project_root = tmp_path / "projects"
+    cwd = tmp_path / "wd"
+    cwd.mkdir()
+    encoded = str(cwd).replace("/", "-")
+    project_dir = project_root / encoded
+    project_dir.mkdir(parents=True)
+
+    # 上一轮留下的 resume session jsonl（首响应慢，但 session 本身是好的）
+    resume_sid = str(uuid.uuid4())
+    resume_jsonl = project_dir / f"{resume_sid}.jsonl"
+    resume_jsonl.write_text(
+        json.dumps({"type": "system", "sessionId": resume_sid}) + "\n"
+    )
+
+    # 假 claude：
+    #   resume 模式 → 吃完 stdin 后静默 1.5s（模拟首 token 等待，0 CPU/0 JSONL/0 PTY），
+    #                 超过 base 0.8s 但在 resume 4.0s 内，然后追加真实 user+assistant 后退出
+    #   fresh 模式  → 写个可区分文本（一旦走到这里说明被误杀降级了，断言会失败）
+    script = textwrap.dedent(f"""
+        #!{sys.executable}
+        import json, os, select, sys, time, uuid
+        PROJECT_DIR = {str(project_dir)!r}
+        argv = sys.argv
+        is_resume = "--resume" in argv
+        resume_sid = argv[argv.index("--resume") + 1] if is_resume else None
+
+        sys.stdout.write("ready\\n"); sys.stdout.flush()
+
+        buf = b""
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            r, _, _ = select.select([sys.stdin.fileno()], [], [], 0.2)
+            if r:
+                c = os.read(sys.stdin.fileno(), 65536)
+                if not c: break
+                buf += c
+                if b"\\x1b[201~" in buf or b"\\r" in buf:
+                    break
+
+        if is_resume:
+            # 首响应静默等待——三信号全 0，单独就能撞穿 base 阈值
+            select.select([], [], [], 1.5)
+            path = os.path.join(PROJECT_DIR, resume_sid + ".jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({{
+                    "type": "user",
+                    "message": {{"role": "user", "content": "继续执行"}},
+                }}) + "\\n")
+                f.write(json.dumps({{
+                    "type": "assistant",
+                    "message": {{
+                        "content": [{{"type": "text", "text": "Slow resume survived ✅"}}],
+                        "stop_reason": "end_turn",
+                        "usage": {{"input_tokens": 1, "output_tokens": 2, "iterations": [{{
+                            "input_tokens": 1, "output_tokens": 2
+                        }}]}},
+                    }},
+                }}) + "\\n")
+            time.sleep(10)
+        else:
+            sid = str(uuid.uuid4())
+            path = os.path.join(PROJECT_DIR, sid + ".jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+                f.write(json.dumps({{
+                    "type": "assistant",
+                    "message": {{
+                        "content": [{{"type": "text", "text": "WRONGLY FELL BACK TO FRESH"}}],
+                        "stop_reason": "end_turn",
+                        "usage": {{"input_tokens": 1, "output_tokens": 2, "iterations": [{{
+                            "input_tokens": 1, "output_tokens": 2
+                        }}]}},
+                    }},
+                }}) + "\\n")
+            time.sleep(10)
+    """)
+    fake = tmp_path / "fake-claude-slow-resume.py"
+    fake.write_text(script.lstrip())
+    fake.chmod(0o755)
+
+    monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
+    monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
+    monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
+    # base 0.8s 会杀，resume 宽限 4.0s 放行；静默 1.5s 卡在中间。
+    # _DONE_QUIET_PERIOD 调小，assistant 落地后快速收尾，避免 base 阈值在收尾静默里误触
+    monkeypatch.setattr(claude_pty, "WATCHDOG_INTERVAL", 0.3)
+    monkeypatch.setattr(claude_pty, "WATCHDOG_MAX_STALL", 0.8)
+    monkeypatch.setattr(claude_pty, "WATCHDOG_RESUME_FIRST_STALL", 4.0)
+    monkeypatch.setattr(claude_pty, "_DONE_QUIET_PERIOD", 0.2)
+
+    text, returned_sid, used_fallback = asyncio.run(
+        claude_pty.run_claude(
+            "继续执行",
+            session_id=resume_sid,
+            cwd=str(cwd),
+            permission_mode="bypassPermissions",
+        )
+    )
+
+    assert text == "Slow resume survived ✅", (
+        f"慢 resume 首响应被误杀（或降级 fresh），text={text!r}"
+    )
+    assert used_fallback is False, "合法慢 resume 不应触发 fresh 兜底"
+    assert returned_sid == resume_sid, (
+        f"应沿用原 resume sid，实际 returned_sid={returned_sid}"
     )
