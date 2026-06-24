@@ -123,13 +123,49 @@ async def test_retry_returns_on_success():
 # ── #3 CardKit 流式路由 ───────────────────────────────────────
 
 def test_streaming_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("LARK_CARD_MODE", raising=False)
     monkeypatch.delenv("LARK_CARD_STREAMING", raising=False)
+    monkeypatch.delenv("LARK_CARD_SCHEMA", raising=False)
+    assert fc._card_mode() == "v2"
     assert fc._streaming_enabled() is False
+    assert fc._use_v1_card() is False
 
 
 def test_streaming_flag_on(monkeypatch):
+    monkeypatch.delenv("LARK_CARD_MODE", raising=False)
     monkeypatch.setenv("LARK_CARD_STREAMING", "1")
     assert fc._streaming_enabled() is True
+    assert fc._card_mode() == "cardkit"
+
+
+def test_card_mode_explicit_overrides_legacy(monkeypatch):
+    # LARK_CARD_MODE 显式设置时，盖过旧的两个布尔开关
+    monkeypatch.setenv("LARK_CARD_STREAMING", "1")
+    monkeypatch.setenv("LARK_CARD_SCHEMA", "1.0")
+    monkeypatch.setenv("LARK_CARD_MODE", "v2")
+    assert fc._card_mode() == "v2"
+    assert fc._streaming_enabled() is False
+    assert fc._use_v1_card() is False
+
+
+def test_card_mode_v1_and_cardkit(monkeypatch):
+    monkeypatch.delenv("LARK_CARD_STREAMING", raising=False)
+    monkeypatch.delenv("LARK_CARD_SCHEMA", raising=False)
+    monkeypatch.setenv("LARK_CARD_MODE", "v1")
+    assert fc._card_mode() == "v1"
+    assert fc._use_v1_card() is True
+    monkeypatch.setenv("LARK_CARD_MODE", "cardkit")
+    assert fc._card_mode() == "cardkit"
+    assert fc._streaming_enabled() is True
+
+
+def test_card_mode_legacy_schema_fallback(monkeypatch):
+    # 未设 LARK_CARD_MODE 时回退旧 LARK_CARD_SCHEMA
+    monkeypatch.delenv("LARK_CARD_MODE", raising=False)
+    monkeypatch.delenv("LARK_CARD_STREAMING", raising=False)
+    monkeypatch.setenv("LARK_CARD_SCHEMA", "1.0")
+    assert fc._card_mode() == "v1"
+    assert fc._use_v1_card() is True
 
 
 def test_register_and_next_seq():

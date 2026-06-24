@@ -1,13 +1,15 @@
 """
 飞书 API 异步封装。
 
-默认流式方案：发送内联卡片消息 → 用 patch 逐步更新内容（简单可靠，且带
-LARK_CARD_SCHEMA v1 降级兜底，是线上保命路径）。
-
-可选流式方案（LARK_CARD_STREAMING=1 开启）：CardKit 流式卡片，客户端本地
-打字机效果、增量推送更顺滑。按 message_id 在 FeishuClient 内部路由——只有
-loading=True 的占位卡会建成 CardKit 流式卡，后续 update_card /
-update_card_with_buttons 自动走 CardKit；flag 关闭时一切照旧走 PATCH。
+卡片渲染模式由 LARK_CARD_MODE 统一控制（v1 / v2 / cardkit，缺省 v2）：
+  v2（默认）  → Card JSON 2.0 + patch 逐步整卡更新，简单可靠，线上主路径。
+  v1          → Card JSON v1 降级兜底；Lark 2.0 渲染服务故障时的保命路径。
+  cardkit     → CardKit 流式卡，客户端本地打字机 + 增量推送更顺滑。按 message_id
+               在 FeishuClient 内部路由——只有 loading=True 的占位卡建成流式卡，
+               后续 update_card / update_card_with_buttons 自动走 CardKit；失败
+               自动回退 PATCH/文本/outbox，不丢结果。
+向后兼容：LARK_CARD_MODE 未设时回退旧开关 LARK_CARD_STREAMING=1→cardkit、
+LARK_CARD_SCHEMA=1.0→v1。
 """
 
 import asyncio
@@ -63,9 +65,34 @@ def _load_non_retryable_codes() -> frozenset:
 NON_RETRYABLE_CODES = _load_non_retryable_codes()
 
 
+def _card_mode() -> str:
+    """统一卡片渲染模式：v1 / v2 / cardkit（缺省 v2）。
+
+    优先读 LARK_CARD_MODE：
+      v1            → Card JSON v1（降级兜底，线上保命）
+      v2            → Card JSON 2.0 + PATCH 整卡更新（默认，最稳）
+      cardkit       → CardKit 流式卡（客户端打字机，失败回退 PATCH/文本/outbox）
+    LARK_CARD_MODE 未设时，回退到旧的两个布尔开关（向后兼容）：
+      LARK_CARD_STREAMING=1 → cardkit；LARK_CARD_SCHEMA=1.0 → v1；否则 v2。
+    """
+    raw = (os.getenv("LARK_CARD_MODE", "") or "").strip().lower()
+    if raw in ("v1", "1", "1.0"):
+        return "v1"
+    if raw in ("v2", "2", "2.0"):
+        return "v2"
+    if raw in ("cardkit", "streaming", "stream", "kit"):
+        return "cardkit"
+    # 未显式设置 LARK_CARD_MODE → 回退旧开关
+    if (os.getenv("LARK_CARD_STREAMING", "") or "").strip() in ("1", "true", "on", "yes"):
+        return "cardkit"
+    if (os.getenv("LARK_CARD_SCHEMA", "2.0") or "2.0").strip() in ("1", "1.0", "v1"):
+        return "v1"
+    return "v2"
+
+
 def _streaming_enabled() -> bool:
     """是否启用 CardKit 流式卡片（默认否，走 PATCH）。"""
-    return (os.getenv("LARK_CARD_STREAMING", "") or "").strip() in ("1", "true", "on", "yes")
+    return _card_mode() == "cardkit"
 
 
 def _sanitize_filename(name: str) -> str:
@@ -79,12 +106,12 @@ def _sanitize_filename(name: str) -> str:
 # ── 卡片 schema 兼容层 ────────────────────────────────────────
 # 调用方一律按 Card JSON 2.0 构造卡片；当 Lark 的 2.0 渲染服务故障
 # （报 230099 Failed to create card content / Server Internal Error）时，
-# 设环境变量 LARK_CARD_SCHEMA=1.0 即可把卡片临时降级成 v1 schema 顶着，
-# 等官方修好 2.0 再把开关切回 "2.0"（默认），业务代码零改动。
+# 设 LARK_CARD_MODE=v1 即可把卡片临时降级成 v1 schema 顶着，
+# 等官方修好 2.0 再切回 v2（默认），业务代码零改动。
 
 def _use_v1_card() -> bool:
     """是否把卡片降级成 v1 schema（默认否，用 2.0）"""
-    return (os.getenv("LARK_CARD_SCHEMA", "2.0") or "2.0").strip() in ("1", "1.0", "v1")
+    return _card_mode() == "v1"
 
 
 def _downgrade_button(btn: dict) -> dict:
@@ -127,7 +154,7 @@ def _downgrade_element(el: dict) -> list:
 
 
 def _serialize_card(card: dict) -> str:
-    """序列化卡片 dict；LARK_CARD_SCHEMA=1.0 时把 2.0 卡片降级成 v1"""
+    """序列化卡片 dict；LARK_CARD_MODE=v1 时把 2.0 卡片降级成 v1"""
     if _use_v1_card():
         elements = (card.get("body") or {}).get("elements", [])
         v1_elements = []
@@ -204,7 +231,7 @@ def _card_dict(content: str, loading: bool = False) -> dict:
 
 
 def _card_json(content: str, loading: bool = False) -> str:
-    """生成卡片 JSON 字符串（默认 Card JSON 2.0；LARK_CARD_SCHEMA=1.0 时降级 v1）"""
+    """生成卡片 JSON 字符串（默认 Card JSON 2.0；LARK_CARD_MODE=v1 时降级 v1）"""
     return _serialize_card(_card_dict(content, loading=loading))
 
 
@@ -219,7 +246,7 @@ class FeishuClient:
         self.label = label or (app_id[-6:] if app_id else "bot")
         self._bot_open_id: Optional[str] = None
         # CardKit 流式卡登记表：message_id → {"card_id", "seq", "element_id"}。
-        # 仅 LARK_CARD_STREAMING=1 且 loading 占位卡才会登记；update_card 等据此
+        # 仅 LARK_CARD_MODE=cardkit 且 loading 占位卡才会登记；update_card 等据此
         # 决定走 CardKit 还是 PATCH。重启即丢，只服务进行中的 run。
         self._streaming_cards: dict[str, dict] = {}
         self._STREAMING_MAX = 200
@@ -342,7 +369,7 @@ class FeishuClient:
     async def send_card_to_user(self, open_id: str, content: str = "", loading: bool = True) -> str:
         """向用户发送卡片消息，返回 message_id（带重试）。
 
-        LARK_CARD_STREAMING=1 且 loading 占位卡时，改建 CardKit 流式卡。
+        LARK_CARD_MODE=cardkit 且 loading 占位卡时，改建 CardKit 流式卡。
         """
         if loading and _streaming_enabled():
             try:
@@ -376,7 +403,7 @@ class FeishuClient:
     async def reply_card(self, message_id: str, content: str = "", loading: bool = True) -> str:
         """回复用户消息（卡片形式），触发通知。返回回复消息的 message_id（带重试）。
 
-        LARK_CARD_STREAMING=1 且 loading 占位卡时，改建 CardKit 流式卡。
+        LARK_CARD_MODE=cardkit 且 loading 占位卡时，改建 CardKit 流式卡。
         """
         if loading and _streaming_enabled():
             try:
@@ -431,7 +458,7 @@ class FeishuClient:
         await self._retry_with_backoff(_update, max_retries=3)
         self._remember_card_text(message_id, content)
 
-    # ── CardKit 流式卡片（LARK_CARD_STREAMING=1 时启用）──────────
+    # ── CardKit 流式卡片（LARK_CARD_MODE=cardkit 时启用）──────────
     # 语义：建卡片实体 → 用消息 API 发"卡片引用" → card_element.content 传全量文本
     # + 递增 sequence（客户端本地打字机）→ card.settings 关流式恢复交互。
     # 参考 GabrielZhu123456/feishu-claude-code 的实现，适配本仓库的 message_id 路由。
