@@ -156,7 +156,8 @@ def _make_fake_claude(
             .replace("\\x1b[200~", "").replace("\\x1b[201~", "").strip("\\r\\n")
 
         # 写 jsonl
-        sid = str(uuid.uuid4())
+        sid = (sys.argv[sys.argv.index("--session-id") + 1]
+               if "--session-id" in sys.argv else str(uuid.uuid4()))
         path = os.path.join(PROJECT_DIR, sid + ".jsonl")
         os.makedirs(PROJECT_DIR, exist_ok=True)
         with open(path, "a", buffering=1, encoding="utf-8") as f:
@@ -394,7 +395,8 @@ def test_pty_runner_raises_on_api_error_message(tmp_path, monkeypatch):
 
         paste_text = buf.decode("utf-8", errors="replace") \\
             .replace("\\x1b[200~", "").replace("\\x1b[201~", "").strip("\\r\\n")
-        sid = str(uuid.uuid4())
+        sid = (sys.argv[sys.argv.index("--session-id") + 1]
+               if "--session-id" in sys.argv else str(uuid.uuid4()))
         path = os.path.join(PROJECT_DIR, sid + ".jsonl")
         os.makedirs(PROJECT_DIR, exist_ok=True)
         with open(path, "a", buffering=1, encoding="utf-8") as f:
@@ -503,7 +505,8 @@ def test_send_user_input_large_paste_not_truncated(tmp_path, monkeypatch):
         with open(SIDECAR, "wb") as f:
             f.write(buf)
 
-        sid = str(uuid.uuid4())
+        sid = (sys.argv[sys.argv.index("--session-id") + 1]
+               if "--session-id" in sys.argv else str(uuid.uuid4()))
         path = os.path.join(PROJECT_DIR, sid + ".jsonl")
         os.makedirs(PROJECT_DIR, exist_ok=True)
         with open(path, "a", buffering=1, encoding="utf-8") as f:
@@ -592,7 +595,8 @@ def test_fresh_session_resends_full_input_when_first_paste_is_swallowed(tmp_path
         paste_text = buf.decode("utf-8", errors="replace") \\
             .replace("\\x15", "") \\
             .replace("\\x1b[200~", "").replace("\\x1b[201~", "").strip("\\r\\n")
-        sid = str(uuid.uuid4())
+        sid = (sys.argv[sys.argv.index("--session-id") + 1]
+               if "--session-id" in sys.argv else str(uuid.uuid4()))
         path = os.path.join(PROJECT_DIR, sid + ".jsonl")
         with open(path, "a", buffering=1, encoding="utf-8") as f:
             f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
@@ -832,7 +836,8 @@ def test_pty_runner_orphan_resume_falls_back_to_fresh_session(tmp_path, monkeypa
             # 全新 session：给个像样的回复
             paste_text = buf.decode("utf-8", errors="replace") \\
                 .replace("\\x1b[200~", "").replace("\\x1b[201~", "").strip("\\r\\n")
-            sid = str(uuid.uuid4())
+            sid = (sys.argv[sys.argv.index("--session-id") + 1]
+                   if "--session-id" in sys.argv else str(uuid.uuid4()))
             path = os.path.join(PROJECT_DIR, sid + ".jsonl")
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
@@ -945,10 +950,16 @@ def test_pty_runner_resume_hung_by_watchdog_falls_back_to_fresh_session(tmp_path
             select.select([], [], [], 60.0)
             os._exit(0)
         else:
-            sid = str(uuid.uuid4())
+            sid = (sys.argv[sys.argv.index("--session-id") + 1]
+                   if "--session-id" in sys.argv else str(uuid.uuid4()))
             path = os.path.join(PROJECT_DIR, sid + ".jsonl")
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+                # 真 claude 接受输入后会先回写一条 user 行（runner 据此判定输入到位）
+                f.write(json.dumps({{
+                    "type": "user",
+                    "message": {{"role": "user", "content": [{{"type": "text", "text": "继续执行"}}]}},
+                }}) + "\\n")
                 f.write(json.dumps({{
                     "type": "assistant",
                     "message": {{
@@ -1067,10 +1078,15 @@ def test_pty_runner_slow_resume_first_response_not_killed(tmp_path, monkeypatch)
                 }}) + "\\n")
             time.sleep(10)
         else:
-            sid = str(uuid.uuid4())
+            sid = (sys.argv[sys.argv.index("--session-id") + 1]
+                   if "--session-id" in sys.argv else str(uuid.uuid4()))
             path = os.path.join(PROJECT_DIR, sid + ".jsonl")
             with open(path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+                f.write(json.dumps({{
+                    "type": "user",
+                    "message": {{"role": "user", "content": [{{"type": "text", "text": "继续执行"}}]}},
+                }}) + "\\n")
                 f.write(json.dumps({{
                     "type": "assistant",
                     "message": {{
@@ -1113,3 +1129,204 @@ def test_pty_runner_slow_resume_first_response_not_killed(tmp_path, monkeypatch)
     assert returned_sid == resume_sid, (
         f"应沿用原 resume sid，实际 returned_sid={returned_sid}"
     )
+
+
+# ────────────────── forced --session-id 防串台 (本次根因修复) ──────────────────
+
+def test_jsonl_has_real_user_event(tmp_path):
+    """forced-session 输入到位判定：真实 user 行（含纯图片）算数，
+    system / 纯 tool_result / isMeta 收尾不算。"""
+    from claude_pty import _jsonl_has_real_user_event
+
+    # 只有 system 事件——输入还没到位
+    only_sys = tmp_path / "sys.jsonl"
+    only_sys.write_text(json.dumps({"type": "system", "sessionId": "x"}) + "\n")
+    assert _jsonl_has_real_user_event(str(only_sys)) is False
+
+    # 文本 user 行 → 到位
+    text_user = tmp_path / "text.jsonl"
+    text_user.write_text(
+        json.dumps({"type": "system", "sessionId": "x"}) + "\n"
+        + json.dumps({"type": "user", "message": {"role": "user",
+            "content": [{"type": "text", "text": "你好"}]}}) + "\n"
+    )
+    assert _jsonl_has_real_user_event(str(text_user)) is True
+
+    # 纯图片 user 行（无 text 块）也算到位——带截图无正文的消息不能被误判没到位
+    img_user = tmp_path / "img.jsonl"
+    img_user.write_text(
+        json.dumps({"type": "user", "message": {"role": "user",
+            "content": [{"type": "image", "source": {}}]}}) + "\n"
+    )
+    assert _jsonl_has_real_user_event(str(img_user)) is True
+
+    # isMeta 收尾 + 纯 tool_result 都不算
+    meta_tool = tmp_path / "meta.jsonl"
+    meta_tool.write_text(
+        json.dumps({"type": "user", "isMeta": True, "message": {"role": "user",
+            "content": [{"type": "text", "text": "Continue from where you left off."}]}}) + "\n"
+        + json.dumps({"type": "user", "message": {"role": "user",
+            "content": [{"type": "tool_result", "content": "ok"}]}}) + "\n"
+    )
+    assert _jsonl_has_real_user_event(str(meta_tool)) is False
+
+    # 文件不存在 → False（不抛）
+    assert _jsonl_has_real_user_event(str(tmp_path / "nope.jsonl")) is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
+def test_fresh_session_forces_session_id_and_path(tmp_path, monkeypatch):
+    """fresh run 必须用 --session-id 钉死 session 文件名：
+      - runner 给 claude 传了 --session-id <uuid>
+      - 返回的 sid == 那个 uuid
+      - jsonl 真的落在 <uuid>.jsonl（路径事前确定，零扫描）
+    fake 把收到的 argv dump 到 sidecar 验证。"""
+    project_root = tmp_path / "projects"
+    project_root.mkdir()
+    cwd = tmp_path / "wd"
+    cwd.mkdir()
+    encoded = str(cwd).replace("/", "-")
+    project_dir = project_root / encoded
+    project_dir.mkdir(parents=True)
+    sidecar = tmp_path / "argv.json"
+
+    script = textwrap.dedent(f"""
+        #!{sys.executable}
+        import json, os, sys, time, select, uuid
+        PROJECT_DIR = {str(project_dir)!r}
+        SIDECAR = {str(sidecar)!r}
+        json.dump(sys.argv, open(SIDECAR, "w"))
+        sys.stdout.write("\\x1b[?1049hready\\n"); sys.stdout.flush()
+        buf = b""; deadline = time.time() + 5.0
+        while time.time() < deadline:
+            r,_,_ = select.select([sys.stdin.fileno()], [], [], 0.2)
+            if r:
+                c = os.read(sys.stdin.fileno(), 65536)
+                if not c: break
+                buf += c
+                if b"\\x1b[201~" in buf or b"\\r" in buf: break
+        # 真 claude 行为：用 --session-id 指定的 id 命名 jsonl
+        sid = (sys.argv[sys.argv.index("--session-id") + 1]
+               if "--session-id" in sys.argv else str(uuid.uuid4()))
+        path = os.path.join(PROJECT_DIR, sid + ".jsonl")
+        with open(path, "a", buffering=1, encoding="utf-8") as f:
+            f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+            f.write(json.dumps({{"type": "user", "message": {{"role": "user",
+                "content": [{{"type": "text", "text": "hi"}}]}}}}) + "\\n")
+            f.write(json.dumps({{"type": "assistant", "message": {{"role": "assistant",
+                "content": [{{"type": "text", "text": "ok"}}], "stop_reason": "end_turn",
+                "usage": {{"input_tokens": 1, "output_tokens": 1,
+                    "iterations": [{{"input_tokens": 1, "output_tokens": 1}}]}}}}}}) + "\\n")
+        time.sleep(30)
+    """)
+    fake = tmp_path / "fake-forced.py"
+    fake.write_text(script.lstrip())
+    fake.chmod(0o755)
+
+    monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
+    monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
+    monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
+
+    text, sid, used_fallback = asyncio.run(
+        claude_pty.run_claude("hello", cwd=str(cwd), permission_mode="bypassPermissions")
+    )
+
+    assert sid is not None and len(sid) == 36
+    assert used_fallback is False
+    argv = json.load(open(sidecar))
+    assert "--session-id" in argv, f"runner 没给 fresh run 传 --session-id：{argv}"
+    forced = argv[argv.index("--session-id") + 1]
+    assert sid == forced, f"返回 sid({sid}) != 强制 id({forced})"
+    # 路径事前确定：jsonl 必须就叫 <forced>.jsonl
+    assert (project_dir / f"{forced}.jsonl").is_file()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
+def test_concurrent_fresh_same_cwd_no_crosstalk(tmp_path, monkeypatch):
+    """根因回归：同一个 cwd 里两个 fresh run 并发，各自的回复**绝不**串到对方卡片。
+
+    旧逻辑 spawn 后去共享 project 目录里扫"本次产生的 jsonl"，并发 + 带图片/短消息
+    时退化成"单候选默认接受"，A 会把 B 的 jsonl 认成自己的 → 卡片正文串台（闲鱼
+    thread 显示成汽车之家那次）。改用 --session-id 钉死文件名后，两个 run 物理上写
+    不同文件、各 tail 各的，串台不可能发生。
+
+    fake 把收到的 paste 原样 echo 回 assistant text，断言 A 的 chunks 只含 A 的
+    marker、B 的只含 B 的。"""
+    project_root = tmp_path / "projects"
+    project_root.mkdir()
+    cwd = tmp_path / "shared_wd"           # 关键：两个 run 共用同一个 cwd
+    cwd.mkdir()
+    encoded = str(cwd).replace("/", "-")
+    project_dir = project_root / encoded
+    project_dir.mkdir(parents=True)
+
+    # echo fake：honors --session-id，把 paste 原样塞进 assistant text
+    script = textwrap.dedent(f"""
+        #!{sys.executable}
+        import json, os, sys, time, select, uuid
+        PROJECT_DIR = {str(project_dir)!r}
+        sys.stdout.write("\\x1b[?1049hready\\n"); sys.stdout.flush()
+        buf = b""; deadline = time.time() + 6.0
+        while time.time() < deadline:
+            r,_,_ = select.select([sys.stdin.fileno()], [], [], 0.2)
+            if r:
+                c = os.read(sys.stdin.fileno(), 65536)
+                if not c: break
+                buf += c
+                if b"\\x1b[201~" in buf or b"\\r" in buf: break
+        paste = buf.decode("utf-8", errors="replace").replace("\\x15","") \\
+            .replace("\\x1b[200~","").replace("\\x1b[201~","").strip("\\r\\n")
+        sid = (sys.argv[sys.argv.index("--session-id") + 1]
+               if "--session-id" in sys.argv else str(uuid.uuid4()))
+        path = os.path.join(PROJECT_DIR, sid + ".jsonl")
+        os.makedirs(PROJECT_DIR, exist_ok=True)
+        with open(path, "a", buffering=1, encoding="utf-8") as f:
+            f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+            f.write(json.dumps({{"type": "user", "message": {{"role": "user",
+                "content": [{{"type": "text", "text": paste}}]}}}}) + "\\n")
+            time.sleep(0.2)
+            f.write(json.dumps({{"type": "assistant", "message": {{"role": "assistant",
+                "content": [{{"type": "text", "text": "ECHO::" + paste}}],
+                "stop_reason": "end_turn", "usage": {{"input_tokens": 1, "output_tokens": 1,
+                    "iterations": [{{"input_tokens": 1, "output_tokens": 1}}]}}}}}}) + "\\n")
+        time.sleep(30)
+    """)
+    fake = tmp_path / "fake-echo.py"
+    fake.write_text(script.lstrip())
+    fake.chmod(0o755)
+
+    monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
+    monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
+    monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
+
+    chunks_a: list[str] = []
+    chunks_b: list[str] = []
+
+    async def on_a(c):
+        chunks_a.append(c)
+
+    async def on_b(c):
+        chunks_b.append(c)
+
+    MARK_A = "ALPHA-marker-11111"
+    MARK_B = "BETA-marker-22222"
+
+    async def both():
+        return await asyncio.gather(
+            claude_pty.run_claude(
+                f"first run unique {MARK_A}", cwd=str(cwd),
+                permission_mode="bypassPermissions", on_text_chunk=on_a),
+            claude_pty.run_claude(
+                f"second run unique {MARK_B}", cwd=str(cwd),
+                permission_mode="bypassPermissions", on_text_chunk=on_b),
+        )
+
+    (text_a, sid_a, fb_a), (text_b, sid_b, fb_b) = asyncio.run(both())
+
+    # 各自拿到自己的 echo，绝不串台
+    assert MARK_A in text_a and MARK_B not in text_a, f"A 串台了：{text_a!r}"
+    assert MARK_B in text_b and MARK_A not in text_b, f"B 串台了：{text_b!r}"
+    assert MARK_A not in "".join(chunks_b) and MARK_B not in "".join(chunks_a)
+    # 两个 run 各自独立的 session 文件
+    assert sid_a and sid_b and sid_a != sid_b
+    assert fb_a is False and fb_b is False

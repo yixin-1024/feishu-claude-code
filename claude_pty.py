@@ -30,6 +30,7 @@ import struct
 import subprocess as sp
 import termios
 import time
+import uuid
 from typing import Callable, Optional
 
 from bot_config import CLAUDE_CLI, PERMISSION_MODE
@@ -171,6 +172,47 @@ def _jsonl_first_user_content(path: str, max_lines: int = 16) -> Optional[str]:
     except OSError:
         return None
     return None
+
+
+def _jsonl_has_real_user_event(path: str, max_lines: int = 40) -> bool:
+    """forced session 文件里是否已经出现一条**真实**用户输入行。
+
+    用于 fresh 路径判定"输入被 Claude TUI 接受了没"——文件名已由 --session-id 钉死，
+    不再需要鉴别"是不是自己的"，只需要确认用户那条消息真落进了 jsonl（而不是 paste
+    被空输入框吞掉）。和 [[_jsonl_first_user_content]] 的区别：这里**纯图片**消息
+    （content 只有 image 块、没有 text）也算数——否则带截图、无正文的消息会被误判为
+    "输入没到位"一路重发到超时。只排除 isMeta（resume 收尾注入）和纯 tool_result。
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(max_lines):
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") != "user" or ev.get("isMeta") is True:
+                    continue
+                msg = ev.get("message") or {}
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                if isinstance(content, str):
+                    if content.strip():
+                        return True
+                    continue
+                if isinstance(content, list):
+                    for blk in content:
+                        if isinstance(blk, dict) and blk.get("type") != "tool_result":
+                            return True
+    except OSError:
+        return False
+    return False
 
 
 _WHITESPACE_RUN = re.compile(r"\s+")
@@ -656,30 +698,36 @@ async def run_claude(
         os.makedirs(project_dir, exist_ok=True)
 
         # ── 准备 jsonl 起点 ──────────────────────────────
+        # fresh 会话：预生成一个确定的 session id，用 --session-id 强制 Claude CLI
+        # 把对话写到 <forced_id>.jsonl。jsonl 路径**事前完全确定**，不再需要 spawn
+        # 之后去共享 project 目录里"扫出本次 run 产生的那个 jsonl"——并发同一个 cwd 的
+        # 多个 thread 各自 forced_id 不同，物理上不可能串台。根治了旧"扫描 + 前缀匹配"
+        # 逻辑在带图片 / 短消息时退化成"单候选默认接受"，把邻居会话的 jsonl 错认成自己、
+        # 卡片正文完全串台的事故（闲鱼 thread 的卡片显示成汽车之家二手车那次）。
+        # resume 路径不变：Claude CLI 对 --resume X 是**追加**写回 X.jsonl（已实测），
+        # X 是 thread 专属 id，天然不会和别的 thread 撞文件。
+        forced_session_id = active_session_id or str(uuid.uuid4())
+        jsonl_path: Optional[str] = os.path.join(
+            project_dir, f"{forced_session_id}.jsonl"
+        )
         if active_session_id:
-            jsonl_path: Optional[str] = os.path.join(
-                project_dir, f"{active_session_id}.jsonl"
-            )
             start_offset = (
                 os.path.getsize(jsonl_path) if os.path.isfile(jsonl_path) else 0
             )
-            before_uuids: set[str] = set()
         else:
-            jsonl_path = None
             start_offset = 0
-            # before_uuids 真正拍照延后到 spawn proc 之后——缩短"拍照→spawn"
-            # 之间被别的并发 task 创建新 jsonl 的 race window。
-            before_uuids = set()
 
         # ── 构造命令 ─────────────────────────────────────
-        # 本次 spawn 是否带 --resume——必须在这里捕获成稳定标志：active_session_id
-        # 在 fresh 路径（L824 发现新 jsonl 后）会被改写成新 session id，循环里再读就
-        # 分不清「resume 大上下文」还是「fresh 会话」了。watchdog 的 resume 首响应
-        # 豁免只认这个原始意图，绝不能误放行 fresh-init-hang（PID 24808 那种）。
+        # 本次 spawn 是否带 --resume 的稳定标志。watchdog 的「resume 首响应豁免」
+        # 只认这个原始意图，绝不能误放行 fresh-init-hang（PID 24808 那种）；fresh
+        # 路径的「等 user 行落地」分支也用它区分（resume 直接 tail 已存在的 X.jsonl）。
         started_as_resume = bool(active_session_id)
         cmd = [CLAUDE_CLI]
         if active_session_id:
             cmd += ["--resume", active_session_id]
+        else:
+            # fresh：用预生成 id 接管 session 文件名，jsonl 路径事前确定、免 racy 扫描
+            cmd += ["--session-id", forced_session_id]
         if effective_model:
             cmd += ["--model", effective_model]
         if append_system_prompt:
@@ -698,7 +746,7 @@ async def run_claude(
         # 进来时 len 不变，会假"安静"。
         pty_bytes_counter: list = [0]
         full_text = ""
-        new_session_id = active_session_id
+        new_session_id = forced_session_id
         last_usage: dict = {}
         early_return: Optional[tuple] = None  # 设上就是非正常结束，跳过 usage 推送
 
@@ -720,10 +768,6 @@ async def run_claude(
             if extra_env:
                 env.update(extra_env)
 
-            # spawn_at 紧贴 spawn 动作记录——用于过滤 birth_time 早于自己 spawn
-            # 的 jsonl。wall-clock（time.time），与 st_birthtime/st_ctime 对齐。
-            spawn_at = time.time()
-
             # exec 完，slave 立刻关——否则父进程 fd 残留导致 EOF 永远不到
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -741,13 +785,6 @@ async def run_claude(
                     os.close(slave_fd)
                 except OSError:
                     pass
-
-            # 拍 before_uuids 延后到 spawn 之后——缩短"拍照→spawn"之间被
-            # 并发 task 抢先创建 jsonl 的 race window。新 spawn 出来的 claude
-            # 写 jsonl 至少要几百毫秒后才发生（node 起 + init），所以这里赶在
-            # 它写之前拍一般来得及。最后还要 birth_time >= spawn_at 二次过滤。
-            if active_session_id is None:
-                before_uuids = _snapshot_session_uuids(project_dir)
 
             await _fire(on_process_start, proc)
 
@@ -781,62 +818,21 @@ async def run_claude(
                         _decode_tail(tail_buffer) or "PTY broken on send",
                     )
 
-            # ── 新 session：等 jsonl 文件出现 ─────────────
-            # 并发 spawn 时，所有 task 看到的 new_uuids 集合可能都包含别的
-            # task 的 jsonl——按 mtime max 选会互相串台。这里改成：
-            #   1. 只接受 birth_time >= spawn_at 的 jsonl（spawn 之后才创建）
-            #   2. 按 birth_time 升序遍历候选，用 jsonl 第一条 user 事件的
-            #      message.content 是否包含 expected_prefix 来鉴权
-            #   3. 三态结果（True/False/None）让"user 事件未写入"的候选保留
-            #      到下次 poll，避免误拒
-            if early_return is None and jsonl_path is None:
-                expected_prefix = _expected_match_prefix(message)
-                rejected: set[str] = set()
+            # ── fresh session：等我们这个**确定的** jsonl 落出 user 行 ─────────
+            # jsonl 路径已被 --session-id 钉死成 forced_session_id.jsonl，文件名本身
+            # 就是凭证——不存在"这个 jsonl 是不是本次 run 产生的"这种判断（旧逻辑靠扫
+            # 共享目录 + birth_time + 前缀匹配来猜，并发同 cwd 时会猜错、串台）。这里
+            # 只剩一件事：确认用户输入真被 Claude TUI 接受（写出一条真实 user 行）。
+            # 第一次 paste 被空输入框吞掉时（v2.1.x 偶发）周期性 Ctrl-U 清空并重发。
+            # resume 路径直接 tail 已存在的 X.jsonl，不进这个分支。
+            if early_return is None and not started_as_resume:
                 deadline = loop.time() + _NEW_SESSION_WAIT
-                # Submit-retry 兜底：Claude Code v2.1.x 偶发 TUI 已显示 prompt
-                # 但最初写入 PTY 的 paste 整段被吞，最后停在空输入框，只显示
-                # Try "..." 占位提示。只补 \r 对空输入框无效，所以在 fresh
-                # session JSONL 尚未出现时，周期性 Ctrl-U 清空并重发整段消息。
                 last_resubmit = loop.time()
                 resubmit_attempts = 0
+                input_accepted = False
                 while loop.time() < deadline:
-                    new_uuids = (
-                        _snapshot_session_uuids(project_dir)
-                        - before_uuids
-                        - rejected
-                    )
-                    # 收集合规候选（birth_time >= spawn_at - 容差 0.5s）
-                    candidates: list[tuple[float, str, str]] = []
-                    for u in new_uuids:
-                        p = os.path.join(project_dir, f"{u}.jsonl")
-                        birth = _jsonl_birth_time(p)
-                        if birth is None:
-                            continue
-                        if birth + 0.5 < spawn_at:
-                            # spawn 之前就存在的，肯定不是自己——拉黑省得反复检
-                            rejected.add(u)
-                            continue
-                        candidates.append((birth, u, p))
-                    candidates.sort()  # birth 升序
-                    only_candidate = len(candidates) == 1
-                    chosen_path: Optional[tuple[str, str]] = None
-                    any_pending = False
-                    for _birth, u, p in candidates:
-                        verdict = _jsonl_owns_message(
-                            p, expected_prefix, only_candidate
-                        )
-                        if verdict is True:
-                            chosen_path = (u, p)
-                            break
-                        if verdict is False:
-                            rejected.add(u)
-                        else:  # None：内容还没写到 user 行
-                            any_pending = True
-                    if chosen_path is not None:
-                        u, p = chosen_path
-                        active_session_id = u
-                        new_session_id = u
-                        jsonl_path = p
+                    if _jsonl_has_real_user_event(jsonl_path):
+                        input_accepted = True
                         break
                     if proc.returncode is not None:
                         break
@@ -859,11 +855,8 @@ async def run_claude(
                             pass
                         last_resubmit = loop.time()
                         resubmit_attempts += 1
-                    # 没有"被接受"的候选——下次 poll；any_pending 提示我们至少
-                    # 有一个文件存在但还没写 user 行，正常情况下马上就写完
-                    _ = any_pending
                     await asyncio.sleep(_JSONL_POLL_INTERVAL)
-                if jsonl_path is None:
+                if not input_accepted:
                     rc = proc.returncode if proc.returncode is not None else -1
                     detail = _decode_tail(tail_buffer)
                     early_return = ("", None, rc, f"new session jsonl never appeared. {detail}")
