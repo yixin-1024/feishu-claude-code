@@ -48,8 +48,8 @@ from apscheduler.triggers.cron import CronTrigger
 # （比如 reflection 是日级 cron，错过 04:00 就要等明天），链彻底断在那。
 # reaper 解决"没新 session 来时也定期清"的兜底问题。
 LOCK_GLOBS = [
-    "/Users/user/Desktop/workspace/payment/spx/.*.lock",
-    "/Users/user/Desktop/workspace/tools/feishu-claude-code/.*.lock",
+    os.path.expanduser("~/Desktop/workspace/payment/spx/.*.lock"),
+    os.path.expanduser("~/Desktop/workspace/tools/feishu-claude-code/.*.lock"),
 ]
 REAPER_STALE_MINUTES = 60   # 跟 prompt STEP 0 的 3600s 阈值对齐 — 任何 task 都不该跑超过 60min
 REAPER_INTERVAL_SECONDS = 300  # 每 5 分钟扫一次

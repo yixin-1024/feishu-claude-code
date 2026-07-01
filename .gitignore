@@ -21,22 +21,16 @@ store/
 
 # 本地业务配置（含 chat_id / 个人路径），按 .example 模板自行创建
 scheduled_tasks.yaml
+inbox_config.yaml
 
-# prompts/ 整体忽略（用户私有 cron prompt），但系统级模板要进版本控制。
-# 注意：用 prompts/* 而非 prompts/，否则 negate 对子文件不生效。
+# 私有规划目录（GSD 等），不进版本控制
+.planning/
+
+# prompts/ 整体忽略（用户私有 cron / 角色 prompt，含真实路径/域名/人名），
+# 只有通用框架模板进版本控制。注意用 prompts/* 而非 prompts/，否则 negate 不生效。
 prompts/*
 !prompts/default.md
 !prompts/_dispatch.md
-!prompts/yushitai.md
-!prompts/zhongshu.md
-!prompts/menxia.md
-!prompts/shangshu.md
-!prompts/ganhuode.md
-# spx_*.md 是 reflection 任务渐进演化的产物，进版本控制以保留 patch 历史。
-# verify.md 是通用验证模板。
-# cc_lark_prompt_reflection.md 是 meta-prompt，也要 tracked（反思任务本身的演化）。
-!prompts/spx_*.md
 !prompts/verify.md
-!prompts/cc_lark_prompt_reflection.md
 # 但 .bak.<TS> 仍然忽略（应急快速回滚快照，不该污染历史）
 prompts/*.bak.*

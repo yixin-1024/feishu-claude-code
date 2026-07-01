@@ -1,0 +1,90 @@
+# inbox_watcher 配置模板 —— 复制为 inbox_config.yaml 后按需填写（真实文件已 gitignore）。
+#
+# 工作原理：
+#   1. cc-lark 收到源群消息 → inbox 聚成对话簇（按 reply_to / thread_id）
+#   2. 每个簇独立倒计时（debounce）
+#   3. 即时短路：消息里 @owner + 含动作词 → 不等 debounce，立刻判定
+#   4. 倒计时到期 → 调 claude --print 跑判定 prompt → 决定是否派单
+#
+# yaml 支持 ${VAR} 引用 .env，避免敏感 id 落库。
+
+enabled: false                       # 默认关闭；跑通再开
+
+# 用哪个 bot profile 跑（用它的 lark-cli profile 跑判定 + feishu client 发顶楼）
+profile: default
+
+claude_model: claude-opus-4-8[1m]
+
+# 派单目标群（每个候选任务在这里发一个新顶楼 / 新 thread）
+dispatch_chat_id: ${INBOX_DISPATCH_CHAT_ID}
+
+# Owner 的 open_id + 显示名（识别 "@你" 即时短路 + 过滤掉你自己发的消息）
+owner_open_id: ${INBOX_OWNER_OPEN_ID}
+owner_name: "${INBOX_OWNER_NAME}"
+
+# 判定 prompt 的工作目录（Claude session cwd）
+workspace: ${INBOX_WORKSPACE}
+
+# 判定 prompt 路径（相对本仓）；自备一个，别提交含真实客户信息的版本
+judge_prompt: prompts/inbox_judge.md
+
+# ─── 数据源 ─────────────────────────────────────────────────
+# kind: group → WS 事件驱动（bot 在群里，零延迟）
+# kind: dm    → user 身份轮询（bot 不在双人私聊里，靠 polling）
+sources:
+  - kind: group
+    chat_id: ${INBOX_SRC_CHAT_1}
+    name: "示例群 A"
+  - kind: dm
+    user_id: ${INBOX_DM_USER_1}
+    name: "示例私聊对象"
+
+# ─── 即时短路触发 ──────────────────────────────────────────
+short_circuit:
+  require_mention_owner: true
+  action_keywords: [重发, 改, 部署, 查, 处理, 跑, 修, 加, 删, 排查, 验证, 测试, 帮我]
+
+# ─── Debounce 阈值（秒）─────────────────────────────────────
+debounce:
+  dm_seconds: 60
+  discussion_seconds: 180
+  default_seconds: 90
+
+cooldown_minutes: 30
+dm_poll_interval_seconds: 30
+
+# ─── 长期记忆目录 ──────────────────────────────────────────
+memory_dir: ~/.feishu-claude/inbox
+memory:
+  heuristics_max_chars: 8000
+  dispatched_recent: 10
+  feedback_recent: 20
+
+judge_timeout_seconds: 180
+
+# ─── 自动执行：readonly 类任务 bot 自己接手 ─────────────────
+auto_execute:
+  enabled: false
+  kinds: [readonly]
+  min_confidence: 0.8
+  quota_per_hour: 5
+  quota_per_day: 30
+
+# ─── Case Session 跟踪 ─────────────────────────────────────
+case_session:
+  enabled: true
+  ttl_days: 30
+  max_entries: 200
+
+# ─── Feedback 闭环 ────────────────────────────────────────
+feedback:
+  enabled: true
+  scan_interval_seconds: 3600
+  min_age_hours: 4
+  max_age_days: 7
+
+# ─── 源群就地处理 ─────────────────────────────────────────
+source_inline:
+  enabled: false
+  whitelist: []
+  min_confidence: 0.85
