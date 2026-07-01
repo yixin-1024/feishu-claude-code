@@ -2,8 +2,8 @@
 定时任务调度：cron → 在指定话题群创建新话题 → /spawn 起独立 session 处理。
 
 每条任务在 scheduled_tasks.yaml 里定义：
-    - name: spx_daily_briefing
-      profile: spx
+    - name: my_daily_report
+      profile: default
       cron: "50 17 * * *"          # 五段 cron（分 时 日 月 周），timezone 见下
       timezone: "Asia/Shanghai"     # 可选，默认 Asia/Shanghai
       chat_id: oc_xxx               # 在哪个话题群发顶楼消息（必须支持 thread）
@@ -11,7 +11,7 @@
       topic_title: "📅 每日报"
       topic_body: "🧵 接管：整理今天日报"
       # prompt 二选一：内联 prompt（短的） 或 prompt_file（长的，相对 yaml 同目录）
-      prompt_file: prompts/spx_daily_briefing.md
+      prompt_file: prompts/my_daily_report.md
       # 或：
       # prompt: |
       #   多行 prompt，承接 session 的全部上下文都靠这段。
@@ -47,10 +47,13 @@ from apscheduler.triggers.cron import CronTrigger
 # （每个 prompt STEP 0 里都有 AGE > 3600 即过期的逻辑）。问题是：如果没新 fire 来
 # （比如 reflection 是日级 cron，错过 04:00 就要等明天），链彻底断在那。
 # reaper 解决"没新 session 来时也定期清"的兜底问题。
-LOCK_GLOBS = [
-    os.path.expanduser("~/Desktop/workspace/payment/spx/.*.lock"),
-    os.path.expanduser("~/Desktop/workspace/tools/feishu-claude-code/.*.lock"),
-]
+def _lock_globs() -> list[str]:
+    """要兜底扫描的 stale-lock glob 列表。部署相关的绝对路径放 env
+    CC_LARK_LOCK_GLOBS（冒号分隔），不进代码库；未设置则只兜底扫本仓目录。"""
+    env = os.environ.get("CC_LARK_LOCK_GLOBS", "").strip()
+    if env:
+        return [g.strip() for g in env.split(os.pathsep) if g.strip()]
+    return [os.path.join(os.path.dirname(os.path.abspath(__file__)), ".*.lock")]
 REAPER_STALE_MINUTES = 60   # 跟 prompt STEP 0 的 3600s 阈值对齐 — 任何 task 都不该跑超过 60min
 REAPER_INTERVAL_SECONDS = 300  # 每 5 分钟扫一次
 
@@ -59,7 +62,7 @@ def _reap_stale_locks(stale_minutes: int = REAPER_STALE_MINUTES) -> int:
     """扫已知 lock 目录，rmdir mtime 超过 stale_minutes 的 lock。返回清掉的数量。"""
     now = time.time()
     cleaned = 0
-    for pattern in LOCK_GLOBS:
+    for pattern in _lock_globs():
         for lock_path in glob.glob(pattern):
             if not os.path.isdir(lock_path):
                 continue

@@ -709,7 +709,7 @@ def test_jsonl_owns_message_ignores_collapsed_blank_lines(tmp_path):
 def test_jsonl_owns_message_waits_when_content_unwritten(tmp_path):
     """2026-05-24 真实事故回归：并发 spawn 时不准走 only_candidate 捷径。
 
-    场景：spx_hourly_optimize 和 spx_e2e_patrol 在 17:45 同时 fire。
+    场景：两个定时任务 A/B 在 17:45 同时 fire。
     patrol（A）spawn 后拍 before_uuids snapshot，optimize（B）的 jsonl 比 A 自己
     的先落盘（A 的 PTY init 慢半拍），此时 B 还在 PTY bracketed-paste，user 行
     没写出来。A 看到 new_uuids = {B.uuid}、only_candidate=True、content=None，

@@ -7,12 +7,12 @@
     3. _should_short_circuit      @owner + 动作词 → 立即触发 _schedule_judge
                                   否则按上下文挑 debounce 秒数，重置 deadline
     4. _tick_loop                 每 5s 扫所有 cluster.deadline 过期 → _schedule_judge
-    5. _judge_and_dispatch        调 claude -p 跑 prompts/spx_inbox_judge.md，
+    5. _judge_and_dispatch        调 claude -p 跑 prompts/inbox_judge.md，
                                   decode JSON → dispatch=true 时 bot.send_post 派单
     6. DM polling                 bot 物理上看不到 owner ↔ Boss 私聊；
                                   另起 _dm_poll_loop 用 user 身份 lark-cli 拉
 
-长期记忆（~/.feishu-claude/spx_inbox/）：
+长期记忆（~/.feishu-claude/inbox/）：
     heuristics.md                 用户手写经验，prompt 每次读
     dispatched.jsonl              每次派单一行
     decisions_skipped.jsonl       judge 决定不派也记下来
@@ -77,7 +77,7 @@ class InboxConfig:
     cooldown_minutes: int = 30
     dm_poll_interval_seconds: int = 30
 
-    memory_dir: str = "~/.feishu-claude/spx_inbox"
+    memory_dir: str = "~/.feishu-claude/inbox"
     heuristics_max_chars: int = 8000
     dispatched_recent: int = 10
     feedback_recent: int = 20
@@ -152,7 +152,7 @@ class InboxConfig:
             debounce_default_seconds=int(db.get("default_seconds", 90)),
             cooldown_minutes=int(raw.get("cooldown_minutes", 30)),
             dm_poll_interval_seconds=int(raw.get("dm_poll_interval_seconds", 30)),
-            memory_dir=str(raw.get("memory_dir", "~/.feishu-claude/spx_inbox")),
+            memory_dir=str(raw.get("memory_dir", "~/.feishu-claude/inbox")),
             heuristics_max_chars=int(mem.get("heuristics_max_chars", 8000)),
             dispatched_recent=int(mem.get("dispatched_recent", 10)),
             feedback_recent=int(mem.get("feedback_recent", 20)),
@@ -1078,10 +1078,10 @@ async def _judge_and_dispatch(c: Cluster, reason: str):
 
 
 async def _claude_judge(c: Cluster, reason: str) -> dict:
-    """调 claude --print 跑 prompts/spx_inbox_judge.md，解析 JSON 输出。"""
+    """调 claude --print 跑 prompts/inbox_judge.md，解析 JSON 输出。"""
     prompt_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "prompts", "spx_inbox_judge.md",
+        "prompts", "inbox_judge.md",
     )
     if not os.path.exists(prompt_path):
         return {"dispatch": False, "reasoning": f"prompt 文件不存在: {prompt_path}"}

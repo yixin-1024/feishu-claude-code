@@ -253,7 +253,7 @@ def _expected_match_prefix(message: str) -> Optional[str]:
 # 此时 A 看到的 new_uuids = {B.uuid}、only_candidate=True，但 B 的 user 行还在 PTY
 # bracketed-paste 中（content=None）；旧逻辑直接 return True → A 错认 B 的 jsonl 为
 # 自己的，从此 tail 别人的输出，两个会话的卡片内容会完全串台（2026-05-24 真实事故：
-# spx_hourly_optimize 和 spx_e2e_patrol 17:45 同时触发，patrol 的卡片正文显示成
+# hourly_optimize 和 e2e_patrol 17:45 同时触发，patrol 的卡片正文显示成
 # optimize 的内容）。修复：content==None 一律 return None，等 PTY 把 user 行落出来再判。
 def _jsonl_owns_message(
     path: str,
@@ -620,7 +620,7 @@ async def _send_user_input(
     安静就是还在干活。max_wait 兜超慢加载，再不行也兜底发 \\r 保留旧行为。
 
     2026-05-24 加固：单行短消息走旧短窗（quiet=0.25/max=5）；多行 paste
-    走长窗（quiet=1.0/max=15）——超长 paste（如 spx_website_refactor 473
+    走长窗（quiet=1.0/max=15）——超长 paste（如 website_refactor 473
     行）会被 Claude TUI fold 成占位符，同时 MCP server / claude.ai
     connectors 异步 init 期间 PTY 持续 echo banner（30s+ 不会真正 quiet），
     旧 5s 兜底太早发 \\r 时 Claude TUI 仍在 fold-paste + 等 init 状态，
