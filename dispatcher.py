@@ -330,24 +330,18 @@ async def _handle_verify_command(
 
 
 # ── Hung 自动重试黑名单 ────────────────────────────────────
-# 这些 skill / endpoint 命中即跳过 auto-retry：它们是写操作（开卡 / 开 VA /
-# Bot-B 扣 credit），上一轮可能已经 commit 了一半，重试会 double-write。
-# user text + tool_history 任一命中即视为黑名单。
-_WRITE_OP_MARKERS = (
-    # issuer 发卡 / SGB 开户 API
-    "writeApi", "writeApi",
-    "writeApi", "writeApi",
-    "/write/pathA", "/write/pathB",
-    # 写操作类 skill 名
-    "example-write-skill", "example-write-skill",
-    "example-write-skill", "example-write-skill",
-    "example-write-skill", "example-write-skill",
-)
+# 命中即跳过 auto-retry：这些是写操作（开卡 / 开户 / 扣费类），上一轮可能已经
+# commit 了一半，重试会 double-write。user text + tool_history 任一命中即黑名单。
+# 部署相关的 skill / endpoint 标记放 env CC_LARK_WRITE_OP_MARKERS（逗号分隔），
+# 不进代码库；未设置则为空（通用框架默认无写操作黑名单）。
+def _write_op_markers() -> tuple[str, ...]:
+    raw = os.environ.get("CC_LARK_WRITE_OP_MARKERS", "")
+    return tuple(m.strip() for m in raw.split(",") if m.strip())
 
 
 def _is_write_op_context(user_text: str, tool_history: list[str]) -> bool:
     blob = (user_text or "") + "\n" + "\n".join(tool_history or [])
-    return any(m in blob for m in _WRITE_OP_MARKERS)
+    return any(m in blob for m in _write_op_markers())
 
 
 # ── 命令菜单（锁外即时响应）──────────────────────────────────
@@ -723,7 +717,7 @@ async def _run_and_display(
         # ── Hung 自动重试 ───────────────────────────────────────
         # 只对 claude_pty 抛的 "Claude 客户端疑似 hung" RuntimeError 重试；
         # 其他错误（wall-clock、JSON、API key、orphan resume 等）一律不重试。
-        # 写操作 skill（SGB / issuer / Bot-B 等）跳过 retry，防止 double-write。
+        # 写操作 skill 跳过 retry，防止 double-write。
         # max=1，硬编码；冷却 10s 让 TLS pool / claude 子进程释放。
         _AUTO_RETRY_MAX = 1
         _HUNG_MARKER = "客户端疑似 hung"
@@ -1309,7 +1303,7 @@ def _format_run_error(exc: Optional[BaseException]) -> str:
     if "new session jsonl never appeared" in s:
         s += (
             "\n💡 Claude Code TUI 已启动，但没有接收本轮输入或没有创建会话 JSONL。"
-            "请重试；如果连续出现，先用 Codex/bot-b 承接或重启 bot。"
+            "请重试；如果连续出现，先用备用 runner 承接或重启 bot。"
         )
     return s
 

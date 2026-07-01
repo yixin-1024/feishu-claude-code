@@ -288,7 +288,7 @@ python3 main.py
 | 尚书 | 拆并行子任务 / 派工 / 聚合 | 门下 / 干活的（回奏） | 干活的 / 门下（影子复审） |
 | 干活的 | 真正执行（KYC / 开户 / 代码 / ...）。内嵌六部 6 人格切换 | 尚书 | 尚书（回奏） |
 
-**配置：** 见 `.env.example` 的 "Trinity 三省体系" 段落，或 [`.planning/spx-trinity/DESIGN.md`](.planning/spx-trinity/DESIGN.md)。
+**配置：** 见 `.env.example` 的 "Trinity 三省体系" 段落。
 
 **特性：**
 - 每个角色独立 Claude session，**ticket 上下文不共享**——Boss 和御史台聊的不会泄露给下层

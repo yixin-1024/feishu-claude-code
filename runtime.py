@@ -90,7 +90,7 @@ last_event_ts = time.time()
 
 # 按 profile 的最近活跃时间戳。全局 last_event_ts 会被「任意一个 bot 收到事件」
 # 刷新，所以无法判断「某一条 WS 单独死了」——曾经 hermes 的 WS 静默挂掉，但
-# spx/bot-b 照常收事件把全局时间戳喂饱，于是没有任何监控发现 hermes 变哑。
+# 其它 profile 照常收事件把全局时间戳喂饱，于是没有任何监控发现 hermes 变哑。
 # 这里按 profile 名分开记，供 WS 看门狗 / 状态查询用。
 _profile_last_event: dict[str, float] = {}
 _profile_last_event_lock = threading.Lock()

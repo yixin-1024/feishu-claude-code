@@ -43,7 +43,7 @@ from dotenv import dotenv_values, load_dotenv
 # 必须 override —— /restart 是以"当前运行进程"为父进程跑 `open .app` 拉起新实例，
 # 新进程会继承老进程的环境变量；而老进程启动时 load_dotenv 已把 .env 的值灌进了
 # os.environ。若用默认 override=False，下次重启时这些"上一代灌进来的旧值"会粘住，
-# 改了 .env 也读不到（实测 BOTB_CLAUDE_ENV_FILE 跨重启一直卡在旧文件）。
+# 改了 .env 也读不到（实测 <PROFILE>_CLAUDE_ENV_FILE 跨重启一直卡在旧文件）。
 # override=True 强制每次启动都以磁盘上的 .env 为准，根治这个跨重启粘滞。
 load_dotenv(override=not bool(os.getenv("PYTEST_CURRENT_TEST")))
 
@@ -417,7 +417,7 @@ STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "20"))
 
 # ── 按 profile 注入 claude env 覆盖（多供应商路由）────────────────
 #
-# 某些 bot（如 bot-b）可以走非 Anthropic 的模型供应商：在 .env 里给该 profile
+# 某些 bot 可以走非 Anthropic 的模型供应商：在 .env 里给该 profile
 # 配 <PREFIX>_CLAUDE_ENV_FILE=.env.deepseek，spawn claude 时这个文件里的 env
 # 会 update 进子进程环境，从而覆盖 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN /
 # ANTHROPIC_MODEL 等，把这一路 bot 整体路由到别的端点。
