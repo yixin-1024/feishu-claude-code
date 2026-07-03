@@ -60,9 +60,13 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import socket
+import ssl
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -282,18 +286,27 @@ def decode_security_stdout(raw: str) -> str:
 
 
 def _read_keychain_blob() -> Optional[str]:
-    """读 macOS keychain 里当前 active 的凭证 blob 字符串。"""
-    try:
-        r = subprocess.run(
-            ["security", "find-generic-password",
-             "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode != 0:
+    """读 macOS keychain 里当前 active 的凭证 blob 字符串。
+
+    ⚠️ 必须先按 `-a <用户名>` 精确取：新版 Claude CLI 把凭证写在
+    acct=<macOS 用户名> 的条目上；keychain 里可能还残留同 service 名但
+    acct 不同的历史死条目（实测有 acct="unknown" 的 32 天过期尸体），
+    不带 `-a` 时 `security` 返回任意一条，长期命中死条目 → /usage 永远 401。
+    带 `-a` 找不到时才退回旧的无 `-a` 行为（兼容老 CLI 布局）。
+    """
+    user = os.environ.get("USER") or os.path.basename(os.path.expanduser("~"))
+    for extra in (["-a", user], []):
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials", *extra, "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                return decode_security_stdout(r.stdout)
+        except Exception:
             return None
-        return decode_security_stdout(r.stdout)
-    except Exception:
-        return None
+    return None
 
 
 def _token_fingerprint(blob_or_dict) -> str:
@@ -601,6 +614,34 @@ def _refresh_account_inplace(name: str, *, force: bool = False,
         return True, "ok"
 
 
+# 传输层抖动异常：到 api.anthropic.com 的 TLS 偶发被中途 reset
+# ([SSL: UNEXPECTED_EOF_WHILE_READING] _ssl.c:1006) / 临时断连 / 超时。
+# 只对这些重试；HTTPError（401/403/429 等真实应答）必须原样抛给上层处理。
+_TRANSIENT_NET_EXC = (ssl.SSLError, urllib.error.URLError, socket.timeout, ConnectionError, TimeoutError)
+
+
+def urlopen_with_retry(req, *, context=None, timeout=10, retries=2, backoff=0.6):
+    """对传输层闪断重试的 urlopen。
+
+    - HTTPError（含 401/403/429）立即抛出，不重试——那是服务端真实应答。
+    - 仅对 _TRANSIENT_NET_EXC（TLS reset / 断连 / 超时）重试 retries 次，线性退避。
+    返回 urlopen 的响应对象（可直接用于 `with`）。
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(retries + 1):
+        try:
+            return urllib.request.urlopen(req, context=context, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise  # 真实 HTTP 应答，不重试
+        except _TRANSIENT_NET_EXC as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            raise
+    raise last_exc  # 理论不可达
+
+
 def _probe_one(acc: Account, is_current: bool = False) -> Account:
     """同步阻塞探测单个账户。失败时填 probe_error，不抛。
 
@@ -664,7 +705,7 @@ def _probe_one(acc: Account, is_current: bool = False) -> Account:
         )
         try:
             ctx2 = ssl.create_default_context()
-            with urllib.request.urlopen(req2, context=ctx2, timeout=_PROBE_TIMEOUT_SEC) as r:
+            with urlopen_with_retry(req2, context=ctx2, timeout=_PROBE_TIMEOUT_SEC) as r:
                 return dict(r.headers), None, None
         except urllib.error.HTTPError as e:
             return dict(e.headers or {}), e.code, None

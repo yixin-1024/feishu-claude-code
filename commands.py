@@ -340,13 +340,11 @@ def fetch_quota_headers() -> dict:
     import ssl
 
     try:
-        from account_switcher import decode_security_stdout, ensure_keychain_intact
+        from account_switcher import _read_keychain_blob, ensure_keychain_intact
         ensure_keychain_intact()  # /restart 周期里 keychain 被写丢时自愈
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        creds = json.loads(decode_security_stdout(result.stdout))
+        # 统一走 account_switcher 的读取（优先 -a <用户名>）：keychain 可能残留
+        # 同 service 名的历史死条目，无 -a 读取会长期命中过期 token → 永远 401
+        creds = json.loads(_read_keychain_blob() or "{}")
         token = creds["claudeAiOauth"]["accessToken"]
     except Exception as e:
         return {"ok": False, "error": f"读取凭证失败：{e}"}
@@ -370,10 +368,15 @@ def fetch_quota_headers() -> dict:
     )
 
     try:
+        from account_switcher import urlopen_with_retry
         ctx = ssl.create_default_context()
-        with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+        with urlopen_with_retry(req, context=ctx, timeout=10) as resp:
             headers = dict(resp.headers)
     except urllib.error.HTTPError as e:
+        # 401/403 = token 失效，明说要重登，别报成"无用量 headers"误导排障
+        if e.code in (401, 403):
+            return {"ok": False,
+                    "error": f"认证失败（HTTP {e.code}）：keychain 里的 token 已失效，请重新 `claude /login`"}
         headers = dict(e.headers)
     except Exception as e:
         return {"ok": False, "error": f"获取用量失败：{e}"}
