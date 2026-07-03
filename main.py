@@ -43,7 +43,9 @@ import inbox_watcher
 import runtime
 from bot_instance import BotInstance
 from log_util import log
-from scheduler import fire_task_now, list_tasks, reload_tasks
+from scheduler import (
+    fire_task_now, list_tasks, reload_tasks, schedule_wake, schedule_cron, list_crons,
+)
 
 
 # profile_name → BotInstance（跨进程共享，dispatcher / http_server / runtime 都依赖）
@@ -95,6 +97,11 @@ def main():
             fire_task=fire_task_now,
             list_tasks=list_tasks,
             reload_tasks=reload_tasks,
+            schedule_wake=schedule_wake,
+            dispatch_task=dispatcher.dispatch_task,
+            read_thread=dispatcher.read_thread,
+            schedule_cron=schedule_cron,
+            list_crons=list_crons,
         ),
     )
 

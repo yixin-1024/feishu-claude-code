@@ -317,7 +317,7 @@ async def _handle_verify_command(
     raw_chat_id = chat_id.split(":", 1)[0] if ":" in chat_id else chat_id
     lark_sys = build_lark_system_prompt(
         bot.profile, raw_chat_id, thread_id, msg.message_id, is_group=True,
-        asker_open_id=user_id,
+        asker_open_id=user_id, runner=session.runner,
     )
 
     await _run_and_display(
@@ -469,7 +469,8 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
         if is_group:
             _text = strip_lark_mentions(_text, getattr(msg, 'mentions', None))
 
-        if _text.lower() == "/stop" or _text.strip().endswith("/stop"):
+        # 精确匹配（此前 endswith 会让"怎么让你 /stop"这类普通句子误触发）
+        if _text.strip().lower() == "/stop":
             if is_group and not await _is_current_bot_mentioned(bot, msg):
                 return
             reply = await _handle_stop_command(bot, user_id, chat_id)
@@ -479,7 +480,7 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
                 await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
 
-        if _text.lower() == "/restart" or _text.strip().endswith("/restart"):
+        if _text.strip().lower() == "/restart":
             if is_group and not await _is_current_bot_mentioned(bot, msg):
                 return
             from commands import _trigger_restart, restart_strategy
@@ -566,6 +567,27 @@ async def _run_and_display(
 ):
     """调用 Claude 并流式展示结果。消息处理和按钮回复共用此函数。"""
     active_run = bot.active_runs.start_run(user_id, chat_id, card_msg_id)
+
+    # cc-lark MCP 的会话上下文。透传给 run_agent → claude 的 extra_env，MCP
+    # server 用这些默认值把 send_text / schedule_wakeup 定向到当前 Lark 话题。
+    wake_context: Optional[dict] = None
+    raw_chat_id, _, thread_id = chat_id.partition(":")
+    if is_group:
+        cli_profile = bot.profile.lark_cli_profile or bot.profile.name
+        wake_context = {
+            "CC_LARK_PROFILE_NAME": bot.profile.name,
+            "CC_LARK_CLI_PROFILE": cli_profile,
+            "CC_LARK_CHAT_ID": raw_chat_id,
+            "CC_LARK_THREAD_ID": thread_id,
+            "CC_LARK_MESSAGE_ID": notify_msg_id or "",
+            "CC_LARK_USER_ID": user_id or "",
+            "CC_LARK_IS_GROUP": "1",
+            "CC_LARK_HTTP_PORT": str(os.getenv("CALLBACK_PORT", "9981")),
+            # Backward-compatible aliases for the first wake_context draft.
+            "CC_LARK_PROFILE": bot.profile.name,
+            "CC_LARK_ANCHOR": notify_msg_id or "",
+            "CC_LARK_CALLBACK_PORT": str(os.getenv("CALLBACK_PORT", "9981")),
+        }
 
     accumulated = ""
     tool_history: list[str] = []
@@ -753,6 +775,7 @@ async def _run_and_display(
                         on_usage=on_usage,
                         on_status=on_status,
                         append_system_prompt=append_system_prompt or None,
+                        wake_context=wake_context,
                     )
                     log(bot.profile.name, "agent", "info",
                         f"完成 runner={session.runner} session={new_session_id}")
@@ -818,8 +841,15 @@ async def _run_and_display(
                     last_exc = e
                     break
         finally:
+            # 成功/失败路径统一：先等心跳协程完全退出再动最终卡片。只 cancel 不 await
+            # 的话，一个 in-flight 的心跳 push（HTTP 已发出）可能在最终内容之后落地，
+            # 把 ✅/❌ 覆盖回"进行中"画面（错误路径此前修过同款竞态，这里补齐成功路径）。
             if not heartbeat_task.done():
                 heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         if not success:
             # claude_pty 撞用量上限 / API 错误时，会把崩溃前的 session id 挂在异常上
@@ -845,8 +875,26 @@ async def _run_and_display(
             )
             if resumable_sid:
                 err_brief += "\n\n💾 上下文已保留，配额恢复后发『继续』即可接着上次进度跑。"
+            # 出错前流式渲染出的内容（工具轨迹 + 部分回答）对用户仍有价值，
+            # 不能整卡覆盖成错误信息——保留旧内容，把错误追加在末尾。
+            partial_parts = []
+            if tool_history:
+                partial_parts.append("\n".join(tool_history[-5:]))
+            if accumulated:
+                d = accumulated
+                if len(d) > _MAX_STREAM_DISPLAY:
+                    d = "...\n\n" + d[-_MAX_STREAM_DISPLAY:]
+                partial_parts.append(d)
+            if partial_parts:
+                err_card = (
+                    "\n\n".join(partial_parts)
+                    + "\n\n---\n\n⚠️ **任务没有执行完，中途报错了**（以上为出错前的进度）\n\n"
+                    + err_brief
+                )
+            else:
+                err_card = err_brief
             try:
-                await bot.feishu.update_card(card_msg_id, err_brief)
+                await bot.feishu.update_card(card_msg_id, err_card)
             except Exception:
                 pass
             # 流式卡若开着，关掉它恢复交互（非流式/未登记则 no-op，且永不抛）
@@ -936,6 +984,11 @@ async def _run_and_display(
                     await bot.feishu.send_text_to_user(user_id, notice)
             except Exception:
                 pass
+
+        # 把本轮最终响应文本作为返回值交回（成功路径）。dispatch_task 的子会话靠它把结果
+        # **内联**进给主 agent 的唤醒消息——不必再 read_thread（而 read_thread 受 Lark
+        # interactive 卡"初始快照"限制，本来也拿不到子的最终答案文本）。错误路径上面已 return（→None）。
+        return full_text
     finally:
         bot.active_runs.clear_run(user_id, chat_id, active_run)
 
@@ -1198,7 +1251,7 @@ async def _process_message(
     raw_chat_id = chat_id.split(":", 1)[0] if ":" in chat_id else chat_id
     lark_sys = build_lark_system_prompt(
         bot.profile, raw_chat_id, thread_id, msg.message_id, is_group,
-        asker_open_id=user_id, trinity_ctx=trinity_ctx,
+        asker_open_id=user_id, trinity_ctx=trinity_ctx, runner=session.runner,
     )
 
     await _run_and_display(
@@ -1228,8 +1281,10 @@ def build_lark_system_prompt(
     is_group: bool,
     asker_open_id: str = "",
     trinity_ctx: Optional[TrinityContext] = None,
+    runner: str = "",
 ) -> str:
-    """构造注入到 Claude 的 Lark 语境系统提示。模板见 prompts/。"""
+    """构造注入到 Claude 的 Lark 语境系统提示。模板见 prompts/。
+    runner 决定运行时 MCP 段落的注入版本（非 claude 后端没有那些工具）。"""
     ticket_state = trinity_ctx.new_state.value if trinity_ctx else None
     ticket_id = trinity_ctx.ticket.ticket_id if trinity_ctx else ""
     ticket_history = trinity_ctx.history_text if trinity_ctx else ""
@@ -1243,6 +1298,7 @@ def build_lark_system_prompt(
         ticket_state=ticket_state,
         ticket_id=ticket_id,
         ticket_history=ticket_history,
+        runner=runner,
     )
 
 
@@ -1578,7 +1634,7 @@ async def handle_button_reply(bot: BotInstance, user_id: str, chat_id: str, text
             raw_chat_id, _, btn_thread_id = chat_id.partition(":")
             lark_sys = build_lark_system_prompt(
                 bot.profile, raw_chat_id, btn_thread_id, clicked_msg_id or "", is_group,
-                asker_open_id=user_id,
+                asker_open_id=user_id, runner=session.runner,
             )
             await _run_and_display(
                 bot,
@@ -1650,12 +1706,16 @@ async def handle_spawn(
     anchor_message_id: str,
     prompt: str,
     model: str = "",
-):
+) -> tuple[bool, str]:
     """在 (user, chat_id_raw:thread_id) 这一格强制开新 session 跑 prompt。
 
     设计场景：大群里的"调度 session"读完上下文后，用 lark-cli 在会话群创建新话题，
     再 curl 这个端点把后续工作派给独立 session。和 WS 路径不冲突——这是绕过 WS 的
     内部触发入口。
+
+    返回 (ok, text)：ok=True 时 text 是子会话最终响应文本；ok=False 时 text 是
+    失败原因（忙被拒 / 卡片失败 / agent 出错等）。此前所有失败路径都裸 return None，
+    dispatch_task 的 done-callback 无法区分"跑完了"和"根本没跑"，掉活会被记成 ✅。
     """
     tag = bot.profile.name
 
@@ -1694,7 +1754,7 @@ async def handle_spawn(
                 )
             except Exception:
                 pass
-            return
+            return (False, f"thread_id 转换失败：{reason}")
 
     chat_id = f"{chat_id_raw}:{thread_id}"
 
@@ -1709,7 +1769,7 @@ async def handle_spawn(
             pass
         log(tag, "spawn", "warn",
             f"拒绝：目标话题忙 chat={chat_id_raw[:10]}... thread={thread_id[:10]}...")
-        return
+        return (False, "目标话题已有任务在跑，spawn 被拒（忙）")
 
     async with lock:
         try:
@@ -1726,11 +1786,11 @@ async def handle_spawn(
                     await bot.feishu.reply_text(anchor_message_id, f"❌ spawn 失败：{e}")
                 except Exception:
                     pass
-                return
+                return (False, f"占位卡片发送失败：{e}")
 
             lark_sys = build_lark_system_prompt(
                 bot.profile, chat_id_raw, thread_id, anchor_message_id, is_group=True,
-                asker_open_id=user_id,
+                asker_open_id=user_id, runner=session.runner,
             )
 
             log(tag, "spawn", "info",
@@ -1738,14 +1798,296 @@ async def handle_spawn(
                 f"thread={thread_id[:10]}... anchor={anchor_message_id[:12]}... "
                 f"prompt_len={len(prompt)}")
 
-            await _run_and_display(
+            # 返回子会话最终响应文本，供 dispatch_task 的 done-callback 内联进唤醒消息。
+            # _run_and_display：成功返回 full_text，错误/被停止路径返回 None。
+            res = await _run_and_display(
                 bot,
                 user_id, chat_id, True, prompt,
                 card_msg_id, session, anchor_message_id,
                 preview_text=prompt[:40],
                 append_system_prompt=lark_sys,
             )
+            if res is None:
+                return (False, "agent 运行失败或被停止（详见子话题卡片）")
+            return (True, res)
         except Exception as e:
             log(tag, "spawn", "error", f"异常: {type(e).__name__}: {e}")
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
+            return (False, f"内部异常：{type(e).__name__}: {e}")
+
+
+# ── 通用多 agent 派发（dispatch_task / read_thread）────────────────────────
+# 基于 Lark 的多 agent 派发+监工系统的可复用内核。把两条原语做进 bot 侧，
+# 经 cc_mcp_server 的 dispatch_task / read_thread 工具暴露给任意编排 agent：
+#   · dispatch_task —— 在目标群新开一条 thread 派一个独立 cc-lark 子会话（fan-out）
+#   · read_thread   —— 拉回某子会话 thread 的全部消息（supervise / 取结果）
+# 派发走内部 handle_spawn（不依赖 lark-cli user 身份 / WS 往返），子会话在新 thread
+# 里独立跑；编排方拿 thread_id 后用 read_thread 轮询。保留实测出的物理硬约束：
+# 并发 ≤ cap（实测 14 全卡死）。"不碰 prod"靠派发 prompt 自带，不在这层强制。
+# 默认 7：与 prompts/default.md、cc_mcp_server 工具描述保持同一口径（实测 14 全卡死）。
+DISPATCH_CONCURRENCY_CAP = int(os.getenv("DISPATCH_CONCURRENCY_CAP", "7") or "7")
+_DISPATCH_TASKS: set = set()   # 持回报/唤醒等辅助 task 引用，防被 GC
+# cap 的计数依据：每个子会话 task 从 create_task 起就进这个集合、done 才出。
+# 此前用 active_runs 计数有 TOCTOU 窗口——子会话从派发到真正 start_run 之间隔着
+# 建话题/mget/发卡片好几个 await，一波快速连派会全部通过检查。
+_DISPATCH_CHILDREN: set = set()
+# 父→子批次跟踪：parent_thread -> {bot, thread, anchor, chat, user, pending:int, children:[(title,thread)]}
+# 子会话**结束后一定回报父 agent**靠这层工程化（不靠子 agent 自觉 @）：
+#   · 每个子会话结束 → 往父 thread 贴一行完成/异常通知（bot 知道 turn 生命周期，子崩了也能报）
+#   · 父的最后一个子会话结束 → 唤醒父 agent 一次（handle_spawn 进父 thread，带"去 read_thread 收 N 个结果"）
+# 只在 dispatch_task 带了父上下文（parent_thread/parent_anchor）时启用；缺则退化成纯 fire-and-forget。
+_DISPATCH_PARENTS: dict[str, dict] = {}
+
+
+_BOT_OPEN_ID_CACHE: dict[str, str] = {}   # app_id -> bot 自身 open_id（@自己触发用）
+
+
+async def _resolve_bot_open_id(bot: BotInstance) -> str:
+    """拿 bot 自己的 open_id（用于 @ 自己触发 WS 唤醒）。profile 配了 BOT_OPEN_ID 优先；
+    否则向 Lark 要 /bot/v3/info 自动发现并按 app_id 缓存。失败返回空串（调用方降级）。"""
+    if getattr(bot.profile, "bot_open_id", ""):
+        return bot.profile.bot_open_id
+    app_id = bot.profile.app_id
+    if app_id in _BOT_OPEN_ID_CACHE:
+        return _BOT_OPEN_ID_CACHE[app_id]
+
+    def _fetch() -> str:
+        import urllib.request as _u
+        dom = (bot.profile.domain or "https://open.larksuite.com").rstrip("/")
+        req = _u.Request(
+            f"{dom}/open-apis/auth/v3/tenant_access_token/internal",
+            data=json.dumps({"app_id": app_id, "app_secret": bot.profile.app_secret}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        tok = json.loads(_u.urlopen(req, timeout=10).read())["tenant_access_token"]
+        req2 = _u.Request(f"{dom}/open-apis/bot/v3/info", headers={"Authorization": f"Bearer {tok}"})
+        info = json.loads(_u.urlopen(req2, timeout=10).read())
+        return ((info.get("bot") or {}).get("open_id") or "")
+
+    try:
+        oid = await asyncio.to_thread(_fetch)
+    except Exception as e:
+        log(bot.profile.name, "wake", "warn", f"取 bot open_id 失败: {type(e).__name__}: {e}")
+        oid = ""
+    if oid:
+        _BOT_OPEN_ID_CACHE[app_id] = oid
+    return oid
+
+
+async def wake_thread_as_user(bot: BotInstance, anchor_msg_id: str, prompt: str) -> bool:
+    """以 **user 身份** 在 anchor_msg_id 所在 thread 里 @bot 自己发一条 prompt。
+
+    走的是正常 WS 入站路径（owner 发的 @bot 消息）——和 /spawn 不同：忙时 **排队** 而非
+    "已忽略" 丢弃，且会 **resume 该 thread 的现有 session**（带上下文）。这才是稳的唤醒姿势。
+    返回是否发送成功（失败仅 log，调用方不崩）。"""
+    if not anchor_msg_id:
+        log(bot.profile.name, "wake", "warn", "缺 anchor，无法 send-as-user 唤醒")
+        return False
+    bot_oid = await _resolve_bot_open_id(bot)
+    if not bot_oid:
+        log(bot.profile.name, "wake", "warn", "拿不到 bot open_id，无法 @ 自己唤醒")
+        return False
+    cli_profile = bot.profile.lark_cli_profile or bot.profile.name
+    text = f'<at user_id="{bot_oid}"></at> {prompt}'
+    cmd = [
+        "lark-cli", "--profile", cli_profile, "im", "+messages-reply",
+        "--as", "user", "--message-id", anchor_msg_id, "--reply-in-thread",
+        "--text", text,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        _out, err = await asyncio.wait_for(proc.communicate(), timeout=25)
+    except Exception as e:
+        log(bot.profile.name, "wake", "warn", f"send-as-user 唤醒异常: {type(e).__name__}: {e}")
+        return False
+    if proc.returncode != 0:
+        log(bot.profile.name, "wake", "warn",
+            f"send-as-user 唤醒 lark-cli rc={proc.returncode} err={err.decode('utf-8','replace')[:200]}")
+        return False
+    return True
+
+
+async def _dispatch_safe_reply(bot: BotInstance, anchor: str, text: str) -> None:
+    """往父 thread 贴一行（best-effort，失败只 log）。"""
+    try:
+        await bot.feishu.reply_text(anchor, text)
+    except Exception as e:
+        log(bot.profile.name, "dispatch", "warn", f"回父 thread 失败: {type(e).__name__}: {e}")
+
+
+async def _dispatch_wake_parent(grp: dict) -> None:
+    """父的子任务批次全部完成 → 唤醒父 agent 一次去收口（监工闭环）。
+
+    走 send-as-user @bot（wake_thread_as_user）而不是 handle_spawn——后者 reject-if-busy
+    会被 "话题已有任务在跑，已忽略" 丢掉（实测闭环就栽在这）；前者经 WS 排队、且 resume
+    父 session。**唤醒消息内联每个子任务的实际结果**（grp["results"] 里存的子会话最终响应
+    文本），主 agent 醒来即拿到全部内容，无需再 read_thread。"""
+    bot = grp["bot"]
+    results = grp.get("results", [])
+    blocks = []
+    for title, thread, text, ok in results:
+        head = f"━━ {title} {'✅' if ok else '⚠️ 未完成'}（thread {thread}）"
+        body = (text or "").strip() or "（子会话无文本输出）"
+        if len(body) > 1500:
+            body = body[:1500] + f'\n…（截断，完整用 read_thread(thread_id="{thread}")）'
+        blocks.append(f"{head}\n{body}")
+    joined = "\n\n".join(blocks) or "（无结果）"
+    prompt = (
+        f"[🔔 子任务批次完成] 你派出的 {len(results)} 个子任务都跑完了，结果已**内联**在下面"
+        f"（无需再 read_thread，除非要看完整细节）：\n\n{joined}\n\n"
+        f"请核对 / 汇总后回复用户。如还需继续，可再 dispatch_task 派下一波。"
+    )
+    ok = await wake_thread_as_user(bot, grp.get("anchor", ""), prompt)
+    if not ok:
+        log(bot.profile.name, "dispatch", "warn", "批次完成唤醒父 agent 失败（send-as-user 未成功）")
+
+
+async def dispatch_task(
+    bot: BotInstance, *, user_id: str, group_chat_id: str,
+    title: str, prompt: str, cap: int = DISPATCH_CONCURRENCY_CAP,
+    parent_thread: str = "", parent_anchor: str = "",
+) -> dict:
+    """在 group_chat_id 新开一条 thread 派一个独立 cc-lark 子会话跑 prompt。
+
+    fire-and-forget：建好话题 + 启动子会话后立即返回 thread_id，子会话独立续跑，
+    不阻塞本次调用。编排方用 read_thread(thread_id) 轮询拉结果。≤cap 并发保护。
+
+    parent_thread/parent_anchor：派发方（主 agent）所在 thread + 其锚点消息。给了就启用
+    "子会话结束→回报父 thread + 批次全完→唤醒父 agent"的工程化闭环（见 _DISPATCH_PARENTS）。
+    """
+    if not group_chat_id:
+        return {"ok": False, "error": "缺少 group_chat_id（派发目标群）"}
+    if not (prompt and prompt.strip()):
+        return {"ok": False, "error": "prompt 不能为空"}
+    active = len(_DISPATCH_CHILDREN)
+    if active >= cap:
+        return {"ok": False, "error": f"并发已达上限 {cap}（在跑/在启动的子会话 {active}），等已派的跑完再派下一波"}
+    user = user_id or bot.store.find_primary_user() or ""
+    if not user:
+        return {"ok": False, "error": "无法确定归属人 user_id"}
+
+    topic_title = (title.strip() if (title and title.strip())
+                   else prompt.strip().splitlines()[0])[:60]
+    try:
+        anchor = await bot.feishu.send_post_to_chat(
+            chat_id=group_chat_id,
+            title=f"🤖 {topic_title}",
+            body_text="（cc-lark 子任务已派发，正在独立处理…）",
+            mention_open_id=user,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"建话题失败: {type(e).__name__}: {e}"}
+
+    thread_id = anchor
+    try:
+        resolved = await bot.feishu.get_message_thread_id(anchor)
+        if resolved:
+            thread_id = resolved
+    except Exception:
+        pass
+
+    # 父批次登记（带父上下文才启用回报闭环）
+    if parent_thread and parent_anchor:
+        grp = _DISPATCH_PARENTS.setdefault(parent_thread, {
+            "bot": bot, "thread": parent_thread, "anchor": parent_anchor,
+            "chat": group_chat_id, "user": user, "pending": 0, "results": [],
+        })
+        grp["pending"] += 1
+
+    # fire-and-forget：子会话独立跑，不阻塞派发返回。进 _DISPATCH_CHILDREN 计数
+    # （cap 依据）兼防 GC。
+    t = asyncio.create_task(handle_spawn(
+        bot, user_id=user, chat_id_raw=group_chat_id,
+        thread_id=thread_id, anchor_message_id=anchor, prompt=prompt,
+    ))
+    _DISPATCH_CHILDREN.add(t)
+
+    def _on_child_done(fut, _title=topic_title, _thread=thread_id, _ptid=parent_thread):
+        _DISPATCH_CHILDREN.discard(fut)
+        # handle_spawn 返回 (ok, text)：ok=False 时 text 是失败原因。
+        # 掉活（忙被拒/卡片失败/agent 出错）必须报 ⚠️，不能装 ✅。
+        exc = None
+        ok = False
+        result_text = ""
+        fail_reason = ""
+        try:
+            exc = fut.exception()
+        except Exception:
+            exc = None
+        if exc is not None:
+            fail_reason = f"{type(exc).__name__}: {exc}"
+        else:
+            r = None
+            try:
+                r = fut.result()
+            except Exception:
+                pass
+            if isinstance(r, tuple) and len(r) == 2:
+                ok = bool(r[0])
+                if ok:
+                    result_text = r[1] or ""
+                else:
+                    fail_reason = r[1] or "子会话未跑完（原因未知）"
+            else:  # 兼容旧契约（裸文本/None）
+                ok = r is not None
+                result_text = r or ""
+                if not ok:
+                    fail_reason = "子会话未返回结果"
+        # 1) 每个子会话结束 → 回报父 thread（含结果摘要；工程化保证，子崩了也报）
+        if parent_anchor:
+            status = "✅ 完成" if ok else f"⚠️ 未完成（{fail_reason[:120]}）"
+            line = f"🔔 子任务「{_title}」{status}　thread={_thread}"
+            snippet = (result_text or "").strip().replace("\n", " ")
+            if snippet:
+                line += f"\n{snippet[:200]}"
+            rt = asyncio.create_task(_dispatch_safe_reply(bot, parent_anchor, line))
+            _DISPATCH_TASKS.add(rt)
+            rt.add_done_callback(_DISPATCH_TASKS.discard)
+        # 2) 批次全完 → 唤醒父 agent 一次收口（内联所有子结果；失败的内联原因）
+        grp2 = _DISPATCH_PARENTS.get(_ptid) if _ptid else None
+        if grp2 is not None:
+            grp2["pending"] -= 1
+            grp2.setdefault("results", []).append(
+                (_title, _thread, result_text if ok else f"（未完成）{fail_reason}", ok))
+            if grp2["pending"] <= 0:
+                _DISPATCH_PARENTS.pop(_ptid, None)
+                wt = asyncio.create_task(_dispatch_wake_parent(grp2))
+                _DISPATCH_TASKS.add(wt)
+                wt.add_done_callback(_DISPATCH_TASKS.discard)
+
+    t.add_done_callback(_on_child_done)
+
+    log(bot.profile.name, "dispatch", "info",
+        f"派子会话 chat={group_chat_id[:12]}... thread={thread_id[:14]}... "
+        f"active={active + 1} parent={parent_thread[:12] + '...' if parent_thread else '-'}")
+    return {"ok": True, "thread_id": thread_id, "anchor_message_id": anchor,
+            "active_after": active + 1, "cap": cap}
+
+
+async def read_thread(bot: BotInstance, *, thread_id: str, limit: int = 50) -> dict:
+    """读一条 thread 的全部消息，渲染成 `[seq] sender time: text` 紧凑 transcript。
+
+    给编排 agent 拉回某个 dispatch_task 子会话的进展/结果。复用 thread_context 的
+    消息抽取逻辑，不重造轮子。"""
+    if not thread_id:
+        return {"ok": False, "error": "缺少 thread_id"}
+    try:
+        msgs = await bot.feishu.list_thread_messages(thread_id, limit=limit)
+    except Exception as e:
+        return {"ok": False, "error": f"读 thread 失败: {type(e).__name__}: {e}"}
+    from thread_context import _extract, _sender_label, _fmt_time
+    lines: list[str] = []
+    for i, m in enumerate(msgs, 1):
+        try:
+            text, _atts = _extract(m, None)
+        except Exception:
+            text = "[unparseable]"
+        sender = _sender_label(m)
+        ts = _fmt_time(m.create_time)
+        lines.append(f"[{i}] {sender} {ts}: {text}".strip())
+    transcript = "\n".join(lines) if lines else "(thread 暂无消息)"
+    if len(transcript) > 8000:
+        transcript = "…(前文截断)\n" + transcript[-8000:]
+    return {"ok": True, "count": len(msgs), "transcript": transcript}

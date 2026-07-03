@@ -36,9 +36,14 @@ import traceback
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
+import uuid
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 # ── 后台 lock reaper：兜底清 stale lock，让链能自愈 ───────────
 # 背景：每个定时 task prompt STEP 0 里都有 `mkdir $LOCK` 的并发互斥。正常路径下
@@ -169,6 +174,9 @@ def _load_tasks(path: str) -> list[ScheduledTask]:
 
 # name -> async _fire；供 fire_task_now（HTTP /trigger 路径）await
 _TASK_REGISTRY: dict[str, Callable[[], Awaitable[None]]] = {}
+# job_id -> chat_id：list_crons 按 chat 过滤的作用域表。
+# wake job 在 schedule_wake 里登记；yaml 任务（含 agent cron）在注册 job 时登记。
+_JOB_CHAT_SCOPE: dict[str, str] = {}
 # 全局：start_scheduler 把构造好的 scheduler 和加载状态放这里，/reload 复用
 _STATE: dict = {
     "scheduler": None,
@@ -193,6 +201,238 @@ async def fire_task_now(name: str) -> None:
     if fn is None:
         raise KeyError(f"task {name!r} 不存在；已注册: {list_tasks()}")
     await fn()
+
+
+def schedule_wake(
+    *,
+    profile: str,
+    chat_id: str,
+    thread_id: str,
+    anchor_message_id: str,
+    user_id: str,
+    minutes: int,
+    note: str,
+) -> dict:
+    """安排 N 分钟后在 (chat_id:thread_id) 这条话题里自动开一个新 turn 续上 note。
+
+    这是 cc_mcp_server 的 wake_me_in 工具的持久兑现端：MCP 那层只是把请求 POST
+    到 bot 的 /wake，真正"过 N 分钟再唤醒"由这里挂到常驻 BackgroundScheduler 上
+    （一次性 DateTrigger）。fire 时复用 spawn_fn(=handle_spawn) 在该话题强开新 session。
+
+    依赖 start_scheduler 已经把 scheduler/bots/bot_loop/spawn_fn 放进 _STATE。
+    返回 {"ok": True, "fire_at_local": "...", "job_id": "..."} 或 {"ok": False, "error": ...}。
+    """
+    sched = _STATE["scheduler"]
+    bots = _STATE["bots"]
+    bot_loop = _STATE["bot_loop"]
+    spawn_fn = _STATE["spawn_fn"]
+    if sched is None or bots is None or bot_loop is None or spawn_fn is None:
+        return {"ok": False, "error": "scheduler 未启动"}
+
+    try:
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "minutes 必须是整数"}
+    if not (1 <= minutes <= 1440):
+        return {"ok": False, "error": "minutes 必须在 1..1440 之间"}
+    if not (chat_id and thread_id):
+        return {"ok": False, "error": "缺少 chat_id / thread_id"}
+    if not (note and note.strip()):
+        return {"ok": False, "error": "note 不能为空"}
+
+    # profile → bot：显式优先；单 bot 时可省略。
+    bot = bots.get(profile) if profile else None
+    if bot is None:
+        if len(bots) == 1:
+            bot = next(iter(bots.values()))
+        else:
+            return {"ok": False, "error": f"profile {profile!r} 未加载（多 bot 必须指定）"}
+
+    user = user_id or bot.store.find_primary_user() or ""
+    if not user:
+        return {"ok": False, "error": "无法确定归属人 user_id"}
+    # 回复锚点缺失时退回 thread_id 本身（handle_spawn 能把 om_ 自动转 omt_）。
+    anchor = anchor_message_id or thread_id
+
+    tz = ZoneInfo("Asia/Shanghai")
+    run_date = datetime.now(tz) + timedelta(minutes=minutes)
+    job_id = f"wake-{thread_id[-8:]}-{uuid.uuid4().hex[:6]}"
+    _JOB_CHAT_SCOPE[job_id] = chat_id  # list_crons 按 chat 过滤用
+
+    wake_prompt = (
+        f"[⏰ 自动唤醒] 你在大约 {minutes} 分钟前给自己排了这次唤醒。\n"
+        f"你当时留下的待办 / 要检查的事：\n{note.strip()}\n\n"
+        f"请据此继续；需要更多上下文可读本话题历史或相关文件。处理完按正常方式回复即可。"
+    )
+
+    # fire 时走 send-as-user @bot（dispatcher.wake_thread_as_user）唤醒：经 WS 入站路径、
+    # 忙时排队不丢、且 resume 本话题 session。比 handle_spawn(reject-if-busy) 稳。
+    # 懒 import 避免 scheduler↔dispatcher 顶层循环依赖；失败兜底回退 spawn_fn(handle_spawn)。
+    def _fire():
+        async def _do():
+            try:
+                from dispatcher import wake_thread_as_user
+                ok = await wake_thread_as_user(bot, anchor, wake_prompt)
+                if ok:
+                    return
+                print(f"[scheduler/wake] ⚠️ {job_id} send-as-user 未成功，回退 handle_spawn", flush=True)
+            except Exception as e:
+                print(f"[scheduler/wake] ⚠️ {job_id} wake_thread_as_user 异常 {type(e).__name__}: {e}，回退 handle_spawn", flush=True)
+            try:
+                await spawn_fn(bot, user_id=user, chat_id_raw=chat_id,
+                               thread_id=thread_id, anchor_message_id=anchor, prompt=wake_prompt)
+            except Exception as e:
+                print(f"[scheduler/wake] ❌ {job_id} 回退 spawn 也失败: {type(e).__name__}: {e}", flush=True)
+        try:
+            asyncio.run_coroutine_threadsafe(_do(), bot_loop)
+            print(f"[scheduler/wake] 🔔 fire {job_id} → chat={chat_id[:12]}... thread={thread_id[:12]}...", flush=True)
+        except Exception as e:
+            print(f"[scheduler/wake] ❌ {job_id} submit 失败: {type(e).__name__}: {e}", flush=True)
+        finally:
+            _JOB_CHAT_SCOPE.pop(job_id, None)  # 一次性 job 跑完即出作用域表
+
+    try:
+        sched.add_job(
+            _fire,
+            trigger=DateTrigger(run_date=run_date),
+            id=job_id,
+            name=job_id,
+            # 系统睡眠跨过 fire 时间也补跑（醒来后 wake-nudger 会拉起）；一次性，跑完自删。
+            misfire_grace_time=None,
+            coalesce=True,
+            max_instances=1,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"add_job 失败: {type(e).__name__}: {e}"}
+
+    fire_local = run_date.strftime("%m/%d %H:%M")
+    print(
+        f"[scheduler/wake] ✅ 已排 {job_id} → {fire_local} (+{minutes}min) "
+        f"profile={bot.profile.name} thread={thread_id[:12]}...",
+        flush=True,
+    )
+    return {"ok": True, "fire_at_local": fire_local, "job_id": job_id}
+
+
+def schedule_cron(
+    *,
+    profile: str,
+    chat_id: str,
+    user_id: str,
+    cron: str,
+    prompt: str,
+    title: str = "",
+    timezone: str = "Asia/Shanghai",
+) -> dict:
+    """新增一条**重复**定时任务（真·"每天几点干个啥"）—— cc_mcp_server 的 schedule_cron 后端。
+
+    安全落盘：prompt 写进独立 data/agent_crons/<name>.md（避开多行 prompt 的 YAML 转义雷），
+    再用 yaml.safe_dump 生成一条 entry **追加**到 scheduled_tasks.yaml（只 append、不 load+dump，
+    保留既有注释和 ${VAR}），最后调 reload_tasks() 即时生效。重启后仍在（落了盘）。
+    复用全套现成 cron 管线（quota 预检 / 建话题 / spawn / 睡眠安全调度）。
+
+    返回 {"ok": True, "name", "cron", "next_run", "prompt_file"} 或 {"ok": False, "error"}。
+    """
+    sched = _STATE["scheduler"]
+    bots = _STATE["bots"]
+    config_path = _STATE["config_path"]
+    if sched is None or bots is None or not config_path:
+        return {"ok": False, "error": "scheduler 未启动（需要 scheduled_tasks.yaml 至少一条任务才会起）"}
+
+    cron = (cron or "").strip()
+    if not cron:
+        return {"ok": False, "error": "cron 不能为空（五段：分 时 日 月 周）"}
+    if not (prompt and prompt.strip()):
+        return {"ok": False, "error": "prompt 不能为空"}
+    if not chat_id:
+        return {"ok": False, "error": "缺少 chat_id"}
+
+    bot = bots.get(profile) if profile else None
+    if bot is None and len(bots) == 1:
+        bot = next(iter(bots.values()))
+    if bot is None:
+        return {"ok": False, "error": f"profile {profile!r} 未加载（多 bot 必须指定）"}
+    prof = bot.profile.name
+    user = user_id or bot.store.find_primary_user() or ""
+    if not user:
+        return {"ok": False, "error": "无法确定归属人 user_id"}
+
+    # 先校验 cron 合法（非法就别落盘）
+    try:
+        CronTrigger.from_crontab(cron, timezone=timezone)
+    except Exception as e:
+        return {"ok": False, "error": f"cron 非法: {e}"}
+
+    # uuid 后缀：同一秒批量创建两条也不会撞 job id
+    name = f"agent_cron_{int(time.time())}_{uuid.uuid4().hex[:4]}"
+    base_dir = os.path.dirname(os.path.abspath(config_path))
+    rel_prompt = os.path.join("data", "agent_crons", f"{name}.md")
+    abs_prompt = os.path.join(base_dir, rel_prompt)
+    try:
+        os.makedirs(os.path.dirname(abs_prompt), exist_ok=True)
+        with open(abs_prompt, "w", encoding="utf-8") as f:
+            f.write(prompt.strip() + "\n")
+    except OSError as e:
+        return {"ok": False, "error": f"写 prompt 文件失败: {type(e).__name__}: {e}"}
+
+    entry = {
+        "name": name,
+        "profile": prof,
+        "cron": cron,
+        "timezone": timezone,
+        "chat_id": chat_id,
+        "user_id": user,
+        "topic_title": (title.strip() or f"⏰ 定时任务")[:60],
+        "topic_body": "🧵 定时任务（agent 创建）",
+        "prompt_file": rel_prompt,
+    }
+    # yaml.safe_dump 负责所有转义/引号；append-only 保留既有内容与注释。
+    chunk = yaml.safe_dump([entry], allow_unicode=True, sort_keys=False, default_flow_style=False)
+    try:
+        existing = ""
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+        sep = "" if (not existing or existing.endswith("\n")) else "\n"
+        with open(config_path, "w", encoding="utf-8") as f:
+            f.write(existing + sep + chunk)
+    except OSError as e:
+        # 落盘失败：清理已写的 prompt 文件，避免留垃圾
+        try:
+            os.remove(abs_prompt)
+        except OSError:
+            pass
+        return {"ok": False, "error": f"写 scheduled_tasks.yaml 失败: {type(e).__name__}: {e}"}
+
+    res = reload_tasks()
+    if not res.get("ok"):
+        return {"ok": False, "error": f"reload 失败: {res.get('error')}"}
+
+    job = sched.get_job(name)
+    nxt = str(job.next_run_time) if (job and job.next_run_time) else "?"
+    print(f"[scheduler/cron] ✅ 新增 {name} profile={prof} cron='{cron}' → next {nxt}", flush=True)
+    return {"ok": True, "name": name, "cron": cron, "next_run": nxt, "prompt_file": rel_prompt}
+
+
+def list_crons(chat_id: str = "") -> dict:
+    """列出 scheduler 里的 job（含 agent 创建的重复 cron + 一次性 wake）。
+
+    chat_id 非空时只返回该 chat 作用域内的 job（多群共用 bot 时不把 A 群排的
+    任务名泄露给 B 群的 agent）；归属未知的 job 一并隐藏。chat_id 为空 = 全量
+    （本机运维路径，如 http /list_crons 不带参）。"""
+    sched = _STATE["scheduler"]
+    if sched is None:
+        return {"ok": False, "error": "scheduler 未启动"}
+    jobs = []
+    for j in sched.get_jobs():
+        if chat_id and _JOB_CHAT_SCOPE.get(str(j.id)) != chat_id:
+            continue
+        jobs.append({
+            "name": j.id,
+            "next_run": str(j.next_run_time) if j.next_run_time else None,
+            "agent_created": str(j.id).startswith("agent_cron_"),
+        })
+    return {"ok": True, "jobs": jobs}
 
 
 def reload_tasks() -> dict:
@@ -223,6 +463,7 @@ def reload_tasks() -> dict:
             sched.remove_job(name)
         except Exception:
             pass
+        _JOB_CHAT_SCOPE.pop(name, None)
         removed.append(name)
     _TASK_REGISTRY.clear()
 
@@ -239,6 +480,7 @@ def reload_tasks() -> dict:
             continue
         async_fire = _make_async_fire(task, bot, spawn_fn)
         _TASK_REGISTRY[task.name] = async_fire
+        _JOB_CHAT_SCOPE[task.name] = task.chat_id
         sched.add_job(
             _make_sync_fire(task.name, async_fire, bot_loop),
             trigger=trigger, id=task.name, name=task.name,
@@ -266,10 +508,12 @@ def start_scheduler(
 
     若 yaml 不存在或为空，返回 None。
     """
+    # yaml 为空/不存在也照常启动：scheduler 还是 wake_me_in / schedule_cron 的
+    # 持久兑现层，没配 cron 任务不等于不需要它（此前空配置直接 return None，
+    # 导致新部署里 runtime MCP 的 wake/cron 能力整体不可用）。
     tasks = _load_tasks(config_path)
     if not tasks:
-        print(f"[scheduler] 未配置定时任务（{config_path}），跳过", flush=True)
-        return None
+        print(f"[scheduler] 未配置定时任务（{config_path}），空载启动（wake/cron 仍可用）", flush=True)
 
     scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
     _TASK_REGISTRY.clear()
@@ -288,6 +532,7 @@ def start_scheduler(
 
         async_fire = _make_async_fire(task, bot, spawn_fn)
         _TASK_REGISTRY[task.name] = async_fire
+        _JOB_CHAT_SCOPE[task.name] = task.chat_id
 
         scheduler.add_job(
             _make_sync_fire(task.name, async_fire, bot_loop),

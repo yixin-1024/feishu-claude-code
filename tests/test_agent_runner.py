@@ -124,3 +124,37 @@ def test_run_agent_dispatches_to_mimo(monkeypatch):
     assert captured["model"] == "quotio/claude-opus-4-8"
     assert captured["provider"] == "quotio"
     assert captured["base_url"] == "http://127.0.0.1:8317/v1"
+
+
+def test_run_agent_merges_wake_context_into_claude_env(monkeypatch):
+    captured = {}
+
+    async def fake_claude(**kwargs):
+        captured.update(kwargs)
+        return "ok", "sid_1", False
+
+    monkeypatch.setattr("agent_runner.run_claude", fake_claude)
+    monkeypatch.setattr("agent_runner.load_claude_extra_env", lambda _profile: {
+        "ANTHROPIC_MODEL": "claude-sonnet-4-6",
+        "EXISTING": "1",
+    })
+
+    text, sid, fallback = asyncio.run(run_agent(
+        profile=_profile("claude"),
+        runner="claude",
+        message="hi",
+        model="claude-opus-4-8",
+        cwd="/tmp",
+        wake_context={
+            "CC_LARK_CLI_PROFILE": "work",
+            "CC_LARK_MESSAGE_ID": "om_1",
+        },
+    ))
+
+    assert text == "ok"
+    assert sid == "sid_1"
+    assert fallback is False
+    assert captured["extra_env"]["EXISTING"] == "1"
+    assert captured["extra_env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4-6"
+    assert captured["extra_env"]["CC_LARK_CLI_PROFILE"] == "work"
+    assert captured["extra_env"]["CC_LARK_MESSAGE_ID"] == "om_1"

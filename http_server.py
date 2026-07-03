@@ -46,6 +46,14 @@ class HttpHandlers:
     fire_task: Callable[[str], Awaitable[None]]
     list_tasks: Callable[[], list]
     reload_tasks: Callable[[], dict]
+    # 同步：把"N 分钟后唤醒本话题"挂到常驻 scheduler（cc_mcp_server 的 wake_me_in 后端）
+    schedule_wake: Callable[..., dict]
+    # async：通用多 agent 派发 / 监工（cc_mcp_server 的 dispatch_task / read_thread 后端）
+    dispatch_task: Callable[..., Awaitable[dict]]
+    read_thread: Callable[..., Awaitable[dict]]
+    # 同步：重复定时任务（cc_mcp_server 的 schedule_cron / list_crons 后端）
+    schedule_cron: Callable[..., dict]
+    list_crons: Callable[..., dict]
 
 
 _bot_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -180,6 +188,26 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             self._handle_reload()
             return
 
+        if parsed.path == "/wake":
+            self._handle_wake(body)
+            return
+
+        if parsed.path == "/dispatch":
+            self._handle_dispatch(body)
+            return
+
+        if parsed.path == "/read_thread":
+            self._handle_read_thread(body)
+            return
+
+        if parsed.path == "/schedule_cron":
+            self._handle_schedule_cron(body)
+            return
+
+        if parsed.path == "/list_crons":
+            self._handle_list_crons(body)
+            return
+
         # 默认：卡片按钮回调
         try:
             data = json.loads(body)
@@ -281,6 +309,160 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             return
         _submit(_handlers.fire_task(name))
         self._respond(200, {"ok": True, "fired": name})
+
+    def _handle_wake(self, body: bytes):
+        """cc_mcp_server 的 wake_me_in → 在常驻 scheduler 挂一个一次性唤醒任务。
+
+        仅本机：MCP server 跑在 bot spawn 的 claude 子进程里，必经 127.0.0.1。
+        schedule_wake 是同步的（只 add_job，不阻塞），直接调即可。
+        """
+        if not _is_localhost(self.client_address):
+            self._respond(403, {"ok": False, "error": "wake is localhost only"})
+            return
+        try:
+            params = json.loads(body) if body else {}
+            if not isinstance(params, dict):
+                raise ValueError("body must be a JSON object")
+        except Exception as e:
+            self._respond(400, {"ok": False, "error": f"bad json: {e}"})
+            return
+        try:
+            result = _handlers.schedule_wake(
+                profile=(params.get("profile") or "").strip(),
+                chat_id=(params.get("chat_id") or "").strip(),
+                thread_id=(params.get("thread_id") or "").strip(),
+                anchor_message_id=(params.get("anchor_message_id") or "").strip(),
+                user_id=(params.get("user_id") or "").strip(),
+                minutes=params.get("minutes"),
+                note=params.get("note") or "",
+            )
+        except Exception as e:
+            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+        self._respond(200 if result.get("ok") else 400, result)
+
+    def _resolve_bot_by_profile(self, name: str) -> Optional[BotInstance]:
+        name = (name or "").strip()
+        if name and name in _bots:
+            return _bots[name]
+        if len(_bots) == 1:
+            return next(iter(_bots.values()))
+        return None
+
+    def _run_on_loop(self, coro, timeout: float):
+        """把 async handler 投到 bot_loop 跑并等结果（dispatch/read_thread 需要返回值）。"""
+        fut = asyncio.run_coroutine_threadsafe(coro, _bot_loop)
+        return fut.result(timeout=timeout)
+
+    def _handle_dispatch(self, body: bytes):
+        """cc_mcp_server 的 dispatch_task → 在目标群新开 thread 派独立子会话。"""
+        if not _is_localhost(self.client_address):
+            self._respond(403, {"ok": False, "error": "dispatch is localhost only"})
+            return
+        try:
+            p = json.loads(body) if body else {}
+            if not isinstance(p, dict):
+                raise ValueError("body must be a JSON object")
+        except Exception as e:
+            self._respond(400, {"ok": False, "error": f"bad json: {e}"})
+            return
+        bot = self._resolve_bot_by_profile(p.get("profile") or "")
+        if bot is None:
+            self._respond(400, {"ok": False, "error": "profile 未加载（多 bot 必须指定 profile）"})
+            return
+        try:
+            result = self._run_on_loop(
+                _handlers.dispatch_task(
+                    bot,
+                    user_id=(p.get("user_id") or "").strip(),
+                    group_chat_id=(p.get("chat_id") or p.get("group_chat_id") or "").strip(),
+                    title=(p.get("title") or "").strip(),
+                    prompt=p.get("prompt") or "",
+                    parent_thread=(p.get("parent_thread") or "").strip(),
+                    parent_anchor=(p.get("parent_anchor") or "").strip(),
+                ),
+                timeout=30,
+            )
+        except Exception as e:
+            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+        self._respond(200 if result.get("ok") else 400, result)
+
+    def _handle_read_thread(self, body: bytes):
+        """cc_mcp_server 的 read_thread → 拉回某 thread 的消息 transcript。"""
+        if not _is_localhost(self.client_address):
+            self._respond(403, {"ok": False, "error": "read_thread is localhost only"})
+            return
+        try:
+            p = json.loads(body) if body else {}
+            if not isinstance(p, dict):
+                raise ValueError("body must be a JSON object")
+        except Exception as e:
+            self._respond(400, {"ok": False, "error": f"bad json: {e}"})
+            return
+        bot = self._resolve_bot_by_profile(p.get("profile") or "")
+        if bot is None:
+            self._respond(400, {"ok": False, "error": "profile 未加载（多 bot 必须指定 profile）"})
+            return
+        try:
+            limit = int(p.get("limit") or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            result = self._run_on_loop(
+                _handlers.read_thread(bot, thread_id=(p.get("thread_id") or "").strip(), limit=limit),
+                timeout=30,
+            )
+        except Exception as e:
+            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+        self._respond(200 if result.get("ok") else 400, result)
+
+    def _handle_schedule_cron(self, body: bytes):
+        """cc_mcp_server 的 schedule_cron → 新增一条重复定时任务（写 yaml + reload）。同步。"""
+        if not _is_localhost(self.client_address):
+            self._respond(403, {"ok": False, "error": "schedule_cron is localhost only"})
+            return
+        try:
+            p = json.loads(body) if body else {}
+            if not isinstance(p, dict):
+                raise ValueError("body must be a JSON object")
+        except Exception as e:
+            self._respond(400, {"ok": False, "error": f"bad json: {e}"})
+            return
+        try:
+            result = _handlers.schedule_cron(
+                profile=(p.get("profile") or "").strip(),
+                chat_id=(p.get("chat_id") or "").strip(),
+                user_id=(p.get("user_id") or "").strip(),
+                cron=(p.get("cron") or "").strip(),
+                prompt=p.get("prompt") or "",
+                title=(p.get("title") or "").strip(),
+            )
+        except Exception as e:
+            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+        self._respond(200 if result.get("ok") else 400, result)
+
+    def _handle_list_crons(self, body: bytes = b""):
+        """body 可带 {"chat_id": "oc_..."} 把结果限定到该 chat 的作用域（agent 路径必带）；
+        不带 = 全量（本机运维 curl）。"""
+        if not _is_localhost(self.client_address):
+            self._respond(403, {"ok": False, "error": "list_crons is localhost only"})
+            return
+        chat_id = ""
+        try:
+            p = json.loads(body) if body else {}
+            if isinstance(p, dict):
+                chat_id = (p.get("chat_id") or "").strip()
+        except Exception:
+            pass  # body 非 JSON 就当全量
+        try:
+            result = _handlers.list_crons(chat_id)
+        except Exception as e:
+            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            return
+        self._respond(200 if result.get("ok") else 400, result)
 
     def _handle_reload(self):
         if not _is_localhost(self.client_address):

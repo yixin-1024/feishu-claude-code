@@ -28,6 +28,7 @@ import re
 import signal
 import struct
 import subprocess as sp
+import sys
 import termios
 import time
 import uuid
@@ -733,6 +734,59 @@ async def run_claude(
         if append_system_prompt:
             cmd += ["--append-system-prompt", append_system_prompt]
         cmd += ["--permission-mode", permission_mode or PERMISSION_MODE]
+
+        # ── 禁掉 Claude Code 自带的、在 cc-lark 里"要么不工作、要么和我们自定义 MCP 工具
+        # 打架"的内置工具，强制 agent 只走我们这套（dispatch_task / wake_me_in / schedule_cron）：
+        #   · 内置 subagent / 多 agent 编排：Task / Workflow / SendMessage / RemoteTrigger
+        #     —— 它们 spawn 的子进程在本 turn 进程组里，turn 结束就被 killpg 杀（原始 bug）；
+        #        我们的 dispatch_task 才是跑在常驻 bot 名下、能活过本轮的正解。
+        #   · 内置自我唤醒 / 等事件：ScheduleWakeup / Monitor —— cc-lark 无常驻 runtime 兑现，
+        #        用 wake_me_in（bot scheduler 真兑现）替代。
+        #   · 内置 cron：CronCreate / CronDelete / CronList —— 同理不被兑现，用 schedule_cron。
+        # 可用 CC_LARK_DISALLOWED_TOOLS（逗号分隔）整体覆盖；设为空串则一个都不禁。
+        _default_deny = (
+            "Task,Workflow,SendMessage,RemoteTrigger,"
+            "ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList"
+        )
+        _deny = os.getenv("CC_LARK_DISALLOWED_TOOLS", _default_deny).strip()
+        if _deny:
+            cmd += ["--disallowedTools", _deny]
+
+        # ── cc 运行时 MCP 注入（wake_me_in 等只有常驻 bot 能兑现的工具）──────
+        # 纯附加 + 全程 try/except：构造出任何问题都"跳过、不加 flag"，绝不阻断 spawn。
+        # 用 --mcp-config（不带 --strict-mcp-config）→ 与用户既有 MCP server **合并**，
+        # 不会顶掉 peekaboo/amap 等（已对 CLI 2.1.196 核实）。inline JSON 串，免临时文件。
+        # 上下文经 extra_env 的 CC_LARK_* 进来（dispatcher._run_and_display 注入），
+        # 原样写进 stdio server 的 env 块 → 模型无需也无法把 thread/@ 传错。
+        # CC_LARK_WAKE_MCP=0 可一键关闭。
+        if (extra_env or {}).get("CC_LARK_THREAD_ID") and os.getenv("CC_LARK_WAKE_MCP", "1") != "0":
+            try:
+                _cc_server = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "cc_mcp_server.py"
+                )
+                if os.path.isfile(_cc_server):
+                    _cc_env = {
+                        k: str(v) for k, v in extra_env.items()
+                        if k.startswith("CC_LARK_") and v is not None
+                    }
+                    # 能力闸门（bot 环境显式配 0/false 才关；未设=开）。透传给 cc_mcp_server，
+                    # 关掉的能力对应工具直接不注册 = 对 agent 隐形。见 cc_mcp_server._allow。
+                    for _flag in ("CC_LARK_ALLOW_DISPATCH", "CC_LARK_ALLOW_WAKE", "CC_LARK_ALLOW_CRON"):
+                        _fv = os.getenv(_flag)
+                        if _fv is not None:
+                            _cc_env[_flag] = _fv
+                    _cc_cfg = {
+                        "mcpServers": {
+                            "cc-lark": {
+                                "command": sys.executable,
+                                "args": [_cc_server],
+                                "env": _cc_env,
+                            }
+                        }
+                    }
+                    cmd += ["--mcp-config", json.dumps(_cc_cfg)]
+            except Exception as _e:
+                print(f"[claude_pty] cc-mcp 注入跳过: {type(_e).__name__}: {_e}", flush=True)
 
         # ── 起 PTY ────────────────────────────────────────
         master_fd, slave_fd = pty.openpty()

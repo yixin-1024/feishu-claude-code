@@ -317,6 +317,16 @@ python3 main.py
 
 **手动派单：** 也可以直接 `curl http://localhost:9981/spawn -d '{"profile":"work","chat_id":"oc_xxx","thread_id":"omt_xxx","anchor_message_id":"om_xxx","prompt":"..."}'` —— 仅本机可调。
 
+## 内置 Claude Code MCP
+
+cc-lark 会在 Claude Code PTY 启动时自动注入一个运行时 MCP server：`cc_mcp_server.py`。
+它暴露 `wake_me_in(minutes, note)`，让 Claude 在当前 Lark 话题里安排一个未来唤醒：
+MCP 前端只把请求 POST 到本机 `/wake`，真正的延迟调度由常驻 bot 的 scheduler 兑现。
+
+这条路径只在话题群上下文可用；runner 会把当前 `profile / chat_id / thread_id /
+anchor_message_id / user_id` 通过 `CC_LARK_*` 环境变量注入给 MCP server。设置
+`CC_LARK_WAKE_MCP=0` 可关闭自动注入。
+
 ## 定时任务
 
 YAML 定义 cron 任务，到点自动在话题群发顶楼并派给 `/spawn`。

@@ -26,7 +26,10 @@ async def run_agent(
     on_usage: Optional[Callable[[dict], None]] = None,
     on_status: Optional[Callable[[str, str], None]] = None,
     append_system_prompt: Optional[str] = None,
+    wake_context: Optional[dict] = None,
 ) -> tuple[str, Optional[str], bool]:
+    """wake_context: 本轮 Lark 会话上下文（CC_LARK_* 形态），仅 claude 后端用——
+    透传成 extra_env 注入 spawn，让 cc_mcp_server 的 wake_me_in 能定向唤醒本话题。"""
     backend = (runner or profile.runner or "claude").strip().lower()
     if backend == "opencode":
         return await run_opencode(
@@ -91,6 +94,9 @@ async def run_agent(
             idle_timeout_sec=profile.codex_idle_timeout_sec,
         )
 
+    claude_env = load_claude_extra_env(profile) or {}
+    if wake_context:
+        claude_env = {**claude_env, **wake_context}
     return await run_claude(
         message=message,
         session_id=session_id,
@@ -103,5 +109,5 @@ async def run_agent(
         on_usage=on_usage,
         on_status=on_status,
         append_system_prompt=append_system_prompt,
-        extra_env=load_claude_extra_env(profile) or None,
+        extra_env=claude_env or None,
     )
