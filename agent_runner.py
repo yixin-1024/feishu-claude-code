@@ -97,6 +97,9 @@ async def run_agent(
     claude_env = load_claude_extra_env(profile) or {}
     if wake_context:
         claude_env = {**claude_env, **wake_context}
+    if profile.claude_runner:
+        # profile 级子后端选择优先于 claude env 文件，便于单独切换某个 bot。
+        claude_env = {**claude_env, "CLAUDE_RUNNER": profile.claude_runner}
     return await run_claude(
         message=message,
         session_id=session_id,

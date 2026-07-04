@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import subprocess as sp
+import sys
 from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, CLAUDE_CLI
@@ -60,6 +61,62 @@ def _extract_text_content(value) -> str:
                 parts.append(item.get("text", ""))
         return "".join(parts)
     return ""
+
+
+def _runner_backend_from_env(extra_env: Optional[dict]) -> str:
+    return (
+        (extra_env or {}).get("CLAUDE_RUNNER")
+        or os.getenv("CLAUDE_RUNNER", _RUNNER_BACKEND)
+        or "pty"
+    ).strip().lower()
+
+
+def _cc_lark_cli_args(extra_env: Optional[dict]) -> list[str]:
+    """Build cc-lark specific Claude CLI flags shared by print and PTY modes."""
+    args: list[str] = []
+    default_deny = (
+        "Task,Workflow,SendMessage,RemoteTrigger,"
+        "ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList"
+    )
+    deny = os.getenv("CC_LARK_DISALLOWED_TOOLS", default_deny).strip()
+    if deny:
+        args += ["--disallowedTools", deny]
+
+    if not (extra_env or {}).get("CC_LARK_THREAD_ID"):
+        return args
+    if os.getenv("CC_LARK_WAKE_MCP", "1") == "0":
+        return args
+
+    try:
+        cc_server = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "cc_mcp_server.py"
+        )
+        if not os.path.isfile(cc_server):
+            return args
+        cc_env = {
+            k: str(v) for k, v in (extra_env or {}).items()
+            if k.startswith("CC_LARK_") and v is not None
+        }
+        for flag in ("CC_LARK_ALLOW_DISPATCH", "CC_LARK_ALLOW_WAKE", "CC_LARK_ALLOW_CRON"):
+            flag_value = os.getenv(flag)
+            if flag_value is not None:
+                cc_env[flag] = flag_value
+        cc_cfg = {
+            "mcpServers": {
+                "cc-lark": {
+                    "command": sys.executable,
+                    "args": [cc_server],
+                    "env": cc_env,
+                }
+            }
+        }
+        args += ["--mcp-config", json.dumps(cc_cfg)]
+    except Exception as exc:
+        print(
+            f"[claude_runner] cc-mcp 注入跳过: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+    return args
 
 
 async def _fire_callback(cb, *args):
@@ -110,7 +167,7 @@ async def run_claude(
         pass
 
     try:
-        runner_backend = os.getenv("CLAUDE_RUNNER", _RUNNER_BACKEND).strip().lower()
+        runner_backend = _runner_backend_from_env(extra_env)
         if runner_backend == "print":
             return await _run_claude_print(
                 message=message,
@@ -186,6 +243,7 @@ async def _run_claude_print(
             cmd += ["--model", effective_model]
         if append_system_prompt:
             cmd += ["--append-system-prompt", append_system_prompt]
+        cmd += _cc_lark_cli_args(extra_env)
 
         env = os.environ.copy()
         env.pop("CLAUDECODE", None)

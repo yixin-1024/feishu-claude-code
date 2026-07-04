@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 
@@ -85,6 +86,61 @@ def test_run_claude_prefers_final_result_over_partial_deltas(monkeypatch):
     assert used_fallback is False
     assert proc.stdin.buffer.endswith(b"hi\n")
     assert proc.stdin.closed is True
+
+
+def test_extra_env_selects_print_backend_over_parent_pty(monkeypatch):
+    monkeypatch.setenv("CLAUDE_RUNNER", "pty")
+    proc = FakeProc([
+        b'{"type":"result","session_id":"sid_print","result":"ok"}\n',
+    ])
+    captured = {}
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    text, session_id, used_fallback = asyncio.run(
+        run_claude("hi", extra_env={"CLAUDE_RUNNER": "print"})
+    )
+
+    assert text == "ok"
+    assert session_id == "sid_print"
+    assert used_fallback is False
+    assert "--print" in captured["cmd"]
+
+
+def test_print_backend_injects_cc_lark_mcp(monkeypatch):
+    proc = FakeProc([
+        b'{"type":"result","session_id":"sid_1","result":"ok"}\n',
+    ])
+    captured = {}
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    asyncio.run(run_claude(
+        "hi",
+        extra_env={
+            "CLAUDE_RUNNER": "print",
+            "CC_LARK_THREAD_ID": "omt_1",
+            "CC_LARK_MESSAGE_ID": "om_1",
+            "CC_LARK_CLI_PROFILE": "work",
+        },
+    ))
+
+    cmd = captured["cmd"]
+    assert "--disallowedTools" in cmd
+    assert "--mcp-config" in cmd
+    cfg = json.loads(cmd[cmd.index("--mcp-config") + 1])
+    server = cfg["mcpServers"]["cc-lark"]
+    assert server["args"][0].endswith("cc_mcp_server.py")
+    assert server["env"]["CC_LARK_THREAD_ID"] == "omt_1"
+    assert server["env"]["CC_LARK_CLI_PROFILE"] == "work"
 
 
 def test_run_claude_returns_partial_output_on_nonzero_exit_with_stderr(monkeypatch):

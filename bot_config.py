@@ -83,6 +83,10 @@ class Profile:
     # 用于把某个 bot 路由到不同的模型供应商（如 .env.deepseek 走 DeepSeek 的 Anthropic 兼容端点）。
     # 文件格式见 load_claude_extra_env：支持 JSON {"env":{...}} 或 dotenv KEY=VALUE。
     claude_env_file: str = ""
+    # 可选：Claude Code 子后端。空=沿用全局 CLAUDE_RUNNER；pty=交互式 JSONL tail；
+    # print=`claude --print --output-format stream-json`。用于单独绕开某个 profile
+    # 的 PTY/JSONL 兼容性问题。
+    claude_runner: str = ""
     codex_bin: str = ""
     codex_sandbox_mode: str = ""
     codex_approval_policy: str = ""
@@ -193,6 +197,11 @@ def _load_profile(name: str) -> Profile:
         raise ValueError(
             f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo，当前: {runner}"
         )
+    claude_runner = env("CLAUDE_RUNNER").strip().lower()
+    if claude_runner and claude_runner not in {"pty", "print"}:
+        raise ValueError(
+            f"profile {name!r} 的 {prefix}_CLAUDE_RUNNER 必须是 pty / print，当前: {claude_runner}"
+        )
     try:
         codex_bypass = int(env("CODEX_DANGEROUS_BYPASS", os.getenv("CODEX_DANGEROUS_BYPASS", "2")) or "2")
     except ValueError:
@@ -232,6 +241,7 @@ def _load_profile(name: str) -> Profile:
         allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),
         claude_env_file=env("CLAUDE_ENV_FILE").strip(),
+        claude_runner=claude_runner,
         codex_bin=env("CODEX_BIN", os.getenv("CODEX_BIN", "")).strip(),
         codex_sandbox_mode=env("CODEX_SANDBOX_MODE", os.getenv("CODEX_SANDBOX_MODE", "")).strip(),
         codex_approval_policy=env("CODEX_APPROVAL_POLICY", os.getenv("CODEX_APPROVAL_POLICY", "")).strip(),
@@ -312,6 +322,7 @@ def _load_legacy_profile() -> Optional[Profile]:
         allowed_group_chat_ids=_split_csv(os.getenv("ALLOWED_GROUP_CHAT_IDS", "")),
         lark_cli_profile=os.getenv("LARK_CLI_PROFILE", legacy_name),
         claude_env_file=os.getenv("CLAUDE_ENV_FILE", "").strip(),
+        claude_runner=os.getenv("CLAUDE_RUNNER", "").strip().lower(),
         codex_bin=os.getenv("CODEX_BIN", "").strip(),
         codex_sandbox_mode=os.getenv("CODEX_SANDBOX_MODE", "").strip(),
         codex_approval_policy=os.getenv("CODEX_APPROVAL_POLICY", "").strip(),

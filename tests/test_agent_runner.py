@@ -158,3 +158,32 @@ def test_run_agent_merges_wake_context_into_claude_env(monkeypatch):
     assert captured["extra_env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4-6"
     assert captured["extra_env"]["CC_LARK_CLI_PROFILE"] == "work"
     assert captured["extra_env"]["CC_LARK_MESSAGE_ID"] == "om_1"
+
+
+def test_run_agent_applies_profile_claude_runner(monkeypatch):
+    captured = {}
+
+    async def fake_claude(**kwargs):
+        captured.update(kwargs)
+        return "ok", "sid_1", False
+
+    monkeypatch.setattr("agent_runner.run_claude", fake_claude)
+    monkeypatch.setattr("agent_runner.load_claude_extra_env", lambda _profile: {
+        "CLAUDE_RUNNER": "pty",
+    })
+
+    profile = _profile("claude")
+    profile.claude_runner = "print"
+
+    text, sid, fallback = asyncio.run(run_agent(
+        profile=profile,
+        runner="claude",
+        message="hi",
+        model="claude-opus-4-8",
+        cwd="/tmp",
+    ))
+
+    assert text == "ok"
+    assert sid == "sid_1"
+    assert fallback is False
+    assert captured["extra_env"]["CLAUDE_RUNNER"] == "print"

@@ -114,6 +114,27 @@ def _snapshot_session_uuids(project_dir: str) -> set[str]:
     return out
 
 
+def _snapshot_session_files(project_dir: str) -> dict[str, tuple[str, int]]:
+    """Return session id -> (jsonl path, current size) for a project dir."""
+    if not os.path.isdir(project_dir):
+        return {}
+    out: dict[str, tuple[str, int]] = {}
+    try:
+        names = os.listdir(project_dir)
+    except OSError:
+        return {}
+    for f in names:
+        if not (f.endswith(".jsonl") and len(f) == 36 + 6):
+            continue
+        sid = f[:-6]
+        path = os.path.join(project_dir, f)
+        try:
+            out[sid] = (path, os.path.getsize(path))
+        except OSError:
+            continue
+    return out
+
+
 def _jsonl_birth_time(path: str) -> Optional[float]:
     """文件创建时间（macOS st_birthtime；Linux 没有则回退到 st_ctime）。"""
     try:
@@ -271,6 +292,118 @@ def _jsonl_owns_message(
         # 见上面 docstring：必须等 content 写出来才能校验，不准走 only_candidate 捷径。
         return None
     return expected_prefix in _normalize_for_match(content)
+
+
+def _jsonl_owns_message_since(
+    path: str,
+    expected_prefix: Optional[str],
+    start_offset: int,
+    *,
+    max_lines: int = 120,
+) -> Optional[bool]:
+    """Whether JSONL content appended after start_offset belongs to this prompt.
+
+    Used when fresh sessions let Claude choose the session id. For normal text we
+    require the normalized prompt prefix to appear in the newly appended user
+    event. For short/image-only prompts (no stable prefix), the caller must only
+    accept a single unambiguous candidate.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, start_offset))
+            for _ in range(max_lines):
+                raw = f.readline()
+                if not raw:
+                    break
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    ev = json.loads(raw.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") != "user" or ev.get("isMeta") is True:
+                    continue
+                msg = ev.get("message") or {}
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content")
+                if isinstance(content, str):
+                    text = content
+                    has_real_input = bool(content.strip())
+                elif isinstance(content, list):
+                    text_parts: list[str] = []
+                    has_real_input = False
+                    for blk in content:
+                        if not isinstance(blk, dict):
+                            continue
+                        btype = blk.get("type")
+                        if btype == "tool_result":
+                            continue
+                        if btype == "text":
+                            t = blk.get("text")
+                            if isinstance(t, str) and t.strip():
+                                text_parts.append(t)
+                                has_real_input = True
+                        elif btype:
+                            has_real_input = True
+                    text = "".join(text_parts)
+                else:
+                    continue
+
+                if not has_real_input:
+                    continue
+                if expected_prefix is None:
+                    return True
+                if text and expected_prefix in _normalize_for_match(text):
+                    return True
+                return False
+    except OSError:
+        return None
+    return None
+
+
+def _find_matching_session_jsonl(
+    project_dir: str,
+    before_files: dict[str, tuple[str, int]],
+    expected_prefix: Optional[str],
+) -> Optional[tuple[str, str, int]]:
+    """Find the actual JSONL produced by a fresh interactive Claude run.
+
+    Claude Code versions can change how strictly interactive mode honors
+    --session-id. To avoid both missed sessions and cross-talk, only adopt a
+    JSONL when the newly appended user event matches this prompt. Short or
+    image-only prompts have no stable prefix; those are accepted only when
+    exactly one brand-new JSONL candidate exists.
+    """
+    current = _snapshot_session_files(project_dir)
+    matches: list[tuple[str, str, int]] = []
+    for sid, (path, size) in current.items():
+        before = before_files.get(sid)
+        if before is None:
+            start_offset = 0
+        else:
+            _, old_size = before
+            if size <= old_size:
+                continue
+            # With no prefix, an existing modified session is too ambiguous.
+            if expected_prefix is None:
+                continue
+            start_offset = old_size
+
+        verdict = _jsonl_owns_message_since(path, expected_prefix, start_offset)
+        if verdict is True:
+            matches.append((sid, path, start_offset))
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(
+            f"[run_claude_pty] fresh jsonl 匹配到多个候选，保守等待: "
+            f"{[m[0] for m in matches]}",
+            flush=True,
+        )
+    return None
 
 
 def _ensure_cwd_trusted(cwd: str) -> None:
@@ -699,18 +832,28 @@ async def run_claude(
         os.makedirs(project_dir, exist_ok=True)
 
         # ── 准备 jsonl 起点 ──────────────────────────────
-        # fresh 会话：预生成一个确定的 session id，用 --session-id 强制 Claude CLI
-        # 把对话写到 <forced_id>.jsonl。jsonl 路径**事前完全确定**，不再需要 spawn
-        # 之后去共享 project 目录里"扫出本次 run 产生的那个 jsonl"——并发同一个 cwd 的
-        # 多个 thread 各自 forced_id 不同，物理上不可能串台。根治了旧"扫描 + 前缀匹配"
-        # 逻辑在带图片 / 短消息时退化成"单候选默认接受"，把邻居会话的 jsonl 错认成自己、
-        # 卡片正文完全串台的事故（闲鱼 thread 的卡片显示成汽车之家二手车那次）。
-        # resume 路径不变：Claude CLI 对 --resume X 是**追加**写回 X.jsonl（已实测），
-        # X 是 thread 专属 id，天然不会和别的 thread 撞文件。
-        forced_session_id = active_session_id or str(uuid.uuid4())
-        jsonl_path: Optional[str] = os.path.join(
-            project_dir, f"{forced_session_id}.jsonl"
+        # resume 路径：Claude CLI 对 --resume X 是追加写回 X.jsonl（已实测）。
+        # fresh 路径：默认让 Claude 自己生成 session id，再按“本轮启动后写入的
+        # user 事件内容”接管实际 JSONL。之前强制 --session-id 可以避免扫描，但
+        # 2.1.201 现场出现过 TUI 已响应、forced JSONL 却完全不落盘的情况；默认
+        # 回到内容匹配，保留 CLAUDE_PTY_FORCE_SESSION_ID=1 作为诊断/回滚开关。
+        force_fresh_session_id = (
+            os.getenv("CLAUDE_PTY_FORCE_SESSION_ID", "").strip().lower()
+            in {"1", "true", "yes", "on"}
         )
+        forced_session_id = (
+            active_session_id
+            or (str(uuid.uuid4()) if force_fresh_session_id else None)
+        )
+        jsonl_path: Optional[str] = (
+            os.path.join(project_dir, f"{forced_session_id}.jsonl")
+            if forced_session_id
+            else None
+        )
+        before_session_files = (
+            _snapshot_session_files(project_dir) if not active_session_id else {}
+        )
+        expected_prefix = _expected_match_prefix(message)
         if active_session_id:
             start_offset = (
                 os.path.getsize(jsonl_path) if os.path.isfile(jsonl_path) else 0
@@ -726,8 +869,8 @@ async def run_claude(
         cmd = [CLAUDE_CLI]
         if active_session_id:
             cmd += ["--resume", active_session_id]
-        else:
-            # fresh：用预生成 id 接管 session 文件名，jsonl 路径事前确定、免 racy 扫描
+        elif forced_session_id:
+            # 可选诊断路径：用预生成 id 接管 session 文件名。
             cmd += ["--session-id", forced_session_id]
         if effective_model:
             cmd += ["--model", effective_model]
@@ -872,11 +1015,10 @@ async def run_claude(
                         _decode_tail(tail_buffer) or "PTY broken on send",
                     )
 
-            # ── fresh session：等我们这个**确定的** jsonl 落出 user 行 ─────────
-            # jsonl 路径已被 --session-id 钉死成 forced_session_id.jsonl，文件名本身
-            # 就是凭证——不存在"这个 jsonl 是不是本次 run 产生的"这种判断（旧逻辑靠扫
-            # 共享目录 + birth_time + 前缀匹配来猜，并发同 cwd 时会猜错、串台）。这里
-            # 只剩一件事：确认用户输入真被 Claude TUI 接受（写出一条真实 user 行）。
+            # ── fresh session：等实际 jsonl 落出本轮 user 行 ────────────────
+            # 首选 forced path（开启 CLAUDE_PTY_FORCE_SESSION_ID 时），否则扫描本
+            # 轮启动后新建/追加的 JSONL，并用 user 内容前缀认领。短消息/纯图片无
+            # 稳定前缀，只在唯一新候选时接受；多候选宁可等待，也不能串台。
             # 第一次 paste 被空输入框吞掉时（v2.1.x 偶发）周期性 Ctrl-U 清空并重发。
             # resume 路径直接 tail 已存在的 X.jsonl，不进这个分支。
             if early_return is None and not started_as_resume:
@@ -885,7 +1027,23 @@ async def run_claude(
                 resubmit_attempts = 0
                 input_accepted = False
                 while loop.time() < deadline:
-                    if _jsonl_has_real_user_event(jsonl_path):
+                    if jsonl_path and _jsonl_has_real_user_event(jsonl_path):
+                        input_accepted = True
+                        break
+                    actual_jsonl = _find_matching_session_jsonl(
+                        project_dir, before_session_files, expected_prefix
+                    )
+                    if actual_jsonl is not None:
+                        actual_sid, actual_path, actual_offset = actual_jsonl
+                        if actual_path != jsonl_path:
+                            print(
+                                "[run_claude_pty] 接管 Claude 实际生成的 fresh "
+                                f"jsonl: sid={actual_sid}",
+                                flush=True,
+                            )
+                        new_session_id = actual_sid
+                        jsonl_path = actual_path
+                        start_offset = actual_offset
                         input_accepted = True
                         break
                     if proc.returncode is not None:

@@ -66,6 +66,18 @@ def test_load_no_override_returns_empty():
     assert bot_config.load_claude_extra_env(p) == {}
 
 
+def test_load_profile_claude_runner(monkeypatch):
+    monkeypatch.setenv("X_APP_ID", "app")
+    monkeypatch.setenv("X_APP_SECRET", "secret")
+    monkeypatch.setenv("X_PLATFORM", "lark")
+    monkeypatch.setenv("X_DEFAULT_CWD", "/tmp")
+    monkeypatch.setenv("X_CLAUDE_RUNNER", "print")
+
+    profile = bot_config._load_profile("x")
+
+    assert profile.claude_runner == "print"
+
+
 # ── 注入 spawn ────────────────────────────────────────────────
 class _FakeStdin:
     def __init__(self): self.buffer = b""; self.closed = False

@@ -1175,8 +1175,76 @@ def test_jsonl_has_real_user_event(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
-def test_fresh_session_forces_session_id_and_path(tmp_path, monkeypatch):
-    """fresh run 必须用 --session-id 钉死 session 文件名：
+def test_fresh_session_adopts_cli_generated_session_id(tmp_path, monkeypatch):
+    """fresh 默认不强制 --session-id，由 Claude CLI 自己生成 sid。
+
+    runner 通过本轮 user 内容匹配接管实际生成的 JSONL，避免 Claude Code 新版
+    交互式 TUI 不按 forced id 落盘时直接报 "new session jsonl never appeared"。
+    """
+    project_root = tmp_path / "projects"
+    project_root.mkdir()
+    cwd = tmp_path / "wd"
+    cwd.mkdir()
+    encoded = str(cwd).replace("/", "-")
+    project_dir = project_root / encoded
+    project_dir.mkdir(parents=True)
+    sidecar = tmp_path / "argv.json"
+
+    script = textwrap.dedent(f"""
+        #!{sys.executable}
+        import json, os, sys, time, select, uuid
+        PROJECT_DIR = {str(project_dir)!r}
+        SIDECAR = {str(sidecar)!r}
+        json.dump(sys.argv, open(SIDECAR, "w"))
+        sys.stdout.write("\\x1b[?1049hready\\n"); sys.stdout.flush()
+        buf = b""; deadline = time.time() + 5.0
+        while time.time() < deadline:
+            r,_,_ = select.select([sys.stdin.fileno()], [], [], 0.2)
+            if r:
+                c = os.read(sys.stdin.fileno(), 65536)
+                if not c: break
+                buf += c
+                if b"\\x1b[201~" in buf or b"\\r" in buf: break
+        paste = buf.decode("utf-8", errors="replace").replace("\\x1b[200~","") \\
+            .replace("\\x1b[201~","").strip("\\r\\n")
+        sid = str(uuid.uuid4())
+        path = os.path.join(PROJECT_DIR, sid + ".jsonl")
+        with open(path, "a", buffering=1, encoding="utf-8") as f:
+            f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+            f.write(json.dumps({{"type": "user", "message": {{"role": "user",
+                "content": [{{"type": "text", "text": paste}}]}}}}) + "\\n")
+            f.write(json.dumps({{"type": "assistant", "message": {{"role": "assistant",
+                "content": [{{"type": "text", "text": "generated ok"}}], "stop_reason": "end_turn",
+                "usage": {{"input_tokens": 1, "output_tokens": 1,
+                    "iterations": [{{"input_tokens": 1, "output_tokens": 1}}]}}}}}}) + "\\n")
+        time.sleep(30)
+    """)
+    fake = tmp_path / "fake-generated.py"
+    fake.write_text(script.lstrip())
+    fake.chmod(0o755)
+
+    monkeypatch.delenv("CLAUDE_PTY_FORCE_SESSION_ID", raising=False)
+    monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
+    monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
+    monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
+
+    text, sid, used_fallback = asyncio.run(
+        claude_pty.run_claude(
+            "hello generated session", cwd=str(cwd), permission_mode="bypassPermissions"
+        )
+    )
+
+    argv = json.load(open(sidecar))
+    assert "--session-id" not in argv
+    assert sid is not None and len(sid) == 36
+    assert (project_dir / f"{sid}.jsonl").is_file()
+    assert text == "generated ok"
+    assert used_fallback is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
+def test_fresh_session_force_session_id_env_still_supported(tmp_path, monkeypatch):
+    """CLAUDE_PTY_FORCE_SESSION_ID=1 时仍可用 --session-id 钉死 session 文件名：
       - runner 给 claude 传了 --session-id <uuid>
       - 返回的 sid == 那个 uuid
       - jsonl 真的落在 <uuid>.jsonl（路径事前确定，零扫描）
@@ -1223,6 +1291,7 @@ def test_fresh_session_forces_session_id_and_path(tmp_path, monkeypatch):
     fake.write_text(script.lstrip())
     fake.chmod(0o755)
 
+    monkeypatch.setenv("CLAUDE_PTY_FORCE_SESSION_ID", "1")
     monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
     monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
     monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
@@ -1242,13 +1311,85 @@ def test_fresh_session_forces_session_id_and_path(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
+def test_fresh_session_adopts_actual_jsonl_when_forced_id_ignored(tmp_path, monkeypatch):
+    """回归 Claude Code 2.1.201 现场症状：
+
+    runner 传了 --session-id，但交互式 TUI 没按 forced id 写 JSONL。只要本轮
+    产生了可用 JSONL 且 user 内容匹配，就接管实际 sid，不报
+    "new session jsonl never appeared"。
+    """
+    project_root = tmp_path / "projects"
+    project_root.mkdir()
+    cwd = tmp_path / "wd"
+    cwd.mkdir()
+    encoded = str(cwd).replace("/", "-")
+    project_dir = project_root / encoded
+    project_dir.mkdir(parents=True)
+    sidecar = tmp_path / "argv.json"
+
+    script = textwrap.dedent(f"""
+        #!{sys.executable}
+        import json, os, sys, time, select, uuid
+        PROJECT_DIR = {str(project_dir)!r}
+        SIDECAR = {str(sidecar)!r}
+        json.dump(sys.argv, open(SIDECAR, "w"))
+        sys.stdout.write("\\x1b[?1049hready\\n"); sys.stdout.flush()
+        buf = b""; deadline = time.time() + 5.0
+        while time.time() < deadline:
+            r,_,_ = select.select([sys.stdin.fileno()], [], [], 0.2)
+            if r:
+                c = os.read(sys.stdin.fileno(), 65536)
+                if not c: break
+                buf += c
+                if b"\\x1b[201~" in buf or b"\\r" in buf: break
+        paste = buf.decode("utf-8", errors="replace").replace("\\x1b[200~","") \\
+            .replace("\\x1b[201~","").strip("\\r\\n")
+        forced = sys.argv[sys.argv.index("--session-id") + 1]
+        sid = str(uuid.uuid4())
+        assert sid != forced
+        path = os.path.join(PROJECT_DIR, sid + ".jsonl")
+        with open(path, "a", buffering=1, encoding="utf-8") as f:
+            f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+            f.write(json.dumps({{"type": "user", "message": {{"role": "user",
+                "content": [{{"type": "text", "text": paste}}]}}}}) + "\\n")
+            f.write(json.dumps({{"type": "assistant", "message": {{"role": "assistant",
+                "content": [{{"type": "text", "text": "actual ok"}}], "stop_reason": "end_turn",
+                "usage": {{"input_tokens": 1, "output_tokens": 1,
+                    "iterations": [{{"input_tokens": 1, "output_tokens": 1}}]}}}}}}) + "\\n")
+        time.sleep(30)
+    """)
+    fake = tmp_path / "fake-ignore-forced.py"
+    fake.write_text(script.lstrip())
+    fake.chmod(0o755)
+
+    monkeypatch.setenv("CLAUDE_PTY_FORCE_SESSION_ID", "1")
+    monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
+    monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
+    monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
+
+    text, sid, used_fallback = asyncio.run(
+        claude_pty.run_claude(
+            "hello actual session", cwd=str(cwd), permission_mode="bypassPermissions"
+        )
+    )
+
+    argv = json.load(open(sidecar))
+    forced = argv[argv.index("--session-id") + 1]
+    assert sid and sid != forced
+    assert (project_dir / f"{sid}.jsonl").is_file()
+    assert not (project_dir / f"{forced}.jsonl").exists()
+    assert text == "actual ok"
+    assert used_fallback is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
 def test_concurrent_fresh_same_cwd_no_crosstalk(tmp_path, monkeypatch):
     """根因回归：同一个 cwd 里两个 fresh run 并发，各自的回复**绝不**串到对方卡片。
 
     旧逻辑 spawn 后去共享 project 目录里扫"本次产生的 jsonl"，并发 + 带图片/短消息
     时退化成"单候选默认接受"，A 会把 B 的 jsonl 认成自己的 → 卡片正文串台（闲鱼
-    thread 显示成汽车之家那次）。改用 --session-id 钉死文件名后，两个 run 物理上写
-    不同文件、各 tail 各的，串台不可能发生。
+    thread 显示成汽车之家那次）。现在 fresh 默认由 Claude 生成 sid，但必须等
+    user 内容前缀匹配后才接管 JSONL；匹配不到宁可等待，也不串台。
 
     fake 把收到的 paste 原样 echo 回 assistant text，断言 A 的 chunks 只含 A 的
     marker、B 的只含 B 的。"""
