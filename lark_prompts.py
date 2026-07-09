@@ -163,16 +163,16 @@ def render_lark_prompt(
         profile.role 不存在 → prompts/default.md（兼容当前行为）
 
     runner：本轮会话后端。运行时 MCP 工具（wake_me_in / dispatch_task / ...）只注入
-    claude 后端（agent_runner 只给 run_claude 透传 wake_context），所以 prompt 里的
-    工具介绍段必须跟着分支——否则 opencode/mimo/codex 的 agent 会被教唆去调不存在的
-    工具、或开"过会儿回来"的空头支票。
+    claude/codex 后端（agent_runner 只给这两个后端透传 wake_context），所以 prompt 里的
+    工具介绍段必须跟着分支——否则 opencode/mimo 的 agent 会被教唆去调不存在的工具、
+    或开"过会儿回来"的空头支票。
     """
     cli_profile = profile.lark_cli_profile or profile.name
     brand = profile.brand_label
 
     backend = (runner or "claude").strip().lower()
     runtime_mcp_section = render(
-        "_runtime_mcp_claude" if backend == "claude" else "_runtime_mcp_other", {},
+        "_runtime_mcp_claude" if backend in {"claude", "codex"} else "_runtime_mcp_other", {},
     )
 
     base_ctx = {

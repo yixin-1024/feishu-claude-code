@@ -744,6 +744,13 @@ async def _run_and_display(
         _AUTO_RETRY_MAX = 1
         _HUNG_MARKER = "客户端疑似 hung"
         _COOLDOWN_SECONDS = 10
+        # 上游流中断后 resume 续跑用的提示：既补全被截断的回复，又明令别重复已做的副作用。
+        _STALL_RESUME_NUDGE = (
+            "继续。上一轮回复在流式返回时被上游中断"
+            "（API Error: Response stalled mid-stream），"
+            "请基于已经完成的工作补全最终回复；"
+            "不要重复执行上一轮已经做过的写操作 / 命令 / 文件改动。"
+        )
         retry_count = 0
         last_exc: Optional[Exception] = None
         success = False
@@ -794,7 +801,45 @@ async def _run_and_display(
                         return
 
                     is_hung = isinstance(e, RuntimeError) and _HUNG_MARKER in str(e)
+                    is_stall = (
+                        isinstance(e, RuntimeError)
+                        and getattr(e, "cc_retryable_resume", False) is True
+                    )
                     blacklisted = _is_write_op_context(claude_msg, tool_history)
+
+                    # 上游流中断 / 服务端瞬时错误：崩溃前的 session 干净可 --resume，
+                    # 直接 resume 同一会话、用「继续」提示补全被截断的最终回复即可恢复
+                    # （不像 hung 那样服务端 state 已脏、必须清 session 走 fresh）。
+                    # 写操作场景仍跳过，避免续跑重复 commit（black list 兜底）。
+                    if is_stall and retry_count < _AUTO_RETRY_MAX and not blacklisted:
+                        retry_count += 1
+                        resumable = getattr(e, "cc_session_id", None) or session.session_id
+                        if resumable:
+                            session.session_id = resumable
+                        claude_msg = _STALL_RESUME_NUDGE
+                        log(bot.profile.name, "claude", "warn",
+                            f"上游流中断，resume 自动续跑 "
+                            f"({retry_count}/{_AUTO_RETRY_MAX}) session={(resumable or '')[:8]}")
+                        # 清掉被中断那轮流式出来的残片（可能含半截回答或 CLI 的
+                        # "API Error…" 文本），让续跑后的卡片只显示恢复出来的完整回复。
+                        accumulated = ""
+                        try:
+                            await bot.feishu.update_card(
+                                card_msg_id,
+                                f"🔄 上游响应中断，正在自动续跑 "
+                                f"({retry_count}/{_AUTO_RETRY_MAX})...",
+                            )
+                        except Exception:
+                            pass
+                        await asyncio.sleep(_COOLDOWN_SECONDS)
+                        last_output_ts = time.time()
+                        last_push_time = 0.0
+                        start_ts = time.time()
+                        current_tool = None
+                        pty_warning = None
+                        heartbeat_task = asyncio.create_task(_heartbeat())
+                        continue
+
                     can_retry = (
                         is_hung
                         and retry_count < _AUTO_RETRY_MAX
@@ -1827,11 +1872,22 @@ async def handle_spawn(
 # 并发 ≤ cap（实测 14 全卡死）。"不碰 prod"靠派发 prompt 自带，不在这层强制。
 # 默认 7：与 prompts/default.md、cc_mcp_server 工具描述保持同一口径（实测 14 全卡死）。
 DISPATCH_CONCURRENCY_CAP = int(os.getenv("DISPATCH_CONCURRENCY_CAP", "7") or "7")
+# 批次收口 debounce：一波里最后一个子会话结束后，等这么多秒再唤醒父 agent。
+# 窗口内若父又派进新 dispatch（同一 parent_thread），则本次收口作废、并进同一波——
+# 修掉"快任务/秒失败的子会话在父把整波 dispatch 落库前就把 pending 打到 0、导致
+# 提前用半波结果唤醒父 + 父被唤醒多次"的 wave-split 竞态。
+WAVE_DEBOUNCE_SEC = int(os.getenv("DISPATCH_WAVE_DEBOUNCE_SEC", "6") or "6")
 _DISPATCH_TASKS: set = set()   # 持回报/唤醒等辅助 task 引用，防被 GC
-# cap 的计数依据：每个子会话 task 从 create_task 起就进这个集合、done 才出。
+# cap 的计数依据：每个子会话 task 从 create_task 起就进对应 chat 的集合、done 才出。
 # 此前用 active_runs 计数有 TOCTOU 窗口——子会话从派发到真正 start_run 之间隔着
 # 建话题/mget/发卡片好几个 await，一波快速连派会全部通过检查。
-_DISPATCH_CHILDREN: set = set()
+# 按 chat 分桶（此前是全局单一集合）：cap 是**每个群**独立的 —— 多群/多租户时一个
+# 忙群不会把并发额度吃光饿死别的群。计数 = 目标群当前在跑/在启动的子会话数。
+_DISPATCH_CHILDREN: dict[str, set] = {}
+
+
+def _dispatch_active(chat_id: str) -> int:
+    return len(_DISPATCH_CHILDREN.get(chat_id, ()))
 # 父→子批次跟踪：parent_thread -> {bot, thread, anchor, chat, user, pending:int, children:[(title,thread)]}
 # 子会话**结束后一定回报父 agent**靠这层工程化（不靠子 agent 自觉 @）：
 #   · 每个子会话结束 → 往父 thread 贴一行完成/异常通知（bot 知道 turn 生命周期，子崩了也能报）
@@ -1841,6 +1897,15 @@ _DISPATCH_PARENTS: dict[str, dict] = {}
 
 
 _BOT_OPEN_ID_CACHE: dict[str, str] = {}   # app_id -> bot 自身 open_id（@自己触发用）
+
+
+def _format_dispatch_body(prompt: str) -> str:
+    """新建子任务 thread 顶楼展示：状态 + 完整 worker prompt。"""
+    return (
+        "（cc-lark 子任务已派发，正在独立处理…）\n\n"
+        "【完整任务提示词】\n"
+        f"{prompt.strip()}"
+    )
 
 
 async def _resolve_bot_open_id(bot: BotInstance) -> str:
@@ -1944,10 +2009,28 @@ async def _dispatch_wake_parent(grp: dict) -> None:
         log(bot.profile.name, "dispatch", "warn", "批次完成唤醒父 agent 失败（send-as-user 未成功）")
 
 
+async def _dispatch_wake_parent_debounced(ptid: str) -> None:
+    """pending 归零后延迟 WAVE_DEBOUNCE_SEC 再收口，吸收"父还在把整波 dispatch 落库"
+    的时间差。窗口内被 dispatch_task 取消（有新 dispatch 进同一 parent）则本次作废。
+
+    只有一个挂起点（sleep）；醒来后到 pop 之间**无 await**，单线程事件循环下不会有新
+    dispatch 插进来偷改状态 → 判定 + 摘出批次是原子的。"""
+    try:
+        await asyncio.sleep(WAVE_DEBOUNCE_SEC)
+    except asyncio.CancelledError:
+        return  # 窗口内来了新 dispatch，本次收口并进同一波，作废
+    grp = _DISPATCH_PARENTS.get(ptid)
+    if grp is None or grp.get("pending", 0) > 0:
+        return  # 已被收口 / 又有在跑的了：交给后续 child 完成时再触发
+    _DISPATCH_PARENTS.pop(ptid, None)
+    await _dispatch_wake_parent(grp)
+
+
 async def dispatch_task(
     bot: BotInstance, *, user_id: str, group_chat_id: str,
     title: str, prompt: str, cap: int = DISPATCH_CONCURRENCY_CAP,
     parent_thread: str = "", parent_anchor: str = "",
+    target_bot: "BotInstance | None" = None,
 ) -> dict:
     """在 group_chat_id 新开一条 thread 派一个独立 cc-lark 子会话跑 prompt。
 
@@ -1956,33 +2039,58 @@ async def dispatch_task(
 
     parent_thread/parent_anchor：派发方（主 agent）所在 thread + 其锚点消息。给了就启用
     "子会话结束→回报父 thread + 批次全完→唤醒父 agent"的工程化闭环（见 _DISPATCH_PARENTS）。
+
+    target_bot：**跨 agent 派发**——子会话在 target_bot 名下跑（可为异后端 bot，如
+    codex=GPT / opencode=Gemini / mimo），从而实现 claude 调 GPT 这类跨 agent 编排。
+    缺省 = bot（同 agent 派发，原行为）。target_bot 必须是同进程已加载、且是本群成员的
+    bot；建话题 + 跑子会话都用 target_bot，而回报父 thread + 唤醒父 agent 仍用 bot
+    （派发方自己）——因为唤醒父 = resume 父自己的 session，必须父 bot @ 父自己。
     """
     if not group_chat_id:
+        log(bot.profile.name, "dispatch", "warn", "派发被拒：缺少 group_chat_id")
         return {"ok": False, "error": "缺少 group_chat_id（派发目标群）"}
     if not (prompt and prompt.strip()):
+        log(bot.profile.name, "dispatch", "warn",
+            f"派发被拒：prompt 为空 chat={group_chat_id[:12]}...")
         return {"ok": False, "error": "prompt 不能为空"}
-    active = len(_DISPATCH_CHILDREN)
+    active = _dispatch_active(group_chat_id)
     if active >= cap:
-        return {"ok": False, "error": f"并发已达上限 {cap}（在跑/在启动的子会话 {active}），等已派的跑完再派下一波"}
+        log(bot.profile.name, "dispatch", "warn",
+            f"派发被拒：并发达上限 chat={group_chat_id[:12]}... active={active}/{cap}")
+        return {"ok": False, "error": f"并发已达上限 {cap}（本群在跑/在启动的子会话 {active}），等已派的跑完再派下一波"}
     user = user_id or bot.store.find_primary_user() or ""
     if not user:
+        log(bot.profile.name, "dispatch", "warn", "派发被拒：无法确定归属人 user_id")
         return {"ok": False, "error": "无法确定归属人 user_id"}
+
+    # 跨 agent：子会话在 child_bot 名下跑；缺省同 bot（原行为）。
+    child_bot = target_bot or bot
+    cross = child_bot is not bot
+    # open_id 是按 app 维度的——父的 open_id 在异 app 子 bot 里无效。跨 agent 时
+    # 用子 bot 自己的 primary user 作 @/session 归属；拿不到就不 @（post 仍可发）。
+    child_user = user if not cross else (child_bot.store.find_primary_user() or "")
 
     topic_title = (title.strip() if (title and title.strip())
                    else prompt.strip().splitlines()[0])[:60]
+    if cross:
+        topic_title = f"[{child_bot.profile.runner}] {topic_title}"[:60]
     try:
-        anchor = await bot.feishu.send_post_to_chat(
+        anchor = await child_bot.feishu.send_post_to_chat(
             chat_id=group_chat_id,
             title=f"🤖 {topic_title}",
-            body_text="（cc-lark 子任务已派发，正在独立处理…）",
-            mention_open_id=user,
+            body_text=_format_dispatch_body(prompt),
+            mention_open_id=child_user,
         )
     except Exception as e:
-        return {"ok": False, "error": f"建话题失败: {type(e).__name__}: {e}"}
+        hint = ""
+        if cross:
+            hint = (f"（跨 agent 派发：确认 {child_bot.profile.name}"
+                    f"[{child_bot.profile.runner}] 这个 bot 已被拉进本群）")
+        return {"ok": False, "error": f"建话题失败: {type(e).__name__}: {e}{hint}"}
 
     thread_id = anchor
     try:
-        resolved = await bot.feishu.get_message_thread_id(anchor)
+        resolved = await child_bot.feishu.get_message_thread_id(anchor)
         if resolved:
             thread_id = resolved
     except Exception:
@@ -1995,17 +2103,27 @@ async def dispatch_task(
             "chat": group_chat_id, "user": user, "pending": 0, "results": [],
         })
         grp["pending"] += 1
+        # 新 dispatch 进来 → 作废上一次"疑似收口"的 debounce（把这一波并进来），
+        # 修 wave-split：不让先跑完的子会话提前用半波结果唤醒父 agent。
+        _timer = grp.pop("wake_timer", None)
+        if _timer is not None and not _timer.done():
+            _timer.cancel()
 
-    # fire-and-forget：子会话独立跑，不阻塞派发返回。进 _DISPATCH_CHILDREN 计数
-    # （cap 依据）兼防 GC。
+    # fire-and-forget：子会话独立跑，不阻塞派发返回。进目标群的 _DISPATCH_CHILDREN
+    # 桶（per-chat cap 依据）兼防 GC。
     t = asyncio.create_task(handle_spawn(
-        bot, user_id=user, chat_id_raw=group_chat_id,
+        child_bot, user_id=(child_user or user), chat_id_raw=group_chat_id,
         thread_id=thread_id, anchor_message_id=anchor, prompt=prompt,
     ))
-    _DISPATCH_CHILDREN.add(t)
+    _DISPATCH_CHILDREN.setdefault(group_chat_id, set()).add(t)
 
-    def _on_child_done(fut, _title=topic_title, _thread=thread_id, _ptid=parent_thread):
-        _DISPATCH_CHILDREN.discard(fut)
+    def _on_child_done(fut, _title=topic_title, _thread=thread_id, _ptid=parent_thread,
+                       _chat=group_chat_id):
+        _bucket = _DISPATCH_CHILDREN.get(_chat)
+        if _bucket is not None:
+            _bucket.discard(fut)
+            if not _bucket:
+                _DISPATCH_CHILDREN.pop(_chat, None)
         # handle_spawn 返回 (ok, text)：ok=False 时 text 是失败原因。
         # 掉活（忙被拒/卡片失败/agent 出错）必须报 ⚠️，不能装 ✅。
         exc = None
@@ -2052,8 +2170,13 @@ async def dispatch_task(
             grp2.setdefault("results", []).append(
                 (_title, _thread, result_text if ok else f"（未完成）{fail_reason}", ok))
             if grp2["pending"] <= 0:
-                _DISPATCH_PARENTS.pop(_ptid, None)
-                wt = asyncio.create_task(_dispatch_wake_parent(grp2))
+                # 不立即收口：挂一个 debounce，给父把整波剩下的 dispatch 落库的时间。
+                # 窗口内来了新 dispatch 会 cancel 掉它（并进同一波），否则到点才唤醒父。
+                _old = grp2.pop("wake_timer", None)
+                if _old is not None and not _old.done():
+                    _old.cancel()
+                wt = asyncio.create_task(_dispatch_wake_parent_debounced(_ptid))
+                grp2["wake_timer"] = wt
                 _DISPATCH_TASKS.add(wt)
                 wt.add_done_callback(_DISPATCH_TASKS.discard)
 
@@ -2061,9 +2184,12 @@ async def dispatch_task(
 
     log(bot.profile.name, "dispatch", "info",
         f"派子会话 chat={group_chat_id[:12]}... thread={thread_id[:14]}... "
+        f"agent={child_bot.profile.name}[{child_bot.profile.runner}]"
+        f"{'(cross)' if cross else ''} "
         f"active={active + 1} parent={parent_thread[:12] + '...' if parent_thread else '-'}")
     return {"ok": True, "thread_id": thread_id, "anchor_message_id": anchor,
-            "active_after": active + 1, "cap": cap}
+            "active_after": active + 1, "cap": cap,
+            "agent": child_bot.profile.name, "agent_runner": child_bot.profile.runner}
 
 
 async def read_thread(bot: BotInstance, *, thread_id: str, limit: int = 50) -> dict:

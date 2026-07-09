@@ -123,14 +123,20 @@ DISPATCH_TASK_TOOL = {
         "The sub-agent runs fully autonomously; you do NOT block waiting for it — poll its "
         "progress/result later with read_thread(thread_id). Write `prompt` SELF-CONTAINED "
         "(working dir, scope, acceptance criteria, any 'do not touch prod' guards) — the "
-        "worker has none of your context. HARD LIMIT: the bot enforces a concurrency cap "
-        "(default 7; excess dispatches are rejected) — dispatch in waves and wait for the "
-        "prior wave before launching the next. Target group/recipient are supplied automatically. "
+        "worker has none of your context. HARD LIMIT: the bot enforces a PER-GROUP concurrency "
+        "cap (default 7; excess dispatches in the same group are rejected) — dispatch in waves "
+        "and wait for the prior wave before launching the next. Target group/recipient are supplied automatically. "
         "AUTO-REPORT: each sub-agent posts a completion line back to YOUR thread when it "
         "finishes (even if it crashes), and once the WHOLE wave is done you are automatically "
         "woken with each sub-agent's ACTUAL RESULT inlined in the wake message — so you may "
         "dispatch a wave and simply END THE TURN; you'll be brought back with all results in "
-        "hand to aggregate, no read_thread needed (read_thread is only for full detail)."
+        "hand to aggregate, no read_thread needed (read_thread is only for full detail). "
+        "CROSS-AGENT: by default the worker runs the SAME backend as you (e.g. Claude). Pass "
+        "`agent` to run the worker on a DIFFERENT agent/backend loaded in this bot — e.g. "
+        "agent=\"gpt\" runs it on the codex(GPT) bot, letting Claude delegate a sub-task to GPT "
+        "(or \"gemini\"/\"mimo\", or an exact profile name). The target agent's bot must be a "
+        "member of this group; if it isn't the dispatch returns a clear error. The auto-report "
+        "and wake still come back to YOU regardless of which agent ran the worker."
     ),
     "inputSchema": {
         "type": "object",
@@ -142,6 +148,15 @@ DISPATCH_TASK_TOOL = {
             "title": {
                 "type": "string",
                 "description": "Optional short thread title (defaults to the prompt's first line).",
+            },
+            "agent": {
+                "type": "string",
+                "description": (
+                    "Optional target agent/backend for the worker (CROSS-AGENT dispatch). "
+                    "Accepts a family alias — \"gpt\"/\"codex\" (GPT), \"claude\", "
+                    "\"gemini\"/\"opencode\", \"mimo\" — or an exact loaded profile name. "
+                    "Omit to run the worker on your own backend (default)."
+                ),
             },
         },
         "required": ["prompt"],
@@ -305,6 +320,8 @@ def _tool_dispatch_task(args: dict) -> dict:
         "user_id": user_id,
         "title": (args.get("title") or "").strip(),
         "prompt": prompt.strip(),
+        # 跨 agent：可选目标后端（"gpt"/"gemini"/"mimo"/profile 名）；空=同 agent
+        "agent": (args.get("agent") or "").strip(),
         # 父上下文：让 bot 在子会话结束后回报本 thread + 批次全完时唤醒我（主 agent）
         "parent_thread": (os.environ.get("CC_LARK_THREAD_ID") or "").strip(),
         "parent_anchor": (os.environ.get("CC_LARK_ANCHOR") or os.environ.get("CC_LARK_MESSAGE_ID") or "").strip(),
@@ -316,8 +333,11 @@ def _tool_dispatch_task(args: dict) -> dict:
         return _err(f"Failed to reach cc-lark dispatcher: {type(e).__name__}: {e}")
     if not body.get("ok"):
         return _err(f"Dispatch rejected: {body.get('error', 'unknown error')}")
+    agent_note = ""
+    if body.get("agent"):
+        agent_note = f" on agent {body.get('agent')}[{body.get('agent_runner')}]"
     return _ok(
-        f"✅ Dispatched a sub-agent in a new thread. thread_id={body.get('thread_id')} "
+        f"✅ Dispatched a sub-agent{agent_note} in a new thread. thread_id={body.get('thread_id')} "
         f"(active {body.get('active_after')}/{body.get('cap')}). "
         f"It runs autonomously — poll its progress/result later with "
         f"read_thread(thread_id=\"{body.get('thread_id')}\")."

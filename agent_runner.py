@@ -28,8 +28,10 @@ async def run_agent(
     append_system_prompt: Optional[str] = None,
     wake_context: Optional[dict] = None,
 ) -> tuple[str, Optional[str], bool]:
-    """wake_context: 本轮 Lark 会话上下文（CC_LARK_* 形态），仅 claude 后端用——
-    透传成 extra_env 注入 spawn，让 cc_mcp_server 的 wake_me_in 能定向唤醒本话题。"""
+    """wake_context: 本轮 Lark 会话上下文（CC_LARK_* 形态）。
+
+    Claude/Codex 后端会把它透传给 cc_mcp_server，让 wake/dispatch/cron 能定向到本话题。
+    """
     backend = (runner or profile.runner or "claude").strip().lower()
     if backend == "opencode":
         return await run_opencode(
@@ -92,6 +94,7 @@ async def run_agent(
             approval_policy=profile.codex_approval_policy,
             dangerous_bypass_level=profile.codex_dangerous_bypass,
             idle_timeout_sec=profile.codex_idle_timeout_sec,
+            extra_env=wake_context,
         )
 
     claude_env = load_claude_extra_env(profile) or {}

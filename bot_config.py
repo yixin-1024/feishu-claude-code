@@ -485,6 +485,47 @@ def load_claude_extra_env(profile: "Profile") -> dict[str, str]:
     _CLAUDE_ENV_CACHE[path] = (mtime, parsed)
     return parsed
 
+
+# ── cc-lark 运行时 MCP 能力闸门（支持 per-profile 覆盖）──────────
+#
+# 三个闸门决定 spawn 出的 claude 里注册哪几个 cc-lark 运行时工具：
+#   CC_LARK_ALLOW_DISPATCH（dispatch_task + read_thread）
+#   CC_LARK_ALLOW_WAKE    （wake_me_in）
+#   CC_LARK_ALLOW_CRON    （schedule_cron + list_crons）
+# 优先级：<PROFILE>_<FLAG>（该 profile 专属）> <FLAG>（全局）> 未设（=开，由
+# cc_mcp_server._allow 默认放行）。profile 段大写、非字母数字转下划线，与 env
+# 命名惯例一致（如 profile "spx" → SPX_CC_LARK_ALLOW_DISPATCH）。
+# 这样"从不编排的 bot（regtank/seesaw 等）默认关掉 dispatch/cron，省掉每 turn
+# 白背的工具描述 context"就能单独配，而不必全局一刀切。
+
+_CC_LARK_GATE_FLAGS = ("CC_LARK_ALLOW_DISPATCH", "CC_LARK_ALLOW_WAKE", "CC_LARK_ALLOW_CRON")
+
+
+def _profile_env_prefix(profile_name: str) -> str:
+    """把 profile 名归一成 env 前缀：大写 + 非字母数字→下划线 + 尾随下划线。"""
+    import re
+    if not profile_name:
+        return ""
+    return re.sub(r"[^A-Za-z0-9]", "_", profile_name).upper() + "_"
+
+
+def resolve_cc_lark_gates(profile_name: str = "") -> dict[str, str]:
+    """解析 cc-lark 运行时 MCP 三个能力闸门，支持 per-profile 覆盖。
+
+    只返回**显式设了值**的闸门键（per-profile 优先，回退全局）；没设的键不放进
+    返回值 → 交给 cc_mcp_server._allow 默认放行。给 runner 注入 --mcp-config 用。
+    """
+    prefix = _profile_env_prefix(profile_name)
+    gates: dict[str, str] = {}
+    for flag in _CC_LARK_GATE_FLAGS:
+        val = os.getenv(prefix + flag) if prefix else None
+        if val is None:
+            val = os.getenv(flag)
+        if val is not None:
+            gates[flag] = val
+    return gates
+
+
 # ── 旧代码兼容：有些模块可能仍读这些名字，保留向后兼容 ─────────
 # 取第一个 profile 作为"默认"值，仅用于没有 profile 上下文的场景
 _primary = PROFILES[0]

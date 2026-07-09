@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dispatcher import _format_usage_footer
+from dispatcher import _format_dispatch_body, _format_usage_footer
 
 
 def test_usage_footer_uses_codex_context_window():
@@ -18,3 +18,13 @@ def test_usage_footer_uses_codex_context_window():
     )
 
     assert "53.3k / 258.4k" in footer
+
+
+def test_dispatch_body_includes_full_prompt():
+    prompt = "第一行任务\n第二行要求\n不要再派发子 agent"
+
+    body = _format_dispatch_body(prompt)
+
+    assert "cc-lark 子任务已派发" in body
+    assert "【完整任务提示词】" in body
+    assert prompt in body

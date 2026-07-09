@@ -912,12 +912,12 @@ async def run_claude(
                         k: str(v) for k, v in extra_env.items()
                         if k.startswith("CC_LARK_") and v is not None
                     }
-                    # 能力闸门（bot 环境显式配 0/false 才关；未设=开）。透传给 cc_mcp_server，
+                    # 能力闸门（显式配 0/false 才关；未设=开）。支持 per-profile 覆盖
+                    # （<PROFILE>_<FLAG> 优先于全局 <FLAG>），透传给 cc_mcp_server：
                     # 关掉的能力对应工具直接不注册 = 对 agent 隐形。见 cc_mcp_server._allow。
-                    for _flag in ("CC_LARK_ALLOW_DISPATCH", "CC_LARK_ALLOW_WAKE", "CC_LARK_ALLOW_CRON"):
-                        _fv = os.getenv(_flag)
-                        if _fv is not None:
-                            _cc_env[_flag] = _fv
+                    from bot_config import resolve_cc_lark_gates
+                    _cc_env.update(resolve_cc_lark_gates(
+                        (extra_env or {}).get("CC_LARK_PROFILE") or ""))
                     _cc_cfg = {
                         "mcpServers": {
                             "cc-lark": {
@@ -1205,6 +1205,10 @@ async def run_claude(
                                     exc = RuntimeError(
                                         f"Claude API 错误（{api_err}, HTTP {status_code}）：{detail}"
                                     )
+                                # 非 rate_limit 的 API 错误（server_error / overloaded /
+                                # "Response stalled mid-stream" 等）是服务端瞬时抖动，崩溃前
+                                # 的 session 干净可 --resume——标记出来让 dispatcher 自动续跑。
+                                exc.cc_retryable_resume = str(api_err) != "rate_limit"
                                 # 崩在配额墙 / API 错误上的 session JSONL 是完整、干净、
                                 # 可 --resume 的（不像 watchdog hung 那样服务端 conversation
                                 # state 已脏）。把崩溃前已知的 session id 挂在异常上带出去，

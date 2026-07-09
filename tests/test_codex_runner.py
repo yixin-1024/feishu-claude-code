@@ -129,3 +129,67 @@ def test_run_codex_prepends_system_prompt(monkeypatch):
     assert text == "ok"
     assert sid == "thread_1"
     assert captured["cmd"][-1] == "system block\n\nuser message"
+
+
+def test_run_codex_injects_cc_lark_mcp(monkeypatch):
+    captured = {}
+    proc = FakeProc([
+        b'{"type":"thread.started","thread_id":"thread_1"}\n',
+        b'{"type":"turn.completed","text":"ok"}\n',
+    ])
+
+    async def fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("CC_LARK_ALLOW_WAKE", "0")
+
+    text, sid, _ = asyncio.run(run_codex(
+        "hi",
+        codex_bin="/bin/codex",
+        extra_env={
+            "CC_LARK_CHAT_ID": "oc_1",
+            "CC_LARK_THREAD_ID": "omt_1",
+            "CC_LARK_MESSAGE_ID": "om_1",
+            "NOT_CC_LARK": "ignored",
+        },
+    ))
+
+    assert text == "ok"
+    assert sid == "thread_1"
+    cmd = captured["cmd"]
+    config = {
+        cmd[i + 1].split("=", 1)[0]: cmd[i + 1].split("=", 1)[1]
+        for i, value in enumerate(cmd)
+        if value == "-c"
+    }
+    assert config["mcp_servers.cc-lark.command"].startswith('"')
+    assert config["mcp_servers.cc-lark.args"].endswith('cc_mcp_server.py"]')
+    assert config["mcp_servers.cc-lark.env.CC_LARK_CHAT_ID"] == '"oc_1"'
+    assert config["mcp_servers.cc-lark.env.CC_LARK_THREAD_ID"] == '"omt_1"'
+    assert config["mcp_servers.cc-lark.env.CC_LARK_MESSAGE_ID"] == '"om_1"'
+    assert config["mcp_servers.cc-lark.env.CC_LARK_ALLOW_WAKE"] == '"0"'
+    assert not any("NOT_CC_LARK" in item for item in cmd)
+
+
+def test_run_codex_skips_cc_lark_mcp_without_thread(monkeypatch):
+    captured = {}
+    proc = FakeProc([
+        b'{"type":"thread.started","thread_id":"thread_1"}\n',
+        b'{"type":"turn.completed","text":"ok"}\n',
+    ])
+
+    async def fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    asyncio.run(run_codex(
+        "hi",
+        codex_bin="/bin/codex",
+        extra_env={"CC_LARK_CHAT_ID": "oc_1"},
+    ))
+
+    assert not any("mcp_servers.cc-lark" in item for item in captured["cmd"])

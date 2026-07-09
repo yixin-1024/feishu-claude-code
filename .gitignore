@@ -28,11 +28,13 @@ inbox_config.yaml
 
 # 本地运行时产物 / 工作区（不进 git）：
 # data/ = agent 创建的 cron prompt 等运行时落盘；output/ = 会话产物；
-# tmp/ = 临时工作区；papers/ = 论文工作区（大体积，独立于 bot 功能）
+# tmp/ = 临时工作区；papers/ = 论文工作区（大体积，独立于 bot 功能）；
+# logs/ = 发送失败重投 outbox 等运行时日志（含 chat_id / 会话内容）
 data/
 output/
 tmp/
 papers/
+logs/
 
 # prompts/ 整体忽略（用户私有 cron / 角色 prompt，含真实路径/域名/人名），
 # 只有通用框架模板进版本控制。注意用 prompts/* 而非 prompts/，否则 negate 不生效。

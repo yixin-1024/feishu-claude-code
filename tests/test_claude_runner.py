@@ -249,3 +249,66 @@ def test_run_claude_fires_tool_use_callback(monkeypatch):
     assert len(tool_calls) == 2
     assert tool_calls[0] == ("Bash", {})
     assert tool_calls[1] == ("Bash", {"command": "ls"})
+
+
+def test_stalled_result_raises_transient_resumable(monkeypatch):
+    """上游流中断的 result 事件（is_error + stalled 文本）应 raise，而不是把错误
+    字符串当正常回复返回；异常要带上可 resume 的 session id 且标记为瞬时可恢复。"""
+    proc = FakeProc([
+        b'{"type":"system","session_id":"sid_stall"}\n',
+        b'{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial answer"}}}\n',
+        b'{"type":"result","subtype":"error_during_execution","is_error":true,'
+        b'"api_error_status":null,"session_id":"sid_stall",'
+        b'"result":"API Error: Response stalled mid-stream. The response above may be incomplete."}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(run_claude("hi"))
+
+    exc = ei.value
+    assert "stalled mid-stream" in str(exc)
+    assert getattr(exc, "cc_session_id", None) == "sid_stall"
+    assert getattr(exc, "cc_retryable_resume", None) is True
+
+
+def test_rate_limit_result_raises_non_transient(monkeypatch):
+    """用量墙的 result 事件应 raise 但标记为不可瞬时恢复（重试无益，得等配额）。"""
+    proc = FakeProc([
+        b'{"type":"result","subtype":"error_during_execution","is_error":true,'
+        b'"api_error_status":429,"session_id":"sid_rl",'
+        b'"result":"rate_limit: You have hit your usage limit."}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(run_claude("hi"))
+
+    exc = ei.value
+    assert getattr(exc, "cc_session_id", None) == "sid_rl"
+    assert getattr(exc, "cc_retryable_resume", None) is False
+
+
+def test_normal_result_with_error_word_not_flagged(monkeypatch):
+    """正常成功回复即便文本里含 'server_error' 字样也不能被误判为错误结果。"""
+    proc = FakeProc([
+        b'{"type":"result","subtype":"success","is_error":false,'
+        b'"session_id":"sid_ok","result":"the server_error happens when overloaded"}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    text, session_id, _ = asyncio.run(run_claude("hi"))
+    assert text == "the server_error happens when overloaded"
+    assert session_id == "sid_ok"

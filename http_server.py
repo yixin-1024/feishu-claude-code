@@ -96,6 +96,45 @@ def _resolve_bot_from_value(value: dict) -> Optional[BotInstance]:
     return None
 
 
+# 跨 agent 派发：dispatch_task 的 `agent` 参数 → 已加载的目标 bot。
+# runner 家族别名让编排 agent 用直觉名字（"gpt"）而不用记内部 profile 名。
+_AGENT_RUNNER_ALIASES = {
+    "gpt": "codex", "codex": "codex", "openai": "codex", "chatgpt": "codex", "o1": "codex",
+    "claude": "claude", "anthropic": "claude",
+    "gemini": "opencode", "opencode": "opencode",
+    "mimo": "mimo",
+}
+
+
+def resolve_target_agent(
+    bots: dict[str, BotInstance], spec: str, *, exclude: str = "",
+) -> tuple[Optional[BotInstance], str]:
+    """把 dispatch_task 的 `agent` 解析成目标 bot。返回 (bot, err)。
+
+    解析顺序：① 精确 profile 名（区分/不区分大小写）→ ② runner 家族别名
+    （gpt/codex→codex, claude→claude, gemini/opencode→opencode, mimo→mimo），
+    别名命中多个时优先选 != 调用方(exclude) 的那个。命中不到返回 (None, 错误说明+可选项)。
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return None, "empty agent spec"
+    if spec in bots:
+        return bots[spec], ""
+    low = spec.lower()
+    for name, b in bots.items():
+        if name.lower() == low:
+            return b, ""
+    want = _AGENT_RUNNER_ALIASES.get(low)
+    if want:
+        cands = [b for b in bots.values() if b.profile.runner == want]
+        pref = [b for b in cands if b.profile.name != exclude]
+        chosen = pref or cands
+        if chosen:
+            return chosen[0], ""
+    avail = ", ".join(f"{n}({b.profile.runner})" for n, b in bots.items()) or "（无）"
+    return None, f"未找到 agent {spec!r}。已加载可选：{avail}"
+
+
 def _resolve_spawn_request(
     params: dict,
 ) -> tuple[Optional[BotInstance], str, dict, Optional[dict]]:
@@ -310,6 +349,19 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         _submit(_handlers.fire_task(name))
         self._respond(200, {"ok": True, "fired": name})
 
+    def _mcp_respond(self, endpoint: str, profile: str, result: dict):
+        """MCP 运行时端点统一回包：非 ok 结果 warn 落主日志。此前 MCP 层的失败只进
+        claude 的 mcp-logs stderr，cc-lark.log 看不到 MCP 健康度 → 无法审计"有没有触顶/丢活"。"""
+        if not result.get("ok"):
+            log(profile or "global", "mcp", "warn",
+                f"{endpoint} 被拒: {str(result.get('error'))[:200]}")
+        self._respond(200 if result.get("ok") else 400, result)
+
+    def _mcp_error(self, endpoint: str, profile: str, exc: Exception):
+        log(profile or "global", "mcp", "warn",
+            f"{endpoint} 异常: {type(exc).__name__}: {exc}")
+        self._respond(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
     def _handle_wake(self, body: bytes):
         """cc_mcp_server 的 wake_me_in → 在常驻 scheduler 挂一个一次性唤醒任务。
 
@@ -326,9 +378,10 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._respond(400, {"ok": False, "error": f"bad json: {e}"})
             return
+        _prof = (params.get("profile") or "").strip()
         try:
             result = _handlers.schedule_wake(
-                profile=(params.get("profile") or "").strip(),
+                profile=_prof,
                 chat_id=(params.get("chat_id") or "").strip(),
                 thread_id=(params.get("thread_id") or "").strip(),
                 anchor_message_id=(params.get("anchor_message_id") or "").strip(),
@@ -337,9 +390,9 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                 note=params.get("note") or "",
             )
         except Exception as e:
-            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            self._mcp_error("wake", _prof, e)
             return
-        self._respond(200 if result.get("ok") else 400, result)
+        self._mcp_respond("wake", _prof, result)
 
     def _resolve_bot_by_profile(self, name: str) -> Optional[BotInstance]:
         name = (name or "").strip()
@@ -366,10 +419,20 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._respond(400, {"ok": False, "error": f"bad json: {e}"})
             return
-        bot = self._resolve_bot_by_profile(p.get("profile") or "")
+        _prof = (p.get("profile") or "").strip()
+        bot = self._resolve_bot_by_profile(_prof)
         if bot is None:
-            self._respond(400, {"ok": False, "error": "profile 未加载（多 bot 必须指定 profile）"})
+            self._mcp_respond("dispatch", _prof,
+                              {"ok": False, "error": "profile 未加载（多 bot 必须指定 profile）"})
             return
+        # 跨 agent 派发：agent 参数指定异后端目标 bot（如 "gpt"→codex）。缺省=同 bot。
+        _agent = (p.get("agent") or "").strip()
+        target_bot = None
+        if _agent:
+            target_bot, err = resolve_target_agent(_bots, _agent, exclude=bot.profile.name)
+            if target_bot is None:
+                self._mcp_respond("dispatch", _prof, {"ok": False, "error": err})
+                return
         try:
             result = self._run_on_loop(
                 _handlers.dispatch_task(
@@ -380,13 +443,14 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                     prompt=p.get("prompt") or "",
                     parent_thread=(p.get("parent_thread") or "").strip(),
                     parent_anchor=(p.get("parent_anchor") or "").strip(),
+                    target_bot=target_bot,
                 ),
                 timeout=30,
             )
         except Exception as e:
-            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            self._mcp_error("dispatch", _prof, e)
             return
-        self._respond(200 if result.get("ok") else 400, result)
+        self._mcp_respond("dispatch", _prof, result)
 
     def _handle_read_thread(self, body: bytes):
         """cc_mcp_server 的 read_thread → 拉回某 thread 的消息 transcript。"""
@@ -400,9 +464,11 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._respond(400, {"ok": False, "error": f"bad json: {e}"})
             return
-        bot = self._resolve_bot_by_profile(p.get("profile") or "")
+        _prof = (p.get("profile") or "").strip()
+        bot = self._resolve_bot_by_profile(_prof)
         if bot is None:
-            self._respond(400, {"ok": False, "error": "profile 未加载（多 bot 必须指定 profile）"})
+            self._mcp_respond("read_thread", _prof,
+                              {"ok": False, "error": "profile 未加载（多 bot 必须指定 profile）"})
             return
         try:
             limit = int(p.get("limit") or 50)
@@ -414,9 +480,9 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                 timeout=30,
             )
         except Exception as e:
-            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            self._mcp_error("read_thread", _prof, e)
             return
-        self._respond(200 if result.get("ok") else 400, result)
+        self._mcp_respond("read_thread", _prof, result)
 
     def _handle_schedule_cron(self, body: bytes):
         """cc_mcp_server 的 schedule_cron → 新增一条重复定时任务（写 yaml + reload）。同步。"""
@@ -430,9 +496,10 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._respond(400, {"ok": False, "error": f"bad json: {e}"})
             return
+        _prof = (p.get("profile") or "").strip()
         try:
             result = _handlers.schedule_cron(
-                profile=(p.get("profile") or "").strip(),
+                profile=_prof,
                 chat_id=(p.get("chat_id") or "").strip(),
                 user_id=(p.get("user_id") or "").strip(),
                 cron=(p.get("cron") or "").strip(),
@@ -440,9 +507,9 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                 title=(p.get("title") or "").strip(),
             )
         except Exception as e:
-            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            self._mcp_error("schedule_cron", _prof, e)
             return
-        self._respond(200 if result.get("ok") else 400, result)
+        self._mcp_respond("schedule_cron", _prof, result)
 
     def _handle_list_crons(self, body: bytes = b""):
         """body 可带 {"chat_id": "oc_..."} 把结果限定到该 chat 的作用域（agent 路径必带）；
@@ -460,9 +527,9 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         try:
             result = _handlers.list_crons(chat_id)
         except Exception as e:
-            self._respond(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+            self._mcp_error("list_crons", "", e)
             return
-        self._respond(200 if result.get("ok") else 400, result)
+        self._mcp_respond("list_crons", "", result)
 
     def _handle_reload(self):
         if not _is_localhost(self.client_address):

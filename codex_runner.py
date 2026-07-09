@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import signal
+import sys
 from typing import Any, Callable, Optional
 
 IDLE_TIMEOUT = 3600
@@ -31,6 +32,43 @@ def resolve_codex_bin(configured: Optional[str] = None) -> str:
 def _to_toml_string(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
+
+def _to_toml_array(values: list[str]) -> str:
+    return "[" + ", ".join(_to_toml_string(v) for v in values) + "]"
+
+
+def _cc_lark_mcp_config_flags(extra_env: Optional[dict]) -> list[str]:
+    """Build per-spawn Codex config overrides for the cc-lark runtime MCP server."""
+    if not (extra_env or {}).get("CC_LARK_THREAD_ID"):
+        return []
+    if os.getenv("CC_LARK_WAKE_MCP", "1") == "0":
+        return []
+
+    cc_server = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cc_mcp_server.py")
+    if not os.path.isfile(cc_server):
+        return []
+
+    cc_env = {
+        k: str(v) for k, v in (extra_env or {}).items()
+        if k.startswith("CC_LARK_") and v is not None
+    }
+    # 能力闸门支持 per-profile 覆盖（<PROFILE>_<FLAG> 优先于全局 <FLAG>）。
+    from bot_config import resolve_cc_lark_gates
+    cc_env.update(resolve_cc_lark_gates((extra_env or {}).get("CC_LARK_PROFILE") or ""))
+
+    config = [
+        ("mcp_servers.cc-lark.command", _to_toml_string(sys.executable)),
+        ("mcp_servers.cc-lark.args", _to_toml_array([cc_server])),
+        ("mcp_servers.cc-lark.startup_timeout_sec", "30"),
+    ]
+    for key in sorted(cc_env):
+        config.append((f"mcp_servers.cc-lark.env.{key}", _to_toml_string(cc_env[key])))
+
+    flags: list[str] = []
+    for key, value in config:
+        flags.extend(["-c", f"{key}={value}"])
+    return flags
 
 
 async def _fire_callback(cb, *args):
@@ -233,6 +271,7 @@ async def run_codex(
     approval_policy: Optional[str] = None,
     dangerous_bypass_level: int = 0,
     idle_timeout_sec: int = IDLE_TIMEOUT,
+    extra_env: Optional[dict] = None,
 ) -> tuple[str, Optional[str], bool]:
     del permission_mode, on_status
 
@@ -248,6 +287,7 @@ async def run_codex(
     dangerous_bypass_level = max(0, min(2, int(dangerous_bypass_level or 0)))
     if dangerous_bypass_level == 1:
         config_flags.extend(["-c", f"approval_policy={_to_toml_string(approval_policy or 'never')}"])
+    config_flags.extend(_cc_lark_mcp_config_flags(extra_env))
 
     exec_flags = ["--json", "--skip-git-repo-check"]
     if model:

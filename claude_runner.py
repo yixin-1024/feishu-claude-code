@@ -63,6 +63,45 @@ def _extract_text_content(value) -> str:
     return ""
 
 
+# 上游流中断 / 服务端 5xx / overloaded 这类瞬时错误：崩溃前的 session JSONL 干净、
+# 可 --resume，自动续跑基本能恢复。rate_limit / 用量墙不算（重试无益，得等配额恢复）。
+_TRANSIENT_ERR_PATTERNS = (
+    "stalled mid-stream",
+    "overloaded",
+    "server_error",
+    "internal server error",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+)
+
+
+def _classify_result_error(data: dict, text: str):
+    """判断 stream-json 的 result 事件是不是错误结果。
+
+    返回 (人类可读错误消息, 是否瞬时可 resume 恢复)；正常结果返回 None。
+    字段以实测 CLI 2.1.201 为准：subtype='success'/'error_during_execution'…、
+    is_error=bool、api_error_status=int|None、result=错误文本（流中断时是
+    "API Error: Response stalled mid-stream. ..."）。
+    """
+    subtype = str(data.get("subtype") or "")
+    is_error = data.get("is_error") is True
+    if not is_error and subtype in ("", "success"):
+        return None
+    status = data.get("api_error_status")
+    detail = (text or "").strip() or subtype or "unknown error"
+    blob = f"{text}\n{subtype}".lower()
+    # 用量墙 / 限流：重试无益，标记为不可瞬时恢复
+    if status == 429 or "rate_limit" in blob or "usage limit" in blob or "session limit" in blob:
+        return (f"Claude Max 用量已达上限：{detail}", False)
+    transient = (
+        subtype == "error_during_execution"
+        or (isinstance(status, int) and 500 <= status <= 599)
+        or any(p in blob for p in _TRANSIENT_ERR_PATTERNS)
+    )
+    return (f"Claude API 错误（{subtype or 'error'}, HTTP {status}）：{detail}", transient)
+
+
 def _runner_backend_from_env(extra_env: Optional[dict]) -> str:
     return (
         (extra_env or {}).get("CLAUDE_RUNNER")
@@ -97,10 +136,9 @@ def _cc_lark_cli_args(extra_env: Optional[dict]) -> list[str]:
             k: str(v) for k, v in (extra_env or {}).items()
             if k.startswith("CC_LARK_") and v is not None
         }
-        for flag in ("CC_LARK_ALLOW_DISPATCH", "CC_LARK_ALLOW_WAKE", "CC_LARK_ALLOW_CRON"):
-            flag_value = os.getenv(flag)
-            if flag_value is not None:
-                cc_env[flag] = flag_value
+        # 能力闸门支持 per-profile 覆盖（<PROFILE>_<FLAG> 优先于全局 <FLAG>）。
+        from bot_config import resolve_cc_lark_gates
+        cc_env.update(resolve_cc_lark_gates((extra_env or {}).get("CC_LARK_PROFILE") or ""))
         cc_cfg = {
             "mcpServers": {
                 "cc-lark": {
@@ -368,6 +406,18 @@ async def _run_claude_print(
                     if sid:
                         new_session_id = sid
                     final_text = _extract_text_content(data.get("result", ""))
+                    # 上游流中断 / 服务端错误时，CLI 也走 result 事件，只是 is_error=true /
+                    # subtype=error_*，result 里塞的是 "API Error: Response stalled mid-stream…"。
+                    # 旧逻辑会把这段错误文本当正常回复原样发出（还覆盖掉已流式出来的真内容）。
+                    # 与 PTY 后端对齐：识别为错误就 raise，把可 resume 的 session id 带出去，
+                    # 让 dispatcher 显示错误卡 + 自动续跑（瞬时错误）而不是伪装成回答。
+                    err = _classify_result_error(data, final_text or full_text)
+                    if err is not None:
+                        msg, transient = err
+                        exc = RuntimeError(msg)
+                        exc.cc_session_id = new_session_id
+                        exc.cc_retryable_resume = transient
+                        raise exc
                     if final_text:
                         full_text = final_text
                     # usage 顶层是跨内部迭代的累加值，不反映上下文实际占用。
