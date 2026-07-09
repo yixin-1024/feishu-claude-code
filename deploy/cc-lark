@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# cc-lark — 飞书/Lark Claude Bot 服务控制（macOS .app + 登录项）
-# 早期版本用 launchd LaunchAgent。launchd 启动的进程，TCC 责任方 = launchd，
-# 导致 main.py 子进程链里的 peekaboo 拿不到「辅助功能 / 屏幕录制」等 GUI 权限。
-# 现在改成把 main.py + ngrok 放在 /Applications/cc-lark.app 里跑，
-# 责任方变成 cc-lark.app（com.cc-lark.bot.app），授权链能落到 peekaboo。
+# cc-lark — 飞书/Lark Claude Bot 服务控制（macOS launchd KeepAlive）
+# supervisor = 持久化 LaunchAgent `cc-lark-main`（~/Library/LaunchAgents/cc-lark-main.plist）：
+# RunAtLoad + KeepAlive 跑 .app wrapper（wrapper 负责起 ngrok + main.py），
+# 崩溃/OOM/外部 SIGTERM 任何死法都在 ~10s 内自动重拉；/restart 走
+# `launchctl kickstart -k`。不再用「登录项 + open」——二者并存会双启动抢 9981。
 
 set -euo pipefail
 
@@ -17,11 +17,15 @@ LOG_DIR="$HOME/.feishu-claude"
 LOG_FILE="$LOG_DIR/cc-lark.log"
 NGROK_LOG="$LOG_DIR/cc-lark-ngrok.log"
 
+# launchd supervisor（持久化 LaunchAgent，落盘 plist，重启机器/注销都在）
+LAUNCHD_LABEL="cc-lark-main"
+PLIST_PATH="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+GUI_DOMAIN="gui/$(id -u)"
+SERVICE_TARGET="${GUI_DOMAIN}/${LAUNCHD_LABEL}"
+
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
 SCRIPT_PATH="$REPO_ROOT/deploy/cc-lark"
 ENV_FILE="$REPO_ROOT/.env"
-
-TCC_DB="/Library/Application Support/com.apple.TCC/TCC.db"
 
 # ── 进程探测 ──────────────────────────────────────────────────────────────
 
@@ -75,6 +79,60 @@ _print_ws_info() {
 _login_items_has() {
     osascript -e "tell application \"System Events\" to (login item \"${APP_NAME}\" exists)" 2>/dev/null \
         | grep -q "true"
+}
+
+# 若历史遗留了 cc-lark 登录项，清掉——launchd RunAtLoad 已接管开机启动，
+# 二者并存会在登录时双启动抢 9981。
+_remove_login_item_if_any() {
+    if _login_items_has; then
+        osascript -e "tell application \"System Events\" to delete login item \"${APP_NAME}\"" >/dev/null 2>&1 \
+            && echo "🧹 已移除遗留登录项（launchd 已接管开机启动）"
+    fi
+}
+
+# ── launchd supervisor ───────────────────────────────────────────────────
+
+_launchd_loaded() { launchctl print "$SERVICE_TARGET" >/dev/null 2>&1; }
+
+_write_plist() {
+    mkdir -p "$(dirname "$PLIST_PATH")" "$LOG_DIR"
+    # KeepAlive=true（无条件）：wrapper 收 SIGTERM 后 trap exit 0，用
+    # SuccessfulExit=false 崩溃后不会重拉；故无条件保活，有意重启交给 kickstart -k。
+    cat > "$PLIST_PATH" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${WRAPPER_PATH}</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${REPO_ROOT}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/launchd.err.log</string>
+</dict>
+</plist>
+PLIST_EOF
+    echo "📝 已写 launchd plist: $PLIST_PATH"
+}
+
+# 重新载入 plist（先 bootout 再 bootstrap，幂等）
+_launchd_reload() {
+    launchctl bootout "$SERVICE_TARGET" 2>/dev/null || true
+    launchctl bootstrap "$GUI_DOMAIN" "$PLIST_PATH" 2>&1
 }
 
 # ── .app 生成 ────────────────────────────────────────────────────────────
@@ -225,11 +283,8 @@ _try_symlink() {
 # ── 命令 ─────────────────────────────────────────────────────────────────
 
 cmd_install() {
-    local add_login=true
-    [[ "${1:-}" == "--no-login-item" ]] && add_login=false
-
-    local was_running=false
-    _is_running && was_running=true
+    # --no-login-item 保留为兼容旧调用的 no-op（launchd 形态下没有登录项概念）
+    [[ "${1:-}" == "--no-login-item" ]] && shift || true
 
     echo "📦 (重新)生成 $APP_PATH"
     _write_wrapper
@@ -237,32 +292,26 @@ cmd_install() {
     _codesign
     _try_symlink || true
 
-    if $add_login; then
-        if _login_items_has; then
-            echo "✅ 登录项已存在"
-        else
-            osascript -e "tell application \"System Events\" to make login item at end with properties {path:\"${APP_PATH}\", hidden:false}" >/dev/null
-            echo "✅ 已加入登录项"
-        fi
-    fi
-
-    echo ""
-    if $was_running; then
-        echo "⚠️  当前有实例在跑（用旧 wrapper）"
-        echo "   要应用新 wrapper：cc-lark restart"
-        echo "   ⚠️  签名 cdhash 变了，TCC 授权可能失效；若 peekaboo 报权限错，"
-        echo "       去「系统设置 → 隐私与安全性」把 cc-lark 从相关权限移除再重新加。"
+    # launchd 接管：写 plist + (重)载入。清掉任何遗留登录项防双实例。
+    _remove_login_item_if_any
+    _write_plist
+    echo "🚀 载入 launchd 服务 ($LAUNCHD_LABEL)"
+    _launchd_reload
+    sleep 2
+    if _is_running; then
+        echo "✅ 已安装并启动（wrapper PID $(_wrapper_pid)）— 崩溃/重启机器都自动拉起"
     else
-        echo "下一步: cc-lark start"
+        echo "⚠️  已安装但未见 wrapper 进程，看日志: tail -n 50 $LOG_FILE" >&2
     fi
 }
 
 cmd_uninstall() {
-    cmd_stop >/dev/null 2>&1 || true
-    if _login_items_has; then
-        osascript -e "tell application \"System Events\" to delete login item \"${APP_NAME}\"" >/dev/null
-        echo "🗑  已从登录项移除"
+    if _launchd_loaded; then
+        launchctl bootout "$SERVICE_TARGET" 2>/dev/null || true
+        echo "🗑  已 bootout launchd 服务"
     fi
+    [[ -f "$PLIST_PATH" ]] && rm -f "$PLIST_PATH" && echo "🗑  已删除 plist"
+    _remove_login_item_if_any
     if [[ -d "$APP_PATH" ]]; then
         rm -rf "$APP_PATH"
         echo "🗑  已删除 $APP_PATH"
@@ -270,24 +319,23 @@ cmd_uninstall() {
     for dir in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin"; do
         [[ -L "$dir/cc-lark" ]] && rm -f "$dir/cc-lark"
     done
-    echo "✅ 已卸载（.app + 登录项 + symlink）"
-    echo "ℹ️  TCC 授权（辅助功能/屏幕录制/完全磁盘访问）需要你手动去系统设置里删，"
-    echo "    否则留下灰条目；下次同 bundle id 重装可能直接复用旧授权（也可能失效）。"
+    echo "✅ 已卸载（launchd + .app + symlink）"
 }
 
 cmd_start() {
-    if [[ ! -d "$APP_PATH" ]]; then
-        echo "❌ 未安装：$APP_PATH 不存在；先 cc-lark install" >&2
+    if [[ ! -f "$PLIST_PATH" ]]; then
+        echo "❌ 未安装 launchd 服务：$PLIST_PATH 不存在；先 cc-lark install" >&2
         exit 1
     fi
     if _is_running; then
-        echo "ℹ️  已经在跑（PID $(_wrapper_pid)）"
+        echo "ℹ️  已经在跑（wrapper PID $(_wrapper_pid)）"
         return 0
     fi
-    open "$APP_PATH"
+    _launchd_loaded || _launchd_reload >/dev/null 2>&1
+    launchctl kickstart "$SERVICE_TARGET" 2>/dev/null || true
     sleep 2
     if _is_running; then
-        echo "✅ 已启动（PID $(_wrapper_pid)）"
+        echo "✅ 已启动（wrapper PID $(_wrapper_pid)）"
     else
         echo "❌ 启动失败，看日志: tail -n 50 $LOG_FILE" >&2
         exit 1
@@ -295,32 +343,41 @@ cmd_start() {
 }
 
 cmd_stop() {
-    local pid
-    pid="$(_wrapper_pid)"
-    if [[ -z "$pid" ]]; then
+    # 停服 = 关掉 KeepAlive（bootout），否则 kill 后 launchd 立刻重拉。
+    if ! _launchd_loaded && ! _is_running; then
         echo "ℹ️  本来就没在跑"
         return 0
     fi
-    kill -TERM "$pid" 2>/dev/null || true
+    launchctl bootout "$SERVICE_TARGET" 2>/dev/null || true
     local i
     for i in 1 2 3 4 5 6 7 8; do
         sleep 1
         _is_running || break
     done
     if _is_running; then
-        echo "⚠️  TERM 无效，强杀"
+        echo "⚠️  bootout 后仍在跑，强杀 wrapper"
         kill -KILL "$(_wrapper_pid)" 2>/dev/null || true
         sleep 1
     fi
     # 兜底：万一 trap cleanup 没跑到，把 ngrok 也清掉
-    pgrep -f "ngrok http.*${BUNDLE_ID%.*}" >/dev/null 2>&1 && pkill -f "ngrok http.*${BUNDLE_ID%.*}" || true
-    echo "⏹  已停止"
+    pgrep -f '^ngrok http' >/dev/null 2>&1 && pkill -f '^ngrok http' || true
+    echo "⏹  已停止（launchd 服务已 bootout；cc-lark start 重新拉起）"
 }
 
 cmd_restart() {
-    cmd_stop || true
-    sleep 1
-    cmd_start
+    # 有意重启：kickstart -k 原子杀+拉（KeepAlive 全程在，不经历「停服」窗口）
+    if ! _launchd_loaded; then
+        echo "ℹ️  launchd 服务未载入，走 start"
+        cmd_start
+        return
+    fi
+    launchctl kickstart -k "$SERVICE_TARGET" 2>&1 || true
+    sleep 2
+    if _is_running; then
+        echo "♻️  已重启（wrapper PID $(_wrapper_pid)）"
+    else
+        echo "⚠️  重启后未见 wrapper，看日志: tail -n 50 $LOG_FILE" >&2
+    fi
 }
 
 cmd_status() {
@@ -345,22 +402,13 @@ cmd_status() {
         printf "  %-12s %s\n" "wrapper"  "未运行"
     fi
 
-    if _login_items_has; then
-        printf "  %-12s %s\n" "登录项"   "已加入"
+    if _launchd_loaded; then
+        printf "  %-12s %s\n" "launchd"  "已载入（$LAUNCHD_LABEL，KeepAlive）"
     else
-        printf "  %-12s %s\n" "登录项"   "未加入（cc-lark install 会自动加）"
+        printf "  %-12s %s\n" "launchd"  "未载入（cc-lark install 会写 plist 并载入）"
     fi
-
-    if [[ -r "$TCC_DB" ]]; then
-        local granted
-        granted="$(sqlite3 "$TCC_DB" \
-            "SELECT service FROM access WHERE client='${BUNDLE_ID}' AND auth_value=2;" 2>/dev/null \
-            | sed -e 's/kTCCService//' | tr '\n' ' ')"
-        if [[ -n "$granted" ]]; then
-            printf "  %-12s %s\n" "TCC 授权" "$granted"
-        else
-            printf "  %-12s %s\n" "TCC 授权" "（无；首次使用 peekaboo 时去系统设置加）"
-        fi
+    if _login_items_has; then
+        printf "  %-12s %s\n" "⚠️ 登录项" "仍存在（应移除，与 launchd 双启动抢端口）"
     fi
 
     _print_ws_info
@@ -397,20 +445,21 @@ cmd_logs() {
 
 usage() {
     cat <<EOF
-cc-lark — 飞书/Lark Claude Bot 服务控制（macOS .app + 登录项）
+cc-lark — 飞书/Lark Claude Bot 服务控制（macOS launchd KeepAlive）
 
 用法:
-  cc-lark install [--no-login-item]   生成/重写 /Applications/cc-lark.app + 登录项
-  cc-lark uninstall                   卸载 (.app + 登录项 + symlink)
-  cc-lark start                       启动（open .app）
-  cc-lark stop                        停止（TERM wrapper + ngrok 兜底）
-  cc-lark restart                     重启
-  cc-lark status                      运行状态 + 登录项 + TCC 授权 + bot 日志末尾
+  cc-lark install                     生成 .app wrapper + 写 launchd plist 并载入（崩溃自动拉起）
+  cc-lark uninstall                   卸载 (launchd + .app + symlink)
+  cc-lark start                       启动（launchctl kickstart）
+  cc-lark stop                        停止（launchctl bootout，关掉 KeepAlive）
+  cc-lark restart                     重启（launchctl kickstart -k，原子杀+拉）
+  cc-lark status                      运行状态 + launchd + WS + bot 日志末尾
   cc-lark logs [bot|ngrok] [-n N] [-f]  查看日志
 
 文件:
   .app        : ${APP_PATH}
   wrapper     : ${WRAPPER_PATH}
+  launchd     : ${PLIST_PATH}  (label ${LAUNCHD_LABEL})
   bot   日志  : ${LOG_FILE}
   ngrok 日志  : ${NGROK_LOG}
 
@@ -420,10 +469,6 @@ cc-lark — 飞书/Lark Claude Bot 服务控制（macOS .app + 登录项）
 
 环境变量:
   PYTHON_BIN      覆盖 python3 路径（默认 \$(command -v python3)，pyenv shim 会自动解析为真实解释器）
-
-TCC 注意:
-  改 wrapper 后 ad-hoc 签名 cdhash 会变。若 peekaboo 报「不被允许」，
-  去「系统设置 → 隐私与安全性」把 cc-lark 从对应权限里删掉再重新加。
 EOF
 }
 

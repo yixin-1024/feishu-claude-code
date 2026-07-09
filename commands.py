@@ -1103,14 +1103,17 @@ def _trigger_restart() -> None:
 
     if os.path.isdir(APP_PATH):
         quoted_app = shlex.quote(APP_PATH)
-        # 匹配带 trailing slash 路径，避免误伤其他同名进程
-        match = f"{APP_PATH}/"
+        # 按 wrapper 的显式 PID 收尾，**绝不用 `pkill -f <APP_PATH>`** —— 那个
+        # pattern 会命中本 detached 脚本自身的命令行（含 `open` 的路径参数），
+        # 把脚本在跑到 open 之前就 kill 掉（self-match 自杀，历史隐患）。
+        # main.py 一旦 os._exit，wrapper 的 `wait` 返回即自跑 cleanup（杀 ngrok+退出），
+        # 这里 kill -TERM 只是 wrapper 卡死时的兜底（不 KILL，留 trap 收 ngrok）；
+        # 随后 sleep 让 ngrok 远端 endpoint 释放，再全新 open。
+        wrapper_pid = os.getppid()
         script = (
+            f"sleep 2; "
+            f"kill -TERM {int(wrapper_pid)} 2>/dev/null || true; "
             f"sleep 3; "
-            f"pkill -TERM -f {shlex.quote(match)} 2>/dev/null; "
-            f"sleep 1; "
-            f"pkill -KILL -f {shlex.quote(match)} 2>/dev/null; "
-            f"sleep 0.5; "
             f"open {quoted_app}"
         )
         subprocess.Popen(
