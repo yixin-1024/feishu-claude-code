@@ -197,6 +197,41 @@ async def test_group_not_in_whitelist_ignored(isolated_sessions):
     proc.assert_not_awaited()
 
 
+async def test_group_wildcard_whitelist_allows_any_group(isolated_sessions):
+    bot = _make_bot(allowed_groups={"*"})
+    mention = _make_mention()
+    event = _make_event(
+        chat_id="oc_any_group",
+        chat_type="group",
+        text="@_user_1 hi",
+        mentions=[mention],
+    )
+    with patch("dispatcher._process_message", new_callable=AsyncMock) as proc:
+        await handle_message_async(bot, event)
+    proc.assert_awaited_once()
+
+
+async def test_group_systemd_restart_reports_supervisor_and_triggers(isolated_sessions):
+    bot = _make_bot(allowed_groups={"*"})
+    mention = _make_mention()
+    event = _make_event(
+        chat_id="oc_any_group",
+        chat_type="group",
+        text="/restart @_user_1",
+        mentions=[mention],
+    )
+    with (
+        patch("commands.restart_strategy", return_value="systemd"),
+        patch("dispatcher._handle_restart_command", new_callable=AsyncMock, return_value=0),
+        patch("commands._trigger_restart") as trigger,
+    ):
+        await handle_message_async(bot, event)
+
+    trigger.assert_called_once_with()
+    bot.feishu.reply_card.assert_awaited_once()
+    assert "systemd" in bot.feishu.reply_card.await_args.kwargs["content"]
+
+
 async def test_user_not_in_allowlist_ignored(isolated_sessions):
     bot = _make_bot(allowed_users={"ou_allowed"})
     event = _make_event(user_id="ou_random", text="hi")

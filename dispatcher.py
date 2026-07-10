@@ -453,7 +453,11 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
 
     # 访问控制：群聊白名单 + 用户 allowlist（静默忽略，避免泄露 bot 存在）
     if not bot.profile.is_trinity:
-        if is_group and raw_chat_id not in bot.profile.allowed_group_chat_ids:
+        if (
+            is_group
+            and "*" not in bot.profile.allowed_group_chat_ids
+            and raw_chat_id not in bot.profile.allowed_group_chat_ids
+        ):
             log(tag, "acl", "info", f"群不在白名单 chat={raw_chat_id[:10]}...")
             return
         if bot.profile.allowed_open_ids and user_id not in bot.profile.allowed_open_ids:
@@ -486,7 +490,7 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
             from commands import _trigger_restart, restart_strategy
             strat = restart_strategy()
             if strat == "bare":
-                ack = ("❌ 没找到 supervisor（非 launchd 任务、无 .app），"
+                ack = ("❌ 没找到 supervisor（非 launchd/systemd 任务、无 .app），"
                        "直接退出会停服，已取消重启。")
                 try:
                     if is_group:
@@ -497,9 +501,14 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
                     pass
                 return
             affected = await _handle_restart_command(bot)
-            via = "launchd kickstart" if strat == "launchd" else "open .app"
+            via = {
+                "launchd": "launchd kickstart",
+                "systemd": "systemd Restart=always",
+                "app": "open .app",
+            }[strat]
+            eta = "~5-10s" if strat == "systemd" else "~3-5s"
             ack = (f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— "
-                   f"{via}，~3-5s 后回来。")
+                   f"{via}，{eta} 后回来。")
             try:
                 if is_group:
                     await bot.feishu.reply_card(msg.message_id, content=ack, loading=False)
@@ -1584,15 +1593,20 @@ async def handle_menu_command(bot: BotInstance, user_id: str, chat_id: str, cmd_
                 try:
                     await bot.feishu.update_card(
                         card_msg_id,
-                        "❌ 没找到 supervisor（非 launchd 任务、无 .app），"
+                        "❌ 没找到 supervisor（非 launchd/systemd 任务、无 .app），"
                         "直接退出会停服，已取消重启。")
                 except Exception:
                     pass
             return
         affected = await _handle_restart_command(bot)
-        via = "launchd kickstart" if strat == "launchd" else "open .app"
+        via = {
+            "launchd": "launchd kickstart",
+            "systemd": "systemd Restart=always",
+            "app": "open .app",
+        }[strat]
+        eta = "~5-10s" if strat == "systemd" else "~3-5s"
         ack = (f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— "
-               f"{via}，~3-5s 后回来。")
+               f"{via}，{eta} 后回来。")
         if card_msg_id:
             try:
                 await bot.feishu.update_card(card_msg_id, ack)

@@ -1064,10 +1064,81 @@ def _launchd_target() -> Optional[str]:
         return None
 
 
+def _systemd_unit() -> Optional[str]:
+    """Return the current systemd service unit when it can safely relaunch us.
+
+    The unit name comes from the kernel-owned cgroup path rather than config, then
+    ``systemctl show`` must confirm all three safety properties:
+
+    - the unit is active;
+    - this process is the unit's MainPID;
+    - ``Restart=always`` will relaunch it after a clean exit.
+
+    Any ambiguity is treated as unsupported so ``/restart`` can never turn into
+    an accidental service stop.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as cgroup_file:
+            cgroup_lines = cgroup_file.readlines()
+    except OSError:
+        return None
+
+    unit = None
+    for line in cgroup_lines:
+        cgroup_path = line.rstrip("\n").split(":", 2)[-1]
+        for component in reversed(cgroup_path.split("/")):
+            if component.endswith(".service"):
+                unit = component
+                break
+        if unit:
+            break
+    if not unit:
+        return None
+
+    try:
+        result = subprocess.run(
+            [
+                "systemctl", "show",
+                "--property=MainPID",
+                "--property=ActiveState",
+                "--property=Restart",
+                "--no-pager",
+                "--",
+                unit,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+
+    properties = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            properties[key] = value
+    if (
+        properties.get("MainPID") != str(os.getpid())
+        or properties.get("ActiveState") != "active"
+        or properties.get("Restart") != "always"
+    ):
+        return None
+    return unit
+
+
 def restart_strategy() -> str:
-    """返回当前会走哪条重启路径，给 /restart 文案 + 自检用：launchd / app / bare。"""
+    """返回当前会走哪条重启路径：launchd / systemd / app / bare。"""
     if _launchd_target():
         return "launchd"
+    if _systemd_unit():
+        return "systemd"
     if os.path.isdir(APP_PATH):
         return "app"
     return "bare"
@@ -1080,9 +1151,10 @@ def _trigger_restart() -> None:
        原子地杀掉当前进程并重新拉起。**绝不 `open .app`** —— 老逻辑同时 open .app
        又被 KeepAlive 拉起会变双实例抢 9981 端口（历史 bug 根源）。kickstart 没
        生效时 3s 兜底 os._exit，由 KeepAlive 补拉。
-    2. **app**（旧 .app 部署）：清 .app 残留进程树再 open，保留兼容。
-    3. **bare**（手动 `python main.py`，无 supervisor）：直接退出（无人拉起，
-       仅作降级；此形态下 /restart 等于停服，调用方应已在文案里提示）。
+    2. **systemd**（Linux）：确认当前进程是 active unit 的 MainPID，且
+       `Restart=always`，再正常退出并由 systemd 拉起；不需要 sudo 或 shell。
+    3. **app**（旧 .app 部署）：清 .app 残留进程树再 open，保留兼容。
+    4. **bare**（手动 `python main.py`，无 supervisor）：拒绝退出，避免停服。
     """
     target = _launchd_target()
     if target:
@@ -1099,6 +1171,12 @@ def _trigger_restart() -> None:
         # 兜底：kickstart 若未能杀掉我们，自退让 KeepAlive 拉起（不会双实例：
         # KeepAlive 只维持一个；kickstart 已把旧的杀掉时这个 _die 不会触发）。
         asyncio.get_event_loop().call_later(3.0, lambda: os._exit(0))
+        return
+
+    if _systemd_unit():
+        # Dispatcher 已经发完回执并中断 active runs；稍作延迟让最后的 Lark
+        # 请求落地，然后 clean-exit。Restart=always 会在 RestartSec 后原子拉起。
+        asyncio.get_event_loop().call_later(1.0, lambda: os._exit(0))
         return
 
     if os.path.isdir(APP_PATH):
@@ -1127,8 +1205,7 @@ def _trigger_restart() -> None:
         asyncio.get_event_loop().call_later(2.0, lambda: os._exit(0))
         return
 
-    # bare：无 supervisor，尽力退出（外部若有 wrapper 会拉起）。
-    asyncio.get_event_loop().call_later(2.0, lambda: os._exit(0))
+    raise RuntimeError("no supported supervisor; refusing to stop the service")
 
 
 async def handle_command(
@@ -1436,10 +1513,10 @@ async def handle_command(
         strat = restart_strategy()
         if strat == "bare":
             return (
-                "❌ 没找到任何 supervisor（既不是 launchd 任务也没有 "
+                "❌ 没找到任何 supervisor（既不是 launchd/systemd 任务也没有 "
                 f"{APP_PATH}），无法自动重启 —— 直接退出会停服。"
-                f"\n请用 `launchctl submit -l {LAUNCHD_LABEL} ...` 托管，"
-                "或 `deploy/cc-lark install` 装 .app 后再用 /restart。"
+                f"\nmacOS 请用 `launchctl submit -l {LAUNCHD_LABEL} ...` 托管；"
+                "Linux 请用 `Restart=always` 的 systemd service。"
             )
         _trigger_restart()
         if strat == "launchd":
@@ -1447,6 +1524,8 @@ async def handle_command(
                 f"♻️ 服务重启中 — launchd（`{LAUNCHD_LABEL}`）kickstart 杀+拉，"
                 "约 3-5s 回来。"
             )
+        if strat == "systemd":
+            return "♻️ 服务重启中 — systemd `Restart=always`，约 5-10s 回来。"
         return "♻️ 服务重启中 — 清 .app 残留后 `open .app` 拉起，全部就绪约 5s。"
 
     elif cmd == "group":

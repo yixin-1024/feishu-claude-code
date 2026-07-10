@@ -390,6 +390,10 @@ sudo systemctl enable --now feishu-claude
 journalctl -u feishu-claude -f
 ```
 
+群里的 `/restart` 会从 `/proc/self/cgroup` 自动识别当前 `.service`。为防止误停服，
+只有当 systemd 确认该 unit 处于 `active`、bot 是 `MainPID`、且配置了
+`Restart=always` 时才会执行；上面的示例 service 已满足这些条件。
+
 服务会自动重启。看门狗每 6 小时主动重启一次进程，刷新 WebSocket 连接。
 
 ## CLI Handover
