@@ -74,7 +74,10 @@ def test_run_claude_prefers_final_result_over_partial_deltas(monkeypatch):
         b'{"type":"result","session_id":"sid_123","result":"Hello world"}\n',
     ])
 
+    captured = {}
+
     async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["kwargs"] = kwargs
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
@@ -86,6 +89,7 @@ def test_run_claude_prefers_final_result_over_partial_deltas(monkeypatch):
     assert used_fallback is False
     assert proc.stdin.buffer.endswith(b"hi\n")
     assert proc.stdin.closed is True
+    assert captured["kwargs"]["start_new_session"] is True
 
 
 def test_extra_env_selects_print_backend_over_parent_pty(monkeypatch):

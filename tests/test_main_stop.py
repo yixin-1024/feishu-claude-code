@@ -89,6 +89,7 @@ async def test_heartbeat_does_not_overwrite_error_card_on_watchdog_kill():
     bot.feishu.reply_card = mock.AsyncMock(return_value="card_id_1")
 
     active_run = mock.Mock(stop_requested=False)
+    active_run.card_update_lock = asyncio.Lock()
     bot.active_runs.start_run.return_value = active_run
 
     session = mock.Mock(session_id=None, model="claude-opus-4-7[1m]", cwd="/tmp",

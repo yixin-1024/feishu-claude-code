@@ -1,19 +1,30 @@
 import asyncio
 import os
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
 from bot_config import THREAD_SHARED_SESSION
 
 
+_KILL_WAIT_TIMEOUT_SECONDS = 1.0
+
+
 def _kill_pgroup(proc, sig: int) -> bool:
-    """杀 proc 所在进程组（spawn 时 start_new_session=True，proc 是 pgid leader）。
-    只杀 leader 会留下 claude 起的 MCP server / hook 子进程当孤儿。"""
+    """仅终止 proc 自己领导的独立进程组。
+
+    runner 正常应以 start_new_session=True 启动，满足 pid == pgid。这里仍做
+    fail-closed 校验：共享 bot 进程组或不是组长时绝不 killpg，交给调用方退回
+    单 PID terminate/kill，避免一个 runner 配置遗漏把 main.py / wrapper 一起杀掉。
+    """
     try:
-        os.killpg(os.getpgid(proc.pid), sig)
+        pid = int(proc.pid)
+        pgid = os.getpgid(pid)
+        if pgid != pid or pgid == os.getpgrp():
+            return False
+        os.killpg(pgid, sig)
         return True
-    except (ProcessLookupError, PermissionError, AttributeError):
+    except (ProcessLookupError, PermissionError, AttributeError, TypeError, ValueError):
         return False
 
 
@@ -25,6 +36,9 @@ class ActiveRun:
     proc: object | None = None
     stop_requested: bool = False
     stop_announced: bool = False
+    # 流式 push、最终落卡与 /stop|/restart 中断提示共用这把锁。
+    # 中断提示会等待已在途的旧写入结束后最后落卡，后续写入看到 stop flag 跳过。
+    card_update_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 def _key(user_id: str, chat_id: str) -> str:
@@ -106,7 +120,15 @@ async def stop_run(
                     proc.kill()
                 except ProcessLookupError:
                     pass
-            await proc.wait()
+            # SIGKILL 后理论上会立即退出，但磁盘/内核异常时 wait 仍可能卡死。
+            # /restart 不能因此永远停在“中断任务”阶段。
+            try:
+                await asyncio.wait_for(
+                    proc.wait(),
+                    timeout=max(_KILL_WAIT_TIMEOUT_SECONDS, grace_seconds),
+                )
+            except asyncio.TimeoutError:
+                pass
 
     if on_stopped is not None and not active_run.stop_announced:
         await _maybe_await(on_stopped(active_run))

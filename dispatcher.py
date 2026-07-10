@@ -122,10 +122,15 @@ async def _is_current_bot_mentioned(bot: BotInstance, msg) -> bool:
 # ── /stop 命令处理 ───────────────────────────────────────────
 
 async def _announce_stopped_run(bot: BotInstance, active_run: ActiveRun):
-    try:
-        await bot.feishu.update_card(active_run.card_msg_id, "⏹ 已停止当前任务")
-    except Exception as exc:
-        log(bot.profile.name, "stop", "warn", f"update stopped card failed: {exc}")
+    async with active_run.card_update_lock:
+        try:
+            await bot.feishu.update_card(active_run.card_msg_id, "⏹ 已停止当前任务")
+        except Exception as exc:
+            log(bot.profile.name, "stop", "warn", f"update stopped card failed: {exc}")
+        try:
+            await bot.feishu.finalize_streaming_card(active_run.card_msg_id)
+        except Exception as exc:
+            log(bot.profile.name, "stop", "warn", f"finalize stopped card failed: {exc}")
 
 
 async def _handle_stop_command(bot: BotInstance, sender_open_id: str, chat_id: str) -> str:
@@ -157,11 +162,26 @@ async def _handle_restart_command(originating_bot: BotInstance) -> int:
         async def _announce(r):
             if not r.card_msg_id:
                 return
-            try:
-                await b.feishu.update_card(r.card_msg_id, RESTART_MSG)
-            except Exception as e:
-                log(prof_name, "restart", "warn",
-                    f"update_card 失败 chat={r.chat_id[:12]}: {e}")
+            async with r.card_update_lock:
+                try:
+                    await asyncio.wait_for(
+                        b.feishu.update_card(r.card_msg_id, RESTART_MSG),
+                        timeout=1.5,
+                    )
+                except Exception as e:
+                    log(prof_name, "restart", "warn",
+                        f"update_card 失败 chat={r.chat_id[:12]}: {e}")
+                finally:
+                    try:
+                        # CardKit 注册表会随进程重启丢失；必须在旧进程里关掉
+                        # streaming，否则中断卡可能永久停在流式状态。
+                        await asyncio.wait_for(
+                            b.feishu.finalize_streaming_card(r.card_msg_id),
+                            timeout=1.0,
+                        )
+                    except Exception as e:
+                        log(prof_name, "restart", "warn",
+                            f"finalize streaming card 失败 chat={r.chat_id[:12]}: {e}")
         try:
             await stop_run(
                 b.active_runs, run.user_id, run.chat_id,
@@ -184,6 +204,169 @@ async def _handle_restart_command(originating_bot: BotInstance) -> int:
     log(originating_bot.profile.name, "restart", "info",
         f"广播完毕（{affected} 个 active run），触发 detach + exit")
     return affected
+
+
+_RESTART_NOTICE_TIMEOUT_SECONDS = 3.0
+_RESTART_DRAIN_TIMEOUT_SECONDS = 4.0
+_restart_in_progress = False
+_restart_committed = False
+
+
+def _active_run_count() -> int:
+    """返回所有 profile 当前 active run 数量，供重启前即时回执使用。"""
+    total = 0
+    for b in list(_bots.values()):
+        runs = getattr(getattr(b, "active_runs", None), "_runs", None)
+        if runs is not None:
+            try:
+                total += len(runs)
+            except TypeError:
+                pass
+    return total
+
+
+async def _send_restart_notice(
+    bot: BotInstance,
+    user_id: str,
+    is_group: bool,
+    message_id: str,
+    content: str,
+    *,
+    card_msg_id: str = "",
+) -> bool:
+    """在动任何 runner 之前发送重启提醒；失败可观测，但不阻断用户的重启意图。"""
+
+    async def _send():
+        if card_msg_id:
+            await bot.feishu.update_card(card_msg_id, content)
+        elif is_group and message_id:
+            await bot.feishu.reply_text(message_id, content)
+        elif user_id:
+            await bot.feishu.send_text_to_user(user_id, content)
+        else:
+            raise RuntimeError("restart notice 缺少 message_id/user_id")
+
+    try:
+        await asyncio.wait_for(_send(), timeout=_RESTART_NOTICE_TIMEOUT_SECONDS)
+        log(bot.profile.name, "restart", "info", "重启提醒已发送")
+        return True
+    except Exception as exc:
+        anchor = message_id or card_msg_id or "-"
+        log(bot.profile.name, "restart", "warn",
+            f"重启提醒发送失败 anchor={anchor[:14]}，仍继续重启: {exc}")
+        return False
+
+
+async def _handle_restart_request(
+    bot: BotInstance,
+    user_id: str,
+    is_group: bool,
+    message_id: str,
+    *,
+    card_msg_id: str = "",
+) -> bool:
+    """统一编排 /restart：先通知，再立即中断任务，最后触发 supervisor 重拉。"""
+    global _restart_in_progress, _restart_committed
+    from commands import _trigger_restart, restart_strategy
+
+    # 同一 event loop 内无 await 地 check-and-set，避免两个 /restart 重复 kickstart；
+    # 同时阻止“active run 快照之后、进程真正退出之前”再启动新 runner。
+    if _restart_in_progress:
+        await _send_restart_notice(
+            bot, user_id, is_group, message_id,
+            "♻️ 重启请求已经在处理中，请稍候。",
+            card_msg_id=card_msg_id,
+        )
+        return True
+    _restart_in_progress = True
+
+    async def _restart_step(awaitable):
+        """Reset the restart gate if the orchestration task is cancelled."""
+        global _restart_in_progress, _restart_committed
+        try:
+            return await awaitable
+        except asyncio.CancelledError:
+            _restart_in_progress = False
+            _restart_committed = False
+            log(bot.profile.name, "restart", "warn", "重启编排被取消，已重置全局闸门")
+            raise
+
+    affected = _active_run_count()
+    task_note = (
+        f"正在中断 {affected} 个未完成任务"
+        if affected else "当前没有未完成任务"
+    )
+    await _restart_step(
+        _send_restart_notice(
+            bot, user_id, is_group, message_id,
+            f"♻️ 收到，正在立即重启：{task_note}；约 3-10 秒恢复。",
+            card_msg_id=card_msg_id,
+        )
+    )
+
+    # supervisor 探测含同步 launchctl；放到线程里，至少不阻塞其它 profile 的
+    # event loop。提醒已先发出，因此异常慢探测也不会再表现成“完全没回复”。
+    try:
+        strat = await _restart_step(asyncio.to_thread(restart_strategy))
+    except Exception as exc:
+        _restart_in_progress = False
+        _restart_committed = False
+        log(bot.profile.name, "restart", "error", f"探测 supervisor 失败: {exc}")
+        await _restart_step(
+            _send_restart_notice(
+                bot, user_id, is_group, message_id,
+                f"❌ 无法确认重启方式，已取消：{exc}",
+                card_msg_id=card_msg_id,
+            )
+        )
+        return False
+
+    if strat == "bare":
+        _restart_in_progress = False
+        _restart_committed = False
+        await _restart_step(
+            _send_restart_notice(
+                bot, user_id, is_group, message_id,
+                "❌ 没找到 supervisor（非 launchd/systemd 任务、无 .app），"
+                "直接退出会停服，已取消重启。",
+                card_msg_id=card_msg_id,
+            )
+        )
+        return False
+
+    # 只有确认 supervisor 能重拉后才把请求升级为“已提交重启”。
+    # 探测失败/bare 期间恰好完成的正常任务仍应该能够落卡并发送
+    # 结果；否则重启最终取消了，用户的结果却已经被吞掉。
+    _restart_committed = True
+
+    try:
+        await _restart_step(
+            asyncio.wait_for(
+                _handle_restart_command(bot),
+                timeout=_RESTART_DRAIN_TIMEOUT_SECONDS,
+            )
+        )
+    except asyncio.TimeoutError:
+        log(bot.profile.name, "restart", "warn",
+            f"中断 active runs 超过 {_RESTART_DRAIN_TIMEOUT_SECONDS:.0f}s，继续重启")
+    except Exception as exc:
+        log(bot.profile.name, "restart", "warn", f"中断 active runs 异常，继续重启: {exc}")
+
+    try:
+        _trigger_restart()
+        return True
+    except Exception as exc:
+        _restart_in_progress = False
+        _restart_committed = False
+        log(bot.profile.name, "restart", "error", f"触发 supervisor 重启失败: {exc}")
+        await _restart_step(
+            _send_restart_notice(
+                bot, user_id, is_group, message_id,
+                f"❌ 触发重启失败：{exc}",
+                card_msg_id=card_msg_id,
+            )
+        )
+        return False
 
 
 # ── /verify：审计当前 thread ─────────────────────────────────
@@ -484,39 +667,11 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
                 await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
 
-        if _text.strip().lower() == "/restart":
+        _parsed_lock_free = parse_command(_text)
+        if _parsed_lock_free and _parsed_lock_free[0] == "restart":
             if is_group and not await _is_current_bot_mentioned(bot, msg):
                 return
-            from commands import _trigger_restart, restart_strategy
-            strat = restart_strategy()
-            if strat == "bare":
-                ack = ("❌ 没找到 supervisor（非 launchd/systemd 任务、无 .app），"
-                       "直接退出会停服，已取消重启。")
-                try:
-                    if is_group:
-                        await bot.feishu.reply_card(msg.message_id, content=ack, loading=False)
-                    else:
-                        await bot.feishu.send_card_to_user(user_id, content=ack, loading=False)
-                except Exception:
-                    pass
-                return
-            affected = await _handle_restart_command(bot)
-            via = {
-                "launchd": "launchd kickstart",
-                "systemd": "systemd Restart=always",
-                "app": "open .app",
-            }[strat]
-            eta = "~5-10s" if strat == "systemd" else "~3-5s"
-            ack = (f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— "
-                   f"{via}，{eta} 后回来。")
-            try:
-                if is_group:
-                    await bot.feishu.reply_card(msg.message_id, content=ack, loading=False)
-                else:
-                    await bot.feishu.send_card_to_user(user_id, content=ack, loading=False)
-            except Exception:
-                pass
-            _trigger_restart()
+            await _handle_restart_request(bot, user_id, is_group, msg.message_id)
             return
 
         if _text == "/":
@@ -575,7 +730,27 @@ async def _run_and_display(
     append_system_prompt: str = "",
 ):
     """调用 Claude 并流式展示结果。消息处理和按钮回复共用此函数。"""
+    if _restart_in_progress:
+        try:
+            await bot.feishu.update_card(
+                card_msg_id,
+                "♻️ 服务正在重启，本条任务未执行；服务恢复后请重新发送。",
+            )
+        except Exception:
+            pass
+        try:
+            await bot.feishu.finalize_streaming_card(card_msg_id)
+        except Exception:
+            pass
+        return
+
     active_run = bot.active_runs.start_run(user_id, chat_id, card_msg_id)
+
+    def _stopping() -> bool:
+        # committed gate is raised once a supervisor is confirmed, before active
+        # runs are drained. Re-check it after every potentially slow Lark request
+        # so an old run cannot append a success/error notification after restart.
+        return active_run.stop_requested or _restart_committed
 
     # cc-lark MCP 的会话上下文。透传给 run_agent → claude 的 extra_env，MCP
     # server 用这些默认值把 send_text / schedule_wakeup 定向到当前 Lark 话题。
@@ -625,15 +800,16 @@ async def _run_and_display(
 
     async def push(content: str):
         nonlocal push_failures
-        if push_failures >= 3:
-            return
-        try:
-            await bot.feishu.update_card(card_msg_id, content)
-            push_failures = 0
-        except Exception as push_err:
-            push_failures += 1
-            log(bot.profile.name, "stream", "warn",
-                f"push 失败 ({push_failures}/3): {push_err}")
+        async with active_run.card_update_lock:
+            if _stopping() or push_failures >= 3:
+                return
+            try:
+                await bot.feishu.update_card(card_msg_id, content)
+                push_failures = 0
+            except Exception as push_err:
+                push_failures += 1
+                log(bot.profile.name, "stream", "warn",
+                    f"push 失败 ({push_failures}/3): {push_err}")
 
     def _build_display() -> str:
         parts = []
@@ -793,6 +969,10 @@ async def _run_and_display(
                         append_system_prompt=append_system_prompt or None,
                         wake_context=wake_context,
                     )
+                    # /stop 或 /restart 已接管最终卡片；runner 被 TERM 后即使带着
+                    # partial output“成功”返回，也不能再把中断提示覆盖成结果 + ✅。
+                    if active_run.stop_requested:
+                        return
                     log(bot.profile.name, "agent", "info",
                         f"完成 runner={session.runner} session={new_session_id}")
                     success = True
@@ -832,15 +1012,13 @@ async def _run_and_display(
                         # 清掉被中断那轮流式出来的残片（可能含半截回答或 CLI 的
                         # "API Error…" 文本），让续跑后的卡片只显示恢复出来的完整回复。
                         accumulated = ""
-                        try:
-                            await bot.feishu.update_card(
-                                card_msg_id,
-                                f"🔄 上游响应中断，正在自动续跑 "
-                                f"({retry_count}/{_AUTO_RETRY_MAX})...",
-                            )
-                        except Exception:
-                            pass
+                        await push(
+                            f"🔄 上游响应中断，正在自动续跑 "
+                            f"({retry_count}/{_AUTO_RETRY_MAX})..."
+                        )
                         await asyncio.sleep(_COOLDOWN_SECONDS)
+                        if active_run.stop_requested:
+                            return
                         last_output_ts = time.time()
                         last_push_time = 0.0
                         start_ts = time.time()
@@ -868,15 +1046,13 @@ async def _run_and_display(
                             log(bot.profile.name, "claude", "warn",
                                 f"清掉 hung session={session.session_id[:8]}，下一轮 fresh")
                             session.session_id = None
-                        try:
-                            await bot.feishu.update_card(
-                                card_msg_id,
-                                f"🔄 检测到 client hung，{_COOLDOWN_SECONDS}s 冷却后自动重试 "
-                                f"({retry_count}/{_AUTO_RETRY_MAX})...",
-                            )
-                        except Exception:
-                            pass
+                        await push(
+                            f"🔄 检测到 client hung，{_COOLDOWN_SECONDS}s 冷却后自动重试 "
+                            f"({retry_count}/{_AUTO_RETRY_MAX})..."
+                        )
                         await asyncio.sleep(_COOLDOWN_SECONDS)
+                        if active_run.stop_requested:
+                            return
                         # 重置心跳计时（否则下一轮一启动就报"无输出 N min"）
                         last_output_ts = time.time()
                         last_push_time = 0.0
@@ -947,24 +1123,31 @@ async def _run_and_display(
                 )
             else:
                 err_card = err_brief
-            try:
-                await bot.feishu.update_card(card_msg_id, err_card)
-            except Exception:
-                pass
-            # 流式卡若开着，关掉它恢复交互（非流式/未登记则 no-op，且永不抛）
-            await bot.feishu.finalize_streaming_card(card_msg_id)
-            # 卡片是 in-place patch，不会触发 Lark 新消息通知。异常退出时额外发一条独立
-            # ❌ 短消息，与成功路径下的独立 ✅ 对齐，让用户能在消息列表里直接看到出错。
-            err_notify = "❌ 异常退出" + (
-                f"（已自动重试 {retry_count} 次）" if retry_count > 0 else ""
-            )
-            try:
-                if is_group and notify_msg_id:
-                    await bot.feishu.reply_text(notify_msg_id, err_notify)
-                else:
-                    await bot.feishu.send_text_to_user(user_id, err_notify)
-            except Exception:
-                pass
+            async with active_run.card_update_lock:
+                if _stopping():
+                    return
+                try:
+                    await bot.feishu.update_card(card_msg_id, err_card)
+                except Exception:
+                    pass
+                if _stopping():
+                    return
+                # 流式卡若开着，关掉它恢复交互（非流式/未登记则 no-op，且永不抛）
+                await bot.feishu.finalize_streaming_card(card_msg_id)
+                if _stopping():
+                    return
+                # 卡片是 in-place patch，不会触发 Lark 新消息通知。异常退出时额外发一条
+                # 独立 ❌ 短消息，与成功路径下的独立 ✅ 对齐。
+                err_notify = "❌ 异常退出" + (
+                    f"（已自动重试 {retry_count} 次）" if retry_count > 0 else ""
+                )
+                try:
+                    if is_group and notify_msg_id:
+                        await bot.feishu.reply_text(notify_msg_id, err_notify)
+                    else:
+                        await bot.feishu.send_text_to_user(user_id, err_notify)
+                except Exception:
+                    pass
             return
 
         final = full_text or accumulated or "（无输出）"
@@ -978,48 +1161,64 @@ async def _run_and_display(
             final = f"{final}\n\n{footer}"
         options = _extract_options(final) or ask_options
         card_patched = False
-        try:
-            if options:
-                buttons = [
-                    {"text": display, "value": {"reply": value, "cid": chat_id, "profile": bot.profile.name}}
-                    for display, value in options
-                ]
-                short = all(len(b["text"]) <= 10 for b in buttons)
-                # 流式卡：update_card_with_buttons 内部会推最终文本 + 关流式 + 加按钮
-                await bot.feishu.update_card_with_buttons(card_msg_id, final, buttons, flow=short)
-            else:
-                await bot.feishu.update_card(card_msg_id, final)
-                # 无按钮的流式卡推完最终文本后需手动关流式（非流式则 no-op）
+        async with active_run.card_update_lock:
+            if _stopping():
+                return
+            try:
+                if options:
+                    buttons = [
+                        {"text": display, "value": {"reply": value, "cid": chat_id, "profile": bot.profile.name}}
+                        for display, value in options
+                    ]
+                    short = all(len(b["text"]) <= 10 for b in buttons)
+                    # 流式卡：update_card_with_buttons 内部会推最终文本 + 关流式 + 加按钮
+                    await bot.feishu.update_card_with_buttons(card_msg_id, final, buttons, flow=short)
+                else:
+                    await bot.feishu.update_card(card_msg_id, final)
+                    if _stopping():
+                        return
+                    # 无按钮的流式卡推完最终文本后需手动关流式（非流式则 no-op）
+                    await bot.feishu.finalize_streaming_card(card_msg_id)
+                if _stopping():
+                    return
+                card_patched = True
+            except Exception as e:
+                if _stopping():
+                    return
+                log(bot.profile.name, "card", "error", f"卡片更新失败，回退发文本: {e}")
+                # 卡片更新失败时流式卡可能仍开着，先收尾
                 await bot.feishu.finalize_streaming_card(card_msg_id)
-            card_patched = True
-        except Exception as e:
-            log(bot.profile.name, "card", "error", f"卡片更新失败，回退发文本: {e}")
-            # 卡片更新失败时流式卡可能仍开着，先收尾
-            await bot.feishu.finalize_streaming_card(card_msg_id)
-            try:
-                if is_group and notify_msg_id:
-                    await bot.feishu.reply_card(notify_msg_id, content=final, loading=False)
-                else:
-                    await bot.feishu.send_text_to_user(user_id, final)
-            except Exception as fallback_err:
-                log(bot.profile.name, "card", "error", f"文本回退也失败: {fallback_err}")
-                # 卡片 + 文本回退都失败（额度耗尽 / 渲染故障等）：结果落 outbox，绝不丢
-                saved = bot.feishu.save_outbox(
-                    final, kind="result", error=str(fallback_err),
-                    meta={"chat_id": chat_id, "user": user_id,
-                          "card_msg_id": card_msg_id, "session": new_session_id or ""},
-                )
-                if saved:
-                    log(bot.profile.name, "outbox", "warn", f"结果已落 outbox: {saved}")
+                if _stopping():
+                    return
+                try:
+                    if is_group and notify_msg_id:
+                        await bot.feishu.reply_card(notify_msg_id, content=final, loading=False)
+                    else:
+                        await bot.feishu.send_text_to_user(user_id, final)
+                except Exception as fallback_err:
+                    if _stopping():
+                        return
+                    log(bot.profile.name, "card", "error", f"文本回退也失败: {fallback_err}")
+                    # 卡片 + 文本回退都失败（额度耗尽 / 渲染故障等）：结果落 outbox，绝不丢
+                    saved = bot.feishu.save_outbox(
+                        final, kind="result", error=str(fallback_err),
+                        meta={"chat_id": chat_id, "user": user_id,
+                              "card_msg_id": card_msg_id, "session": new_session_id or ""},
+                    )
+                    if saved:
+                        log(bot.profile.name, "outbox", "warn", f"结果已落 outbox: {saved}")
 
-        if card_patched:
-            try:
-                if is_group and notify_msg_id:
-                    await bot.feishu.reply_text(notify_msg_id, "✅")
-                else:
-                    await bot.feishu.send_text_to_user(user_id, "✅")
-            except Exception:
-                pass
+            if card_patched and not _stopping():
+                try:
+                    if is_group and notify_msg_id:
+                        await bot.feishu.reply_text(notify_msg_id, "✅")
+                    else:
+                        await bot.feishu.send_text_to_user(user_id, "✅")
+                except Exception:
+                    pass
+
+        if _stopping():
+            return
 
         if new_session_id:
             await bot.store.on_agent_response(
@@ -1027,9 +1226,14 @@ async def _run_and_display(
                 usage=final_usage or None,
             )
 
+        if _stopping():
+            return
+
         if plan_exited and session.permission_mode == "plan":
             log(bot.profile.name, "plan", "info", "ExitPlanMode 检测到，切换为 bypassPermissions")
             await bot.store.set_permission_mode(user_id, chat_id, "bypassPermissions")
+            if _stopping():
+                return
             try:
                 notice = "🚀 已退出规划模式，发送任意消息开始执行。"
                 if is_group and notify_msg_id:
@@ -1192,6 +1396,11 @@ async def _process_message(
     parsed = parse_command(text)
     if parsed:
         cmd, args = parsed
+        # 富文本或带参数的 /restart 不会命中 handle_message_async 的精确文本快路径，
+        # 仍必须走同一套“先提醒、再中断、后重拉”编排，不能落到 commands 旧路径。
+        if cmd == "restart":
+            await _handle_restart_request(bot, user_id, is_group, msg.message_id)
+            return
         if cmd == "verify":
             log(tag, "cmd", "info", f"执行 /verify args={args!r}")
             await _handle_verify_command(
@@ -1586,33 +1795,9 @@ async def handle_menu_command(bot: BotInstance, user_id: str, chat_id: str, cmd_
         return
 
     if cmd == "restart":
-        from commands import _trigger_restart, restart_strategy
-        strat = restart_strategy()
-        if strat == "bare":
-            if card_msg_id:
-                try:
-                    await bot.feishu.update_card(
-                        card_msg_id,
-                        "❌ 没找到 supervisor（非 launchd/systemd 任务、无 .app），"
-                        "直接退出会停服，已取消重启。")
-                except Exception:
-                    pass
-            return
-        affected = await _handle_restart_command(bot)
-        via = {
-            "launchd": "launchd kickstart",
-            "systemd": "systemd Restart=always",
-            "app": "open .app",
-        }[strat]
-        eta = "~5-10s" if strat == "systemd" else "~3-5s"
-        ack = (f"♻️ 服务重启中（通知了 {affected} 个进行中的会话）— "
-               f"{via}，{eta} 后回来。")
-        if card_msg_id:
-            try:
-                await bot.feishu.update_card(card_msg_id, ack)
-            except Exception:
-                pass
-        _trigger_restart()
+        await _handle_restart_request(
+            bot, user_id, is_group, "", card_msg_id=card_msg_id,
+        )
         return
 
     reply = await handle_command(cmd, args, user_id, chat_id, bot.store, bot=bot)

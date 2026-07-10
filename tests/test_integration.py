@@ -220,16 +220,26 @@ async def test_group_systemd_restart_reports_supervisor_and_triggers(isolated_se
         text="/restart @_user_1",
         mentions=[mention],
     )
-    with (
-        patch("commands.restart_strategy", return_value="systemd"),
-        patch("dispatcher._handle_restart_command", new_callable=AsyncMock, return_value=0),
-        patch("commands._trigger_restart") as trigger,
-    ):
-        await handle_message_async(bot, event)
+    dispatcher._restart_in_progress = False
+    dispatcher._restart_committed = False
+    try:
+        with (
+            patch("commands.restart_strategy", return_value="systemd"),
+            patch(
+                "dispatcher._handle_restart_command",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch("commands._trigger_restart") as trigger,
+        ):
+            await handle_message_async(bot, event)
+    finally:
+        dispatcher._restart_in_progress = False
+        dispatcher._restart_committed = False
 
     trigger.assert_called_once_with()
-    bot.feishu.reply_card.assert_awaited_once()
-    assert "systemd" in bot.feishu.reply_card.await_args.kwargs["content"]
+    bot.feishu.reply_text.assert_awaited_once()
+    assert "重启" in bot.feishu.reply_text.await_args.args[1]
 
 
 async def test_user_not_in_allowlist_ignored(isolated_sessions):
@@ -286,6 +296,52 @@ async def test_group_stop_handles_current_bot_mention(isolated_sessions):
 
     proc.assert_not_awaited()
     bot.feishu.reply_card.assert_awaited()
+
+
+async def test_group_restart_ignores_other_bot_mention(isolated_sessions):
+    bot = _make_bot(allowed_groups={"oc_a"}, bot_open_id="ou_this_bot")
+    other = _make_mention(key="@Other", open_id="ou_other_bot")
+    event = _make_event(
+        chat_id="oc_a",
+        chat_type="group",
+        text="/restart @Other",
+        mentions=[other],
+    )
+
+    with patch("dispatcher._handle_restart_request", new_callable=AsyncMock) as restart:
+        await handle_message_async(bot, event)
+
+    restart.assert_not_awaited()
+
+
+async def test_group_restart_handles_current_bot_mention(isolated_sessions):
+    bot = _make_bot(allowed_groups={"oc_a"}, bot_open_id="ou_this_bot")
+    mention = _make_mention(key="@This", open_id="ou_this_bot")
+    event = _make_event(
+        chat_id="oc_a",
+        chat_type="group",
+        text="/restart @This",
+        mentions=[mention],
+    )
+
+    with patch("dispatcher._handle_restart_request", new_callable=AsyncMock) as restart:
+        await handle_message_async(bot, event)
+
+    restart.assert_awaited_once_with(bot, "ou_user_1", True, "om_msg_1")
+
+
+async def test_restart_with_args_uses_safe_dispatcher_path(isolated_sessions):
+    bot = _make_bot()
+    event = _make_event(text="/restart now")
+
+    with (
+        patch("dispatcher._handle_restart_request", new_callable=AsyncMock) as restart,
+        patch("dispatcher._process_message", new_callable=AsyncMock) as process,
+    ):
+        await handle_message_async(bot, event)
+
+    restart.assert_awaited_once_with(bot, "ou_user_1", False, "om_msg_1")
+    process.assert_not_awaited()
 
 
 # ── per-chat 锁 ─────────────────────────────────────────────

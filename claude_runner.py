@@ -299,6 +299,10 @@ async def _run_claude_print(
             cwd=cwd or os.path.expanduser("~"),
             env=env,
             limit=10 * 1024 * 1024,
+            # stop_run() 会按进程组终止 runner 及其 MCP/tool 子进程。
+            # print 后端也必须像 PTY/Codex/OpenCode/MiMo 一样成为独立组长；
+            # 否则 killpg 会把同组的 main.py / .app wrapper 一起杀掉。
+            start_new_session=True,
         )
 
         await _fire_callback(on_process_start, proc)

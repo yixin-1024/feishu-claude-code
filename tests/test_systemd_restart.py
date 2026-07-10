@@ -142,15 +142,11 @@ def test_trigger_restart_refuses_bare_process():
     loop.call_later.assert_not_called()
 
 
-async def test_restart_command_reports_systemd_strategy():
-    with (
-        patch.object(commands, "restart_strategy", return_value="systemd"),
-        patch.object(commands, "_trigger_restart") as trigger,
-    ):
+async def test_restart_command_defers_to_safe_dispatcher_orchestration():
+    with patch.object(commands, "_trigger_restart") as trigger:
         reply = await commands.handle_command(
             "restart", "", "ou_user", "oc_chat", MagicMock(),
         )
 
-    trigger.assert_called_once_with()
-    assert "systemd" in reply
-    assert "Restart=always" in reply
+    trigger.assert_not_called()
+    assert "消息分发器" in reply

@@ -96,7 +96,7 @@ HELP_TEXT = """\
 `/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
 
 **服务管理：**
-`/restart` — 重启 cc-lark 服务（detached，不会自残）
+`/restart` — 立即提醒、打断未完成任务并重启服务（群聊需 @ 当前 bot）
 `/group add <chat_id> [cwd]` — 把群加白名单并设默认 cwd（实时生效 + 持久化到 .env）
 
 
@@ -1510,23 +1510,9 @@ async def handle_command(
         return "⏹ /stop 命令在消息队列外处理，如果看到这条说明当前没有运行中的任务。"
 
     elif cmd == "restart":
-        strat = restart_strategy()
-        if strat == "bare":
-            return (
-                "❌ 没找到任何 supervisor（既不是 launchd/systemd 任务也没有 "
-                f"{APP_PATH}），无法自动重启 —— 直接退出会停服。"
-                f"\nmacOS 请用 `launchctl submit -l {LAUNCHD_LABEL} ...` 托管；"
-                "Linux 请用 `Restart=always` 的 systemd service。"
-            )
-        _trigger_restart()
-        if strat == "launchd":
-            return (
-                f"♻️ 服务重启中 — launchd（`{LAUNCHD_LABEL}`）kickstart 杀+拉，"
-                "约 3-5s 回来。"
-            )
-        if strat == "systemd":
-            return "♻️ 服务重启中 — systemd `Restart=always`，约 5-10s 回来。"
-        return "♻️ 服务重启中 — 清 .app 残留后 `open .app` 拉起，全部就绪约 5s。"
+        # 真正重启必须由 dispatcher 统一编排：先把提醒发出去，再中断 active
+        # runs，最后触发 supervisor。这里绝不能先 _trigger_restart 再等调用方回复。
+        return "⚠️ 请单独发送 `/restart`；重启将由消息分发器安全执行。"
 
     elif cmd == "group":
         return await _handle_group_command(args, bot)
