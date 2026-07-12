@@ -3,8 +3,8 @@
 
 定位：把"只有常驻 bot 能干的运行时动作"暴露成 Claude Code 可调的 MCP 工具。
 本进程是**每个 turn 由 claude 拉起的短命前端**——turn 结束随 claude 一起被 killpg
-也无所谓，因为它**不持有任何状态**：它只把一次工具调用翻译成对常驻 bot 本机 HTTP
-端点（默认 127.0.0.1:9981 /wake）的一次请求，真正的"几分钟后唤醒"由 bot 的
+也无所谓，因为它**不持有任何状态**：它只把一次工具调用翻译成对常驻 bot 本机
+control API（默认 127.0.0.1:9982 /wake）的一次鉴权请求，真正的"几分钟后唤醒"由 bot 的
 APScheduler 持久兑现（见 scheduler.schedule_wake）。
 
 → 这正是"MCP server 必须 host 在常驻 bot 里"的落地：调度状态在 bot，stdio 这层
@@ -49,9 +49,24 @@ def _log(msg: str) -> None:
         pass
 
 
-def _callback_base() -> str:
-    port = (os.environ.get("CC_LARK_CALLBACK_PORT") or "9981").strip() or "9981"
+def _control_base() -> str:
+    # canonical 变量优先。后两个 alias 只为兼容尚未重启、仍注入旧 wake_context 的 bot；
+    # 新版 dispatcher 始终提供 CC_LARK_CONTROL_PORT，绝不会把控制请求发向 ngrok 端口。
+    port = (
+        os.environ.get("CC_LARK_CONTROL_PORT")
+        or os.environ.get("CC_LARK_HTTP_PORT")
+        or os.environ.get("CC_LARK_CALLBACK_PORT")
+        or "9982"
+    ).strip() or "9982"
     return f"http://127.0.0.1:{port}"
+
+
+def _control_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    token = (os.environ.get("CC_LARK_CONTROL_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def _allow(flag: str, default: str = "1") -> bool:
@@ -72,9 +87,9 @@ _ALLOW_CRON = _allow("CC_LARK_ALLOW_CRON")
 def _post_json(path: str, payload: dict, timeout: int = 35) -> dict:
     """POST 一个 JSON 给常驻 bot 的本机端点，返回解析后的 dict。任何异常向上抛。"""
     req = urllib.request.Request(
-        f"{_callback_base()}{path}",
+        f"{_control_base()}{path}",
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=_control_headers(),
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -271,14 +286,7 @@ def _tool_wake_me_in(args: dict) -> dict:
         "note": note.strip(),
     }
     try:
-        req = urllib.request.Request(
-            f"{_callback_base()}/wake",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read().decode("utf-8") or "{}")
+        body = _post_json("/wake", payload, timeout=10)
     except Exception as e:  # noqa: BLE001 — 任何失败都回成可见的工具错误，绝不抛进协议层
         _log(f"/wake POST failed: {type(e).__name__}: {e}")
         return _err(f"Failed to reach cc-lark scheduler: {type(e).__name__}: {e}")
@@ -522,7 +530,7 @@ def _write_framed_message(out: dict) -> None:
 
 
 def main() -> None:
-    _log(f"start (callback={_callback_base()} thread={os.environ.get('CC_LARK_THREAD_ID','-')[:14]})")
+    _log(f"start (callback={_control_base()} thread={os.environ.get('CC_LARK_THREAD_ID','-')[:14]})")
     while True:
         try:
             msg = _read_framed_message()
