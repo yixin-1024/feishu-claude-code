@@ -81,7 +81,13 @@ def main():
     for p in config.PROFILES:
         _bots[p.name] = BotInstance(p)
 
-    # 3) 三个层都通过 configure() 注入依赖（避免循环 import）
+    # 3) control plane secret：显式 env 优先，否则生成/复用 0600 token 文件。
+    # 先写回 os.environ，后续每个 agent spawn 才能把同一个 token 注入 cc_mcp_server。
+    control_token = http_server.load_or_create_control_token()
+    os.environ["CC_LARK_CONTROL_TOKEN"] = control_token
+    os.environ["CC_LARK_CONTROL_PORT"] = str(config.CONTROL_PORT)
+
+    # 4) 三个层都通过 configure() 注入依赖（避免循环 import）
     dispatcher.configure(bot_loop=bot_loop, bots=_bots)
 
     http_server.configure(
@@ -103,6 +109,7 @@ def main():
             schedule_cron=schedule_cron,
             list_crons=list_crons,
         ),
+        control_token=control_token,
     )
 
     runtime.configure(
@@ -115,32 +122,37 @@ def main():
         ),
     )
 
-    # 4) HTTP server + ngrok（卡片按钮回调走这里）
+    # 5) 拆分 HTTP listener：ngrok 只暴露 callback；control 只绑 loopback + token。
     cb_port = config.CALLBACK_PORT
+    control_port = config.CONTROL_PORT
+    if cb_port == control_port:
+        raise RuntimeError("CONTROL_PORT must differ from CALLBACK_PORT")
     http_server.start_callback_server(cb_port)
+    http_server.start_control_server(control_port)
     ngrok_url = http_server.start_ngrok(cb_port)
     if ngrok_url:
         print(f"   卡片回调    : {ngrok_url}/callback")
     else:
         print(f"   卡片回调    : http://localhost:{cb_port}/callback (需启动 ngrok)")
+    print(f"   本机控制面  : http://127.0.0.1:{control_port} (Bearer token)")
 
-    # 5) 后台基础设施
+    # 6) 后台基础设施
     runtime.start_summary_thread()
 
-    # 6) 每个 profile 起一个 WS 客户端
+    # 7) 每个 profile 起一个 WS 客户端
     print("✅ 连接 WebSocket 长连接（自动重连）...")
     for bot in _bots.values():
         runtime.start_profile_ws(bot)
 
-    # 7) 定时任务调度器（独立后台线程，绕开 asyncio monotonic timer 的 macOS 睡眠坑）
+    # 8) 定时任务调度器（独立后台线程，绕开 asyncio monotonic timer 的 macOS 睡眠坑）
     sched_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduled_tasks.yaml")
     runtime.start_scheduler_bg(sched_path)
 
-    # 7.1) inbox_watcher：事件驱动的"任务派单扫描器"
+    # 8.1) inbox_watcher：事件驱动的"任务派单扫描器"
     inbox_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox_config.yaml")
     inbox_watcher.start(inbox_cfg_path, _bots, bot_loop)
 
-    # 8) Claude Max 用量监控：跨阈值 / 窗口重置时主动给 owner 私聊通报
+    # 9) Claude Max 用量监控：跨阈值 / 窗口重置时主动给 owner 私聊通报
     # 通报通道：QUOTA_NOTIFY_PROFILE / QUOTA_NOTIFY_OPEN_ID 显式指定，
     # 缺省退回到第一个 profile 的第一个 allowed_open_id（默认 owner）。
     notify_profile = os.getenv("QUOTA_NOTIFY_PROFILE") or config.PROFILES[0].name

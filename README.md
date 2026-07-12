@@ -162,6 +162,8 @@ python3 main.py
 | 命令 | 说明 |
 |------|------|
 | `/usage` | 查看 Claude Max 用量和重置时间 (macOS) |
+| `/accounts` | 查看已保存的 Claude Max 账户及自动切换状态 |
+| `/switch <账户>` | 在 Claude runner 下切换本机全局 Claude Code 账户 |
 | `/skills` | 列出已安装的 Claude Skills |
 | `/mcp` | 列出 MCP Servers |
 | `/help` | 帮助 |
@@ -224,11 +226,19 @@ python3 main.py
 
 ### 5. 开启卡片回调 (可选)
 
-按钮交互（选项点击、命令菜单）需要配置卡片回调：
+按钮交互（选项点击、命令菜单）需要订阅 `card.action.trigger`。推荐在「事件与回调」
+的回调配置里选择「使用长连接接收回调」；SDK 会完成来源鉴权，且不需要公网入口。
 
-1. 「事件与回调」→「卡片交互配置」
-2. 使用 ngrok 暴露本机 `CALLBACK_PORT`（默认 9981）
-3. 回调地址填 ngrok URL
+如必须使用 Webhook：
+
+1. 使用 ngrok 暴露本机 `CALLBACK_PORT`（默认 9981）
+2. 回调地址填 `ngrok URL + /callback`
+3. 把开放平台「加密策略」里的 Verification Token 写入
+   `<PROFILE>_VERIFICATION_TOKEN`
+
+> ngrok 只能指向 `CALLBACK_PORT`。不要暴露 `CONTROL_PORT`；后者仅供本机 MCP/运维调用。
+> 所有按钮还会用对应 profile 的 App Secret 做 HMAC，绑定点击人、原消息和 30 天有效期；
+> 服务升级后旧的未签名按钮会提示过期，重新打开菜单即可。
 
 > 不配置卡片回调时，所有功能仍可用，只是按钮点击不生效，需要手动输入命令。
 
@@ -257,6 +267,9 @@ python3 main.py
 | `ALLOWED_GROUP_CHAT_IDS` | 推荐 | 空=禁用所有群 | 群聊 chat_id 白名单 (oc_*)，逗号分隔 |
 | `DISPATCH_CHAT_ID` | 否 | 空=禁用派单 | 会话群 chat_id；bot 在其它群被 @ 时把任务派到这里的新话题 |
 | `CALLBACK_PORT` | 否 | `9981` | 卡片按钮回调 HTTP 端口 |
+| `CONTROL_PORT` | 否 | `CALLBACK_PORT + 1` | 本机控制面端口，仅绑定 `127.0.0.1`，禁止转发到公网 |
+| `CC_LARK_CONTROL_TOKEN` | 否 | 自动生成 | 控制面 Bearer token；默认保存在 `~/.feishu-claude/control-token`（0600） |
+| `<PROFILE>_VERIFICATION_TOKEN` | 推荐 | 空 | Webhook 卡片回调的官方 Verification Token；长连接模式无需配置 |
 | `NGROK_DOMAIN` | 否 | 随机 | ngrok 固定域名 (避免每次重启换 URL) |
 | `STREAM_CHUNK_SIZE` | 否 | `20` | 流式推送的字符积累阈值 |
 | `CLAUDE_CLI_PATH` | 否 | 自动查找 | Claude CLI 可执行文件路径 |
@@ -315,17 +328,17 @@ python3 main.py
 
 **简单问候不走派单**（"你在干嘛"、"链接是啥"），系统提示有判断规则。
 
-**手动派单：** 也可以直接 `curl http://localhost:9981/spawn -d '{"profile":"work","chat_id":"oc_xxx","thread_id":"omt_xxx","anchor_message_id":"om_xxx","prompt":"..."}'` —— 仅本机可调。
+**手动派单：** 使用下方“本地控制端点”的 Bearer token 方式调用 `POST /spawn`。
 
-## 内置 Claude Code MCP
+## 内置 cc-lark 运行时 MCP
 
-cc-lark 会在 Claude Code PTY 启动时自动注入一个运行时 MCP server：`cc_mcp_server.py`。
-它暴露 `wake_me_in(minutes, note)`，让 Claude 在当前 Lark 话题里安排一个未来唤醒：
-MCP 前端只把请求 POST 到本机 `/wake`，真正的延迟调度由常驻 bot 的 scheduler 兑现。
+cc-lark 会在 Claude 与 Codex 会话启动时注入 `cc_mcp_server.py`。它提供
+`wake_me_in`、`dispatch_task`、`read_thread`、`schedule_cron`、`list_crons`；stdio
+前端只把鉴权请求发到本机 control listener，真正的派工与调度由常驻 bot 兑现。
 
 这条路径只在话题群上下文可用；runner 会把当前 `profile / chat_id / thread_id /
-anchor_message_id / user_id` 通过 `CC_LARK_*` 环境变量注入给 MCP server。设置
-`CC_LARK_WAKE_MCP=0` 可关闭自动注入。
+anchor_message_id / user_id / control port / token` 通过 `CC_LARK_*` 环境变量注入给
+MCP server。设置 `CC_LARK_WAKE_MCP=0` 可关闭自动注入。
 
 ## 定时任务
 
@@ -339,19 +352,31 @@ mkdir prompts && vim prompts/work_daily_briefing.md
 
 `scheduled_tasks.yaml` 字段说明见模板内注释；支持 `${VAR}` 引用 `.env` 变量。
 
-**本地控制端点**（仅 127.0.0.1）：
+**本地控制端点**（仅 `127.0.0.1:CONTROL_PORT`，全部要求 Bearer token）：
 
 | 端点 | 用途 |
 |------|------|
 | `GET /trigger` | 列出已注册任务 |
 | `GET /trigger?name=xxx` 或 `POST /trigger` | 手动触发任务（绕过 cron） |
 | `GET/POST /reload` | 热加载 yaml + prompt 文件，不打断进行中的任务 |
+| `POST /spawn` | 派单进独立 session |
+| `GET /handover` | CLI session 接管 |
 
 ```bash
-curl http://localhost:9981/trigger                        # 看有哪些任务
-curl http://localhost:9981/trigger?name=work_daily_briefing  # 立即跑一次
-curl http://localhost:9981/reload                         # 改完 yaml 不重启刷新
+set -a; source .env; set +a
+CALLBACK_PORT=${CALLBACK_PORT:-9981}
+CONTROL_PORT=${CONTROL_PORT:-$((CALLBACK_PORT + 1))}
+TOKEN_FILE=${CC_LARK_CONTROL_TOKEN_FILE:-$HOME/.feishu-claude/control-token}
+CONTROL_TOKEN=${CC_LARK_CONTROL_TOKEN:-$(cat "$TOKEN_FILE")}
+AUTH=(-H "Authorization: Bearer $CONTROL_TOKEN")
+
+curl "${AUTH[@]}" "http://127.0.0.1:$CONTROL_PORT/trigger"
+curl "${AUTH[@]}" "http://127.0.0.1:$CONTROL_PORT/trigger?name=work_daily_briefing"
+curl -X POST "${AUTH[@]}" "http://127.0.0.1:$CONTROL_PORT/reload"
 ```
+
+公网 callback listener 对 `/spawn`、`/trigger`、`/wake`、`/dispatch`、cron、handover
+等路径统一返回 404。即使经过 ngrok 后 socket peer 显示为 localhost，也无法进入控制面。
 
 ## 部署
 
@@ -361,7 +386,6 @@ curl http://localhost:9981/reload                         # 改完 yaml 不重�
 
 ```bash
 ./deploy/cc-lark install          # 装 bot + ngrok，开机自启
-./deploy/cc-lark install --no-ngrok  # 只装 bot
 cc-lark status                    # 查状态 + 看最近 10 行日志
 cc-lark restart                   # 重启（ngrok 优先，再重启 bot）
 cc-lark logs -f                   # 跟踪 bot 日志
@@ -369,7 +393,8 @@ cc-lark logs ngrok -f             # 跟踪 ngrok 日志
 cc-lark uninstall                 # 卸载
 ```
 
-脚本会读 `.env` 里的 `CALLBACK_PORT` / `NGROK_DOMAIN`，自动生成 plist。`ALLOWED_GROUP_CHAT_IDS=oc_xxx,oc_yyy` 支持多群白名单。
+脚本只把 `.env` 的 `CALLBACK_PORT` 暴露给 ngrok；Python 进程另行监听本机
+`CONTROL_PORT`。`ALLOWED_GROUP_CHAT_IDS=oc_xxx,oc_yyy` 支持多群白名单。
 
 ### macOS：手动 launchctl（不走包装）
 
@@ -428,6 +453,7 @@ python3 handover.py "对话中的一段独特文本"
 - **`cc-lark` launchctl wrapper** — One-command install/start/stop/restart/status/logs for macOS
 - **Dispatch / session group** — Mention bot in any group, it auto-creates a thread in a designated "session group" and runs the task in an isolated session there
 - **Cron tasks** — YAML-defined cron jobs that fire posts into a thread group and spawn isolated sessions; hot-reload via `/reload` endpoint
+- **Split control plane** — Public ngrok listener serves card callbacks only; privileged local APIs use a loopback-only, Bearer-authenticated port
 
 Quick start: clone, `pip install -r requirements.txt`, configure `.env` with Feishu/Lark app credentials, run `python3 main.py` (or `./deploy/cc-lark install` on macOS).
 

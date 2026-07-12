@@ -26,6 +26,12 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 
 from bot_config import Profile
 from bot_instance import BotInstance
+from card_security import (
+    card_action_allowed,
+    card_context_matches,
+    claim_event,
+    verify_action_value,
+)
 from agent_runner import run_agent
 from commands import parse_command, handle_command
 from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
@@ -559,7 +565,12 @@ async def _show_command_menu(bot: BotInstance, user_id: str, chat_id: str, is_gr
         elements.append({"tag": "markdown", "content": title})
         columns = []
         for btn in buttons:
-            value = {**btn["value"], "cid": chat_id, "profile": bot.profile.name}
+            value = {
+                **btn["value"],
+                "cid": chat_id,
+                "profile": bot.profile.name,
+                "_cc_uid": user_id,
+            }
             columns.append({
                 "tag": "column",
                 "width": "auto",
@@ -758,6 +769,11 @@ async def _run_and_display(
     raw_chat_id, _, thread_id = chat_id.partition(":")
     if is_group:
         cli_profile = bot.profile.lark_cli_profile or bot.profile.name
+        callback_port = str(os.getenv("CALLBACK_PORT", "9981"))
+        control_port = str(os.getenv(
+            "CC_LARK_CONTROL_PORT",
+            os.getenv("CONTROL_PORT", str(int(callback_port) + 1)),
+        ))
         wake_context = {
             "CC_LARK_PROFILE_NAME": bot.profile.name,
             "CC_LARK_CLI_PROFILE": cli_profile,
@@ -766,11 +782,16 @@ async def _run_and_display(
             "CC_LARK_MESSAGE_ID": notify_msg_id or "",
             "CC_LARK_USER_ID": user_id or "",
             "CC_LARK_IS_GROUP": "1",
-            "CC_LARK_HTTP_PORT": str(os.getenv("CALLBACK_PORT", "9981")),
-            # Backward-compatible aliases for the first wake_context draft.
+            "CC_LARK_CONTROL_PORT": control_port,
+            "CC_LARK_CONTROL_TOKEN": os.getenv("CC_LARK_CONTROL_TOKEN", ""),
+            # Backward-compatible alias for the first wake_context draft. It represented
+            # the internal HTTP API, so after the split it must follow the control port.
+            "CC_LARK_HTTP_PORT": control_port,
             "CC_LARK_PROFILE": bot.profile.name,
             "CC_LARK_ANCHOR": notify_msg_id or "",
-            "CC_LARK_CALLBACK_PORT": str(os.getenv("CALLBACK_PORT", "9981")),
+            # Keep the real public callback port available for diagnostics only. New MCP
+            # clients use CC_LARK_CONTROL_PORT and never POST control actions here.
+            "CC_LARK_CALLBACK_PORT": callback_port,
         }
 
     accumulated = ""
@@ -1167,7 +1188,12 @@ async def _run_and_display(
             try:
                 if options:
                     buttons = [
-                        {"text": display, "value": {"reply": value, "cid": chat_id, "profile": bot.profile.name}}
+                        {"text": display, "value": {
+                            "reply": value,
+                            "cid": chat_id,
+                            "profile": bot.profile.name,
+                            "_cc_uid": user_id,
+                        }}
                         for display, value in options
                     ]
                     short = all(len(b["text"]) <= 10 for b in buttons)
@@ -1419,6 +1445,7 @@ async def _process_message(
                 val = btn.get("value")
                 if isinstance(val, dict):
                     val.setdefault("profile", bot.profile.name)
+                    val["_cc_uid"] = user_id
 
             if reply_buttons:
                 if is_group:
@@ -1704,7 +1731,7 @@ def _resolve_bot_from_value(value: dict) -> Optional[BotInstance]:
     return None
 
 
-def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+def on_card_action(bot: BotInstance, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     """用户点击卡片按钮（SDK 长连接回调路径）"""
     # 通知 runtime 刷新最近活动时间
     try:
@@ -1719,13 +1746,49 @@ def on_card_action(data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
     action_type = value.get("action", "")
     chat_id = value.get("cid", user_id)
     clicked_msg_id = event.context.open_message_id if event.context else None
+    callback_chat_id = event.context.open_chat_id if event.context else ""
 
-    bot = _resolve_bot_from_value(value)
-    if bot is None:
+    header = data.header
+    source_valid = bool(
+        header
+        and data.schema == "2.0"
+        and header.event_type == "card.action.trigger"
+        and header.app_id == bot.profile.app_id
+        and value.get("profile") == bot.profile.name
+    )
+    if not source_valid:
         resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "warning"
         toast.content = "按钮已过期，请重新操作"
+        resp.toast = toast
+        return resp
+
+    verified, reason = verify_action_value(
+        value,
+        bot.profile.app_secret,
+        user_id=user_id,
+        message_id=clicked_msg_id or "",
+    )
+    context_valid = card_context_matches(user_id, chat_id, callback_chat_id or "")
+    if (
+        not verified
+        or not context_valid
+        or not card_action_allowed(bot.profile, user_id, chat_id)
+    ):
+        log(bot.profile.name, "card", "warn",
+            f"拒绝卡片动作 user={user_id[:8]}... reason={reason or 'acl/replay'}")
+        resp = P2CardActionTriggerResponse()
+        toast = CallBackToast()
+        toast.type = "warning"
+        toast.content = "按钮无效或已过期，请重新操作"
+        resp.toast = toast
+        return resp
+    if not claim_event(bot.profile.name, header.event_id or ""):
+        resp = P2CardActionTriggerResponse()
+        toast = CallBackToast()
+        toast.type = "info"
+        toast.content = "该操作已处理"
         resp.toast = toast
         return resp
 
@@ -1813,6 +1876,7 @@ async def handle_menu_command(bot: BotInstance, user_id: str, chat_id: str, cmd_
         val = btn.get("value")
         if isinstance(val, dict):
             val.setdefault("profile", bot.profile.name)
+            val["_cc_uid"] = user_id
 
     if card_msg_id:
         try:

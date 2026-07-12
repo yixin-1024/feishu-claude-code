@@ -1121,7 +1121,7 @@ def auto_stash_identity_for_current() -> tuple[str, Optional[str]]:
     return ("stashed", name)
 
 
-# ── 状态持久化（仅冷却时间戳）─────────────────────────────────────
+# ── 状态持久化（冷却、最近目标、手动保护期）────────────────────────
 
 
 def _load_state() -> dict:
@@ -1161,6 +1161,9 @@ _DEFAULT_SWITCHER: Optional["AccountSwitcher"] = None
 _SPAWN_PROBE_THROTTLE_SEC = 45
 _last_spawn_probe_at = 0.0
 _spawn_probe_lock = threading.Lock()
+# 手动 /switch 与后台自动切换必须共用同一把进程内锁。否则两条路径可能同时
+# 读取旧账户、再先后覆写 keychain，最终 active 账户与 switcher state 对不上。
+_ACCOUNT_SWITCH_LOCK = threading.Lock()
 
 
 def set_default_switcher(sw: Optional["AccountSwitcher"]) -> None:
@@ -1168,6 +1171,72 @@ def set_default_switcher(sw: Optional["AccountSwitcher"]) -> None:
     供 spawn 路径（claude_runner.run_claude）按需触发。"""
     global _DEFAULT_SWITCHER
     _DEFAULT_SWITCHER = sw
+
+
+def manual_switch_hold_seconds() -> int:
+    """返回显式选择账户后暂停自动切换的秒数；自动切换未启用时为 0。"""
+    sw = _DEFAULT_SWITCHER
+    if sw is None or not getattr(sw, "enabled", False):
+        return 0
+    try:
+        return max(0, int(getattr(sw, "cooldown_sec", _DEFAULT_COOLDOWN_SEC)))
+    except (TypeError, ValueError):
+        return _DEFAULT_COOLDOWN_SEC
+
+
+def switch_account_manually(name: str) -> tuple[bool, str]:
+    """显式切换到 saved Claude Code 账户，并同步自动切换状态。
+
+    这是聊天 `/switch <name>` 与 CLI `use <name>` 的高层入口。低层
+    :func:`use_account` 只负责 credentials + identity；这里额外负责：
+      - 与后台 AccountSwitcher 串行，避免同时改 keychain；
+      - 切换前回存当前账户可能刚轮换过的 token + identity；
+      - 写入 last_switch_*，让冷却与 keychain 自愈知道用户刚选了谁；
+      - 在一个自动切换 cooldown 内尊重人工选择，并刷新 spawn probe 节流时间。
+    """
+    err = _validate_name(name)
+    if err:
+        return False, err
+    if not _ACCOUNT_SWITCH_LOCK.acquire(blocking=False):
+        return False, "another Claude account switch is already in progress; retry shortly"
+
+    try:
+        current = current_account_name()
+        now = time.time()
+
+        # Claude CLI 可能已经轮换过当前 token。离开前先把 live keychain 回存到
+        # saved slot；即使目标就是当前账户，也要 resync 后直接 no-op，不能拿旧
+        # snapshot 再覆写一次 live token。
+        if current:
+            sync_status, sync_msg = resync_current_from_keychain()
+            if sync_status not in {"noop", "resynced"}:
+                print(f"[switcher] manual resync 跳过: {sync_msg}", flush=True)
+
+        if current != name:
+            ok, msg = use_account(name)
+            if not ok:
+                return False, msg
+        else:
+            msg = f"already using {name}"
+
+        state = _load_state()
+        state["last_switch_at"] = now
+        state["last_switch_from"] = current or ""
+        state["last_switch_to"] = name
+        state["last_switch_source"] = "manual"
+        hold_sec = manual_switch_hold_seconds()
+        if hold_sec:
+            state["manual_hold_until"] = now + hold_sec
+        else:
+            state.pop("manual_hold_until", None)
+        _save_state(state)
+
+        global _last_spawn_probe_at
+        with _spawn_probe_lock:
+            _last_spawn_probe_at = now
+        return True, msg
+    finally:
+        _ACCOUNT_SWITCH_LOCK.release()
 
 
 def maybe_switch_before_spawn(*, force: bool = False) -> Optional[str]:
@@ -1266,12 +1335,23 @@ class AccountSwitcher:
             return None
         if not self._lock.acquire(blocking=False):
             return None
+        if not _ACCOUNT_SWITCH_LOCK.acquire(blocking=False):
+            self._lock.release()
+            return None
         try:
             return self._maybe_switch_locked()
         finally:
+            _ACCOUNT_SWITCH_LOCK.release()
             self._lock.release()
 
     def _maybe_switch_locked(self) -> Optional[str]:
+        # `/switch <name>` 是用户的显式选择。自动切换启用时，在一个 cooldown
+        # 内连 emergency 路径也不覆盖它；否则手动选中临近 reset 的账户后，下一次
+        # spawn 会立刻因 hard-limit 又切走，看起来像命令完全没生效。
+        state = _load_state()
+        if float(state.get("manual_hold_until") or 0) > time.time():
+            return None
+
         # 先探测 + 决策，再决定要不要受冷却 / 活跃子进程约束。
         # 关键：gate 放到 decide 之后，才能区分「紧急切换」(当前账户已不可用) 和
         # 「优化切换」(候选只是略优)。否则当前账户限流/挂掉时，冷却 + 活跃子进程
@@ -1290,7 +1370,6 @@ class AccountSwitcher:
         # 直接绕过冷却 + 活跃子进程 gate。
         emergency = (cur_acc is None) or (not cur_acc.usable)
 
-        state = _load_state()
         if not emergency:
             # 优化切换：只尊重冷却防抖（避免临界差距下来回抖）。
             # 不再因"有正在跑的 claude 子进程"而推迟——Claude 支持 keychain 热切换，
@@ -1318,6 +1397,8 @@ class AccountSwitcher:
         state["last_switch_at"] = time.time()
         state["last_switch_from"] = current or ""
         state["last_switch_to"] = target
+        state["last_switch_source"] = "auto"
+        state.pop("manual_hold_until", None)
         _save_state(state)
 
         # 7) 通报
@@ -1409,7 +1490,7 @@ def _cli_main(argv: list[str]) -> int:
         return 0 if status in ("noop", "resynced") else 1
 
     if args.cmd == "use":
-        ok, msg = use_account(args.name)
+        ok, msg = switch_account_manually(args.name)
         print(msg)
         if ok:
             print("→ restart any running Claude Code session to pick up the new token.")
@@ -1452,4 +1533,3 @@ def _cli_main(argv: list[str]) -> int:
 if __name__ == "__main__":
     import sys
     sys.exit(_cli_main(sys.argv[1:]))
-

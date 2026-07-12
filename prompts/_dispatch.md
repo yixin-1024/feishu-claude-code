@@ -37,7 +37,11 @@ echo "ANCHOR=$ANCHOR"
 `thread_id` 直接传刚拿到的 `$ANCHOR`（om_xxx 形式）—— /spawn 服务端会**自动 mget 转换成真正的 omt_xxx**，不要自己再去 chat-messages-list 查，那一步绕路且容易出错（race condition / jq 失败时 Claude 走捷径用 message_id 替代会污染 session 索引，已踩过坑）：
 
 ```bash
-curl -sS -X POST http://localhost:9981/spawn -H 'Content-Type: application/json' \
+CONTROL_PORT="${CC_LARK_CONTROL_PORT:-${CC_LARK_HTTP_PORT:-${CC_LARK_CALLBACK_PORT:-9982}}}"
+: "${CC_LARK_CONTROL_TOKEN:?cc-lark control token missing}"
+curl -sS -X POST "http://127.0.0.1:$CONTROL_PORT/spawn" \
+  -H "Authorization: Bearer $CC_LARK_CONTROL_TOKEN" \
+  -H 'Content-Type: application/json' \
   -d "$(jq -n --arg a "$ANCHOR" --arg p '<完整 prompt 多行字符串>' \
      '{profile:"${cli_profile}", chat_id:"${dispatch_chat_id}", thread_id:$a, anchor_message_id:$a, prompt:$p}')"
 ```

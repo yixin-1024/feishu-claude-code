@@ -166,6 +166,43 @@ async def test_group_chat_mention_self_processed(isolated_sessions):
     proc.assert_awaited_once()
 
 
+async def test_group_switch_ignores_other_bot_mention(isolated_sessions):
+    bot = _make_bot(allowed_groups={"oc_group_1"}, bot_open_id="ou_this_bot")
+    mention = _make_mention(key="@Other", open_id="ou_other_bot")
+    event = _make_event(
+        chat_id="oc_group_1",
+        chat_type="group",
+        text="/switch info @Other",
+        mentions=[mention],
+    )
+
+    with patch("commands._switch_claude_account") as switch:
+        await handle_message_async(bot, event)
+
+    switch.assert_not_called()
+    bot.feishu.reply_card.assert_not_awaited()
+
+
+async def test_group_switch_handles_current_bot_mention(isolated_sessions):
+    bot = _make_bot(allowed_groups={"oc_group_1"}, bot_open_id="ou_this_bot")
+    mention = _make_mention(key="@This", open_id="ou_this_bot")
+    event = _make_event(
+        chat_id="oc_group_1",
+        chat_type="group",
+        text="/switch info @This",
+        mentions=[mention],
+    )
+
+    with patch(
+        "commands._switch_claude_account",
+        return_value="✅ Claude Code 账户已切换为 `info`。",
+    ) as switch:
+        await handle_message_async(bot, event)
+
+    switch.assert_called_once_with("info")
+    bot.feishu.reply_card.assert_awaited_once()
+
+
 async def test_group_text_removes_mentions_before_agent(isolated_sessions):
     bot = _make_bot(allowed_groups={"oc_group_1"})
     bot.feishu.reply_card.return_value = "card_1"

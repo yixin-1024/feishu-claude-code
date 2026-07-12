@@ -150,6 +150,8 @@ def test_run_agent_merges_wake_context_into_claude_env(monkeypatch):
         wake_context={
             "CC_LARK_CLI_PROFILE": "work",
             "CC_LARK_MESSAGE_ID": "om_1",
+            "CC_LARK_CONTROL_PORT": "9982",
+            "CC_LARK_CONTROL_TOKEN": "secret-token",
         },
     ))
 
@@ -160,6 +162,8 @@ def test_run_agent_merges_wake_context_into_claude_env(monkeypatch):
     assert captured["extra_env"]["ANTHROPIC_MODEL"] == "claude-sonnet-4-6"
     assert captured["extra_env"]["CC_LARK_CLI_PROFILE"] == "work"
     assert captured["extra_env"]["CC_LARK_MESSAGE_ID"] == "om_1"
+    assert captured["extra_env"]["CC_LARK_CONTROL_PORT"] == "9982"
+    assert captured["extra_env"]["CC_LARK_CONTROL_TOKEN"] == "secret-token"
 
 
 def test_run_agent_applies_profile_claude_runner(monkeypatch):

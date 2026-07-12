@@ -19,7 +19,7 @@
 # 用法：
 #   1. cp scheduled_tasks.yaml.example scheduled_tasks.yaml
 #   2. 按需改字段；prompt_file 指向的文件自己放 prompts/ 目录
-#   3. 重启 bot 或 curl http://localhost:9981/reload 热加载
+#   3. 重启 bot，或按 README 的 Bearer token 示例调用本机 CONTROL_PORT /reload 热加载
 
 - name: work_daily_briefing
   profile: work

@@ -349,6 +349,73 @@ def isolated_state(monkeypatch, tmp_path):
     yield sf
 
 
+def test_manual_switch_resyncs_records_state_and_holds_auto(isolated_state, monkeypatch):
+    fake_default = MagicMock(enabled=True, cooldown_sec=1800)
+    monkeypatch.setattr(accs, "_DEFAULT_SWITCHER", fake_default)
+    monkeypatch.setattr(accs, "_last_spawn_probe_at", 0.0)
+    monkeypatch.setattr(accs, "current_account_name", lambda: "mar")
+    resync = MagicMock(return_value=("resynced", "mar"))
+    use = MagicMock(return_value=(True, "switched to info (team/default_claude_max_5x)"))
+    monkeypatch.setattr(accs, "resync_current_from_keychain", resync)
+    monkeypatch.setattr(accs, "use_account", use)
+
+    before = time.time()
+    ok, msg = accs.switch_account_manually("info")
+
+    assert ok and "switched to info" in msg
+    resync.assert_called_once_with()
+    use.assert_called_once_with("info")
+    state = json.loads(isolated_state.read_text())
+    assert state["last_switch_from"] == "mar"
+    assert state["last_switch_to"] == "info"
+    assert state["last_switch_source"] == "manual"
+    assert state["manual_hold_until"] >= before + 1799
+    assert accs._last_spawn_probe_at >= before
+
+
+def test_manual_switch_same_account_resyncs_without_reapplying_snapshot(
+    isolated_state, monkeypatch
+):
+    monkeypatch.setattr(accs, "_DEFAULT_SWITCHER", None)
+    monkeypatch.setattr(accs, "current_account_name", lambda: "info")
+    resync = MagicMock(return_value=("resynced", "info"))
+    use = MagicMock()
+    monkeypatch.setattr(accs, "resync_current_from_keychain", resync)
+    monkeypatch.setattr(accs, "use_account", use)
+
+    ok, msg = accs.switch_account_manually("info")
+
+    assert ok and msg == "already using info"
+    resync.assert_called_once_with()
+    use.assert_not_called()
+    state = json.loads(isolated_state.read_text())
+    assert state["last_switch_to"] == "info"
+    assert "manual_hold_until" not in state
+
+
+def test_manual_switch_failure_does_not_write_state(isolated_state, monkeypatch):
+    monkeypatch.setattr(accs, "current_account_name", lambda: "mar")
+    monkeypatch.setattr(accs, "resync_current_from_keychain", lambda: ("noop", "mar"))
+    monkeypatch.setattr(accs, "use_account", lambda _name: (False, "keychain write failed"))
+
+    ok, msg = accs.switch_account_manually("info")
+
+    assert not ok and "keychain" in msg
+    assert not isolated_state.exists()
+
+
+def test_manual_hold_blocks_even_emergency_auto_switch(isolated_state, monkeypatch):
+    isolated_state.write_text(json.dumps({"manual_hold_until": time.time() + 1800}))
+    sw = AccountSwitcher(enabled=True)
+    monkeypatch.setattr(
+        accs,
+        "probe_all",
+        lambda: pytest.fail("manual hold should skip probing and auto-switching"),
+    )
+
+    assert sw.maybe_switch() is None
+
+
 def test_maybe_switch_skips_when_disabled(isolated_state):
     sw = AccountSwitcher(enabled=False)
     with patch.object(accs, "probe_all") as p:
@@ -1197,4 +1264,3 @@ def test_claude_dir_lock_proceeds_when_held_fresh(monkeypatch, tmp_path):
     with accs._claude_dir_lock(budget_sec=0.15) as got:
         assert got is False  # 抢不到但继续，不阻塞
     assert os.path.isdir(lock_dir)  # 别人的锁没被动
-

@@ -78,6 +78,9 @@ class Profile:
     chat_default_cwd: dict[str, str] = field(default_factory=dict)
     allowed_open_ids: set[str] = field(default_factory=set)
     allowed_group_chat_ids: set[str] = field(default_factory=set)
+    # Webhook callback source verification. Long-connection callbacks are already
+    # authenticated by the SDK; HTTP callbacks should also set this per profile.
+    verification_token: str = ""
     lark_cli_profile: str = ""  # 告诉 Claude 用 `lark-cli --profile <name>` 发消息
     # 可选：该 profile spawn claude 时额外注入的 env 覆盖文件（相对 cc-lark 目录或绝对路径）。
     # 用于把某个 bot 路由到不同的模型供应商（如 .env.deepseek 走 DeepSeek 的 Anthropic 兼容端点）。
@@ -239,6 +242,7 @@ def _load_profile(name: str) -> Profile:
         chat_default_cwd=chat_default_cwd,
         allowed_open_ids=_split_csv(env("ALLOWED_OPEN_IDS")),
         allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
+        verification_token=env("VERIFICATION_TOKEN").strip(),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),
         claude_env_file=env("CLAUDE_ENV_FILE").strip(),
         claude_runner=claude_runner,
@@ -320,6 +324,7 @@ def _load_legacy_profile() -> Optional[Profile]:
         default_model=os.getenv("DEFAULT_MODEL", ""),
         allowed_open_ids=_split_csv(os.getenv("ALLOWED_OPEN_IDS", "")),
         allowed_group_chat_ids=_split_csv(os.getenv("ALLOWED_GROUP_CHAT_IDS", "")),
+        verification_token=os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip(),
         lark_cli_profile=os.getenv("LARK_CLI_PROFILE", legacy_name),
         claude_env_file=os.getenv("CLAUDE_ENV_FILE", "").strip(),
         claude_runner=os.getenv("CLAUDE_RUNNER", "").strip().lower(),
@@ -419,8 +424,10 @@ PERMISSION_MODE = os.getenv("PERMISSION_MODE", "bypassPermissions")
 # session 数据目录（每个 profile 写一个独立 json 文件）
 SESSIONS_DIR = os.path.expanduser("~/.feishu-claude")
 
-# 卡片按钮回调 HTTP 端口（ngrok 暴露），所有 profile 共用同一个端口
+# 卡片按钮回调 HTTP 端口（ngrok 暴露），所有 profile 共用同一个端口。
+# control API 必须使用独立 loopback 端口，不能和 callback/ngrok 共面。
 CALLBACK_PORT = int(os.getenv("CALLBACK_PORT", "9981"))
+CONTROL_PORT = int(os.getenv("CONTROL_PORT", str(CALLBACK_PORT + 1)))
 
 # 流式卡片更新：每积累多少字符推送一次
 STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "20"))

@@ -465,6 +465,7 @@ cc-lark — 飞书/Lark Claude Bot 服务控制（macOS launchd KeepAlive）
 
 .env 可配置:
   CALLBACK_PORT   卡片回调端口（默认 9981）
+  CONTROL_PORT    本机控制面端口（默认 CALLBACK_PORT+1；禁止暴露给 ngrok）
   NGROK_DOMAIN    ngrok 固定域名（不设置则随机域名）
 
 环境变量:

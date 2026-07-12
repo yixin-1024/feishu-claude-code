@@ -17,8 +17,40 @@ import sys
 import urllib.parse
 import urllib.request
 
+from dotenv import dotenv_values
+
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
-HANDOVER_URL = "http://localhost:9981/handover"
+_REPO_ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def _setting(name: str, default: str = "") -> str:
+    value = (os.environ.get(name) or "").strip()
+    if value:
+        return value
+    try:
+        return str(dotenv_values(_REPO_ENV).get(name) or default).strip()
+    except Exception:
+        return default
+
+
+def _control_token() -> str:
+    token = _setting("CC_LARK_CONTROL_TOKEN")
+    if token:
+        return token
+    token_file = os.path.expanduser(
+        _setting("CC_LARK_CONTROL_TOKEN_FILE", "~/.feishu-claude/control-token")
+    )
+    try:
+        with open(token_file, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _handover_url() -> str:
+    callback_port = int(_setting("CALLBACK_PORT", "9981"))
+    port = _setting("CONTROL_PORT", str(callback_port + 1))
+    return f"http://127.0.0.1:{port}/handover"
 
 
 def _find_session(fingerprint: str) -> tuple[str, str] | None:
@@ -69,8 +101,17 @@ def main():
         query["profile"] = sys.argv[2]
     params = urllib.parse.urlencode(query)
 
+    token = _control_token()
+    if not token:
+        print("ERROR: 找不到 cc-lark control token；请先启动新版 bot", file=sys.stderr)
+        sys.exit(1)
+
+    req = urllib.request.Request(
+        f"{_handover_url()}?{params}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
     try:
-        with urllib.request.urlopen(f"{HANDOVER_URL}?{params}", timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read())
     except ConnectionRefusedError:
         print("ERROR: 飞书 Bot 未运行")

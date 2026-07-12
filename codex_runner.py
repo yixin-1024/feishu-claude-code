@@ -51,7 +51,9 @@ def _cc_lark_mcp_config_flags(extra_env: Optional[dict]) -> list[str]:
 
     cc_env = {
         k: str(v) for k, v in (extra_env or {}).items()
-        if k.startswith("CC_LARK_") and v is not None
+        if k.startswith("CC_LARK_")
+        and k != "CC_LARK_CONTROL_TOKEN"
+        and v is not None
     }
     # 能力闸门支持 per-profile 覆盖（<PROFILE>_<FLAG> 优先于全局 <FLAG>）。
     from bot_config import resolve_cc_lark_gates

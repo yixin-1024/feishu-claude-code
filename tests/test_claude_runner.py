@@ -134,6 +134,7 @@ def test_print_backend_injects_cc_lark_mcp(monkeypatch):
             "CC_LARK_THREAD_ID": "omt_1",
             "CC_LARK_MESSAGE_ID": "om_1",
             "CC_LARK_CLI_PROFILE": "work",
+            "CC_LARK_CONTROL_TOKEN": "secret-token",
         },
     ))
 
@@ -145,6 +146,7 @@ def test_print_backend_injects_cc_lark_mcp(monkeypatch):
     assert server["args"][0].endswith("cc_mcp_server.py")
     assert server["env"]["CC_LARK_THREAD_ID"] == "omt_1"
     assert server["env"]["CC_LARK_CLI_PROFILE"] == "work"
+    assert "CC_LARK_CONTROL_TOKEN" not in server["env"]
 
 
 def test_run_claude_returns_partial_output_on_nonzero_exit_with_stderr(monkeypatch):

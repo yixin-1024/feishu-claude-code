@@ -293,7 +293,9 @@ def start_profile_ws(bot: BotInstance) -> None:
     def _on_card(data):
         touch_event()
         _touch_profile_event(name)
-        return _bindings.on_card_action(data)
+        # The WS connection is authenticated for this exact app/profile.  Pass the
+        # bound bot through; action.value.profile must never be allowed to reroute it.
+        return _bindings.on_card_action(bot, data)
 
     def _build_client():
         handler = (

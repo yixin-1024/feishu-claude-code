@@ -13,6 +13,7 @@ LARK_CARD_SCHEMA=1.0→v1。
 """
 
 import asyncio
+import copy
 import json
 import os
 import tempfile
@@ -31,6 +32,7 @@ from lark_oapi.api.im.v1.model import (
 )
 
 import outbox
+from card_security import sign_action_value
 
 
 class FeishuApiError(RuntimeError):
@@ -256,6 +258,48 @@ class FeishuClient:
         # 会 fallback 到这个 cache。仅内存，重启就丢；只对"刚发完卡片就要审"场景有效。
         self._card_text_cache: dict[str, str] = {}
         self._CARD_CACHE_MAX = 500  # 简单上限防止无界增长
+
+    def _signed_action_value(self, value: dict, message_id: str) -> dict:
+        """Sign a callback value and bind it to its intended user + card message."""
+        user_id = value.get("_cc_uid", "") if isinstance(value, dict) else ""
+        return sign_action_value(
+            value,
+            self._app_secret,
+            user_id=user_id,
+            message_id=message_id,
+        )
+
+    def _protect_card_elements(self, elements: list[dict], message_id: str) -> list[dict]:
+        """Sign every callback button in an arbitrary Card JSON element tree."""
+        protected = copy.deepcopy(elements)
+
+        def visit(node):
+            if isinstance(node, list):
+                for item in node:
+                    visit(item)
+                return
+            if not isinstance(node, dict):
+                return
+            if node.get("tag") == "button":
+                raw = node.get("value")
+                if not isinstance(raw, dict):
+                    for behavior in node.get("behaviors", []) or []:
+                        if behavior.get("type") == "callback" and isinstance(behavior.get("value"), dict):
+                            raw = behavior["value"]
+                            break
+                if isinstance(raw, dict):
+                    signed = self._signed_action_value(raw, message_id)
+                    node["value"] = signed
+                    for behavior in node.get("behaviors", []) or []:
+                        if behavior.get("type") == "callback":
+                            behavior["value"] = signed
+            for key, child in node.items():
+                # Callback values are opaque business data, not Card JSON subtrees.
+                if key != "value":
+                    visit(child)
+
+        visit(protected)
+        return protected
 
     def _remember_card_text(self, message_id: str, content: str) -> None:
         """记下一张卡片的当前文本，给 thread_context 解析 bot 历史卡片用。"""
@@ -599,28 +643,31 @@ class FeishuClient:
 
             if buttons:
                 st["seq"] += 1
-                await self._streaming_add_buttons(card_id, buttons, flow=flow, sequence=st["seq"])
+                await self._streaming_add_buttons(
+                    card_id, buttons, flow=flow, sequence=st["seq"], message_id=message_id,
+                )
         except Exception as e:
             print(f"[cardkit] finalize 失败 msg={message_id[:12]}: {e}", flush=True)
         finally:
             self._streaming_cards.pop(message_id, None)
 
     async def _streaming_add_buttons(self, card_id: str, buttons: list[dict], flow: bool = False,
-                                     sequence: int = 1):
+                                     sequence: int = 1, message_id: str = ""):
         """流式结束后给卡片追加按钮元素。sequence 为必填（缺则 99992402 校验失败）。"""
         from lark_oapi.api.cardkit.v1.model import (
             CreateCardElementRequest, CreateCardElementRequestBody,
         )
         btn_elements = []
         for i, btn in enumerate(buttons):
+            signed_value = self._signed_action_value(btn["value"], message_id)
             btn_elements.append({
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": btn["text"]},
                 "type": "default",
                 "size": "small",
                 "name": f"btn_{i}",
-                "value": btn["value"],
-                "behaviors": [{"type": "callback", "value": btn["value"]}],
+                "value": signed_value,
+                "behaviors": [{"type": "callback", "value": signed_value}],
             })
         if not btn_elements:
             return
@@ -878,14 +925,15 @@ class FeishuClient:
         base = _card_dict(content)
         btn_elements = []
         for i, btn in enumerate(buttons):
+            signed_value = self._signed_action_value(btn["value"], message_id)
             btn_elements.append({
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": btn["text"]},
                 "type": "default",
                 "size": "small",
                 "name": f"btn_{i}",
-                "value": btn["value"],
-                "behaviors": [{"type": "callback", "value": btn["value"]}],
+                "value": signed_value,
+                "behaviors": [{"type": "callback", "value": signed_value}],
             })
         if flow and btn_elements:
             # 横排: column_set + flex_mode flow
@@ -916,6 +964,7 @@ class FeishuClient:
 
     async def update_card_elements(self, message_id: str, elements: list[dict]):
         """用自定义 elements 列表更新卡片（支持 markdown + button 混排）"""
+        elements = self._protect_card_elements(elements, message_id)
         card_content = _serialize_card({
             "schema": "2.0",
             "body": {"elements": elements},

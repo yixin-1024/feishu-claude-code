@@ -91,6 +91,7 @@ HELP_TEXT = """\
 `/mcp` — 列出已配置的 MCP Servers
 `/usage` — 查看当前 runner 的上下文/用量信息
 `/accounts` — 查看所有 Claude Max 账户全景 + 智能切换状态
+`/switch <账户>` — 在 Claude runner 下切换本机全局 Claude Code 账户
 
 **审计：**
 `/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
@@ -127,7 +128,7 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 # Bot 自身处理的命令，其余 /xxx 转发给 Claude
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "runner", "model", "mode", "status", "cd", "ls",
-    "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "stop",
+    "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "switch", "stop",
     "restart", "group", "defaults",
 }
 
@@ -739,6 +740,79 @@ def _get_accounts() -> str:
         return f"❌ 探测账户失败：{e}"
     sw = AccountSwitcher()  # 无 send_fn、纯渲染
     return sw.render_matrix(accounts, current)
+
+
+def _get_account_switch_picker(chat_id: str) -> dict | str:
+    """构建 `/switch` 无参数时的账户选择卡片，不发 quota 探测请求。"""
+    try:
+        from account_switcher import list_accounts_summary
+        rows = list_accounts_summary()
+    except Exception as e:
+        return f"❌ 读取 Claude Code 账户失败：{e}"
+    if not rows:
+        return "❌ 没有已保存的 Claude Code 账户。请先在本机运行 `claude-switch save <名称>`。"
+
+    current = next((row["name"] for row in rows if row.get("active")), None)
+    current_line = f"当前账户：`{current}`" if current else "当前账户：`未识别`"
+    return {
+        "text": (
+            "👤 **切换 Claude Code 账户**\n"
+            f"{current_line}\n"
+            "该操作只切换本机全局 Claude Code 凭证，不改变当前 chat 的 runner / model。"
+        ),
+        "buttons": [
+            {
+                "text": ("● " if row.get("active") else "") + row["name"],
+                "value": {
+                    "action": "run_cmd",
+                    "cmd": f"/switch {row['name']}",
+                    "cid": chat_id,
+                },
+            }
+            for row in rows
+        ],
+    }
+
+
+def _switch_claude_account(name: str) -> str:
+    """同步执行一次显式 Claude Code 账户切换，供 asyncio.to_thread 调用。"""
+    try:
+        from account_switcher import (
+            list_account_files,
+            manual_switch_hold_seconds,
+            switch_account_manually,
+        )
+        ok, detail = switch_account_manually(name)
+    except Exception as e:
+        return f"❌ Claude Code 账户切换失败：{e}"
+
+    try:
+        available = list_account_files()
+    except Exception:
+        available = []
+    available_line = "、".join(f"`{item}`" for item in available) or "（无）"
+    if not ok:
+        return (
+            f"❌ Claude Code 账户切换失败：{detail}\n"
+            f"可用账户：{available_line}"
+        )
+
+    if detail.startswith("already using "):
+        headline = f"✅ 当前已经是 Claude Code 账户 `{name}`。"
+    else:
+        headline = f"✅ Claude Code 账户已切换为 `{name}`。"
+    lines = [
+        headline,
+        "新启动的 Claude Code 任务会使用该账户；正在运行的任务不受影响。",
+        "当前 chat 的 runner / model 保持不变。",
+    ]
+    hold_sec = manual_switch_hold_seconds()
+    if hold_sec:
+        minutes = max(1, hold_sec // 60)
+        lines.append(f"自动切换将在约 {minutes} 分钟的手动保护期后恢复判断。")
+    if "identity missing" in detail:
+        lines.append("⚠️ 该账户缺少 identity 快照，Claude Code 可能要求重新登录。")
+    return "\n".join(lines)
 
 
 _EXEC_TIMEOUT_SEC = 30
@@ -1505,6 +1579,22 @@ async def handle_command(
 
     elif cmd == "accounts":
         return await asyncio.to_thread(_get_accounts)
+
+    elif cmd == "switch":
+        cur = await store.get_current(user_id, chat_id)
+        runner = str(
+            getattr(cur, "runner", "")
+            or getattr(getattr(bot, "profile", None), "runner", "claude")
+        ).lower()
+        if runner != "claude":
+            return (
+                "⚠️ `/switch` 只用于 Claude Code 账户切换。\n"
+                f"当前 chat runner 是 `{runner}`；可先发送 `/runner claude`。"
+            )
+        name = args.strip()
+        if not name:
+            return await asyncio.to_thread(_get_account_switch_picker, chat_id)
+        return await asyncio.to_thread(_switch_claude_account, name)
 
     elif cmd == "stop":
         return "⏹ /stop 命令在消息队列外处理，如果看到这条说明当前没有运行中的任务。"

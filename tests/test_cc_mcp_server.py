@@ -4,6 +4,14 @@ import json
 import cc_mcp_server
 
 
+def test_control_base_defaults_to_private_port(monkeypatch):
+    monkeypatch.delenv("CC_LARK_CONTROL_PORT", raising=False)
+    monkeypatch.delenv("CC_LARK_HTTP_PORT", raising=False)
+    monkeypatch.delenv("CC_LARK_CALLBACK_PORT", raising=False)
+
+    assert cc_mcp_server._control_base() == "http://127.0.0.1:9982"
+
+
 def test_tools_list_exposes_all_runtime_tools():
     resp = cc_mcp_server._handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 
@@ -33,9 +41,12 @@ def test_wake_me_in_posts_current_context(monkeypatch):
         captured["url"] = req.full_url
         captured["timeout"] = timeout
         captured["body"] = json.loads(req.data.decode("utf-8"))
+        captured["headers"] = req.header_items()
         return FakeResp()
 
-    monkeypatch.setenv("CC_LARK_CALLBACK_PORT", "9988")
+    monkeypatch.setenv("CC_LARK_CALLBACK_PORT", "9981")
+    monkeypatch.setenv("CC_LARK_CONTROL_PORT", "9988")
+    monkeypatch.setenv("CC_LARK_CONTROL_TOKEN", "control-secret")
     monkeypatch.setenv("CC_LARK_PROFILE", "work")
     monkeypatch.setenv("CC_LARK_CHAT_ID", "oc_1")
     monkeypatch.setenv("CC_LARK_THREAD_ID", "omt_1")
@@ -48,6 +59,8 @@ def test_wake_me_in_posts_current_context(monkeypatch):
     assert result["isError"] is False
     assert captured["url"] == "http://127.0.0.1:9988/wake"
     assert captured["timeout"] == 10
+    headers = {k.lower(): v for k, v in req_headers(captured).items()}
+    assert headers["authorization"] == "Bearer control-secret"
     assert captured["body"] == {
         "profile": "work",
         "chat_id": "oc_1",
@@ -57,6 +70,11 @@ def test_wake_me_in_posts_current_context(monkeypatch):
         "minutes": 3,
         "note": "check CI",
     }
+
+
+def req_headers(captured):
+    """urllib 会规范化 header 大小写，统一转 dict 供断言。"""
+    return dict(captured["headers"])
 
 
 def test_write_framed_message_is_newline_delimited(monkeypatch):

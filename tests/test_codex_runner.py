@@ -152,6 +152,8 @@ def test_run_codex_injects_cc_lark_mcp(monkeypatch):
             "CC_LARK_CHAT_ID": "oc_1",
             "CC_LARK_THREAD_ID": "omt_1",
             "CC_LARK_MESSAGE_ID": "om_1",
+            "CC_LARK_CONTROL_PORT": "9982",
+            "CC_LARK_CONTROL_TOKEN": "secret-token",
             "NOT_CC_LARK": "ignored",
         },
     ))
@@ -169,6 +171,10 @@ def test_run_codex_injects_cc_lark_mcp(monkeypatch):
     assert config["mcp_servers.cc-lark.env.CC_LARK_CHAT_ID"] == '"oc_1"'
     assert config["mcp_servers.cc-lark.env.CC_LARK_THREAD_ID"] == '"omt_1"'
     assert config["mcp_servers.cc-lark.env.CC_LARK_MESSAGE_ID"] == '"om_1"'
+    assert config["mcp_servers.cc-lark.env.CC_LARK_CONTROL_PORT"] == '"9982"'
+    # Secret remains in the inherited process environment; never serialize it into
+    # Codex `-c` flags where it would be visible in `ps` output.
+    assert "mcp_servers.cc-lark.env.CC_LARK_CONTROL_TOKEN" not in config
     assert config["mcp_servers.cc-lark.env.CC_LARK_ALLOW_WAKE"] == '"0"'
     assert not any("NOT_CC_LARK" in item for item in cmd)
 

@@ -1,14 +1,17 @@
 """卡片回调 + 控制端点的 HTTP 服务。
 
 提供端点：
-    POST /callback        Lark 卡片按钮回调（也可被 url_verification 探测）
-    POST /spawn           （仅本机）派单进新 session
+    POST /callback        Lark 卡片按钮回调（公网 listener 唯一业务端点）
+    POST /spawn           （本机 control listener）派单进新 session
     GET  /spawn           （仅本机）派单（query string 版本）
     POST /trigger         （仅本机）手动触发已注册的 cron 任务
     GET  /trigger         （仅本机）同上
     POST /reload          （仅本机）热重载 scheduled_tasks.yaml
     GET  /reload          （仅本机）同上
     GET  /handover        （仅本机）CLI session 接管
+
+安全边界：公网 callback listener 与本机 control listener 是两个独立 HTTPServer。
+ngrok 只转发 callback 端口；control 端口仅绑定 127.0.0.1 且要求 Bearer token。
 
 设计：本模块**不 import** dispatcher / business logic，所有业务回调通过
 `configure(...)` 注入，避免循环 import + 让单元测试只 mock callbacks 即可。
@@ -17,18 +20,26 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
+import secrets
 import subprocess
 import threading
 import time
 import urllib.request
 from dataclasses import dataclass
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse, parse_qs
 
 from bot_instance import BotInstance
+from card_security import (
+    card_action_allowed,
+    card_context_matches,
+    claim_event,
+    verify_action_value,
+)
 from log_util import log
 
 
@@ -59,6 +70,13 @@ class HttpHandlers:
 _bot_loop: Optional[asyncio.AbstractEventLoop] = None
 _bots: dict[str, BotInstance] = {}
 _handlers: Optional[HttpHandlers] = None
+_control_token = ""
+
+_CONTROL_TOKEN_FILE = os.path.expanduser(
+    os.getenv("CC_LARK_CONTROL_TOKEN_FILE", "~/.feishu-claude/control-token")
+)
+_MAX_REQUEST_BODY = int(os.getenv("CC_LARK_HTTP_MAX_BODY", str(1024 * 1024)))
+_REQUEST_READ_TIMEOUT_SEC = float(os.getenv("CC_LARK_HTTP_READ_TIMEOUT_SEC", "15"))
 
 
 def configure(
@@ -66,18 +84,64 @@ def configure(
     bot_loop: asyncio.AbstractEventLoop,
     bots: dict[str, BotInstance],
     handlers: HttpHandlers,
+    control_token: str = "",
 ) -> None:
     """主入口在启动时调一次，注入运行时状态 + 业务回调。"""
-    global _bot_loop, _bots, _handlers
+    global _bot_loop, _bots, _handlers, _control_token
     _bot_loop = bot_loop
     _bots = bots
     _handlers = handlers
+    _control_token = (control_token or os.getenv("CC_LARK_CONTROL_TOKEN") or "").strip()
+
+
+def load_or_create_control_token(path: str = "") -> str:
+    """返回 control plane token；未显式配置时安全落盘生成一个。
+
+    token 文件固定 0600，既让 bot 重启后保持稳定，也让本机运维脚本能显式读取并
+    通过 Authorization header 调用 control API。任何文件错误都退化为本进程随机
+    token（仍然 fail-closed，不会因为落盘失败关闭鉴权）。
+    """
+    configured = (os.getenv("CC_LARK_CONTROL_TOKEN") or "").strip()
+    if configured:
+        return configured
+
+    token_path = os.path.expanduser(path or _CONTROL_TOKEN_FILE)
+    try:
+        os.makedirs(os.path.dirname(token_path) or ".", mode=0o700, exist_ok=True)
+        try:
+            with open(token_path, encoding="utf-8") as f:
+                existing = f.read().strip()
+            if existing:
+                os.chmod(token_path, 0o600)
+                return existing
+        except FileNotFoundError:
+            pass
+
+        token = secrets.token_urlsafe(48)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(token_path, flags, 0o600)
+        except FileExistsError:
+            with open(token_path, encoding="utf-8") as f:
+                raced = f.read().strip()
+            if raced:
+                os.chmod(token_path, 0o600)
+                return raced
+            raise RuntimeError(f"control token file is empty: {token_path}")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(token + "\n")
+        os.chmod(token_path, 0o600)
+        return token
+    except Exception as e:
+        log("global", "http", "warn",
+            f"control token 无法落盘，改用本进程临时 token: {type(e).__name__}: {e}")
+        return secrets.token_urlsafe(48)
 
 
 # ── 内部工具 ─────────────────────────────────────────────────
 
 def _is_localhost(client_address) -> bool:
-    """HTTP 客户端是否来自本机（防止 /spawn 被 ngrok 暴露公网调用）"""
+    """HTTP 客户端是否来自本机（control listener 的纵深校验）。"""
     try:
         host = client_address[0]
     except Exception:
@@ -85,15 +149,19 @@ def _is_localhost(client_address) -> bool:
     return host in ("127.0.0.1", "::1", "localhost")
 
 
-def _resolve_bot_from_value(value: dict) -> Optional[BotInstance]:
-    """从按钮 value.profile 取 BotInstance；兼容老卡片（无 profile 字段）时取第一个 profile。"""
-    name = value.get("profile") if isinstance(value, dict) else None
-    if name and name in _bots:
-        return _bots[name]
-    # 老卡片 fallback：只有一个 profile 时用它，否则放弃
-    if len(_bots) == 1:
-        return next(iter(_bots.values()))
-    return None
+def _extract_control_token(headers) -> str:
+    auth = (headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    # 兼容不方便设置 Authorization 的本机脚本；仍需持有同一个 secret。
+    return (headers.get("X-CC-Lark-Token") or "").strip()
+
+
+def _resolve_callback_bot(header: dict) -> Optional[BotInstance]:
+    """Resolve an HTTP callback only from Lark's header.app_id, never action.value."""
+    app_id = header.get("app_id", "") if isinstance(header, dict) else ""
+    matches = [bot for bot in _bots.values() if bot.profile.app_id == app_id]
+    return matches[0] if len(matches) == 1 else None
 
 
 # 跨 agent 派发：dispatch_task 的 `agent` 参数 → 已加载的目标 bot。
@@ -207,13 +275,35 @@ def _submit(coro: Awaitable) -> None:
 # ── HTTP handler ──────────────────────────────────────────────
 
 class _CardCallbackHandler(BaseHTTPRequestHandler):
-    """处理飞书/Lark 卡片按钮点击 + 本机控制端点。"""
+    """公网 callback handler；control 子类只复用业务处理方法。"""
+
+    control_plane = False
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(_REQUEST_READ_TIMEOUT_SEC)
 
     # ── POST ─────────────────────────────────────────────────
     def do_POST(self):
         parsed = urlparse(self.path)
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length)
+
+        if not self.control_plane:
+            # `/` 是旧部署的 callback 兼容别名；其余公网路径一律 404，尤其不能再
+            # 因 ngrok 转发的 socket peer=127.0.0.1 而落进 control handlers。
+            if parsed.path not in ("/callback", "/"):
+                self._respond(404, {"error": "not found"})
+                return
+            body = self._read_body()
+            if body is None:
+                return
+            self._handle_card_callback(body)
+            return
+
+        if not self._authorize_control():
+            return
+        body = self._read_body()
+        if body is None:
+            return
 
         if parsed.path == "/spawn":
             self._handle_spawn_post(body)
@@ -247,7 +337,29 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             self._handle_list_crons(body)
             return
 
-        # 默认：卡片按钮回调
+        self._respond(404, {"error": "not found"})
+
+    def _read_body(self) -> Optional[bytes]:
+        """在完成 path/auth 判定后读取受限、带超时的请求体。"""
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except (TypeError, ValueError):
+            self._respond(400, {"error": "invalid Content-Length"})
+            return None
+        if length < 0 or length > _MAX_REQUEST_BODY:
+            self._respond(413, {"error": "request body too large"})
+            return None
+        try:
+            return self.rfile.read(length)
+        except TimeoutError:
+            try:
+                self._respond(408, {"error": "request body timeout"})
+            except OSError:
+                pass
+            return None
+
+    def _handle_card_callback(self, body: bytes):
+        """处理公网 Lark callback；只会由 callback listener 调用。"""
         try:
             data = json.loads(body)
         except Exception:
@@ -255,6 +367,15 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             return
 
         if data.get("type") == "url_verification":
+            configured = [
+                bot.profile.verification_token
+                for bot in _bots.values()
+                if getattr(bot.profile, "verification_token", "")
+            ]
+            supplied = str(data.get("token") or "")
+            if configured and not any(hmac.compare_digest(supplied, token) for token in configured):
+                self._respond(403, {"error": "invalid verification token"})
+                return
             self._respond(200, {"challenge": data.get("challenge", "")})
             return
 
@@ -263,6 +384,12 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
     # ── GET ──────────────────────────────────────────────────
     def do_GET(self):
         parsed = urlparse(self.path)
+
+        if not self.control_plane:
+            self._respond(404, {"error": "not found"})
+            return
+        if not self._authorize_control():
+            return
 
         if parsed.path == "/spawn":
             self._handle_spawn_get(parsed.query)
@@ -278,6 +405,20 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             return
 
         self._respond(404, {"error": "not found"})
+
+    def _authorize_control(self) -> bool:
+        """control API 双重校验：loopback listener + constant-time token。"""
+        if not _is_localhost(self.client_address):
+            self._respond(403, {"error": "control API is localhost only"})
+            return False
+        if not _control_token:
+            self._respond(503, {"error": "control API token is not configured"})
+            return False
+        supplied = _extract_control_token(self.headers)
+        if not supplied or not hmac.compare_digest(supplied, _control_token):
+            self._respond(401, {"error": "invalid control API token"})
+            return False
+        return True
 
     # ── 各端点 ───────────────────────────────────────────────
 
@@ -572,14 +713,58 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         action = event.get("action", {})
         value = action.get("value", {}) or {}
         context = event.get("context", {})
+        header = data.get("header", {})
 
         action_type = value.get("action", "")
         chat_id = value.get("cid", user_id)
         clicked_msg_id = context.get("open_message_id", "")
+        callback_chat_id = context.get("open_chat_id", "")
 
-        bot = _resolve_bot_from_value(value)
-        if bot is None:
+        bot = _resolve_callback_bot(header)
+        source_valid = bool(
+            bot
+            and data.get("schema") == "2.0"
+            and header.get("event_type") == "card.action.trigger"
+            and value.get("profile") == bot.profile.name
+        )
+        if not source_valid:
             self._respond(200, {"toast": {"type": "warning", "content": "按钮已过期"}})
+            return
+        assert bot is not None
+
+        expected_token = getattr(bot.profile, "verification_token", "") or ""
+        supplied_token = str(header.get("token") or "")
+        if expected_token and not hmac.compare_digest(supplied_token, expected_token):
+            log(bot.profile.name, "http", "warn", "拒绝卡片回调 reason=verification-token")
+            self._respond(200, {
+                "toast": {"type": "warning", "content": "按钮无效或已过期，请重新操作"},
+            })
+            return
+
+        verified, reason = verify_action_value(
+            value,
+            bot.profile.app_secret,
+            user_id=user_id,
+            message_id=clicked_msg_id,
+        )
+        context_valid = card_context_matches(user_id, chat_id, callback_chat_id)
+        if (
+            not verified
+            or not context_valid
+            or not card_action_allowed(bot.profile, user_id, chat_id)
+        ):
+            log(bot.profile.name, "http", "warn",
+                f"拒绝卡片回调 user={user_id[:8]}... reason={reason or 'acl'}")
+            self._respond(200, {
+                "toast": {"type": "warning", "content": "按钮无效或已过期，请重新操作"},
+            })
+            return
+
+        event_id = str(header.get("event_id") or "")
+        if not claim_event(bot.profile.name, event_id):
+            self._respond(200, {
+                "toast": {"type": "info", "content": "该操作已处理"},
+            })
             return
 
         log(bot.profile.name, "http", "info",
@@ -619,16 +804,54 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _ControlRequestHandler(_CardCallbackHandler):
+    """仅绑定 loopback 的、带 token 鉴权的 control API handler。"""
+
+    control_plane = True
+
+
 # ── 启动 ─────────────────────────────────────────────────────
 
-def start_callback_server(port: int) -> HTTPServer:
-    """启动 HTTP server，跑在后台线程里。返回 server 句柄。"""
+def start_callback_server(port: int) -> ThreadingHTTPServer:
+    """启动公网 callback listener；除 POST /callback（及旧 `/`）外全 404。"""
     if _handlers is None:
         raise RuntimeError("call http_server.configure(...) before start_callback_server")
-    server = HTTPServer(('0.0.0.0', port), _CardCallbackHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', port), _CardCallbackHandler)
+    server.daemon_threads = True
     t = threading.Thread(target=server.serve_forever, daemon=True, name="http-callback")
     t.start()
     return server
+
+
+def start_control_server(port: int) -> ThreadingHTTPServer:
+    """启动仅 loopback 可达、且强制 token 的 control listener。"""
+    if _handlers is None:
+        raise RuntimeError("call http_server.configure(...) before start_control_server")
+    if not _control_token:
+        raise RuntimeError("control token must be configured before start_control_server")
+    server = ThreadingHTTPServer(('127.0.0.1', port), _ControlRequestHandler)
+    server.daemon_threads = True
+    t = threading.Thread(target=server.serve_forever, daemon=True, name="http-control")
+    t.start()
+    return server
+
+
+def _matching_ngrok_tunnel(data: dict, port: int) -> Optional[str]:
+    """只复用确实转发到 callback port 的 HTTPS tunnel。"""
+    for tunnel in data.get("tunnels", []):
+        if tunnel.get("proto") != "https":
+            continue
+        addr = str((tunnel.get("config") or {}).get("addr") or "").strip()
+        parsed = urlparse(addr if "://" in addr else f"http://{addr}")
+        if parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+            continue
+        try:
+            target_port = parsed.port
+        except ValueError:
+            continue
+        if target_port == port:
+            return tunnel.get("public_url")
+    return None
 
 
 def start_ngrok(port: int) -> Optional[str]:
@@ -636,9 +859,9 @@ def start_ngrok(port: int) -> Optional[str]:
     try:
         with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=2) as r:
             tunnels = json.loads(r.read())
-            for t in tunnels.get("tunnels", []):
-                if t.get("proto") == "https":
-                    return t["public_url"]
+            existing = _matching_ngrok_tunnel(tunnels, port)
+            if existing:
+                return existing
     except Exception:
         pass
 
@@ -657,9 +880,7 @@ def start_ngrok(port: int) -> Optional[str]:
         time.sleep(3)
         with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=5) as r:
             tunnels = json.loads(r.read())
-            for t in tunnels.get("tunnels", []):
-                if t.get("proto") == "https":
-                    return t["public_url"]
+            return _matching_ngrok_tunnel(tunnels, port)
     except Exception as e:
         log("global", "ngrok", "warn", f"ngrok 启动失败: {e}")
     return None
