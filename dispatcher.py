@@ -1171,7 +1171,23 @@ async def _run_and_display(
                     pass
             return
 
-        final = full_text or accumulated or "（无输出）"
+        # 收尾卡片 = 中间过程（去掉工具执行行）+ 分隔 + 最终产出。process 为空
+        # （单段自包含回复）时退回只显示干净结论，不给简单回答强加过程区。
+        process_text, result_text = _split_process_and_result(accumulated, full_text)
+        final = result_text or "（无输出）"
+        # 选项只从最终产出里认，别被过程叙述里的候选文本污染。
+        options = _extract_options(result_text) or ask_options
+        if process_text:
+            if len(process_text) > _MAX_STREAM_DISPLAY:
+                process_text = (
+                    "…（过程较长，仅显示末段）\n\n"
+                    + process_text[-_MAX_STREAM_DISPLAY:]
+                )
+            final = (
+                f"🔍 **过程**\n\n{process_text}\n\n"
+                f"---\n\n"
+                f"📌 **最终结论**\n\n{result_text}"
+            )
         if used_fresh_session_fallback:
             final = (
                 "⚠️ 无法接续上一轮会话（resume 失败），已自动开新会话继续"
@@ -1180,7 +1196,6 @@ async def _run_and_display(
         footer = _format_usage_footer(final_usage, session.model)
         if footer:
             final = f"{final}\n\n{footer}"
-        options = _extract_options(final) or ask_options
         card_patched = False
         async with active_run.card_update_lock:
             if _stopping():
@@ -1615,6 +1630,27 @@ def _format_usage_footer(usage: dict, model: str) -> str:
         return str(n)
 
     return f"— 📊 上下文 {fmt(total_context)} / {fmt(window)} ({pct:.1f}%)"
+
+
+def _split_process_and_result(accumulated: str, result: str) -> tuple[str, str]:
+    """把流式累积的 assistant 文字拆成「中间过程」和「最终产出」。
+
+    `accumulated` 是整段跑下来所有 assistant 文字的拼接，尾部通常就是 `result`
+    ——最终那条消息本身也是流式吐出来的，所以会重复出现在末尾。把尾部的 result
+    抠掉，剩下的就是工具调用之间的叙述（中间过程）。工具执行轨迹（tool_history）
+    从来没进 accumulated，所以天然不含"执行指令"那些 🔧 行。
+
+    返回 (process, result)：process 为空表示这是一条自包含的单段回复，收尾时
+    照旧只显示干净结论、不加过程区。"""
+    proc = (accumulated or "").strip()
+    res = (result or "").strip()
+    if not proc:
+        return "", res
+    if not res or proc == res:
+        return "", res or proc
+    if proc.endswith(res):
+        proc = proc[: len(proc) - len(res)].strip()
+    return proc, res
 
 
 # Claude CLI TUI 输出的 ANSI 控制序列（CSI / OSC / DEC private mode / 单字符）。
