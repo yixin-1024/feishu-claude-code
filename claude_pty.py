@@ -874,6 +874,9 @@ async def run_claude(
             cmd += ["--session-id", forced_session_id]
         if effective_model:
             cmd += ["--model", effective_model]
+        _cc_effort = (extra_env or {}).get("CLAUDE_EFFORT") or os.getenv("CLAUDE_EFFORT")
+        if _cc_effort:
+            cmd += ["--effort", _cc_effort]
         if append_system_prompt:
             cmd += ["--append-system-prompt", append_system_prompt]
         cmd += ["--permission-mode", permission_mode or PERMISSION_MODE]
