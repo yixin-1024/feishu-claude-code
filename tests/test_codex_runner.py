@@ -2,9 +2,11 @@ import asyncio
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from codex_runner import run_codex
+from codex_runner import _clean_stderr, run_codex
 
 
 class FakeStdout:
@@ -58,6 +60,8 @@ def test_run_codex_parses_thread_and_streams(monkeypatch):
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    # 单轮解析用例：关掉自动续跑，否则续跑会重复调用已耗尽的 FakeProc。
+    monkeypatch.setenv("CODEX_AUTO_CONTINUE", "0")
 
     chunks = []
     tools = []
@@ -119,6 +123,7 @@ def test_run_codex_prepends_system_prompt(monkeypatch):
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("CODEX_AUTO_CONTINUE", "0")
 
     text, sid, _ = asyncio.run(run_codex(
         "user message",
@@ -144,6 +149,7 @@ def test_run_codex_injects_cc_lark_mcp(monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setenv("CC_LARK_ALLOW_WAKE", "0")
+    monkeypatch.setenv("CODEX_AUTO_CONTINUE", "0")
 
     text, sid, _ = asyncio.run(run_codex(
         "hi",
@@ -199,3 +205,39 @@ def test_run_codex_skips_cc_lark_mcp_without_thread(monkeypatch):
     ))
 
     assert not any("mcp_servers.cc-lark" in item for item in captured["cmd"])
+
+
+def test_run_codex_surfaces_usage_limit_error(monkeypatch):
+    """codex 命中用量限制时以 stdout JSON error 事件报出、且 returncode=0；
+    runner 必须把这条真因抛出来，而不是让无害的 stdin 横幅冒充报错。"""
+    proc = FakeProc([
+        b'{"type":"thread.started","thread_id":"thread_x"}\n',
+        b'{"type":"turn.started"}\n',
+        b'{"type":"error","message":"You\'ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 26th, 2026 11:01 PM."}\n',
+        b'{"type":"turn.failed","error":{"message":"You\'ve hit your usage limit."}}\n',
+    ], returncode=0)
+
+    async def fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(run_codex("hi", codex_bin="/bin/codex"))
+
+    msg = str(excinfo.value)
+    assert "usage limit" in msg
+    assert "Jul 26th, 2026" in msg
+    # 绝不能把无害横幅当报错抛出来。
+    assert "Reading additional input from stdin" not in msg
+
+
+def test_clean_stderr_drops_benign_noise():
+    raw = (
+        "Reading additional input from stdin...\n"
+        "2026-07-21T01:41:42Z ERROR codex_models_manager::manager: failed to renew cache TTL\n"
+        "Shell cwd was reset to /some/path\n"
+        "panic: real fatal error"
+    )
+    assert _clean_stderr(raw) == "panic: real fatal error"
+    assert _clean_stderr("Reading additional input from stdin...\n") == ""
