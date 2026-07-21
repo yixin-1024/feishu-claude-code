@@ -16,9 +16,10 @@ def test_tools_list_exposes_all_runtime_tools():
     resp = cc_mcp_server._handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 
     tools = resp["result"]["tools"]
-    # 默认三个闸门全开 → 5 个工具全注册
+    # 默认三个闸门全开 → 全部工具注册（dispatch 闸门含 dispatch/read/append/steer 四件套）
     assert [t["name"] for t in tools] == [
-        "wake_me_in", "dispatch_task", "read_thread", "schedule_cron", "list_crons",
+        "wake_me_in", "dispatch_task", "read_thread", "append_to_task", "steer_task",
+        "schedule_cron", "list_crons",
     ]
     wake = tools[0]
     assert wake["inputSchema"]["required"] == ["minutes", "note"]
@@ -75,6 +76,70 @@ def test_wake_me_in_posts_current_context(monkeypatch):
 def req_headers(captured):
     """urllib 会规范化 header 大小写，统一转 dict 供断言。"""
     return dict(captured["headers"])
+
+
+def _fake_steer_urlopen(captured, resp_body=b'{"ok": true, "stopped": true, "queued": false}'):
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return resp_body
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResp()
+
+    return fake_urlopen
+
+
+def test_append_to_task_posts_steer_without_stop(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("CC_LARK_CONTROL_PORT", "9988")
+    monkeypatch.setenv("CC_LARK_PROFILE", "work")
+    monkeypatch.setenv("CC_LARK_CHAT_ID", "oc_1")
+    monkeypatch.setenv("CC_LARK_USER_ID", "ou_1")
+    monkeypatch.setattr(
+        cc_mcp_server.urllib.request, "urlopen",
+        _fake_steer_urlopen(captured, b'{"ok": true, "queued": true}'),
+    )
+
+    result = cc_mcp_server._tool_append_to_task({"thread_id": "omt_9", "message": "也顺手加个测试"})
+
+    assert result["isError"] is False
+    assert captured["url"] == "http://127.0.0.1:9988/steer"
+    assert captured["body"] == {
+        "profile": "work", "chat_id": "oc_1", "user_id": "ou_1",
+        "thread_id": "omt_9", "instruction": "也顺手加个测试", "stop_first": False,
+    }
+
+
+def test_steer_task_posts_steer_with_stop(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("CC_LARK_CONTROL_PORT", "9988")
+    monkeypatch.setenv("CC_LARK_PROFILE", "work")
+    monkeypatch.setenv("CC_LARK_CHAT_ID", "oc_1")
+    monkeypatch.setenv("CC_LARK_USER_ID", "ou_1")
+    monkeypatch.setattr(
+        cc_mcp_server.urllib.request, "urlopen", _fake_steer_urlopen(captured),
+    )
+
+    result = cc_mcp_server._tool_steer_task({"thread_id": "omt_9", "message": "方向错了，改用方案 B"})
+
+    assert result["isError"] is False
+    assert captured["url"] == "http://127.0.0.1:9988/steer"
+    assert captured["body"]["stop_first"] is True
+    assert captured["body"]["instruction"] == "方向错了，改用方案 B"
+
+
+def test_steer_requires_thread_and_message(monkeypatch):
+    monkeypatch.setenv("CC_LARK_CHAT_ID", "oc_1")
+    assert cc_mcp_server._tool_append_to_task({"message": "x"})["isError"] is True
+    assert cc_mcp_server._tool_steer_task({"thread_id": "omt_9", "message": "  "})["isError"] is True
 
 
 def test_write_framed_message_is_newline_delimited(monkeypatch):

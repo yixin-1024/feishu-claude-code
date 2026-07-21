@@ -258,6 +258,15 @@ class FeishuClient:
         # 会 fallback 到这个 cache。仅内存，重启就丢；只对"刚发完卡片就要审"场景有效。
         self._card_text_cache: dict[str, str] = {}
         self._CARD_CACHE_MAX = 500  # 简单上限防止无界增长
+        # 收尾确认写延时（秒）：v2 静态卡终态 patch 后停一小会儿再补一次同内容，
+        # 抵消飞书对紧邻两次 message patch 偶发乱序/合并导致完成态卡片停在流式快照
+        # （带 `⏱ 计时`）不翻完成态的问题。见 update_card_final。<=0 关闭。
+        try:
+            self._FINAL_CONFIRM_DELAY = float(
+                os.getenv("LARK_CARD_FINAL_CONFIRM_DELAY", "0.6") or "0.6"
+            )
+        except ValueError:
+            self._FINAL_CONFIRM_DELAY = 0.6
 
     def _signed_action_value(self, value: dict, message_id: str) -> dict:
         """Sign a callback value and bind it to its intended user + card message."""
@@ -501,6 +510,31 @@ class FeishuClient:
 
         await self._retry_with_backoff(_update, max_retries=3)
         self._remember_card_text(message_id, content)
+
+    async def update_card_final(self, message_id: str, content: str):
+        """卡片收尾：把内容钉成终态（完成/报错），抗飞书 patch 乱序。
+
+        背景：v2 静态卡每次更新都是整卡 `apatch`，飞书对同一条消息「紧邻的两次
+        patch」不保证应用顺序，偶发会把收尾这条 patch 排到最后一条流式/心跳 patch
+        之前、或直接合并丢掉。结果：agent 已跑完（甚至已发了独立 ✅），卡片却停在
+        带 `⏱ 2m42s` 计时 footer 的流式快照，不翻成完成态——即本次要修的 bug。
+
+        修法：首次 patch 后停 `_FINAL_CONFIRM_DELAY` 秒再补一次同内容的确认写。
+        此刻心跳已停、本 run 不再有其它 patch，确认写是飞书看到的最后一次写，稳定
+        胜出；这次 patch 事件也顺带逼客户端重渲染（即便首次是纯客户端没刷新也兜住）。
+        cardkit 流式卡本身用 sequence 号保序，不受此问题影响，直接走 update_card。
+        """
+        await self.update_card(message_id, content)
+        # 流式卡（cardkit）已由 sequence 保序，且收尾另有 finalize_streaming_card；
+        # 不做二次写，避免多推一条打字机动画。
+        if message_id in self._streaming_cards or self._FINAL_CONFIRM_DELAY <= 0:
+            return
+        await asyncio.sleep(self._FINAL_CONFIRM_DELAY)
+        try:
+            await self.update_card(message_id, content)
+        except Exception as e:
+            # 确认写失败不影响主流程：首次 patch 绝大多数情况下已经成功。
+            print(f"[card] 收尾确认写失败（忽略）: {e}", flush=True)
 
     # ── CardKit 流式卡片（LARK_CARD_MODE=cardkit 时启用）──────────
     # 语义：建卡片实体 → 用消息 API 发"卡片引用" → card_element.content 传全量文本
@@ -961,6 +995,15 @@ class FeishuClient:
 
         await self._retry_with_backoff(_update, max_retries=3)
         self._remember_card_text(message_id, content)
+        # 收尾确认写：这也是一条终态 patch（内容 + 按钮），同样可能被飞书排到最后
+        # 一条流式 patch 之前 / 合并丢掉，导致卡片停在流式快照、按钮不出现。补一次。
+        # 见 update_card_final 的说明。
+        if self._FINAL_CONFIRM_DELAY > 0:
+            await asyncio.sleep(self._FINAL_CONFIRM_DELAY)
+            try:
+                await self._retry_with_backoff(_update, max_retries=1)
+            except Exception as e:
+                print(f"[card] 按钮卡收尾确认写失败（忽略）: {e}", flush=True)
 
     async def update_card_elements(self, message_id: str, elements: list[dict]):
         """用自定义 elements 列表更新卡片（支持 markdown + button 混排）"""

@@ -208,3 +208,86 @@ def test_streaming_max_eviction():
     for i in range(12):
         client._register_streaming(f"om_{i}", f"card_{i}", "md_stream")
     assert len(client._streaming_cards) <= 8
+
+
+# ── 收尾确认写：抗飞书 patch 乱序，防计时卡冻结 ─────────────────────
+
+async def test_update_card_final_double_writes_v2(monkeypatch):
+    """v2 静态卡收尾必须写两次（首次 + 确认写），确认写稳定压过紧邻的流式 patch。"""
+    client = _make_client()
+    client._FINAL_CONFIRM_DELAY = 0.6
+    calls = []
+
+    async def _fake_update(mid, content):
+        calls.append((mid, content))
+
+    slept = []
+
+    async def _fake_sleep(sec):
+        slept.append(sec)
+
+    monkeypatch.setattr(client, "update_card", _fake_update)
+    monkeypatch.setattr(fc.asyncio, "sleep", _fake_sleep)
+
+    await client.update_card_final("om_1", "✅ 完成态")
+
+    assert calls == [("om_1", "✅ 完成态"), ("om_1", "✅ 完成态")]
+    assert slept == [0.6]  # 两次写之间隔了确认延时
+
+
+async def test_update_card_final_single_write_when_delay_disabled(monkeypatch):
+    """LARK_CARD_FINAL_CONFIRM_DELAY<=0 时退回单次写，不加确认写。"""
+    client = _make_client()
+    client._FINAL_CONFIRM_DELAY = 0
+    calls = []
+
+    async def _fake_update(mid, content):
+        calls.append((mid, content))
+
+    monkeypatch.setattr(client, "update_card", _fake_update)
+    await client.update_card_final("om_1", "final")
+    assert calls == [("om_1", "final")]
+
+
+async def test_update_card_final_no_double_write_for_streaming(monkeypatch):
+    """cardkit 流式卡有 sequence 保序，收尾只写一次（避免多推打字机动画）。"""
+    client = _make_client()
+    client._FINAL_CONFIRM_DELAY = 0.6
+    client._register_streaming("om_1", "card_abc", "md_stream")
+    calls = []
+
+    async def _fake_update(mid, content):
+        calls.append((mid, content))
+
+    slept = []
+
+    async def _fake_sleep(sec):
+        slept.append(sec)
+
+    monkeypatch.setattr(client, "update_card", _fake_update)
+    monkeypatch.setattr(fc.asyncio, "sleep", _fake_sleep)
+
+    await client.update_card_final("om_1", "final")
+    assert calls == [("om_1", "final")]
+    assert slept == []  # 流式卡不进确认写分支
+
+
+async def test_update_card_final_confirm_write_failure_swallowed(monkeypatch):
+    """确认写抛异常必须被吞掉——首次已成功，收尾不该因二次写失败而崩。"""
+    client = _make_client()
+    client._FINAL_CONFIRM_DELAY = 0.6
+    n = {"i": 0}
+
+    async def _flaky_update(mid, content):
+        n["i"] += 1
+        if n["i"] == 2:
+            raise RuntimeError("boom on confirm write")
+
+    async def _fake_sleep(sec):
+        pass
+
+    monkeypatch.setattr(client, "update_card", _flaky_update)
+    monkeypatch.setattr(fc.asyncio, "sleep", _fake_sleep)
+
+    await client.update_card_final("om_1", "final")  # 不抛
+    assert n["i"] == 2

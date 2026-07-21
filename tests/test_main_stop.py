@@ -83,7 +83,8 @@ async def test_heartbeat_does_not_overwrite_error_card_on_watchdog_kill():
             await asyncio.sleep(0.05)  # 心跳 push 快返回
 
     bot = _bot()
-    bot.feishu.update_card = fake_update_card
+    bot.feishu.update_card = fake_update_card          # 心跳「进行中」push 走这里
+    bot.feishu.update_card_final = fake_update_card     # 终态 ❌ 收尾写走这里
     bot.feishu.update_card_with_buttons = mock.AsyncMock()
     bot.feishu.reply_text = mock.AsyncMock()
     bot.feishu.reply_card = mock.AsyncMock(return_value="card_id_1")

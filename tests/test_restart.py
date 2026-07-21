@@ -361,7 +361,8 @@ async def test_restart_during_final_card_update_suppresses_success_notice():
         dispatcher._restart_in_progress = True
         dispatcher._restart_committed = True
 
-    bot.feishu.update_card.side_effect = restart_while_patching
+    # 终态写现在走 update_card_final（收尾确认写，抗飞书 patch 乱序）。
+    bot.feishu.update_card_final.side_effect = restart_while_patching
     with patch.object(
         dispatcher, "run_agent",
         new=AsyncMock(return_value=("finished", "sid-finished", False)),
@@ -372,7 +373,7 @@ async def test_restart_during_final_card_update_suppresses_success_notice():
         )
 
     assert result is None
-    bot.feishu.update_card.assert_awaited_once_with("om_card", "finished")
+    bot.feishu.update_card_final.assert_awaited_once_with("om_card", "finished")
     bot.feishu.send_text_to_user.assert_not_awaited()
 
 
@@ -383,7 +384,8 @@ async def test_restart_during_error_card_update_suppresses_error_notice():
         dispatcher._restart_in_progress = True
         dispatcher._restart_committed = True
 
-    bot.feishu.update_card.side_effect = restart_while_patching
+    # 报错终态卡也走 update_card_final。
+    bot.feishu.update_card_final.side_effect = restart_while_patching
     with patch.object(
         dispatcher, "run_agent",
         new=AsyncMock(side_effect=ValueError("runner failed")),
@@ -394,8 +396,8 @@ async def test_restart_during_error_card_update_suppresses_error_notice():
         )
 
     assert result is None
-    bot.feishu.update_card.assert_awaited_once()
-    assert "runner failed" in bot.feishu.update_card.await_args.args[1]
+    bot.feishu.update_card_final.assert_awaited_once()
+    assert "runner failed" in bot.feishu.update_card_final.await_args.args[1]
     bot.feishu.send_text_to_user.assert_not_awaited()
 
 
@@ -407,7 +409,7 @@ async def test_restart_during_failed_card_update_suppresses_result_fallback():
         dispatcher._restart_committed = True
         raise RuntimeError("card request interrupted")
 
-    bot.feishu.update_card.side_effect = fail_as_restart_starts
+    bot.feishu.update_card_final.side_effect = fail_as_restart_starts
     with patch.object(
         dispatcher, "run_agent",
         new=AsyncMock(return_value=("finished", "sid-finished", False)),
@@ -466,7 +468,7 @@ async def test_cancelled_restart_probe_does_not_swallow_existing_run_result():
     assert restarted is False
     assert dispatcher._restart_in_progress is False
     assert dispatcher._restart_committed is False
-    bot.feishu.update_card.assert_awaited_once_with("om_card", "finished during probe")
+    bot.feishu.update_card_final.assert_awaited_once_with("om_card", "finished during probe")
     assert any(call.args[1] == "✅" for call in bot.feishu.send_text_to_user.await_args_list)
     trigger.assert_not_called()
 

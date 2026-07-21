@@ -36,6 +36,9 @@ class ActiveRun:
     proc: object | None = None
     stop_requested: bool = False
     stop_announced: bool = False
+    # 最近一次流式渲染的正文（不含计时 footer）。/stop 用它把「已停止」标记
+    # 追加在已展示内容之后，而不是整卡覆盖，从而保留停止前的进度。
+    last_body: str = ""
     # 流式 push、最终落卡与 /stop|/restart 中断提示共用这把锁。
     # 中断提示会等待已在途的旧写入结束后最后落卡，后续写入看到 stop flag 跳过。
     card_update_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)

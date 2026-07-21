@@ -128,9 +128,16 @@ async def _is_current_bot_mentioned(bot: BotInstance, msg) -> bool:
 # ── /stop 命令处理 ───────────────────────────────────────────
 
 async def _announce_stopped_run(bot: BotInstance, active_run: ActiveRun):
+    # 保留停止前流式渲染出的进度（工具轨迹 + 部分回答），仅在末尾追加「已停止」
+    # 标记，而不是整卡覆盖成一句"已停止"。与错误路径的"保留旧内容 + 追加"一致。
+    body = (getattr(active_run, "last_body", "") or "").strip()
+    if body and body != "⏳ 思考中...":
+        content = f"{body}\n\n---\n\n⏹ **任务已被停止**（以上为停止前的进度）"
+    else:
+        content = "⏹ 已停止当前任务（尚无输出）"
     async with active_run.card_update_lock:
         try:
-            await bot.feishu.update_card(active_run.card_msg_id, "⏹ 已停止当前任务")
+            await bot.feishu.update_card(active_run.card_msg_id, content)
         except Exception as exc:
             log(bot.profile.name, "stop", "warn", f"update stopped card failed: {exc}")
         try:
@@ -667,15 +674,39 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
         if is_group:
             _text = strip_lark_mentions(_text, getattr(msg, 'mentions', None))
 
-        # 精确匹配（此前 endswith 会让"怎么让你 /stop"这类普通句子误触发）
-        if _text.strip().lower() == "/stop":
+        # /stop：光 /stop = 只打断；/stop <新指令> = 打断当前任务 + 带上下文按新指令续跑
+        # （实时纠偏，option B：resume 现有 session）。精确前缀匹配，避免"怎么让你 /stop"误触发。
+        _stripped = _text.strip()
+        if _stripped.lower() == "/stop" or _stripped.lower().startswith("/stop "):
             if is_group and not await _is_current_bot_mentioned(bot, msg):
                 return
-            reply = await _handle_stop_command(bot, user_id, chat_id)
-            if is_group:
-                await bot.feishu.reply_card(msg.message_id, content=reply, loading=False)
-            else:
-                await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
+            _instr = _stripped[len("/stop"):].strip()
+            if not _instr:
+                reply = await _handle_stop_command(bot, user_id, chat_id)
+                if is_group:
+                    await bot.feishu.reply_card(msg.message_id, content=reply, loading=False)
+                else:
+                    await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
+                return
+            # /stop <新指令>：停当前 run（若有），再按新指令续跑。后台 task 里做，本轮先 ack。
+            _active = bot.active_runs.get_run(user_id, chat_id)
+            _do_stop = _active is not None and not _active.stop_requested
+            _t = asyncio.create_task(_deliver_followup(
+                bot, user_id=user_id, chat_id=chat_id, thread_id=thread_id,
+                anchor_message_id=msg.message_id, instruction=_instr,
+                stop_first=_do_stop, is_group=is_group,
+            ))
+            _DISPATCH_TASKS.add(_t)
+            _t.add_done_callback(_DISPATCH_TASKS.discard)
+            ack = ("⏹ 已停止当前任务，正在按你的新指令续跑…" if _do_stop
+                   else "▶️ 当前没有在跑的任务，直接按你的新指令执行…")
+            try:
+                if is_group:
+                    await bot.feishu.reply_text(msg.message_id, ack)
+                else:
+                    await bot.feishu.send_text_to_user(user_id, ack)
+            except Exception:
+                pass
             return
 
         _parsed_lock_free = parse_command(_text)
@@ -844,6 +875,8 @@ async def _run_and_display(
                 d = "...\n\n" + d[-_MAX_STREAM_DISPLAY:]
             parts.append(d)
         body = "\n".join(parts) if parts else "⏳ 思考中..."
+        # 快照正文（不含 footer），供 /stop 保留停止前进度用。
+        active_run.last_body = body
 
         now = time.time()
         footer = [f"⏱ {_fmt_duration(now - start_ts)}"]
@@ -1148,7 +1181,8 @@ async def _run_and_display(
                 if _stopping():
                     return
                 try:
-                    await bot.feishu.update_card(card_msg_id, err_card)
+                    # 终态（报错）卡同样走确认写，防止停在流式快照（见 update_card_final）。
+                    await bot.feishu.update_card_final(card_msg_id, err_card)
                 except Exception:
                     pass
                 if _stopping():
@@ -1215,7 +1249,9 @@ async def _run_and_display(
                     # 流式卡：update_card_with_buttons 内部会推最终文本 + 关流式 + 加按钮
                     await bot.feishu.update_card_with_buttons(card_msg_id, final, buttons, flow=short)
                 else:
-                    await bot.feishu.update_card(card_msg_id, final)
+                    # 终态卡走确认写：抗飞书对紧邻两次 patch 的乱序/合并，防止卡片
+                    # 停在带 `⏱ 计时` 的流式快照不翻完成态（见 update_card_final）。
+                    await bot.feishu.update_card_final(card_msg_id, final)
                     if _stopping():
                         return
                     # 无按钮的流式卡推完最终文本后需手动关流式（非流式则 no-op）
@@ -2516,3 +2552,140 @@ async def read_thread(bot: BotInstance, *, thread_id: str, limit: int = 50) -> d
     if len(transcript) > 8000:
         transcript = "…(前文截断)\n" + transcript[-8000:]
     return {"ok": True, "count": len(msgs), "transcript": transcript}
+
+
+# ── 实时插话：追加 / 停止并改指令（append / steer）──────────────────────────
+# 两个原语，都作用在一条已有 thread 的 session 上，都走 option B —— resume 现有
+# 会话（get_current），不新开，尽力保留已经跑出来的上下文/进度（被打断那半轮已写进
+# JSONL 的部分能带多少带多少；pty runner 的 session 认领策略可能让它不完整）：
+#   · append —— 不打断当前 run，把新指令排到它后面（当前 run 跑完接着上下文执行）
+#   · steer  —— 先停掉当前 run（保留进度卡），再按新指令 resume 续跑（实时纠偏）
+# 两个入口复用：群里人手打的 `/stop <指令>`，以及 MCP 的 append_to_task / steer_task
+# （编排 agent 监工子会话时实时调整方向）。lock 天然给 append 提供"排队在后"语义。
+
+async def _deliver_followup(
+    bot: BotInstance, *, user_id: str, chat_id: str, thread_id: str,
+    anchor_message_id: str, instruction: str, stop_first: bool,
+    is_group: bool = True,
+):
+    """(可选)停当前 run → 抢 per-chat lock → resume 现有 session 跑 instruction。
+
+    以后台 task 方式 fire-and-forget 调用。stop_first=True：先 stop_run（保留进度卡），
+    等旧 run 释放 lock 再续跑；stop_first=False：直接抢 lock，天然排在当前 run 之后。
+    始终 resume 现有 session（option B），不新开会话。"""
+    tag = bot.profile.name
+    if stop_first:
+        try:
+            await stop_run(
+                bot.active_runs, user_id, chat_id,
+                on_stopped=lambda run: _announce_stopped_run(bot, run),
+            )
+        except Exception as e:
+            log(tag, "steer", "warn", f"停当前 run 失败（仍继续续跑）: {e}")
+
+    lock = bot._ensure_chat_lock(chat_id)
+    async with lock:
+        try:
+            session = await bot.store.get_current(user_id, chat_id)
+            card_msg_id = await bot.feishu.reply_card(anchor_message_id, loading=True)
+        except Exception as e:
+            log(tag, "steer", "error", f"续跑前置失败: {type(e).__name__}: {e}")
+            try:
+                await bot.feishu.reply_text(
+                    anchor_message_id, f"❌ 续跑失败：{type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return
+        raw_chat_id = chat_id.split(":", 1)[0] if ":" in chat_id else chat_id
+        lark_sys = build_lark_system_prompt(
+            bot.profile, raw_chat_id, thread_id, anchor_message_id, is_group,
+            asker_open_id=user_id, runner=session.runner,
+        )
+        run_text = instruction
+        if stop_first:
+            run_text = (
+                "⚠️ 我刚打断了你上一步正在做的事（上一轮任务被 /stop 中止）。"
+                "请改按下面的新指令继续，不要重复已经做过的写操作 / 命令 / 文件改动：\n\n"
+                + instruction
+            )
+        log(tag, "steer", "info",
+            f"续跑 chat={raw_chat_id[:10]}... thread={(thread_id or '-')[:10]}... "
+            f"stop_first={stop_first} len={len(instruction)}")
+        try:
+            await _run_and_display(
+                bot, user_id, chat_id, is_group, run_text,
+                card_msg_id, session, anchor_message_id,
+                preview_text=instruction[:40], append_system_prompt=lark_sys,
+            )
+        except Exception as e:
+            log(tag, "steer", "error", f"续跑执行异常: {type(e).__name__}: {e}")
+
+
+async def steer_or_append_thread(
+    bot: BotInstance, *, user_id: str, group_chat_id: str, thread_id: str,
+    instruction: str, stop_first: bool,
+) -> dict:
+    """MCP append_to_task / steer_task 的 bot 侧实现：往某条已有 thread 的 session
+    实时插话。stop_first=False=追加（不打断），True=停当前 run 再按新指令续跑。
+    仅做锚点解析 + 排后台 task，立即返回（不阻塞等整轮跑完）。"""
+    if not (group_chat_id and thread_id):
+        return {"ok": False, "error": "缺少 group_chat_id / thread_id"}
+    if not (instruction and instruction.strip()):
+        return {"ok": False, "error": "instruction 不能为空"}
+    # 兜底：dispatch_task 偶尔把 anchor 的 om_ 当 thread_id 传回 → 转成真 omt_
+    if thread_id.startswith("om_") and not thread_id.startswith("omt_"):
+        try:
+            actual = await bot.feishu.get_message_thread_id(thread_id)
+            if actual and actual.startswith("omt_"):
+                thread_id = actual
+        except Exception:
+            pass
+    user = user_id or bot.store.find_primary_user() or ""
+    if not user:
+        return {"ok": False, "error": "无法确定归属人 user_id"}
+    chat_id = f"{group_chat_id}:{thread_id}"
+    run = bot.active_runs.get_run(user, chat_id)
+    running = run is not None and not run.stop_requested
+
+    # 回复锚点：优先当前 run 的流式卡（一定在该 thread 内），否则拉 thread 里一条消息
+    anchor = run.card_msg_id if run else ""
+    if not anchor:
+        try:
+            msgs = await bot.feishu.list_thread_messages(thread_id, limit=1)
+            if msgs:
+                anchor = getattr(msgs[0], "message_id", "") or ""
+        except Exception as e:
+            return {"ok": False, "error": f"无法定位 thread 锚点: {type(e).__name__}: {e}"}
+    if not anchor:
+        return {"ok": False, "error": "thread 内没有可回复的消息作为锚点"}
+
+    do_stop = stop_first and running
+    if do_stop:
+        head, title = "⏹ 已停止当前任务，正在按新指令续跑（保留已完成的上下文）", "🛠 停止并改指令"
+    elif running:
+        head, title = "📬 已把新指令追加到当前任务后面，跑完就接着上下文执行", "➕ 追加指令"
+    else:
+        head, title = "▶️ 该话题当前空闲，直接按新指令续跑", "➕ 追加指令"
+    # 把「完整指令」发进 thread —— MCP 路径的指令来自编排 agent，人在群里看不到，
+    # 必须像 dispatch_task 展示 worker prompt 那样把全文贴出来，否则只剩一句状态。
+    body_text = f"{head}\n\n【完整指令】\n{instruction.strip()}"
+    try:
+        await bot.feishu.reply_post(anchor, title=title, body_text=body_text)
+    except Exception:
+        try:
+            await bot.feishu.reply_text(anchor, body_text)  # 富文本失败退回纯文本
+        except Exception:
+            pass
+
+    t = asyncio.create_task(_deliver_followup(
+        bot, user_id=user, chat_id=chat_id, thread_id=thread_id,
+        anchor_message_id=anchor, instruction=instruction.strip(),
+        stop_first=do_stop, is_group=True,
+    ))
+    _DISPATCH_TASKS.add(t)
+    t.add_done_callback(_DISPATCH_TASKS.discard)
+    return {
+        "ok": True, "thread_id": thread_id,
+        "mode": "steer" if stop_first else "append",
+        "stopped": do_stop, "queued": bool(running and not stop_first),
+    }

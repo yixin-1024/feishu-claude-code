@@ -61,9 +61,33 @@ def _control_base() -> str:
     return f"http://127.0.0.1:{port}"
 
 
+def _control_token() -> str:
+    """获取 control API 的 Bearer token。
+
+    env 优先（Claude 后端会把 CC_LARK_CONTROL_TOKEN 注入子进程 env，MCP server 随
+    Claude 继承拿到）。**codex 后端不会把该 env 透传给它 spawn 的 MCP server**（且
+    runner 出于避免 token 落进命令行/ps 的考虑，本就把它从 --mcp-config 的 env 块里
+    剔除了），于是 codex 起的这个进程 env 里没有 token → 调 control API 返回 401，
+    dispatch/wake/cron 全挂。这里退回读常驻 bot 落盘的 0600 token 文件（同机同用户，
+    与 http_server.load_or_create_control_token 同一份 secret），让两种后端都能鉴权，
+    且 token 永不出现在命令行里。
+    """
+    token = (os.environ.get("CC_LARK_CONTROL_TOKEN") or "").strip()
+    if token:
+        return token
+    token_path = os.path.expanduser(
+        (os.environ.get("CC_LARK_CONTROL_TOKEN_FILE") or "~/.feishu-claude/control-token").strip()
+    )
+    try:
+        with open(token_path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def _control_headers() -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
-    token = (os.environ.get("CC_LARK_CONTROL_TOKEN") or "").strip()
+    token = _control_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
@@ -108,7 +132,10 @@ WAKE_TOOL = {
         "you should END THE TURN — do NOT sleep or busy-wait (the runtime kills idle "
         "turns). The woken turn starts a FRESH session in the same thread, so write "
         "`note` self-contained: what you were doing + exactly what to check/do on wake. "
-        "Thread/recipient/profile context is supplied automatically — you do NOT pass it."
+        "Thread/recipient/profile context is supplied automatically — you do NOT pass it. "
+        "A visible notice stating the exact wake time is AUTO-POSTED to this thread, so "
+        "the user can see a wake is already queued (and won't manually re-wake you) — you "
+        "do NOT need to announce the schedule yourself."
     ),
     "inputSchema": {
         "type": "object",
@@ -204,6 +231,62 @@ READ_THREAD_TOOL = {
     },
 }
 
+APPEND_TASK_TOOL = {
+    "name": "append_to_task",
+    "description": (
+        "Append a follow-up instruction to a running (or idle) sub-task session in a thread, "
+        "WITHOUT interrupting whatever it is currently doing. The message is QUEUED: it runs "
+        "after the sub-agent finishes its current turn, resuming the SAME session so full "
+        "context/progress is preserved. Use this to add a next step, extra requirement, or "
+        "clarification while letting the current step complete. `thread_id` is the omt_… "
+        "returned by dispatch_task. For steering a task that has gone off-course and should be "
+        "REDIRECTED NOW (stop the current work first), use steer_task instead. Target "
+        "group/recipient are supplied automatically."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "thread_id": {
+                "type": "string",
+                "description": "The thread id (omt_…) of the sub-task, returned by dispatch_task.",
+            },
+            "message": {
+                "type": "string",
+                "description": "The follow-up instruction to append (runs after the current turn).",
+            },
+        },
+        "required": ["thread_id", "message"],
+    },
+}
+
+STEER_TASK_TOOL = {
+    "name": "steer_task",
+    "description": (
+        "STOP a sub-task's current run immediately and redirect it with a NEW instruction "
+        "(real-time steering). Use when the sub-agent has gone off-course / picked the wrong "
+        "approach and you want to interrupt and correct it NOW rather than wait for it to "
+        "finish. The interrupted turn's progress card is preserved (marked stopped), then the "
+        "SAME session is resumed with your new instruction so prior context/work carries over "
+        "(the new instruction is prefixed with a note that the previous step was interrupted). "
+        "`thread_id` is the omt_… returned by dispatch_task. To add a step WITHOUT interrupting "
+        "the current work, use append_to_task instead. Target group/recipient supplied automatically."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "thread_id": {
+                "type": "string",
+                "description": "The thread id (omt_…) of the sub-task, returned by dispatch_task.",
+            },
+            "message": {
+                "type": "string",
+                "description": "The new instruction to redirect the sub-agent with (after stopping its current run).",
+            },
+        },
+        "required": ["thread_id", "message"],
+    },
+}
+
 SCHEDULE_CRON_TOOL = {
     "name": "schedule_cron",
     "description": (
@@ -242,7 +325,7 @@ TOOLS = []
 if _ALLOW_WAKE:
     TOOLS.append(WAKE_TOOL)
 if _ALLOW_DISPATCH:
-    TOOLS += [DISPATCH_TASK_TOOL, READ_THREAD_TOOL]
+    TOOLS += [DISPATCH_TASK_TOOL, READ_THREAD_TOOL, APPEND_TASK_TOOL, STEER_TASK_TOOL]
 if _ALLOW_CRON:
     TOOLS += [SCHEDULE_CRON_TOOL, LIST_CRONS_TOOL]
 
@@ -297,7 +380,9 @@ def _tool_wake_me_in(args: dict) -> dict:
     fire_at = body.get("fire_at_local") or f"~{minutes} min"
     return _ok(
         f"✅ Scheduled a wake in {minutes} min (fires {fire_at}) in this thread. "
-        f"You can END THE TURN now — a fresh turn will continue with your note."
+        f"A visible notice with this wake time was posted to the thread, so no need to "
+        f"announce it yourself. You can END THE TURN now — a fresh turn will continue "
+        f"with your note."
     )
 
 
@@ -372,6 +457,53 @@ def _tool_read_thread(args: dict) -> dict:
     return _ok(f"Thread {thread_id} — {body.get('count')} message(s):\n\n{body.get('transcript', '')}")
 
 
+def _post_steer(args: dict, *, stop_first: bool, verb: str) -> dict:
+    """append_to_task / steer_task 的共享后端：POST /steer 给常驻 bot。
+    stop_first=False=追加不打断；True=停当前 run 再按新指令续跑。"""
+    thread_id = (args.get("thread_id") or "").strip()
+    message = args.get("message")
+    if not thread_id:
+        return _err("`thread_id` is required (the omt_… returned by dispatch_task).")
+    if not isinstance(message, str) or not message.strip():
+        return _err("`message` must be a non-empty string.")
+    chat_id = (os.environ.get("CC_LARK_CHAT_ID") or "").strip()
+    profile = (os.environ.get("CC_LARK_PROFILE") or "").strip()
+    user_id = (os.environ.get("CC_LARK_USER_ID") or "").strip()
+    if not chat_id:
+        return _err(f"No Lark group context — {verb} only works inside a cc-lark group session.")
+    payload = {
+        "profile": profile, "chat_id": chat_id, "user_id": user_id,
+        "thread_id": thread_id, "instruction": message.strip(), "stop_first": stop_first,
+    }
+    try:
+        body = _post_json("/steer", payload)
+    except Exception as e:  # noqa: BLE001
+        _log(f"/steer POST failed: {type(e).__name__}: {e}")
+        return _err(f"Failed to reach cc-lark: {type(e).__name__}: {e}")
+    if not body.get("ok"):
+        return _err(f"{verb} rejected: {body.get('error', 'unknown error')}")
+    if stop_first:
+        detail = "stopped its current run and redirected it" if body.get("stopped") else \
+                 "no run was active — it will run the new instruction directly"
+    else:
+        detail = "queued after the current run" if body.get("queued") else \
+                 "no run was active — it will run directly"
+    return _ok(
+        f"✅ {verb} delivered to thread {thread_id} ({detail}). "
+        f"Poll read_thread(thread_id=\"{thread_id}\") to see how it continues."
+    )
+
+
+def _tool_append_to_task(args: dict) -> dict:
+    """给某 thread 的子会话追加一条指令，不打断当前 run（排在其后，resume 同一会话）。"""
+    return _post_steer(args, stop_first=False, verb="append_to_task")
+
+
+def _tool_steer_task(args: dict) -> dict:
+    """停掉某 thread 子会话的当前 run，再按新指令 resume 续跑（实时纠偏）。"""
+    return _post_steer(args, stop_first=True, verb="steer_task")
+
+
 def _tool_schedule_cron(args: dict) -> dict:
     """新增一条重复定时任务。cron + prompt 来自 args；profile/chat/user 取自 env。"""
     cron = (args.get("cron") or "").strip()
@@ -429,6 +561,8 @@ if _ALLOW_WAKE:
 if _ALLOW_DISPATCH:
     _HANDLERS["dispatch_task"] = _tool_dispatch_task
     _HANDLERS["read_thread"] = _tool_read_thread
+    _HANDLERS["append_to_task"] = _tool_append_to_task
+    _HANDLERS["steer_task"] = _tool_steer_task
 if _ALLOW_CRON:
     _HANDLERS["schedule_cron"] = _tool_schedule_cron
     _HANDLERS["list_crons"] = _tool_list_crons

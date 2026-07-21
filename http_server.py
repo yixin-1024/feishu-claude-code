@@ -62,6 +62,8 @@ class HttpHandlers:
     # async：通用多 agent 派发 / 监工（cc_mcp_server 的 dispatch_task / read_thread 后端）
     dispatch_task: Callable[..., Awaitable[dict]]
     read_thread: Callable[..., Awaitable[dict]]
+    # async：往已有 thread 的 session 实时插话（cc_mcp_server 的 append_to_task / steer_task 后端）
+    steer_thread: Callable[..., Awaitable[dict]]
     # 同步：重复定时任务（cc_mcp_server 的 schedule_cron / list_crons 后端）
     schedule_cron: Callable[..., dict]
     list_crons: Callable[..., dict]
@@ -327,6 +329,10 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/read_thread":
             self._handle_read_thread(body)
+            return
+
+        if parsed.path == "/steer":
+            self._handle_steer(body)
             return
 
         if parsed.path == "/schedule_cron":
@@ -624,6 +630,44 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             self._mcp_error("read_thread", _prof, e)
             return
         self._mcp_respond("read_thread", _prof, result)
+
+    def _handle_steer(self, body: bytes):
+        """cc_mcp_server 的 append_to_task / steer_task → 往某 thread 的 session 实时插话。
+
+        stop_first=False=追加（不打断当前 run），True=停当前 run 再按新指令续跑。
+        bot 侧只做锚点解析 + 排后台 task 后立即返回，故 30s timeout 足够。"""
+        if not _is_localhost(self.client_address):
+            self._respond(403, {"ok": False, "error": "steer is localhost only"})
+            return
+        try:
+            p = json.loads(body) if body else {}
+            if not isinstance(p, dict):
+                raise ValueError("body must be a JSON object")
+        except Exception as e:
+            self._respond(400, {"ok": False, "error": f"bad json: {e}"})
+            return
+        _prof = (p.get("profile") or "").strip()
+        bot = self._resolve_bot_by_profile(_prof)
+        if bot is None:
+            self._mcp_respond("steer", _prof,
+                              {"ok": False, "error": "profile 未加载（多 bot 必须指定 profile）"})
+            return
+        try:
+            result = self._run_on_loop(
+                _handlers.steer_thread(
+                    bot,
+                    user_id=(p.get("user_id") or "").strip(),
+                    group_chat_id=(p.get("chat_id") or p.get("group_chat_id") or "").strip(),
+                    thread_id=(p.get("thread_id") or "").strip(),
+                    instruction=p.get("instruction") or p.get("message") or "",
+                    stop_first=bool(p.get("stop_first")),
+                ),
+                timeout=30,
+            )
+        except Exception as e:
+            self._mcp_error("steer", _prof, e)
+            return
+        self._mcp_respond("steer", _prof, result)
 
     def _handle_schedule_cron(self, body: bytes):
         """cc_mcp_server 的 schedule_cron → 新增一条重复定时任务（写 yaml + reload）。同步。"""

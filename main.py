@@ -106,6 +106,7 @@ def main():
             schedule_wake=schedule_wake,
             dispatch_task=dispatcher.dispatch_task,
             read_thread=dispatcher.read_thread,
+            steer_thread=dispatcher.steer_or_append_thread,
             schedule_cron=schedule_cron,
             list_crons=list_crons,
         ),
