@@ -762,7 +762,14 @@ def _probe_one(acc: Account, is_current: bool = False) -> Account:
     acc.s7d = h("anthropic-ratelimit-unified-7d-status") or "unknown"
 
     if acc.u5h is None and acc.u7d is None and not acc.probe_error:
-        acc.probe_error = "no rate-limit headers in response"
+        # 5xx / 529 = Anthropic 服务端过载/暂时不可用，这类响应本就不带用量
+        # headers；跟"账户真拿不到 header"分开报，免得误判成该账户挂了。
+        if http_code == 429:
+            acc.probe_error = "rate limited (HTTP 429) — retry later"
+        elif http_code and http_code >= 500:
+            acc.probe_error = f"Anthropic service unavailable (HTTP {http_code}) — retry later"
+        else:
+            acc.probe_error = "no rate-limit headers in response"
 
     return acc
 

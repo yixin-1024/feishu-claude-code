@@ -175,6 +175,18 @@ def main():
     except Exception as e:
         print(f"⚠️ quota_watcher 启动失败: {e}")
 
+    # 9.1) Codex 额度监控：每 30 min 查一次，窗口重置时私信 owner（仅当有 codex profile）
+    if any(getattr(p, "runner", "") == "codex" for p in config.PROFILES):
+        codex_interval = int(os.getenv("CODEX_QUOTA_WATCH_INTERVAL_SEC", "1800"))
+        codex_notify_profile = os.getenv("CODEX_QUOTA_NOTIFY_PROFILE") or notify_profile
+        codex_notify_open_id = os.getenv("CODEX_QUOTA_NOTIFY_OPEN_ID", "").strip() or notify_open_id
+        try:
+            runtime.start_codex_quota_watcher(
+                codex_notify_profile, codex_notify_open_id, codex_interval,
+            )
+        except Exception as e:
+            print(f"⚠️ codex_quota_watcher 启动失败: {e}")
+
     # 主线程保持运行
     try:
         while True:

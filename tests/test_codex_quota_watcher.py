@@ -1,0 +1,106 @@
+import codex_quota_watcher as cqw
+
+
+def _patch_state(monkeypatch, holder):
+    monkeypatch.setattr(cqw, "_load_state", lambda: dict(holder.get("state") or {}))
+    monkeypatch.setattr(
+        cqw, "_save_state", lambda s: holder.__setitem__("state", dict(s))
+    )
+
+
+def _patch_rate_limits(monkeypatch, snapshot):
+    import commands
+
+    monkeypatch.setattr(commands, "_get_codex_rate_limits", lambda: snapshot)
+
+
+def test_first_run_is_silent(monkeypatch):
+    holder = {"state": {}}
+    _patch_state(monkeypatch, holder)
+    _patch_rate_limits(
+        monkeypatch, {"primary": {"usedPercent": 100, "windowDurationMins": 10080}}
+    )
+    sent = []
+    cqw.poll_once(sent.append)
+    assert sent == []
+    # 冷启动水位已落地
+    assert holder["state"]["primary"]["used"] == 100.0
+
+
+def test_reset_via_used_percent_drop_notifies(monkeypatch):
+    holder = {"state": {"primary": {"used": 100.0, "resets": None}}}
+    _patch_state(monkeypatch, holder)
+    _patch_rate_limits(
+        monkeypatch, {"primary": {"usedPercent": 3, "windowDurationMins": 10080}}
+    )
+    sent = []
+    cqw.poll_once(sent.append)
+    assert len(sent) == 1
+    assert "已重置" in sent[0]
+    assert "7天窗口" in sent[0]
+
+
+def test_reset_via_resets_at_advance_notifies(monkeypatch):
+    holder = {"state": {"primary": {"used": 80.0, "resets": 1_000_000}}}
+    _patch_state(monkeypatch, holder)
+    _patch_rate_limits(
+        monkeypatch,
+        {
+            "primary": {
+                "usedPercent": 82,
+                "windowDurationMins": 10080,
+                "resetsAt": 1_000_000 + 7 * 86400,
+            }
+        },
+    )
+    sent = []
+    cqw.poll_once(sent.append)
+    assert len(sent) == 1
+    assert "已重置" in sent[0]
+
+
+def test_no_alert_when_usage_climbs(monkeypatch):
+    holder = {"state": {"primary": {"used": 40.0, "resets": None}}}
+    _patch_state(monkeypatch, holder)
+    _patch_rate_limits(
+        monkeypatch, {"primary": {"usedPercent": 100, "windowDurationMins": 10080}}
+    )
+    sent = []
+    cqw.poll_once(sent.append)
+    assert sent == []
+
+
+def test_small_drop_below_threshold_is_ignored(monkeypatch):
+    # 40% → 30%（回落 10 < 20）且起点 < 50 → 不算重置
+    holder = {"state": {"primary": {"used": 40.0, "resets": None}}}
+    _patch_state(monkeypatch, holder)
+    _patch_rate_limits(
+        monkeypatch, {"primary": {"usedPercent": 30, "windowDurationMins": 10080}}
+    )
+    sent = []
+    cqw.poll_once(sent.append)
+    assert sent == []
+
+
+def test_fetch_failure_leaves_state_untouched(monkeypatch):
+    holder = {"state": {"primary": {"used": 100.0, "resets": None}}}
+    _patch_state(monkeypatch, holder)
+    _patch_rate_limits(monkeypatch, {})
+    sent = []
+    cqw.poll_once(sent.append)
+    assert sent == []
+    # 拉取失败不改 state（否则下一轮真重置会因缺 prev 被当冷启动漏报）
+    assert holder["state"]["primary"]["used"] == 100.0
+
+
+def test_resets_at_microdrift_not_treated_as_reset(monkeypatch):
+    # resets_at 只漂 1 秒、used 不降 → 不是重置
+    holder = {"state": {"primary": {"used": 100.0, "resets": 1785078071}}}
+    _patch_state(monkeypatch, holder)
+    _patch_rate_limits(
+        monkeypatch,
+        {"primary": {"usedPercent": 100, "windowDurationMins": 10080, "resetsAt": 1785078072}},
+    )
+    sent = []
+    cqw.poll_once(sent.append)
+    assert sent == []

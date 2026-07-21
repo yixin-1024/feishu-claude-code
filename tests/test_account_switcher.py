@@ -225,6 +225,29 @@ def test_probe_one_401_then_refresh_also_fails_reports_relogin(monkeypatch, tmp_
     assert "invalid_grant" in out.probe_error
 
 
+def test_probe_one_529_overloaded_not_reported_as_missing_headers(monkeypatch, tmp_path):
+    """Anthropic 过载 529（无 unified header）应报"服务不可用"，别误判成账户拿不到 header。"""
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
+        "reg": {"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-live",
+            "refreshToken": "rt",
+            "expiresAt": int((time.time() + 3 * 3600) * 1000),
+        }},
+    }))
+    # 529 且响应里没有任何 rate-limit header（Anthropic 过载时的真实形态）
+    fake_open, _ = _fake_urlopen_factory([{"http_code": 529, "headers": {}}])
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_open)
+
+    acc = accs.load_account("reg")
+    out = accs._probe_one(acc)
+    assert out.u5h is None and out.u7d is None
+    assert out.probe_error is not None
+    assert "529" in out.probe_error
+    # 不能落回"账户没 header"那句误导文案
+    assert "no rate-limit headers" not in out.probe_error
+
+
 def test_refresh_account_force_bypasses_fast_path(monkeypatch, tmp_path):
     """force=True 时不应因为 expiresAt 还远就 short-circuit。"""
     monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {

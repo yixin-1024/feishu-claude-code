@@ -266,6 +266,45 @@ def start_quota_watcher(
         + ("，账户智能切换：开" if switcher is not None else ""))
 
 
+def start_codex_quota_watcher(
+    notify_profile: str,
+    notify_open_id: str,
+    interval_sec: int = 1800,
+) -> None:
+    """启动 Codex 额度监控后台线程：窗口重置时给 owner 发 Lark 私信。
+
+    通报通过 `notify_profile` 这个 bot 的 send_text_to_user 发给 `notify_open_id`。
+    watcher 跑在独立线程，send_fn 用 run_coroutine_threadsafe 投回 bot_loop。
+    """
+    if _bot_loop is None or not _bots:
+        raise RuntimeError("runtime not configured; call configure() first")
+    bot = _bots.get(notify_profile)
+    if bot is None:
+        log("global", "codex_quota", "warn",
+            f"codex_quota_watcher: profile {notify_profile!r} 未加载，跳过")
+        return
+    if not notify_open_id:
+        log("global", "codex_quota", "warn",
+            "codex_quota_watcher: notify_open_id 为空，跳过启动")
+        return
+
+    from codex_quota_watcher import start_watcher_thread as start_codex_watcher
+
+    def _send(text: str) -> None:
+        try:
+            asyncio.run_coroutine_threadsafe(
+                bot.feishu.send_text_to_user(notify_open_id, text),
+                _bot_loop,
+            )
+        except Exception as e:
+            log(notify_profile, "codex_quota", "error",
+                f"投递 codex 额度通报失败: {e}")
+
+    start_codex_watcher(_send, interval=interval_sec)
+    log(notify_profile, "codex_quota", "info",
+        f"codex 额度监控启动 → 通报到 {notify_open_id[:14]}... 每 {interval_sec}s")
+
+
 # ── 为 profile 启动 WebSocket 客户端 ─────────────────────────
 
 def start_profile_ws(bot: BotInstance) -> None:

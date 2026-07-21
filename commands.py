@@ -5,8 +5,10 @@
 
 import asyncio
 import getpass
+import glob
 import json
 import os
+import select
 import shlex
 import subprocess
 import sys
@@ -368,6 +370,7 @@ def fetch_quota_headers() -> dict:
         method="POST",
     )
 
+    http_status = None
     try:
         from account_switcher import urlopen_with_retry
         ctx = ssl.create_default_context()
@@ -378,6 +381,7 @@ def fetch_quota_headers() -> dict:
         if e.code in (401, 403):
             return {"ok": False,
                     "error": f"认证失败（HTTP {e.code}）：keychain 里的 token 已失效，请重新 `claude /login`"}
+        http_status = e.code
         headers = dict(e.headers)
     except Exception as e:
         return {"ok": False, "error": f"获取用量失败：{e}"}
@@ -407,6 +411,13 @@ def fetch_quota_headers() -> dict:
         "s7d": h("anthropic-ratelimit-unified-7d-status") or "unknown",
     }
     if out["u5h"] is None and out["u7d"] is None:
+        # 5xx / 529 = Anthropic 服务端过载/暂时不可用，这类响应本就不带用量
+        # headers；别再吞成"响应中无用量 headers"误导成账户挂了。
+        if http_status == 429:
+            return {"ok": False, "error": "触发限流（HTTP 429），稍后重试"}
+        if http_status and http_status >= 500:
+            return {"ok": False,
+                    "error": f"Anthropic 服务暂时不可用（HTTP {http_status}），稍后重试"}
         return {"ok": False, "error": "响应中无用量 headers"}
     return out
 
@@ -421,15 +432,26 @@ def _fmt_pct_bar(val) -> str:
     return f"{bar} {pct:.1f}%"
 
 
+def _fmt_reset_short(secs) -> str:
+    """把「距离重置还有多久」渲染成短串。
+
+    ≤ 1 天 → `10h25m`；> 1 天 → `2天零3小时`（不写很多个小时），整天则 `2天`。
+    """
+    secs = max(0, int(secs))
+    if secs >= 86400:
+        days = secs // 86400
+        hours = (secs % 86400) // 3600
+        return f"{days}天零{hours}小时" if hours else f"{days}天"
+    return f"{secs // 3600}h{secs % 3600 // 60}m"
+
+
 def _fmt_reset_ts(ts) -> str:
     if ts is None:
         return "未知"
     try:
         dt = datetime.fromtimestamp(int(ts))
-        diff = dt - datetime.now()
-        hours = int(diff.total_seconds() // 3600)
-        minutes = int((diff.total_seconds() % 3600) // 60)
-        return f"{dt.strftime('%m/%d %H:%M')}（{hours}h{minutes}m 后）"
+        diff = (dt - datetime.now()).total_seconds()
+        return f"{dt.strftime('%m/%d %H:%M')}（{_fmt_reset_short(diff)} 后）"
     except Exception:
         return str(ts)
 
@@ -514,8 +536,10 @@ def _get_usage() -> str:
             mark = "✅" if a.usable else "❌"
             r5_part = ""
             if a.r5h:
-                secs = max(0, a.r5h - now_ts)
-                r5_part = f" (重置 {int(secs//3600)}h{int(secs%3600/60)}m)"
+                r5_part = f" (重置 {_fmt_reset_short(a.r5h - now_ts)})"
+            r7_part = ""
+            if a.r7d:
+                r7_part = f" (重置 {_fmt_reset_short(a.r7d - now_ts)})"
             tail = ""
             if a is best_other and cur_usable and (a.score - cur_score) >= 0.15:
                 tail = "（推荐切换）"
@@ -524,7 +548,7 @@ def _get_usage() -> str:
             elif not a.usable and a.reasons:
                 tail = f"（{a.reasons[0]}）"
             lines.append(
-                f"  `{a.name}` · 5h `{u5}`{r5_part} · 7d `{u7}` · score `{a.score:.2f}` {mark}{tail}"
+                f"  `{a.name}` · 5h `{u5}`{r5_part} · 7d `{u7}`{r7_part} · score `{a.score:.2f}` {mark}{tail}"
             )
 
     # 自动切换开关状态
@@ -660,35 +684,194 @@ def _format_context_line(session_id: Optional[str], model: str, runner: str = "c
     return f"上下文: `{_fmt_tokens(total)} / {_fmt_tokens(window)} ({pct:.1f}%)`"
 
 
-def _format_codex_rate_line(session_id: Optional[str]) -> str:
-    fpath = _find_codex_session_file(session_id or "")
-    if not fpath:
-        return ""
+def _fetch_codex_rate_limits(timeout: float = 8.0) -> dict:
+    """通过 Codex app-server 读取当前账户的实时额度快照。"""
+    proc = None
     try:
-        with open(fpath, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+        proc = subprocess.Popen(
+            ["codex", "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+
+        def _send(message: dict) -> None:
+            proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+            proc.stdin.flush()
+
+        def _read_response(request_id: int, deadline: float) -> dict:
+            while time.monotonic() < deadline:
+                remaining = max(0.0, deadline - time.monotonic())
+                ready, _, _ = select.select([proc.stdout], [], [], remaining)
+                if not ready:
+                    break
+                raw = proc.stdout.readline()
+                if not raw:
+                    break
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("id") == request_id:
+                    return message
+            return {}
+
+        deadline = time.monotonic() + timeout
+        _send({
+            "id": 1,
+            "method": "initialize",
+            "params": {"clientInfo": {"name": "cc-lark", "version": "1"}},
+        })
+        initialized = _read_response(1, deadline)
+        if not initialized.get("result"):
+            return {}
+        _send({"method": "initialized", "params": {}})
+        _send({"id": 2, "method": "account/rateLimits/read"})
+        response = _read_response(2, deadline)
+        snapshot = (response.get("result") or {}).get("rateLimits") or {}
+        if snapshot:
+            snapshot = dict(snapshot)
+            snapshot["_source"] = "live"
+        return snapshot
+    except (OSError, BrokenPipeError, ValueError):
+        return {}
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+def _read_latest_codex_rate_limits() -> dict:
+    """实时 RPC 暂不可用时，读取所有 Codex 任务中最新上报的额度。"""
+    root = os.path.expanduser("~/.codex/sessions")
+    try:
+        paths = glob.glob(os.path.join(root, "*", "*", "*", "*.jsonl"))
+        paths.sort(key=os.path.getmtime, reverse=True)
     except OSError:
-        return ""
-    for raw in reversed(lines):
+        return {}
+    for path in paths[:30]:
         try:
-            d = json.loads(raw)
-        except json.JSONDecodeError:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
             continue
-        payload = d.get("payload") or {}
-        if d.get("type") != "event_msg" or payload.get("type") != "token_count":
+        for raw in reversed(lines):
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            payload = event.get("payload") or {}
+            if event.get("type") != "event_msg" or payload.get("type") != "token_count":
+                continue
+            limits = payload.get("rate_limits") or {}
+            if not limits:
+                continue
+            snapshot = {"_source": "reported"}
+            for key in ("primary", "secondary"):
+                window = limits.get(key) or {}
+                if window.get("used_percent") is not None:
+                    snapshot[key] = {
+                        "usedPercent": window.get("used_percent"),
+                        "windowDurationMins": window.get("window_minutes"),
+                        "resetsAt": window.get("resets_at"),
+                    }
+            if snapshot.keys() - {"_source"}:
+                return snapshot
+    return {}
+
+
+def _codex_window_label(minutes) -> str:
+    """把窗口时长（分钟）翻成中文标签：7天 / 1天 / 5小时 / …"""
+    if minutes and minutes % 10080 == 0:
+        return f"{minutes // 10080 * 7}天"
+    if minutes and minutes % 1440 == 0:
+        return f"{minutes // 1440}天"
+    if minutes and minutes % 60 == 0:
+        return f"{minutes // 60}小时"
+    if minutes:
+        return f"{minutes}分钟"
+    return "当前窗口"
+
+
+def _format_codex_window(window: dict) -> str:
+    used = window.get("usedPercent")
+    if used is None:
+        return ""
+    label = _codex_window_label(window.get("windowDurationMins"))
+    return f"{label} {float(used):.1f}%"
+
+
+def _fmt_codex_reset_ts(ts) -> str:
+    """codex resets_at（unix 秒）→ '07/26 23:01（6天3h 后）'。窗口常跨天，故带天。"""
+    if not ts:
+        return "未知"
+    try:
+        dt = datetime.fromtimestamp(int(ts))
+        diff = (dt - datetime.now()).total_seconds()
+        if diff <= 0:
+            return f"{dt.strftime('%m/%d %H:%M')}（已重置）"
+        days = int(diff // 86400)
+        hours = int((diff % 86400) // 3600)
+        minutes = int((diff % 3600) // 60)
+        if days:
+            rel = f"{days}天{hours}h 后"
+        elif hours:
+            rel = f"{hours}h{minutes}m 后"
+        else:
+            rel = f"{minutes}m 后"
+        return f"{dt.strftime('%m/%d %H:%M')}（{rel}）"
+    except Exception:
+        return str(ts)
+
+
+def _get_codex_rate_limits() -> dict:
+    """实时拉 Codex 额度快照；实时 RPC 不可用时回退到最近任务上报。"""
+    rate_limits = _fetch_codex_rate_limits()
+    if not rate_limits:
+        rate_limits = _read_latest_codex_rate_limits()
+    return rate_limits
+
+
+def _format_codex_rate_line(_session_id: Optional[str] = None) -> str:
+    """实时获取 Codex 额度的紧凑一行版（用于 /status）；失败不回退历史快照。"""
+    rate_limits = _get_codex_rate_limits()
+    parts = [
+        part
+        for key in ("primary", "secondary")
+        if (part := _format_codex_window(rate_limits.get(key) or {}))
+    ]
+    if not parts:
+        return "Codex 配额: `实时获取失败，请稍后重试`"
+    suffix = "（最近任务上报）" if rate_limits.get("_source") == "reported" else ""
+    return f"Codex 配额{suffix}: `{' · '.join(parts)}`"
+
+
+def _codex_usage_bar_lines(rate_limits: dict) -> list[str]:
+    """把 codex 各窗口渲染成 cloud（Claude Max）风格的进度条 + 重置倒计时。
+
+    每个有 usedPercent 的窗口生成 3 行：空行 + **X窗口** + 进度条(+重置)。
+    """
+    lines: list[str] = []
+    for key in ("primary", "secondary"):
+        window = rate_limits.get(key) or {}
+        used = window.get("usedPercent")
+        if used is None:
             continue
-        rate_limits = payload.get("rate_limits") or {}
-        primary = rate_limits.get("primary") or {}
-        secondary = rate_limits.get("secondary") or {}
-        parts = []
-        if primary.get("used_percent") is not None:
-            parts.append(f"5h {float(primary['used_percent']):.1f}%")
-        if secondary.get("used_percent") is not None:
-            parts.append(f"7d {float(secondary['used_percent']):.1f}%")
-        if not parts:
-            return ""
-        return f"Codex 配额: `{' · '.join(parts)}`"
-    return ""
+        label = _codex_window_label(window.get("windowDurationMins"))
+        lines.append("")
+        lines.append(f"**{label}窗口**")
+        lines.append(_fmt_pct_bar(float(used) / 100))
+        resets = window.get("resetsAt")
+        if resets:
+            lines.append(f"重置时间：{_fmt_codex_reset_ts(resets)}")
+    return lines
 
 
 def _runner_default_model(bot, runner: str) -> str:
@@ -1463,7 +1646,7 @@ async def handle_command(
             current_usage=cur.get("last_usage") or None,
         )
         quota_line = (
-            _format_codex_rate_line(cur.get("session_id"))
+            await asyncio.to_thread(_format_codex_rate_line, cur.get("session_id"))
             if runner == "codex"
             else "" if runner in {"opencode", "mimo"}
             else await asyncio.to_thread(_get_quota_compact)
@@ -1534,16 +1717,23 @@ async def handle_command(
         runner = str(cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
         if runner == "codex":
             model = cur.get("model_override") or store.default_model
-            lines = ["📈 **Codex 用量**"]
+            lines = ["📊 **Codex 用量**", ""]
             lines.append(_format_context_line(
                 cur.get("session_id"),
                 model,
                 runner="codex",
                 current_usage=cur.get("last_usage") or None,
             ))
-            rate_line = _format_codex_rate_line(cur.get("session_id"))
-            if rate_line:
-                lines.append(rate_line)
+            rate_limits = await asyncio.to_thread(_get_codex_rate_limits)
+            bar_lines = _codex_usage_bar_lines(rate_limits)
+            if bar_lines:
+                suffix = "（最近任务上报）" if rate_limits.get("_source") == "reported" else ""
+                lines.append("")
+                lines.append(f"**Codex 配额{suffix}**")
+                lines.extend(bar_lines)
+            else:
+                lines.append("Codex 配额: `实时获取失败，请稍后重试`")
+            lines.append("")
             lines.append(f"Runner: `codex`")
             lines.append(f"模型: `{model}`")
             return "\n".join(lines)
