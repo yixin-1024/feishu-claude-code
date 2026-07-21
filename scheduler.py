@@ -311,6 +311,27 @@ def schedule_wake(
         f"profile={bot.profile.name} thread={thread_id[:12]}...",
         flush=True,
     )
+
+    # 往本话题贴一条可见公告，把"已排好自动唤醒 + 具体时间"告诉用户。否则调度只在
+    # 后台发生、用户看不到，容易在等待期间以为没排、又手动唤醒一次，导致本话题被
+    # 重复续跑（用户反馈的痛点）。best-effort：发失败只 log，绝不影响已排定的唤醒。
+    # schedule_wake 跑在 HTTP handler 线程里，reply_text 是 async → 投回 bot_loop 执行。
+    announce = (
+        f"⏰ 已排定自动唤醒：约 {minutes} 分钟后（{fire_local}）我会自己醒来继续本话题，"
+        f"在那之前无需再手动唤醒我。"
+    )
+
+    async def _announce():
+        try:
+            await bot.feishu.reply_text(anchor, announce)
+        except Exception as e:  # noqa: BLE001 — best-effort 公告，绝不因发送失败影响唤醒
+            print(f"[scheduler/wake] ⚠️ {job_id} 唤醒公告发送失败: {type(e).__name__}: {e}", flush=True)
+
+    try:
+        asyncio.run_coroutine_threadsafe(_announce(), bot_loop)
+    except Exception as e:  # noqa: BLE001
+        print(f"[scheduler/wake] ⚠️ {job_id} 唤醒公告提交失败: {type(e).__name__}: {e}", flush=True)
+
     return {"ok": True, "fire_at_local": fire_local, "job_id": job_id}
 
 

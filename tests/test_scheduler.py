@@ -7,6 +7,7 @@
 import asyncio
 import os
 import sys
+import threading
 
 import pytest
 
@@ -158,3 +159,108 @@ def test_fire_proceeds_when_quota_fetch_fails(monkeypatch):
     asyncio.run(fire())
 
     assert len(spawn_called) == 1, "fetch 失败时仍应派单"
+
+
+# ────────────────── schedule_wake：排定后往话题贴可见公告 ──────────────────
+
+class _RecordingFeishu:
+    def __init__(self):
+        self.replies: list[tuple[str, str]] = []
+        self.done = threading.Event()
+
+    async def reply_text(self, message_id, text):
+        self.replies.append((message_id, text))
+        self.done.set()
+        return "om_reply"
+
+
+class _WakeBot:
+    def __init__(self):
+        self.feishu = _RecordingFeishu()
+
+        class _Profile:
+            name = "spx"
+
+        class _Store:
+            def find_primary_user(self_inner):
+                return "ou_primary"
+
+        self.profile = _Profile()
+        self.store = _Store()
+
+
+class _RecordingScheduler:
+    def __init__(self):
+        self.jobs: list[dict] = []
+
+    def add_job(self, fn, **kw):
+        self.jobs.append(kw)
+
+
+def test_schedule_wake_posts_visible_announcement(monkeypatch):
+    """排定唤醒成功后，应往本话题（reply anchor）贴一条含唤醒时间的可见公告，
+    让用户知道已排好、不会再手动重复唤醒（用户反馈的痛点）。"""
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(target=loop.run_forever, daemon=True)
+    t.start()
+    bot = _WakeBot()
+    sched = _RecordingScheduler()
+
+    monkeypatch.setitem(scheduler._STATE, "scheduler", sched)
+    monkeypatch.setitem(scheduler._STATE, "bots", {"spx": bot})
+    monkeypatch.setitem(scheduler._STATE, "bot_loop", loop)
+    monkeypatch.setitem(scheduler._STATE, "spawn_fn", lambda *a, **k: None)
+
+    try:
+        res = scheduler.schedule_wake(
+            profile="spx", chat_id="oc_x", thread_id="omt_abcd1234",
+            anchor_message_id="om_anchor", user_id="ou_user",
+            minutes=5, note="check CI status",
+        )
+        assert res["ok"] is True
+        assert len(sched.jobs) == 1, "应挂一个一次性 wake job"
+        assert bot.feishu.done.wait(timeout=3), "应异步贴出唤醒公告"
+        msg_id, text = bot.feishu.replies[0]
+        assert msg_id == "om_anchor", "公告应 reply 到 anchor（落在本话题）"
+        assert "5 分钟" in text and "自动唤醒" in text
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        t.join(timeout=3)
+        loop.close()
+
+
+def test_schedule_wake_reply_failure_does_not_break_scheduling(monkeypatch):
+    """公告发送失败（reply_text 抛错）时，唤醒仍应成功排定（best-effort，不回滚）。"""
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(target=loop.run_forever, daemon=True)
+    t.start()
+
+    boom_called = threading.Event()
+
+    class _BoomFeishu:
+        async def reply_text(self, message_id, text):
+            boom_called.set()
+            raise RuntimeError("lark down")
+
+    bot = _WakeBot()
+    bot.feishu = _BoomFeishu()
+    sched = _RecordingScheduler()
+
+    monkeypatch.setitem(scheduler._STATE, "scheduler", sched)
+    monkeypatch.setitem(scheduler._STATE, "bots", {"spx": bot})
+    monkeypatch.setitem(scheduler._STATE, "bot_loop", loop)
+    monkeypatch.setitem(scheduler._STATE, "spawn_fn", lambda *a, **k: None)
+
+    try:
+        res = scheduler.schedule_wake(
+            profile="spx", chat_id="oc_x", thread_id="omt_abcd1234",
+            anchor_message_id="om_anchor", user_id="ou_user",
+            minutes=10, note="deploy check",
+        )
+        assert res["ok"] is True, "公告失败不应让唤醒排定失败"
+        assert len(sched.jobs) == 1
+        assert boom_called.wait(timeout=3)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        t.join(timeout=3)
+        loop.close()
