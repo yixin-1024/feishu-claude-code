@@ -162,7 +162,12 @@ def main():
         notify_open_id = explicit_id
     else:
         target = config.PROFILES_BY_NAME.get(notify_profile) or config.PROFILES[0]
-        notify_open_id = next(iter(target.allowed_open_ids), "")
+        # allowed_open_ids 是 set：next(iter(...)) 的顺序受 hash 随机化影响，每次重启
+        # 可能落到白名单里不同的人（曾导致额度通报发错人）。sorted 保证确定性，并
+        # 告警提醒：真正指向 owner 请在 .env 显式配 QUOTA_NOTIFY_OPEN_ID。
+        notify_open_id = next(iter(sorted(target.allowed_open_ids)), "")
+        if notify_open_id:
+            print(f"⚠️ QUOTA_NOTIFY_OPEN_ID 未配置，回退到 {notify_open_id[:14]}...（建议 .env 钉死收件人）")
     interval = int(os.getenv("QUOTA_WATCH_INTERVAL_SEC", "600"))
     # ACCOUNT_AUTO_SWITCH=1 启用多账户智能切换；冷却默认 30 min
     enable_switch = os.getenv("ACCOUNT_AUTO_SWITCH", "0").strip().lower() in ("1", "true", "yes", "on")

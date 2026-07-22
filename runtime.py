@@ -292,13 +292,17 @@ def start_codex_quota_watcher(
 
     def _send(text: str) -> None:
         try:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 bot.feishu.send_text_to_user(notify_open_id, text),
                 _bot_loop,
             )
+            # 阻塞等发送真正落地：否则 Future 被丢弃，协程内抛的异常（如对方从未
+            # 开通与该 bot 的私聊 → 发不出去）会被静默吞掉，日志里查不到，看起来
+            # 就像"重置了却没通报"。watcher 跑在独立线程，这里 block 一会儿无妨。
+            fut.result(timeout=30)
         except Exception as e:
             log(notify_profile, "codex_quota", "error",
-                f"投递 codex 额度通报失败: {e}")
+                f"投递 codex 额度通报失败（收件人 {notify_open_id[:14]}...）: {e}")
 
     start_codex_watcher(_send, interval=interval_sec)
     log(notify_profile, "codex_quota", "info",

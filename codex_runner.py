@@ -617,8 +617,14 @@ async def run_codex(
             prompt, sysp = message, first_sys
         else:
             prompt, sysp = _CONTINUE_NUDGE.format(sentinel=sentinel), None
-            # 轮次之间留一个视觉空行，续跑内容不和上一轮糊在一起。
-            await _fire_callback(on_text_chunk, "\n\n")
+            # 轮次之间打一条带编号的分界符，让用户在卡片上一眼看出：这是【本轮内的
+            # 自动续跑循环】把同一任务推进到第 N 轮（同一 session resume），而不是
+            # 外层重复触发的新任务。pass_idx=0 是首轮，pass_idx≥1 即第 (pass_idx+1) 轮。
+            # （区别于 dispatcher 的「🔄 上游响应中断」——那是流被打断的错误恢复。）
+            await _fire_callback(
+                on_text_chunk,
+                f"\n\n━━━━━━━ 🔁 自动续跑 · 第 {pass_idx + 1} 轮 ━━━━━━━\n\n",
+            )
 
         final_text, tid, done = await _run_codex_once(
             prompt, session_id=sess, append_system_prompt=sysp, sentinel=sentinel, **common,
