@@ -30,6 +30,7 @@ from lark_oapi.api.im.v1.model import (
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
+from lark_oapi.api.contact.v3 import BatchUserRequest
 
 import outbox
 from card_security import sign_action_value
@@ -258,6 +259,12 @@ class FeishuClient:
         # 会 fallback 到这个 cache。仅内存，重启就丢；只对"刚发完卡片就要审"场景有效。
         self._card_text_cache: dict[str, str] = {}
         self._CARD_CACHE_MAX = 500  # 简单上限防止无界增长
+        # open_id → 真实姓名 缓存（contact.v3.user.batch 解析结果）。
+        # 命中缺失（外部用户 / 离职 / 缺权限）也写入空串，避免同一 id 反复打接口。
+        # 仅内存，重启即丢；名字变更极低频，够用。thread_context 渲染话题历史时
+        # 用它把 sender open_id 显示成"Lu Yixin"而不是"user_8b4782"。
+        self._name_cache: dict[str, str] = {}
+        self._NAME_CACHE_MAX = 2000
         # 收尾确认写延时（秒）：v2 静态卡终态 patch 后停一小会儿再补一次同内容，
         # 抵消飞书对紧邻两次 message patch 偶发乱序/合并导致完成态卡片停在流式快照
         # （带 `⏱ 计时`）不翻完成态的问题。见 update_card_final。<=0 关闭。
@@ -942,6 +949,62 @@ class FeishuClient:
             if not has_more or not page_token:
                 break
         return messages
+
+    async def batch_resolve_names(self, open_ids: list[str]) -> dict[str, str]:
+        """
+        把一批 open_id 解析成真实姓名，返回 {open_id: name}。
+
+        - 走 contact.v3.user.batch（需 contact:user.base:readonly，spx bot 已授权）。
+        - 内存缓存：命中过的（含解析不到的空串）不再打接口。
+        - 缺权限 / 接口失败 时静默返回已知部分，不抛异常——调用方（thread_context）
+          会自然回退到 user_<末6位>，不影响主流程。
+        """
+        ids = [i for i in dict.fromkeys(open_ids) if i]  # 去重保序
+        missing = [i for i in ids if i not in self._name_cache]
+
+        for chunk_start in range(0, len(missing), 50):  # 接口单次上限 50
+            chunk = missing[chunk_start:chunk_start + 50]
+
+            def _fetch(c=chunk):
+                req = (
+                    BatchUserRequest.builder()
+                    .user_ids(c)
+                    .user_id_type("open_id")
+                    .build()
+                )
+                return self.client.contact.v3.user.batch(req)
+
+            try:
+                resp = await asyncio.to_thread(_fetch)
+            except Exception as e:
+                print(f"[name] 解析姓名异常: {e}", flush=True)
+                for i in chunk:
+                    self._name_cache.setdefault(i, "")
+                continue
+
+            if not resp.success():
+                print(f"[name] 解析姓名失败: {resp.code} {resp.msg}", flush=True)
+                for i in chunk:
+                    self._name_cache.setdefault(i, "")
+                continue
+
+            items = (resp.data.items or []) if resp.data else []
+            got = {}
+            for it in items:
+                uid = getattr(it, "open_id", "") or getattr(it, "user_id", "") or ""
+                nm = (getattr(it, "name", "") or "").strip()
+                if uid:
+                    got[uid] = nm
+            for i in chunk:
+                self._name_cache[i] = got.get(i, "")
+
+        result = {i: self._name_cache.get(i, "") for i in ids}
+
+        # 简单容量控制：超上限清空重来（名字低频，重建代价小）；本次结果已在 result 里
+        if len(self._name_cache) > self._NAME_CACHE_MAX:
+            self._name_cache.clear()
+
+        return result
 
     async def update_card_with_buttons(self, message_id: str, content: str, buttons: list[dict],
                                       flow: bool = False):

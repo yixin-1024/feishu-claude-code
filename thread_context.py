@@ -7,11 +7,40 @@
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from typing import Optional
 
 from feishu_client import FeishuClient
 from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
+
+
+# app_id → 群内显示名。运行时的 bot（app token）拿不到别的 bot 的名字
+# （contact 只认自然人；application.get 跨 app 返回 210508；chat members 用 app
+# token 又过滤掉 bot），所以只能靠这张静态表把 sender 的 app_id 翻成人看得懂的名字。
+# 名字取"群里实际显示名"（用 lark-cli 用户身份拉 chat-members 得到），不是 .env 的
+# profile 名——例如 cli_a95585cf0563deea 在 .env 叫 regtank，但群里显示 GPT。
+# 需要加新 bot：直接改这里，或用 env KNOWN_BOT_NAMES 传 JSON（app_id→名字）覆盖/补充。
+_KNOWN_BOTS: dict[str, str] = {
+    "cli_a94d647cc978ded1": "Lark CLI",
+    "cli_a95585cf0563deea": "GPT",
+    "cli_aa999bbb6978deef": "hermes",
+    "cli_aabffb3a03385ed4": "mimo",
+}
+
+
+def _bot_names() -> dict[str, str]:
+    """静态表 + 环境变量 KNOWN_BOT_NAMES(JSON) 合并，env 优先。"""
+    names = dict(_KNOWN_BOTS)
+    raw = os.getenv("KNOWN_BOT_NAMES", "").strip()
+    if raw:
+        try:
+            override = json.loads(raw)
+            if isinstance(override, dict):
+                names.update({str(k): str(v) for k, v in override.items()})
+        except Exception:
+            pass
+    return names
 
 
 def _fmt_time(create_time: Optional[str]) -> str:
@@ -120,19 +149,43 @@ def _extract(msg, feishu: Optional["FeishuClient"] = None) -> tuple[str, list[di
     return f"[{msg_type}]", []
 
 
-def _sender_label(msg) -> str:
-    """给消息发送者取一个可读 label：bot 自己 → "bot"；其它优先 mention 同 id 的 name，否则 open_id 末 6 位"""
+def _sender_label(
+    msg,
+    name_map: Optional[dict] = None,
+    bot_names: Optional[dict] = None,
+    self_app_id: str = "",
+) -> str:
+    """给消息发送者取一个可读 label。
+
+    bot（sender_type=="app"，id 是 app_id）：
+      查 bot_names 表 → 显示名；本 bot 自己额外加 "(自己)" 后缀，免得模型把
+      别的 bot（如 GPT）的发言当成自己的历史；表里没有 → bot_<app_id末6>。
+    人类（sender_type=="user"，id 是 open_id）：
+      contact 解析出的真名 > mention 里同 id 的 name > user_<open_id末6>。"""
     sender = msg.sender
     if not sender:
         return "unknown"
-    if (sender.sender_type or "") == "app":
-        return "bot"
     sid = sender.id or ""
+
+    if (sender.sender_type or "") == "app":
+        nm = (bot_names or {}).get(sid, "")
+        if self_app_id and sid == self_app_id:
+            return f"{nm}(自己)" if nm else "bot(自己)"
+        if nm:
+            return nm
+        return f"bot_{sid[-6:]}" if sid else "bot"
+
+    # 1) contact.v3.user.batch 解析出的真实姓名（build_thread_context 预先批量解析）
+    resolved = (name_map or {}).get(sid, "")
+    if resolved:
+        return resolved
+    # 2) 该 sender 若在某条消息里被 @ 过，mention 里带 name，可直接用
     for m in (msg.mentions or []):
         mid = getattr(m, "id", "") or ""
         mname = getattr(m, "name", "") or ""
         if mid and mid == sid and mname:
             return mname
+    # 3) 兜底：open_id 末 6 位
     if sid:
         return f"user_{sid[-6:]}"
     return "unknown"
@@ -182,6 +235,23 @@ async def build_thread_context(
     if not unseen:
         return "", [], None
 
+    # 批量把 sender open_id 解析成真实姓名（bot 自己的消息不需要解析）。
+    # 一次接口拿完，_sender_label 直接查表，失败自动回退 user_<末6位>。
+    sender_ids = [
+        (m.sender.id or "")
+        for m in unseen
+        if m.sender and (m.sender.sender_type or "") != "app" and (m.sender.id or "")
+    ]
+    try:
+        name_map = await feishu.batch_resolve_names(sender_ids) if sender_ids else {}
+    except Exception as e:
+        print(f"[thread] 批量解析姓名失败（回退末6位）: {e}", flush=True)
+        name_map = {}
+
+    # bot（app_id）名字走静态表；本 bot 自己的 app_id 用于标 "(自己)"
+    bot_names = _bot_names()
+    self_app_id = getattr(feishu, "_app_id", "") or ""
+
     # 并发下载所有附件
     download_tasks = []
     download_meta = []  # [(kind, display_name), ...]
@@ -214,7 +284,7 @@ async def build_thread_context(
     all_paths = []
     for seq, m in enumerate(unseen, 1):
         text, _atts = _extract(m, feishu)
-        sender = _sender_label(m)
+        sender = _sender_label(m, name_map, bot_names, self_app_id)
         time_str = _fmt_time(m.create_time)
         header = f"[{seq}] {sender}"
         if time_str:
