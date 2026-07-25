@@ -18,6 +18,7 @@ async def run_agent(
     message: str,
     session_id: Optional[str] = None,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     cwd: Optional[str] = None,
     permission_mode: Optional[str] = None,
     on_text_chunk: Optional[Callable[[str], None]] = None,
@@ -25,6 +26,7 @@ async def run_agent(
     on_process_start: Optional[Callable[[object], None]] = None,
     on_usage: Optional[Callable[[dict], None]] = None,
     on_status: Optional[Callable[[str, str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
     append_system_prompt: Optional[str] = None,
     wake_context: Optional[dict] = None,
 ) -> tuple[str, Optional[str], bool]:
@@ -77,10 +79,15 @@ async def run_agent(
         )
 
     if backend == "codex":
+        # 私聊没有 dispatcher 的 thread wake_context，也必须带 profile，才能解析
+        # <PROFILE>_CODEX_REASONING_EFFORT / AUTO_CONTINUE 等 profile 级配置。
+        codex_env = dict(wake_context or {})
+        codex_env["CC_LARK_PROFILE"] = profile.name
         return await run_codex(
             message=message,
             session_id=session_id,
             model=model,
+            reasoning_effort=effort,
             cwd=cwd,
             permission_mode=permission_mode,
             on_text_chunk=on_text_chunk,
@@ -88,13 +95,14 @@ async def run_agent(
             on_process_start=on_process_start,
             on_usage=on_usage,
             on_status=on_status,
+            should_stop=should_stop,
             append_system_prompt=append_system_prompt,
             codex_bin=profile.codex_bin,
             sandbox_mode=profile.codex_sandbox_mode,
             approval_policy=profile.codex_approval_policy,
             dangerous_bypass_level=profile.codex_dangerous_bypass,
             idle_timeout_sec=profile.codex_idle_timeout_sec,
-            extra_env=wake_context,
+            extra_env=codex_env,
         )
 
     claude_env = load_claude_extra_env(profile) or {}
@@ -107,6 +115,7 @@ async def run_agent(
         message=message,
         session_id=session_id,
         model=model,
+        effort=effort,
         cwd=cwd,
         permission_mode=permission_mode,
         on_text_chunk=on_text_chunk,

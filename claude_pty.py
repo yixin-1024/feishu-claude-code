@@ -34,7 +34,7 @@ import time
 import uuid
 from typing import Callable, Optional
 
-from bot_config import CLAUDE_CLI, PERMISSION_MODE
+from bot_config import CLAUDE_CLI, CLAUDE_EFFORT_LEVELS, PERMISSION_MODE
 
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CLAUDE_CONFIG_PATH = os.path.expanduser("~/.claude.json")
@@ -810,6 +810,7 @@ async def run_claude(
     on_status: Optional[Callable[[str, str], None]] = None,
     append_system_prompt: Optional[str] = None,
     extra_env: Optional[dict] = None,
+    effort: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
     """drop-in 替代 claude_runner.run_claude。内部走 PTY + tail JSONL。
 
@@ -874,7 +875,17 @@ async def run_claude(
             cmd += ["--session-id", forced_session_id]
         if effective_model:
             cmd += ["--model", effective_model]
-        _cc_effort = (extra_env or {}).get("CLAUDE_EFFORT") or os.getenv("CLAUDE_EFFORT")
+        _cc_effort = (
+            effort
+            or (extra_env or {}).get("CLAUDE_EFFORT")
+            or os.getenv("CLAUDE_EFFORT")
+        )
+        _cc_effort = str(_cc_effort).strip().lower() if _cc_effort else ""
+        if _cc_effort and _cc_effort not in CLAUDE_EFFORT_LEVELS:
+            raise ValueError(
+                f"invalid Claude effort {_cc_effort!r}; "
+                f"expected one of {list(CLAUDE_EFFORT_LEVELS)}"
+            )
         if _cc_effort:
             cmd += ["--effort", _cc_effort]
         if append_system_prompt:
@@ -967,6 +978,10 @@ async def run_claude(
             # 供应商路由：profile 配的 .env.<x> 覆盖 ANTHROPIC_BASE_URL/AUTH_TOKEN 等
             if extra_env:
                 env.update(extra_env)
+            if _cc_effort:
+                # 该官方 env 比 --effort 优先；child 内同步，保证会话覆盖真正生效。
+                env["CLAUDE_EFFORT"] = _cc_effort
+                env["CLAUDE_CODE_EFFORT_LEVEL"] = _cc_effort
 
             # exec 完，slave 立刻关——否则父进程 fd 残留导致 EOF 永远不到
             try:

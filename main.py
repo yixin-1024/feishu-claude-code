@@ -98,6 +98,7 @@ def main():
             handle_handover=dispatcher.handle_handover,
             handle_set_mode=dispatcher.handle_set_mode,
             handle_menu_command=dispatcher.handle_menu_command,
+            handle_switch_usage=dispatcher.handle_switch_usage,
             handle_resume_session=dispatcher.handle_resume_session,
             handle_button_reply=dispatcher.handle_button_reply,
             fire_task=fire_task_now,

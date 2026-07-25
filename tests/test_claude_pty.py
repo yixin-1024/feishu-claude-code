@@ -1230,12 +1230,16 @@ def test_fresh_session_adopts_cli_generated_session_id(tmp_path, monkeypatch):
 
     text, sid, used_fallback = asyncio.run(
         claude_pty.run_claude(
-            "hello generated session", cwd=str(cwd), permission_mode="bypassPermissions"
+            "hello generated session",
+            cwd=str(cwd),
+            permission_mode="bypassPermissions",
+            effort="xhigh",
         )
     )
 
     argv = json.load(open(sidecar))
     assert "--session-id" not in argv
+    assert argv[argv.index("--effort") + 1] == "xhigh"
     assert sid is not None and len(sid) == 36
     assert (project_dir / f"{sid}.jsonl").is_file()
     assert text == "generated ok"

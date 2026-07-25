@@ -16,7 +16,13 @@ import time
 from datetime import datetime
 from typing import Optional, Tuple
 
-from bot_config import CLAUDE_CLI, DEFAULT_CWD
+from bot_config import (
+    CLAUDE_CLI,
+    CLAUDE_EFFORT_LEVELS,
+    CODEX_EFFORT_LEVELS,
+    DEFAULT_CWD,
+    load_claude_extra_env,
+)
 from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title, _find_session_file
 
 PLUGINS_DIR = os.path.expanduser("~/.claude/plugins")
@@ -70,17 +76,72 @@ MODEL_ALIASES = {
     "mimo-sonnet": "quotio/claude-sonnet-4-6",
 }
 
+
+def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[str]:
+    """Return the configured runner default for display; None means CLI default."""
+    runner = (runner or "").strip().lower()
+    profile = getattr(bot, "profile", None)
+    profile_name = (
+        getattr(profile, "name", "")
+        or getattr(store, "profile", "")
+        or ""
+    ).strip()
+
+    if runner == "codex":
+        raw = os.getenv(f"{profile_name.upper()}_CODEX_REASONING_EFFORT") if profile_name else None
+        if raw is None:
+            raw = os.getenv("CODEX_REASONING_EFFORT")
+        value = (raw or "").strip().lower()
+        return value if value in {*CODEX_EFFORT_LEVELS, "none", "minimal"} else None
+
+    if runner == "claude":
+        profile_env = load_claude_extra_env(profile) if profile is not None else {}
+        raw = profile_env.get("CLAUDE_EFFORT") or os.getenv("CLAUDE_EFFORT")
+        value = (raw or "").strip().lower()
+        return value if value in CLAUDE_EFFORT_LEVELS else None
+
+    return None
+
+
+def _effective_effort_label(store: SessionStore, bot, runner: str, override: Optional[str]) -> str:
+    return override or _profile_default_effort(store, bot, runner) or "CLI 默认"
+
+
+def _codex_effort_levels(model: str) -> tuple[str, ...]:
+    """Use Codex's local model catalog when available; fall back to the stable UI set."""
+    try:
+        cache_path = os.path.expanduser("~/.codex/models_cache.json")
+        with open(cache_path, encoding="utf-8") as cache_file:
+            models = (json.load(cache_file) or {}).get("models", [])
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            if item.get("slug") != model:
+                continue
+            supported = tuple(
+                level.get("effort")
+                for level in item.get("supported_reasoning_levels", [])
+                if isinstance(level, dict)
+                and level.get("effort") in CODEX_EFFORT_LEVELS
+            )
+            if supported:
+                return supported
+    except (OSError, TypeError, ValueError):
+        pass
+    return CODEX_EFFORT_LEVELS
+
 HELP_TEXT = """\
 📖 **可用命令**
 
 **Bot 管理：**
 `/help` — 显示此帮助
-`/stop` — 停止当前正在运行的任务
+`/stop` — 停止当前正在运行的任务（请单独发送；同条消息后的文字不会执行）
 `/new` 或 `/clear` — 开始新 session
 `/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
 `/runner [codex|claude|opencode|mimo]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code
 `/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID）
+`/effort [级别]` — 设置当前对话推理强度（default / low / medium / high / xhigh / max / ultra）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
 `/status` — 显示当前 session 信息
 `/cd [路径]` — 切换工具执行的工作目录
@@ -129,7 +190,7 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 
 # Bot 自身处理的命令，其余 /xxx 转发给 Claude
 BOT_COMMANDS = {
-    "help", "h", "new", "clear", "resume", "runner", "model", "mode", "status", "cd", "ls",
+    "help", "h", "new", "clear", "resume", "runner", "model", "effort", "mode", "status", "cd", "ls",
     "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "switch", "stop",
     "restart", "group", "defaults",
 }
@@ -472,12 +533,13 @@ def _usage_single_account_lines(data: dict, account_label: Optional[str] = None)
     return lines
 
 
-def _get_usage() -> str:
+def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
     """渲染 /usage 命令的完整输出。
 
     保存了多个账户时：顶部展示当前 active 账户的详尽 bar/重置，下方列出
-    其他账户的一行简表（用量 / score / 是否可用），底部显示自动切换开关。
-    没保存任何账户时退回单账户老视图。
+    其他账户的一行简表（用量 / score / 是否可用），再显示自动切换开关，最后
+    附上账户切换按钮（与 `/switch` 同款）——传入 chat_id 时才带按钮，返回
+    `{"text", "buttons"}` dict；否则（或没保存账户）返回纯文本。
     """
     accounts: dict = {}
     current: Optional[str] = None
@@ -559,6 +621,13 @@ def _get_usage() -> str:
         lines.append(f"自动切换：✅ 已启用（冷却 {cooldown // 60} min · `/accounts` 看全景）")
     else:
         lines.append("自动切换：⏸ 未启用（`.env` 设 `ACCOUNT_AUTO_SWITCH=1` 打开）")
+
+    # 底部账户切换按钮（点击即切换本机全局 Claude Code 账户，并原地重渲染 /usage）
+    buttons = _account_switch_buttons(chat_id, for_usage=True) if chat_id else []
+    if buttons:
+        lines.append("")
+        lines.append("👇 点账户按钮切换 Claude Code 账户 · 🔄 刷新用量：")
+        return {"text": "\n".join(lines), "buttons": buttons}
     return "\n".join(lines)
 
 
@@ -925,6 +994,38 @@ def _get_accounts() -> str:
     return sw.render_matrix(accounts, current)
 
 
+def _account_switch_buttons(chat_id: str, *, for_usage: bool = False) -> list[dict]:
+    """账户切换按钮列表——`/switch` 无参选择卡与 `/usage` 底部复用同一份。
+
+    active 账户前缀 `●`。读取失败或没有保存账户时返回空列表（调用方自行降级）。
+
+    for_usage=False（`/switch` 选择卡）：点击发 `/switch <名称>`，把当前卡片刷成
+    切换结果文本。
+    for_usage=True（`/usage` 底部）：点击走 `switch_usage` 动作——切换后把当前卡片
+    原地重渲染成最新 `/usage`（切换后的账户置顶 ● + 按钮保留），而不是替换成裸切换提示。
+    """
+    try:
+        from account_switcher import list_accounts_summary
+        rows = list_accounts_summary()
+    except Exception:
+        return []
+    buttons: list[dict] = []
+    for row in rows:
+        text = ("● " if row.get("active") else "") + row["name"]
+        if for_usage:
+            value = {"action": "switch_usage", "name": row["name"], "cid": chat_id}
+        else:
+            value = {"action": "run_cmd", "cmd": f"/switch {row['name']}", "cid": chat_id}
+        buttons.append({"text": text, "value": value})
+    # /usage 底部：账户按钮之后追加一个「刷新」按钮，点击原地重跑 /usage
+    if for_usage and buttons:
+        buttons.append({
+            "text": "🔄 刷新",
+            "value": {"action": "run_cmd", "cmd": "/usage", "cid": chat_id},
+        })
+    return buttons
+
+
 def _get_account_switch_picker(chat_id: str) -> dict | str:
     """构建 `/switch` 无参数时的账户选择卡片，不发 quota 探测请求。"""
     try:
@@ -943,17 +1044,7 @@ def _get_account_switch_picker(chat_id: str) -> dict | str:
             f"{current_line}\n"
             "该操作只切换本机全局 Claude Code 凭证，不改变当前 chat 的 runner / model。"
         ),
-        "buttons": [
-            {
-                "text": ("● " if row.get("active") else "") + row["name"],
-                "value": {
-                    "action": "run_cmd",
-                    "cmd": f"/switch {row['name']}",
-                    "cid": chat_id,
-                },
-            }
-            for row in rows
-        ],
+        "buttons": _account_switch_buttons(chat_id),
     }
 
 
@@ -1504,6 +1595,10 @@ async def handle_command(
             parts.append("✅ 已开始新 session。")
         parts.append(f"Runner：**{cur.runner}**")
         parts.append(f"模型：**{cur.model}**")
+        if cur.runner in {"claude", "codex"}:
+            parts.append(
+                f"推理强度：**{_effective_effort_label(store, bot, cur.runner, cur.effort)}**"
+            )
         parts.append(f"当前模式：**{cur.permission_mode}**")
         return {
             "text": "\n".join(parts),
@@ -1524,6 +1619,12 @@ async def handle_command(
         lines.extend([
             f"Runner: `{cur.runner}`",
             f"模型: `{cur.model}`",
+        ])
+        if cur.runner in {"claude", "codex"}:
+            lines.append(
+                f"推理强度: `{_effective_effort_label(store, bot, cur.runner, cur.effort)}`"
+            )
+        lines.extend([
             f"权限模式: `{cur.permission_mode}`",
             f"工作目录: `{cur.cwd}`",
         ])
@@ -1628,6 +1729,65 @@ async def handle_command(
         await store.set_model(user_id, chat_id, model)
         return f"✅ 已切换模型为 `{model}`（仅本 session 覆盖，/model default 可清除）。已开始新 session。"
 
+    elif cmd == "effort":
+        cur = await store.get_current(user_id, chat_id)
+        runner = (cur.runner or "claude").lower()
+        if runner == "claude":
+            levels = CLAUDE_EFFORT_LEVELS
+        elif runner == "codex":
+            levels = _codex_effort_levels(cur.model)
+        else:
+            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude` 或 `codex`。"
+
+        raw = await store.get_current_raw(user_id, chat_id)
+        overridden = bool(raw.get("effort_override"))
+        configured_default = _profile_default_effort(store, bot, runner)
+        effective = raw.get("effort_override") or configured_default or "CLI 默认"
+
+        if not args:
+            buttons = [
+                {
+                    "text": level.upper() if level in {"xhigh", "max", "ultra"} else level.title(),
+                    "value": {
+                        "action": "run_cmd",
+                        "cmd": f"/effort {level}",
+                        "cid": chat_id,
+                    },
+                }
+                for level in levels
+            ]
+            if overridden:
+                buttons.append({
+                    "text": "↩️ 跟随默认",
+                    "value": {
+                        "action": "run_cmd",
+                        "cmd": "/effort default",
+                        "cid": chat_id,
+                    },
+                })
+            status = "当前对话覆盖" if overridden else "跟随默认"
+            return {
+                "text": (
+                    f"当前 runner：**{runner}**\n"
+                    f"当前模型：**{cur.model}**\n"
+                    f"当前推理强度：**{effective}**（{status}）\n"
+                    f"profile 默认：**{configured_default or 'CLI 默认'}**\n"
+                    "可用档位受当前模型能力限制。"
+                ),
+                "buttons": buttons,
+            }
+
+        requested = args.strip().lower()
+        if requested in {"default", "reset", "clear", "默认", "跟随默认"}:
+            await store.set_effort(user_id, chat_id, "")
+            default_label = configured_default or "CLI 默认"
+            return f"✅ 已清除推理强度覆盖，当前对话跟随 profile 默认 `{default_label}`；下一轮调用生效。"
+        if requested not in levels:
+            options = "、".join(f"`{level}`" for level in levels)
+            return f"❌ `{runner}` 不支持推理强度 `{args}`。可选：{options}、`default`。"
+        await store.set_effort(user_id, chat_id, requested)
+        return f"✅ 当前对话推理强度已设为 `{requested}`，下一轮调用生效（session 保持不变）。"
+
     elif cmd == "status":
         cur = await store.get_current_raw(user_id, chat_id)
         sid = cur.get("session_id") or "（新 session）"
@@ -1637,7 +1797,6 @@ async def handle_command(
         workspace = cur.get("workspace") or "（未绑定）"
         started = cur.get("started_at", "")[:16].replace("T", " ")
         mode = cur.get("permission_mode") or "bypassPermissions"
-
         runner = str(runner).lower()
         context_line = _format_context_line(
             cur.get("session_id"),
@@ -1657,11 +1816,18 @@ async def handle_command(
             f"Session ID: `{sid}`",
             f"Runner: `{runner}`",
             f"模型: `{model}`",
+        ]
+        if runner in {"claude", "codex"}:
+            effort_override = cur.get("effort_override")
+            effort = _effective_effort_label(store, bot, runner, effort_override)
+            effort_status = "当前对话覆盖" if effort_override else "跟随默认"
+            lines.append(f"推理强度: `{effort}`（{effort_status}）")
+        lines.extend([
             f"权限模式: `{mode}`",
             f"工作空间: `{workspace}`",
             f"工作目录: `{cwd}`",
             f"开始时间: {started}",
-        ]
+        ])
         if context_line:
             lines.append(context_line)
         if quota_line:
@@ -1765,7 +1931,7 @@ async def handle_command(
             lines.append(f"Runner: `mimo`")
             lines.append(f"模型: `{model}`")
             return "\n".join(lines)
-        return _get_usage()
+        return _get_usage(chat_id)
 
     elif cmd == "accounts":
         return await asyncio.to_thread(_get_accounts)

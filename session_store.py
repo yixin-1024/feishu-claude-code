@@ -347,6 +347,7 @@ class Session:
         permission_mode: str,
         workspace: str = "",
         runner: str = "claude",
+        effort: Optional[str] = None,
     ):
         self.session_id = session_id
         self.model = model
@@ -354,6 +355,7 @@ class Session:
         self.permission_mode = permission_mode
         self.workspace = workspace
         self.runner = runner
+        self.effort = effort
 
 
 class SessionStore:
@@ -513,6 +515,9 @@ class SessionStore:
             # /model 显式选的，缺省 None）or profile 默认（运行时实时取）。这样改
             # config 的默认模型 + 重启，新旧 session 都跟随，不用动代码。
             "model_override": None,
+            # /effort 显式选择的话题级覆盖。None 表示继续跟随 profile/CLI 默认；
+            # 默认值不落盘，避免配置变化后旧会话被钉死。
+            "effort_override": None,
             "cwd": cwd,
             "permission_mode": PERMISSION_MODE,
             "started_at": datetime.now().isoformat(),
@@ -535,6 +540,7 @@ class SessionStore:
             # 并清掉为旧 runner 选的模型 override，让模型回落到 profile 默认。
             current["runner"] = self._default_runner
             current["model_override"] = None
+            current["effort_override"] = None
             current["session_id"] = None
             current["preview"] = ""
             current["started_at"] = datetime.now().isoformat()
@@ -671,6 +677,7 @@ class SessionStore:
             permission_mode=cur.get("permission_mode", PERMISSION_MODE),
             workspace=cur.get("workspace", ""),
             runner=cur.get("runner", self._default_runner),
+            effort=cur.get("effort_override"),
         )
 
     async def on_claude_response(
@@ -752,6 +759,8 @@ class SessionStore:
             "runner": cur.get("runner", self._default_runner),
             # 沿用显式 override（若有）；没有就继续跟随 profile 默认
             "model_override": cur.get("model_override"),
+            # effort 是话题配置，/new 只换 CLI session，继续沿用当前覆盖。
+            "effort_override": cur.get("effort_override"),
             "cwd": cur.get("cwd", self._default_cwd),
             "permission_mode": cur.get("permission_mode", PERMISSION_MODE),
             "started_at": datetime.now().isoformat(),
@@ -815,6 +824,13 @@ class SessionStore:
         cur["started_at"] = datetime.now().isoformat()
         await self._save_async()
 
+    async def set_effort(self, user_id: str, chat_id: str, effort: str):
+        """Set a per-conversation reasoning-effort override without changing session."""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        value = (effort or "").strip().lower()
+        chat_data["current"]["effort_override"] = value or None
+        await self._save_async()
+
     async def set_runner(self, user_id: str, chat_id: str, runner: str, model: str = ""):
         """Set agent runner for a specific chat and start a fresh session."""
         normalized = (runner or "").strip().lower().replace("_", "-")
@@ -826,6 +842,7 @@ class SessionStore:
             raise ValueError("runner must be 'claude', 'codex', 'opencode' or 'mimo'")
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
+        runner_changed = cur.get("runner", self._default_runner) != normalized
         if cur.get("session_id"):
             chat_data["history"] = [
                 h for h in chat_data.get("history", []) if h["session_id"] != cur["session_id"]
@@ -838,6 +855,9 @@ class SessionStore:
             })
             chat_data["history"] = chat_data["history"][-20:]
         cur["runner"] = normalized
+        if runner_changed:
+            # 不同 runner 支持的 effort 档位不同（如 Codex 的 ultra），不可沿用。
+            cur["effort_override"] = None
         # 切 runner 时带的模型作为显式 override（不同 runner 模型不通用）
         if model:
             cur["model_override"] = model

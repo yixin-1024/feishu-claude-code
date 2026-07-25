@@ -698,6 +698,41 @@ def test_get_usage_shows_recommend_switch_when_alt_clearly_better(monkeypatch):
     assert "推荐切换" in out
 
 
+def test_get_usage_appends_switch_buttons_when_chat_id(monkeypatch):
+    """传 chat_id 时 /usage 返回 dict，底部带每个账户的切换按钮。"""
+    import commands
+    fake_probes = {
+        "via": mk("via", u5=0.29, u7=0.10),
+        "reg": mk("reg", u5=0.93, u7=0.21),
+    }
+    monkeypatch.setattr(accs, "probe_all", lambda: fake_probes)
+    monkeypatch.setattr(accs, "current_account_name", lambda: "via")
+    monkeypatch.setattr(
+        accs, "list_accounts_summary",
+        lambda: [{"name": "via", "active": True}, {"name": "reg", "active": False}],
+    )
+    out = commands._get_usage("oc_test_chat")
+    assert isinstance(out, dict)
+    # 文本仍是原来的多账户视图
+    assert "当前 `via`" in out["text"] and "`reg`" in out["text"]
+    # 每个账户一个按钮，active 前缀 ●，走 switch_usage 动作（切完原地重渲染 /usage），带 cid
+    # 账户按钮之后追加一个「🔄 刷新」按钮，点击原地重跑 /usage
+    btns = out["buttons"]
+    assert [b["text"] for b in btns] == ["● via", "reg", "🔄 刷新"]
+    assert btns[0]["value"] == {"action": "switch_usage", "name": "via", "cid": "oc_test_chat"}
+    assert btns[1]["value"] == {"action": "switch_usage", "name": "reg", "cid": "oc_test_chat"}
+    assert btns[2]["value"] == {"action": "run_cmd", "cmd": "/usage", "cid": "oc_test_chat"}
+
+
+def test_get_usage_no_buttons_without_chat_id(monkeypatch):
+    """不传 chat_id → 保持纯文本（向后兼容）。"""
+    import commands
+    monkeypatch.setattr(accs, "probe_all", lambda: {"via": mk("via", u5=0.29, u7=0.10)})
+    monkeypatch.setattr(accs, "current_account_name", lambda: "via")
+    out = commands._get_usage()
+    assert isinstance(out, str)
+
+
 # ────────────────── decode_security_stdout (hex 兜底) ──────────────────
 
 def test_decode_security_stdout_passthrough_json():

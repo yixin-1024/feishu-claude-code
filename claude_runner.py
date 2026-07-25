@@ -25,7 +25,7 @@ import subprocess as sp
 import sys
 from typing import Callable, Optional
 
-from bot_config import PERMISSION_MODE, CLAUDE_CLI
+from bot_config import CLAUDE_CLI, CLAUDE_EFFORT_LEVELS, PERMISSION_MODE
 
 # ── 后端选择 ──────────────────────────────────────────────────
 # 默认走 PTY 后端；线上要回退到 -p 时设置 CLAUDE_RUNNER=print
@@ -181,6 +181,7 @@ async def run_claude(
     on_status: Optional[Callable[[str, str], None]] = None,
     append_system_prompt: Optional[str] = None,
     extra_env: Optional[dict] = None,
+    effort: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
     """
     调用 Claude Code CLI 并流式解析输出。
@@ -213,6 +214,7 @@ async def run_claude(
                 message=message,
                 session_id=session_id,
                 model=model,
+                effort=effort,
                 cwd=cwd,
                 permission_mode=permission_mode,
                 on_text_chunk=on_text_chunk,
@@ -228,6 +230,7 @@ async def run_claude(
             message=message,
             session_id=session_id,
             model=model,
+            effort=effort,
             cwd=cwd,
             permission_mode=permission_mode,
             on_text_chunk=on_text_chunk,
@@ -262,6 +265,7 @@ async def _run_claude_print(
     on_usage: Optional[Callable[[dict], None]] = None,
     append_system_prompt: Optional[str] = None,
     extra_env: Optional[dict] = None,
+    effort: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
     """`claude --print --output-format stream-json` 模式（兼容/兜底后端）。"""
 
@@ -281,7 +285,17 @@ async def _run_claude_print(
             cmd += ["--resume", active_session_id]
         if effective_model:
             cmd += ["--model", effective_model]
-        _cc_effort = (extra_env or {}).get("CLAUDE_EFFORT") or os.getenv("CLAUDE_EFFORT")
+        _cc_effort = (
+            effort
+            or (extra_env or {}).get("CLAUDE_EFFORT")
+            or os.getenv("CLAUDE_EFFORT")
+        )
+        _cc_effort = str(_cc_effort).strip().lower() if _cc_effort else ""
+        if _cc_effort and _cc_effort not in CLAUDE_EFFORT_LEVELS:
+            raise ValueError(
+                f"invalid Claude effort {_cc_effort!r}; "
+                f"expected one of {list(CLAUDE_EFFORT_LEVELS)}"
+            )
         if _cc_effort:
             cmd += ["--effort", _cc_effort]
         if append_system_prompt:
@@ -295,6 +309,11 @@ async def _run_claude_print(
         env["CC_LARK_MIRROR_OFF"] = "1"
         if extra_env:
             env.update(extra_env)
+        if _cc_effort:
+            # Claude Code 的官方环境变量优先级高于 CLI flag；同步设置 child env，
+            # 确保话题级 /effort 不会被父进程已有配置反向覆盖。
+            env["CLAUDE_EFFORT"] = _cc_effort
+            env["CLAUDE_CODE_EFFORT_LEVEL"] = _cc_effort
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,

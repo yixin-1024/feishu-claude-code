@@ -551,6 +551,7 @@ _COMMAND_MENU_GROUPS = [
     ]),
     ("**配置**", [
         {"text": "🔄 切模型",      "value": {"action": "run_cmd", "cmd": "/model"}},
+        {"text": "🧠 推理强度",    "value": {"action": "run_cmd", "cmd": "/effort"}},
         {"text": "⚙️ 切模式",      "value": {"action": "run_cmd", "cmd": "/mode"}},
         {"text": "📁 工作空间",    "value": {"action": "run_cmd", "cmd": "/ws"}},
     ]),
@@ -674,39 +675,21 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
         if is_group:
             _text = strip_lark_mentions(_text, getattr(msg, 'mentions', None))
 
-        # /stop：光 /stop = 只打断；/stop <新指令> = 打断当前任务 + 带上下文按新指令续跑
-        # （实时纠偏，option B：resume 现有 session）。精确前缀匹配，避免"怎么让你 /stop"误触发。
-        _stripped = _text.strip()
-        if _stripped.lower() == "/stop" or _stripped.lower().startswith("/stop "):
+        # 人工 /stop 永远只表示取消，不能把同一条消息后面的文字隐式当成
+        # "停止并续跑"指令。实时纠偏仍由显式 MCP steer_task 提供。
+        # 精确匹配命令前缀，避免"怎么让你 /stop"这类普通句子误触发。
+        _parsed_stop = parse_command(_text)
+        if _parsed_stop and _parsed_stop[0] == "stop":
             if is_group and not await _is_current_bot_mentioned(bot, msg):
                 return
-            _instr = _stripped[len("/stop"):].strip()
-            if not _instr:
-                reply = await _handle_stop_command(bot, user_id, chat_id)
-                if is_group:
-                    await bot.feishu.reply_card(msg.message_id, content=reply, loading=False)
-                else:
-                    await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
-                return
-            # /stop <新指令>：停当前 run（若有），再按新指令续跑。后台 task 里做，本轮先 ack。
-            _active = bot.active_runs.get_run(user_id, chat_id)
-            _do_stop = _active is not None and not _active.stop_requested
-            _t = asyncio.create_task(_deliver_followup(
-                bot, user_id=user_id, chat_id=chat_id, thread_id=thread_id,
-                anchor_message_id=msg.message_id, instruction=_instr,
-                stop_first=_do_stop, is_group=is_group,
-            ))
-            _DISPATCH_TASKS.add(_t)
-            _t.add_done_callback(_DISPATCH_TASKS.discard)
-            ack = ("⏹ 已停止当前任务，正在按你的新指令续跑…" if _do_stop
-                   else "▶️ 当前没有在跑的任务，直接按你的新指令执行…")
-            try:
-                if is_group:
-                    await bot.feishu.reply_text(msg.message_id, ack)
-                else:
-                    await bot.feishu.send_text_to_user(user_id, ack)
-            except Exception:
-                pass
+            _instr = _parsed_stop[1]
+            reply = await _handle_stop_command(bot, user_id, chat_id)
+            if _instr:
+                reply += "\n\nℹ️ `/stop` 后的文字不会自动执行；如需新任务，请另发一条消息。"
+            if is_group:
+                await bot.feishu.reply_card(msg.message_id, content=reply, loading=False)
+            else:
+                await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
 
         _parsed_lock_free = parse_command(_text)
@@ -875,8 +858,10 @@ async def _run_and_display(
                 d = "...\n\n" + d[-_MAX_STREAM_DISPLAY:]
             parts.append(d)
         body = "\n".join(parts) if parts else "⏳ 思考中..."
-        # 快照正文（不含 footer），供 /stop 保留停止前进度用。
-        active_run.last_body = body
+        # 快照正文（不含 footer），供 /stop 保留停止前进度用。收到停止后不再
+        # 改写快照，避免终止竞态把“自动续跑”分隔等迟到内容混进停止卡。
+        if not _stopping():
+            active_run.last_body = body
 
         now = time.time()
         footer = [f"⏱ {_fmt_duration(now - start_ts)}"]
@@ -893,6 +878,8 @@ async def _run_and_display(
 
     async def on_tool_use(name: str, inp: dict):
         nonlocal accumulated, last_push_time, plan_exited, current_tool, last_output_ts
+        if _stopping():
+            return
         if name.lower() == "exitplanmode":
             plan_exited = True
             return
@@ -931,6 +918,8 @@ async def _run_and_display(
 
     async def on_text_chunk(chunk: str):
         nonlocal accumulated, last_push_time, current_tool, last_output_ts
+        if _stopping():
+            return
         if current_tool:
             current_tool = None
         accumulated += chunk
@@ -945,6 +934,8 @@ async def _run_and_display(
 
     async def on_status(level: str, label: str):
         nonlocal pty_warning, last_push_time
+        if _stopping():
+            return
         if level == "clear" or not label:
             if pty_warning is None:
                 return
@@ -962,6 +953,8 @@ async def _run_and_display(
         try:
             while True:
                 await asyncio.sleep(1.0)
+                if _stopping():
+                    return
                 if time.time() - last_push_time >= 1.5:
                     await push(_build_display())
                     last_push_time = time.time()
@@ -1013,6 +1006,7 @@ async def _run_and_display(
                         message=claude_msg,
                         session_id=session.session_id,
                         model=session.model,
+                        effort=getattr(session, "effort", None),
                         cwd=session.cwd,
                         permission_mode=session.permission_mode,
                         on_text_chunk=on_text_chunk,
@@ -1020,6 +1014,7 @@ async def _run_and_display(
                         on_process_start=lambda proc: bot.active_runs.attach_process(user_id, chat_id, proc),
                         on_usage=on_usage,
                         on_status=on_status,
+                        should_stop=_stopping,
                         append_system_prompt=append_system_prompt or None,
                         wake_context=wake_context,
                     )
@@ -1888,6 +1883,18 @@ def on_card_action(bot: BotInstance, data: P2CardActionTrigger) -> P2CardActionT
         resp.toast = toast
         return resp
 
+    if action_type == "switch_usage":
+        name = value.get("name", "")
+        if name:
+            asyncio.run_coroutine_threadsafe(
+                handle_switch_usage(bot, user_id, chat_id, name, clicked_msg_id), _bot_loop)
+        resp = P2CardActionTriggerResponse()
+        toast = CallBackToast()
+        toast.type = "info"
+        toast.content = f"正在切换到 {name}…"
+        resp.toast = toast
+        return resp
+
     if action_type == "resume_session":
         sid = value.get("sid", "")
         if sid:
@@ -1959,6 +1966,43 @@ async def handle_menu_command(bot: BotInstance, user_id: str, chat_id: str, cmd_
                 await bot.feishu.update_card(card_msg_id, reply_text)
         except Exception as e:
             log(bot.profile.name, "menu", "error", f"菜单命令卡片更新失败: {e}")
+
+
+async def handle_switch_usage(bot: BotInstance, user_id: str, chat_id: str, name: str, card_msg_id: str):
+    """点击 /usage 里的账户按钮：切换账户后把当前卡片原地重渲染成最新 /usage。
+
+    与直接跑 `/switch` 的区别——不把整张卡换成裸切换提示，而是切完立刻重出一份
+    /usage（切换后的账户置顶 ● + 按钮保留），顶部只加一行切换结果 headline。
+    """
+    from commands import _get_usage, _switch_claude_account
+
+    switch_result = await asyncio.to_thread(_switch_claude_account, name)
+    headline = (switch_result or "").split("\n", 1)[0].strip()
+
+    usage = await asyncio.to_thread(_get_usage, chat_id)
+    if isinstance(usage, dict):
+        usage_text, buttons = usage["text"], usage.get("buttons", [])
+    else:
+        usage_text, buttons = usage, []
+
+    text = f"{headline}\n\n{usage_text}" if headline else usage_text
+
+    for btn in buttons:
+        val = btn.get("value")
+        if isinstance(val, dict):
+            val.setdefault("profile", bot.profile.name)
+            val["_cc_uid"] = user_id
+
+    if not card_msg_id:
+        return
+    try:
+        if buttons:
+            short = all(len(b["text"]) <= 12 for b in buttons)
+            await bot.feishu.update_card_with_buttons(card_msg_id, text, buttons, flow=short)
+        else:
+            await bot.feishu.update_card(card_msg_id, text)
+    except Exception as e:
+        log(bot.profile.name, "switch_usage", "error", f"切换后刷新 /usage 卡片失败: {e}")
 
 
 async def handle_resume_session(bot: BotInstance, user_id: str, chat_id: str, session_id: str, card_msg_id: str):
@@ -2560,8 +2604,8 @@ async def read_thread(bot: BotInstance, *, thread_id: str, limit: int = 50) -> d
 # JSONL 的部分能带多少带多少；pty runner 的 session 认领策略可能让它不完整）：
 #   · append —— 不打断当前 run，把新指令排到它后面（当前 run 跑完接着上下文执行）
 #   · steer  —— 先停掉当前 run（保留进度卡），再按新指令 resume 续跑（实时纠偏）
-# 两个入口复用：群里人手打的 `/stop <指令>`，以及 MCP 的 append_to_task / steer_task
-# （编排 agent 监工子会话时实时调整方向）。lock 天然给 append 提供"排队在后"语义。
+# 这组原语只供 MCP 的 append_to_task / steer_task 使用（编排 agent 监工子会话
+# 时实时调整方向）。人工 `/stop` 始终是纯取消。lock 天然给 append 提供"排队在后"语义。
 
 async def _deliver_followup(
     bot: BotInstance, *, user_id: str, chat_id: str, thread_id: str,
@@ -2604,7 +2648,7 @@ async def _deliver_followup(
         run_text = instruction
         if stop_first:
             run_text = (
-                "⚠️ 我刚打断了你上一步正在做的事（上一轮任务被 /stop 中止）。"
+                "⚠️ 我刚打断了你上一步正在做的事（上一轮任务被显式中止）。"
                 "请改按下面的新指令继续，不要重复已经做过的写操作 / 命令 / 文件改动：\n\n"
                 + instruction
             )

@@ -255,6 +255,48 @@ def test_public_callback_accepts_signed_bound_action_once(monkeypatch):
     assert len(submitted) == 1
 
 
+def test_public_callback_dispatches_switch_usage(monkeypatch):
+    """/usage 里的账户按钮走 HTTP 回调路径时应命中 switch_usage 分支（而非落到
+    通用 '已发送:' 兜底）。"""
+    bot = _Bot()
+    calls = []
+
+    async def handle_switch_usage(bot_, user_id, chat_id, name, msg_id):
+        calls.append((name, chat_id))
+
+    def capture_submit(coro):
+        calls.append("submitted")
+        coro.close()
+
+    monkeypatch.setattr(http_server, "_bots", {"hermes": bot})
+    monkeypatch.setattr(
+        http_server, "_handlers", SimpleNamespace(handle_switch_usage=handle_switch_usage),
+    )
+    monkeypatch.setattr(http_server, "_submit", capture_submit)
+    monkeypatch.setattr("card_security._seen_events", {})
+    value = sign_action_value(
+        {
+            "action": "switch_usage",
+            "name": "mar",
+            "cid": "oc_allowed",
+            "profile": "hermes",
+        },
+        "secret_hermes",
+        user_id="ou_allowed",
+        message_id="om_card",
+    )
+
+    with _running(http_server.start_callback_server(0)) as (base, _host):
+        status, result = _request(
+            base, "/callback", method="POST", payload=_card_payload(value, event_id="evt_switch"),
+        )
+
+    assert status == 200
+    assert result["toast"]["type"] == "info"
+    assert "mar" in result["toast"]["content"]  # 不是 "已发送:"
+    assert "submitted" in calls  # 确实提交了协程
+
+
 def test_public_callback_checks_profile_verification_token(monkeypatch):
     bot = _Bot()
     bot.profile.verification_token = "official-token"

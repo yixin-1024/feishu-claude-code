@@ -62,6 +62,46 @@ async def test_active_run_already_terminated_between_check_and_call():
     assert "没有正在运行" in reply
 
 
+async def test_late_stream_chunk_after_manual_stop_is_ignored():
+    """停止到达后，runner 的迟到续跑文字不能污染停止前快照或更新卡片。"""
+    import asyncio
+
+    bot = _bot()
+    active_run = mock.Mock(stop_requested=True, last_body="停止前内容")
+    active_run.card_update_lock = asyncio.Lock()
+    bot.active_runs.start_run.return_value = active_run
+
+    session = mock.Mock(
+        session_id=None,
+        model="gpt-5.6-sol",
+        effort=None,
+        cwd="/tmp",
+        permission_mode="bypassPermissions",
+        runner="codex",
+    )
+
+    async def fake_run_agent(**kwargs):
+        assert kwargs["should_stop"]() is True
+        await kwargs["on_text_chunk"]("━━━━━━━ 🔁 自动续跑 · 第 2 轮 ━━━━━━━")
+        return "迟到结果", "thread_1", False
+
+    with mock.patch.object(dispatcher, "run_agent", fake_run_agent):
+        await dispatcher._run_and_display(
+            bot,
+            user_id="u1",
+            chat_id="c1",
+            is_group=True,
+            text="hi",
+            card_msg_id="card_id_1",
+            session=session,
+            notify_msg_id="msg_orig",
+        )
+
+    assert active_run.last_body == "停止前内容"
+    bot.feishu.update_card.assert_not_awaited()
+    bot.feishu.update_card_final.assert_not_awaited()
+
+
 async def test_heartbeat_does_not_overwrite_error_card_on_watchdog_kill():
     """复现 2026-05-17 13:36 卡片显示进行中而不是 ❌ 的 bug：watchdog 抛 RuntimeError
     后，dispatcher 在 except 里 update_card(❌)，**同时**心跳还活着、每 1.5s push

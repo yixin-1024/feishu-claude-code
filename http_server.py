@@ -52,6 +52,7 @@ class HttpHandlers:
     handle_handover: Callable[..., Awaitable[dict]]
     handle_set_mode: Callable[..., Awaitable[None]]
     handle_menu_command: Callable[..., Awaitable[None]]
+    handle_switch_usage: Callable[..., Awaitable[None]]
     handle_resume_session: Callable[..., Awaitable[None]]
     handle_button_reply: Callable[..., Awaitable[None]]
     fire_task: Callable[[str], Awaitable[None]]
@@ -824,6 +825,11 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             if cmd_text:
                 _submit(_handlers.handle_menu_command(bot, user_id, chat_id, cmd_text, clicked_msg_id))
             self._respond(200, {"toast": {"type": "info", "content": cmd_text}})
+        elif action_type == "switch_usage":
+            name = value.get("name", "")
+            if name:
+                _submit(_handlers.handle_switch_usage(bot, user_id, chat_id, name, clicked_msg_id))
+            self._respond(200, {"toast": {"type": "info", "content": f"正在切换到 {name}…"}})
         elif action_type == "resume_session":
             sid = value.get("sid", "")
             if sid:

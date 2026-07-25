@@ -301,6 +301,30 @@ async def test_stop_command_handled_out_of_lock(isolated_sessions):
     bot.feishu.send_card_to_user.assert_awaited()
 
 
+async def test_stop_with_trailing_text_only_stops_and_never_starts_followup(isolated_sessions):
+    """人工 /stop 后的说明文字不能再被隐式当成 steer 指令执行。"""
+    bot = _make_bot()
+    event = _make_event(text="/stop 这是说明，不要自动续跑")
+
+    with (
+        patch(
+            "dispatcher._handle_stop_command",
+            new_callable=AsyncMock,
+            return_value="已发送停止请求",
+        ) as stop,
+        patch("dispatcher._deliver_followup", new_callable=AsyncMock) as followup,
+        patch("dispatcher._process_message", new_callable=AsyncMock) as proc,
+    ):
+        await handle_message_async(bot, event)
+
+    stop.assert_awaited_once_with(bot, "ou_user_1", "ou_user_1")
+    followup.assert_not_awaited()
+    proc.assert_not_awaited()
+    bot.feishu.send_card_to_user.assert_awaited_once()
+    content = bot.feishu.send_card_to_user.await_args.kwargs["content"]
+    assert "不会自动执行" in content
+
+
 async def test_group_stop_ignores_mentions_for_other_bot(isolated_sessions):
     bot = _make_bot(allowed_groups={"oc_a"}, bot_open_id="ou_this_bot")
     bot.active_runs.get_run.return_value = None

@@ -46,7 +46,7 @@ WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心�
 - **精确 @ 识别**：首次启动拉取 bot 自己的 `open_id` 缓存，只有真正 @ 到 bot 才响应
 - **话题群上下文**：在话题评论里 @bot，自动拉取 `last_seen` 之后的话题历史作为前缀，不丢上下文
 - **忘记 @ 补 @**：第一条忘记 @bot 没关系，下一条补一个 `@bot` 就能把前面那条捡回来处理（话题群生效）
-- 每个群/话题独立 session、模型、工作目录（同用户跨 chat 互不阻塞）
+- 每个群/话题独立 session、模型、推理强度、工作目录（同用户跨 chat 互不阻塞）
 - `/ws` 为不同群绑定不同项目
 - **访问控制**：`ALLOWED_OPEN_IDS` 用户白名单、`ALLOWED_GROUP_CHAT_IDS` 群聊白名单，未授权者静默忽略
 
@@ -130,7 +130,7 @@ python3 main.py
 | `/new plan` | 新 session 并进入 Plan 模式 |
 | `/resume` | 列出历史 session（按钮选择） |
 | `/resume 3` | 恢复第 3 个 session |
-| `/stop` | 停止当前运行中的任务 |
+| `/stop` | 停止当前运行中的任务；请单独发送，同条消息后的文字不会执行 |
 | `/status` | 查看当前 session 信息 |
 
 ### 模型与模式
@@ -140,6 +140,9 @@ python3 main.py
 | `/model opus` | 切换到 Opus |
 | `/model sonnet` | 切换到 Sonnet |
 | `/model haiku` | 切换到 Haiku |
+| `/effort` | 查看当前推理强度并用按钮选择档位 |
+| `/effort high` | 当前对话改用 high（不重开 session） |
+| `/effort default` | 清除当前对话覆盖，跟随 profile/CLI 默认 |
 | `/mode bypass` | 跳过所有确认（默认） |
 | `/mode plan` | 只规划不执行 |
 | `/mode default` | 每次工具调用需确认 |

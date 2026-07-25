@@ -6,6 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import codex_runner
 from codex_runner import _clean_stderr, run_codex
 
 
@@ -241,3 +242,54 @@ def test_clean_stderr_drops_benign_noise():
     )
     assert _clean_stderr(raw) == "panic: real fatal error"
     assert _clean_stderr("Reading additional input from stdin...\n") == ""
+
+
+def test_auto_continue_honors_manual_stop_between_passes(monkeypatch):
+    """上一 pass 已 rc=0 时收到 /stop，也不能再产生下一轮内容或进程。"""
+    stopped = {"value": False}
+    calls = []
+    chunks = []
+
+    async def fake_once(message, **kwargs):
+        calls.append((message, kwargs.get("session_id")))
+        stopped["value"] = True
+        return "partial result", "thread_stop", False
+
+    monkeypatch.setenv("CODEX_AUTO_CONTINUE", "1")
+    monkeypatch.setattr(codex_runner, "_run_codex_once", fake_once)
+
+    text, sid, fallback = asyncio.run(run_codex(
+        "do work",
+        should_stop=lambda: stopped["value"],
+        on_text_chunk=chunks.append,
+    ))
+
+    assert (text, sid, fallback) == ("partial result", "thread_stop", False)
+    assert calls == [("do work", None)]
+    assert not any("自动续跑" in chunk for chunk in chunks)
+
+
+def test_auto_continue_does_not_spawn_if_stop_arrives_during_boundary(monkeypatch):
+    """续跑分隔的异步回调让出事件循环后，要再次检查取消状态。"""
+    stopped = {"value": False}
+    calls = []
+
+    async def fake_once(message, **kwargs):
+        calls.append((message, kwargs.get("session_id")))
+        return "partial result", "thread_stop", False
+
+    async def on_chunk(chunk):
+        if "自动续跑" in chunk:
+            stopped["value"] = True
+
+    monkeypatch.setenv("CODEX_AUTO_CONTINUE", "1")
+    monkeypatch.setattr(codex_runner, "_run_codex_once", fake_once)
+
+    text, sid, fallback = asyncio.run(run_codex(
+        "do work",
+        should_stop=lambda: stopped["value"],
+        on_text_chunk=on_chunk,
+    ))
+
+    assert (text, sid, fallback) == ("partial result", "thread_stop", False)
+    assert calls == [("do work", None)]

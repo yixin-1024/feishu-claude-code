@@ -55,6 +55,11 @@ _DOMAIN_MAP = {
     "lark": "https://open.larksuite.com",
 }
 
+# /effort 对外展示的稳定档位。Codex 底层还接受 none/minimal，但并非当前
+# gpt-5.6-sol 的可选档位，因此不暴露在聊天按钮中。
+CLAUDE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+CODEX_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+
 
 def _split_csv(value: str) -> set[str]:
     return {s.strip() for s in (value or "").split(",") if s.strip()}

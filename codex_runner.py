@@ -87,14 +87,29 @@ def _auto_continue_enabled(extra_env: Optional[dict]) -> bool:
 _VALID_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 
 
-def _reasoning_effort(extra_env: Optional[dict]) -> Optional[str]:
-    """按 profile 解析 codex reasoning effort：<PROFILE>_CODEX_REASONING_EFFORT 优先，
+def _reasoning_effort(
+    extra_env: Optional[dict],
+    explicit: Optional[str] = None,
+) -> Optional[str]:
+    """解析 codex reasoning effort：会话显式覆盖优先，其次 profile/global env。
+
+    环境默认顺序为 <PROFILE>_CODEX_REASONING_EFFORT 优先，
     退回全局 CODEX_REASONING_EFFORT；未设则返回 None（不注入，交给 config.toml/默认）。
 
     走 `-c model_reasoning_effort=` 而非改全局 ~/.codex/config.toml —— 后者会被 Codex
     桌面 app 存盘时整份覆盖回默认档（实测 sol 被打回 low）。-c 覆盖每次 spawn 显式生效、
     不落盘、不受桌面 app 干扰（已实测：-c 的值压过 config.toml 的值直达 API）。
     """
+    if explicit is not None:
+        value = str(explicit).strip().lower()
+        if value:
+            if value not in _VALID_EFFORTS:
+                raise ValueError(
+                    f"invalid Codex reasoning effort {explicit!r}; "
+                    f"expected one of {sorted(_VALID_EFFORTS)}"
+                )
+            return value
+
     profile = ((extra_env or {}).get("CC_LARK_PROFILE") or "").strip().upper()
     raw = None
     if profile:
@@ -402,6 +417,7 @@ async def _run_codex_once(
     idle_timeout_sec: int = IDLE_TIMEOUT,
     extra_env: Optional[dict] = None,
     sentinel: str = "",
+    reasoning_effort: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
     """跑一次 codex exec pass。返回 (final_text, thread_id, saw_sentinel)。
 
@@ -426,7 +442,7 @@ async def _run_codex_once(
     if dangerous_bypass_level == 1:
         config_flags.extend(["-c", f"approval_policy={_to_toml_string(approval_policy or 'never')}"])
     config_flags.extend(_cc_lark_mcp_config_flags(extra_env))
-    effort = _reasoning_effort(extra_env)
+    effort = _reasoning_effort(extra_env, reasoning_effort)
     if effort:
         # 裸值形式（已实测 `-c model_reasoning_effort=ultra` 直达 API 且压过 config.toml）。
         config_flags.extend(["-c", f"model_reasoning_effort={effort}"])
@@ -557,6 +573,7 @@ async def run_codex(
     on_process_start: Optional[Callable[[asyncio.subprocess.Process], None]] = None,
     on_usage: Optional[Callable[[dict], None]] = None,
     on_status: Optional[Callable[[str, str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
     append_system_prompt: Optional[str] = None,
     codex_bin: Optional[str] = None,
     sandbox_mode: Optional[str] = None,
@@ -564,6 +581,7 @@ async def run_codex(
     dangerous_bypass_level: int = 0,
     idle_timeout_sec: int = IDLE_TIMEOUT,
     extra_env: Optional[dict] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
     """codex 后端入口。默认在内部自动续跑，直到模型宣告整件任务完成或触顶。
 
@@ -586,14 +604,29 @@ async def run_codex(
         rc = getattr(p, "returncode", None)
         return isinstance(rc, int) and rc < 0
 
+    def _stop_requested() -> bool:
+        if _aborted_by_signal():
+            return True
+        if should_stop is None:
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:
+            # 外部取消探针不应让 runner 自身崩溃；进程信号仍是第二道兜底。
+            return False
+
     common = dict(
-        model=model, cwd=cwd, permission_mode=permission_mode,
+        model=model, reasoning_effort=reasoning_effort,
+        cwd=cwd, permission_mode=permission_mode,
         on_text_chunk=on_text_chunk, on_tool_use=on_tool_use,
         on_process_start=_track_start, on_usage=on_usage, on_status=on_status,
         codex_bin=codex_bin, sandbox_mode=sandbox_mode, approval_policy=approval_policy,
         dangerous_bypass_level=dangerous_bypass_level, idle_timeout_sec=idle_timeout_sec,
         extra_env=extra_env,
     )
+
+    if _stop_requested():
+        return "", session_id, False
 
     if not _auto_continue_enabled(extra_env):
         return await _run_codex_once(
@@ -613,6 +646,10 @@ async def run_codex(
     final_text = ""
 
     for pass_idx in range(max_passes + 1):
+        # /stop 可能恰好落在两个 codex pass 之间，此时上一进程已经 rc=0，
+        # 不能只靠负 returncode 推断取消；必须在产生任何下一轮内容前读显式状态。
+        if _stop_requested():
+            break
         if pass_idx == 0:
             prompt, sysp = message, first_sys
         else:
@@ -625,7 +662,13 @@ async def run_codex(
                 on_text_chunk,
                 f"\n\n━━━━━━━ 🔁 自动续跑 · 第 {pass_idx + 1} 轮 ━━━━━━━\n\n",
             )
+            # 上面的异步回调会让出事件循环；若 /stop 正好在此期间到达，
+            # 不得继续 spawn 新进程。
+            if _stop_requested():
+                break
 
+        if _stop_requested():
+            break
         final_text, tid, done = await _run_codex_once(
             prompt, session_id=sess, append_system_prompt=sysp, sentinel=sentinel, **common,
         )
@@ -633,7 +676,7 @@ async def run_codex(
             thread_out = thread_out or tid
             sess = sess or tid  # 首轮拿到 session 后，后续 resume 同一条
 
-        if done or _aborted_by_signal() or time.monotonic() - started >= budget:
+        if done or _stop_requested() or time.monotonic() - started >= budget:
             break
 
     return final_text, thread_out, False

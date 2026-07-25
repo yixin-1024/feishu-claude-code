@@ -28,6 +28,7 @@ def _profile(runner="codex"):
 
 def test_run_agent_dispatches_to_codex(monkeypatch):
     captured = {}
+    should_stop = lambda: False
 
     async def fake_codex(**kwargs):
         captured.update(kwargs)
@@ -45,6 +46,7 @@ def test_run_agent_dispatches_to_codex(monkeypatch):
         message="hi",
         model="gpt-5.1-codex-max",
         cwd="/tmp",
+        should_stop=should_stop,
         wake_context={"CC_LARK_THREAD_ID": "omt_1"},
     ))
 
@@ -53,6 +55,7 @@ def test_run_agent_dispatches_to_codex(monkeypatch):
     assert fallback is False
     assert captured["message"] == "hi"
     assert captured["model"] == "gpt-5.1-codex-max"
+    assert captured["should_stop"] is should_stop
     assert captured["extra_env"]["CC_LARK_THREAD_ID"] == "omt_1"
 
 
