@@ -54,6 +54,67 @@ def _fmt_time(create_time: Optional[str]) -> str:
         return ""
 
 
+def _degraded_card_text(obj: dict, msg) -> str:
+    """正文取不到的卡片 → 一行痕迹。不是这种退化形态则返回 ""。
+
+    im.v1.message.list 回传 interactive 消息时，正文（markdown、表格、按钮）一律
+    不给，content 退化成 post 式的二维数组：
+        {"title": null, "elements": [[{"tag":"img","image_key":"img_v3_..."},
+                                      {"tag":"text","text":" "}]]}
+    那个 image_key 不是卡片截图，是 Lark 的通用占位插图——多条毫不相干的消息共用
+    同一个 key，下下来只是一张火箭图，零信息，所以不当附件抓。它也确实下不动：bot
+    身份 GET messages/{id}/resources 返回 400 / 234043 Unsupported message type，
+    只有 user 身份取得到。
+
+    bot 自己发的卡片靠上游的 get_card_text 缓存还原，走不到这里；落到这里的是两种
+    人：用户从别的会话转发进来的卡片（正文在 OpenAPI 侧无解），以及本 bot 重启前发
+    的旧卡片（缓存已丢）。sender 是自然人时必然是前者——人只能转发卡片，发不出卡片。
+
+    留这行痕迹是为了让模型知道「这儿有条我读不到的消息」，该开口问，而不是当空消息
+    忽略掉。
+    """
+    elements = obj.get("elements")
+    if not isinstance(elements, list) or not any(
+        isinstance(row, list) for row in elements
+    ):
+        return ""
+
+    hit = False
+    texts: list[str] = []
+    for row in elements:
+        if not isinstance(row, list):
+            continue
+        for node in row:
+            if not isinstance(node, dict):
+                continue
+            tag = node.get("tag", "")
+            if tag == "img" and node.get("image_key"):
+                hit = True
+            elif tag == "text":
+                t = str(node.get("text") or "").strip()
+                if t:
+                    texts.append(t)
+                    hit = True
+
+    if not hit:
+        return ""
+
+    sender_type = (msg.sender.sender_type or "") if getattr(msg, "sender", None) else ""
+    if sender_type == "user":
+        hint = (
+            "[转发进来的卡片 · Lark 不回传正文，读不到"
+            "——需要内容就让用户补一句文字/截图，或按关键词搜原消息]"
+        )
+    else:
+        hint = "[卡片 · Lark 不回传正文，读不到（转发进来的，或本 bot 重启前发的旧卡片）]"
+
+    title = obj.get("title")
+    parts = [str(title).strip()] if isinstance(title, str) and title.strip() else []
+    parts.extend(texts)
+    parts.append(hint)
+    return " ".join(parts)
+
+
 def _extract(msg, feishu: Optional["FeishuClient"] = None) -> tuple[str, list[dict]]:
     """
     从消息体提取纯文本和附件描述。
@@ -143,7 +204,9 @@ def _extract(msg, feishu: Optional["FeishuClient"] = None) -> tuple[str, list[di
                 cached = feishu.get_card_text(msg.message_id or "")
                 if cached:
                     return cached, []
-            return "", []
+            # 缓存也没有：如果 content 是 Lark 那套「只给占位图不给正文」的退化形态，
+            # 留一行痕迹，别让这条消息在上下文里凭空消失。
+            return _degraded_card_text(obj, msg), []
         return text, []
 
     return f"[{msg_type}]", []
