@@ -456,6 +456,7 @@ async def _handle_verify_command(
     try:
         context_block, ctx_paths, ctx_err = await build_thread_context(
             bot.feishu, thread_id, "", msg.message_id,
+            cli_profile=bot.profile.lark_cli_profile or bot.profile.name,
         )
     except Exception as e:
         log(tag, "verify", "error", f"拉 thread 失败: {e}")
@@ -1670,6 +1671,7 @@ async def _process_message(
             last_seen = await bot.store.get_last_seen(user_id, chat_id)
             context_block, ctx_paths, ctx_err = await build_thread_context(
                 bot.feishu, thread_id, last_seen, msg.message_id,
+                cli_profile=bot.profile.lark_cli_profile or bot.profile.name,
             )
             if ctx_err:
                 # 拉历史失败（多半缺 im:message.group_msg 权限）。不再静默吞掉：
@@ -2752,11 +2754,21 @@ async def read_thread(bot: BotInstance, *, thread_id: str, limit: int = 50) -> d
         msgs = await bot.feishu.list_thread_messages(thread_id, limit=limit)
     except Exception as e:
         return {"ok": False, "error": f"读 thread 失败: {type(e).__name__}: {e}"}
-    from thread_context import _extract, _sender_label, _fmt_time
+    from thread_context import (
+        _extract, _sender_label, _fmt_time, _needs_user_fetch, _fetch_card_texts_as_user,
+    )
+    # 子会话的结果几乎全在卡片里，而卡片正文 Lark 不回传：先吃 bot 自己的卡片缓存，
+    # 缓存没有的（重启前发的 / 别的 bot 发的）借 user 身份捞回来，否则这里读到的
+    # 全是占位提示——read_thread 的主用途就是收子会话结果，不能空手而归。
+    need = [(m.message_id or "") for m in msgs if _needs_user_fetch(m, bot.feishu)]
+    cli_profile = bot.profile.lark_cli_profile or bot.profile.name
+    card_texts = (
+        await _fetch_card_texts_as_user(need, cli_profile) if need and cli_profile else {}
+    )
     lines: list[str] = []
     for i, m in enumerate(msgs, 1):
         try:
-            text, _atts = _extract(m, None)
+            text, _atts = _extract(m, bot.feishu, card_texts)
         except Exception:
             text = "[unparseable]"
         sender = _sender_label(m)

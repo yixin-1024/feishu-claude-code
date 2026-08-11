@@ -54,6 +54,101 @@ def _fmt_time(create_time: Optional[str]) -> str:
         return ""
 
 
+# 借 user 身份补捞卡片正文的几条闸门：单批 id 数（mget 上限 50）、一次最多补捞
+# 多少条（防止 /new 后全量重扫时把几十份长报告一股脑灌进上下文）、单条正文上限。
+_CARD_FETCH_BATCH = 50
+_CARD_FETCH_MAX = 20
+_CARD_FETCH_CHARS = 4000
+_CARD_FETCH_TIMEOUT = 20
+
+
+def _unwrap_card(content: str) -> str:
+    """lark-cli 把卡片正文渲染成 `<card>…</card>`，剥掉外壳。"""
+    text = (content or "").strip()
+    if text.startswith("<card>"):
+        text = text[len("<card>"):]
+        if text.rstrip().endswith("</card>"):
+            text = text.rstrip()[: -len("</card>")]
+    return text.strip()
+
+
+async def _fetch_card_texts_as_user(
+    message_ids: list[str], cli_profile: str,
+) -> dict[str, str]:
+    """借 owner 的 user 身份把卡片正文捞回来，返回 message_id → 正文。
+
+    bot 身份（tenant token）永远拿不到 interactive 的正文（见 _degraded_card_text），
+    但**用户身份**的 mget 拿得到渲染后的 `<card>…</card>` 全文，表格、markdown 一字
+    不落——用户在客户端看得见的东西，他自己的 token 就读得到。bot 进程里没有 user
+    凭证，所以借 lark-cli 走一趟（凭证在它的 keychain 里）。
+
+    尽力而为：lark-cli 不在 / user 授权过期 / 超时 / 消息已删 → 静默返回已拿到的
+    部分，caller 对没捞到的退回占位提示。
+    """
+    if not message_ids or not cli_profile:
+        return {}
+
+    out: dict[str, str] = {}
+    targets = message_ids[-_CARD_FETCH_MAX:]  # 超量时保最近的
+    for i in range(0, len(targets), _CARD_FETCH_BATCH):
+        batch = targets[i: i + _CARD_FETCH_BATCH]
+        cmd = [
+            "lark-cli", "--profile", cli_profile,
+            "im", "+messages-mget",
+            "--as", "user",
+            "--message-ids", ",".join(batch),
+            "--no-reactions",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=_CARD_FETCH_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                print(f"[thread] user 身份补捞卡片正文超时（{len(batch)} 条）", flush=True)
+                continue
+            if proc.returncode != 0:
+                err = stderr.decode("utf-8", errors="replace")[:200]
+                print(f"[thread] 补捞卡片正文失败 rc={proc.returncode}: {err}", flush=True)
+                continue
+            payload = json.loads(stdout.decode("utf-8", errors="replace"))
+        except Exception as e:
+            print(f"[thread] 补捞卡片正文异常: {e}", flush=True)
+            continue
+
+        for item in ((payload.get("data") or {}).get("messages") or []):
+            mid = item.get("message_id") or ""
+            body = _unwrap_card(item.get("content") or "")
+            if not mid or not body:
+                continue
+            if len(body) > _CARD_FETCH_CHARS:
+                body = body[:_CARD_FETCH_CHARS] + "…（正文过长已截断）"
+            out[mid] = body
+
+    return out
+
+
+def _needs_user_fetch(msg, feishu: Optional["FeishuClient"] = None) -> bool:
+    """这条卡片的正文 bot 身份读不到、缓存里也没有 → 值得借 user 身份补捞。"""
+    if (msg.msg_type or "") != "interactive":
+        return False
+    if not (msg.message_id or ""):
+        return False
+    if feishu is not None and feishu.get_card_text(msg.message_id or ""):
+        return False  # bot 自己发的卡片，缓存里有真身
+    try:
+        obj = json.loads(msg.body.content if msg.body else "")
+    except Exception:
+        return False
+    return bool(_degraded_card_text(obj, msg))
+
+
 def _degraded_card_text(obj: dict, msg) -> str:
     """正文取不到的卡片 → 一行痕迹。不是这种退化形态则返回 ""。
 
@@ -66,12 +161,10 @@ def _degraded_card_text(obj: dict, msg) -> str:
     身份 GET messages/{id}/resources 返回 400 / 234043 Unsupported message type，
     只有 user 身份取得到。
 
-    bot 自己发的卡片靠上游的 get_card_text 缓存还原，走不到这里；落到这里的是两种
-    人：用户从别的会话转发进来的卡片（正文在 OpenAPI 侧无解），以及本 bot 重启前发
-    的旧卡片（缓存已丢）。sender 是自然人时必然是前者——人只能转发卡片，发不出卡片。
-
-    留这行痕迹是为了让模型知道「这儿有条我读不到的消息」，该开口问，而不是当空消息
-    忽略掉。
+    这行痕迹是最后的兜底：bot 自己发的卡片先靠 get_card_text 缓存还原，缓存没有的
+    再由 _fetch_card_texts_as_user 借 user 身份捞真身，两条都落空才走到这里（用户
+    没授权 lark-cli、或消息已被删）。sender 是自然人时必然是转发进来的——人只能转发
+    卡片，发不出卡片。
     """
     elements = obj.get("elements")
     if not isinstance(elements, list) or not any(
@@ -100,13 +193,11 @@ def _degraded_card_text(obj: dict, msg) -> str:
         return ""
 
     sender_type = (msg.sender.sender_type or "") if getattr(msg, "sender", None) else ""
-    if sender_type == "user":
-        hint = (
-            "[转发进来的卡片 · Lark 不回传正文，读不到"
-            "——需要内容就让用户补一句文字/截图，或按关键词搜原消息]"
-        )
-    else:
-        hint = "[卡片 · Lark 不回传正文，读不到（转发进来的，或本 bot 重启前发的旧卡片）]"
+    who = "转发进来的卡片" if sender_type == "user" else "卡片"
+    hint = (
+        f"[{who} · Lark 不回传正文，user 身份也没捞回来"
+        "——需要内容就让用户补一句文字/截图，或按关键词搜原消息]"
+    )
 
     title = obj.get("title")
     parts = [str(title).strip()] if isinstance(title, str) and title.strip() else []
@@ -115,13 +206,19 @@ def _degraded_card_text(obj: dict, msg) -> str:
     return " ".join(parts)
 
 
-def _extract(msg, feishu: Optional["FeishuClient"] = None) -> tuple[str, list[dict]]:
+def _extract(
+    msg,
+    feishu: Optional["FeishuClient"] = None,
+    card_texts: Optional[dict] = None,
+) -> tuple[str, list[dict]]:
     """
     从消息体提取纯文本和附件描述。
     attachments: [{"kind": "image"|"file"|"audio"|"media", "key": "...", "name": "..."}]
 
     feishu: 传入则在 interactive 卡片解析为空 / 仅 loading 时，fallback 到 feishu
     自己维护的卡片文本 cache（update_card 之后的真实内容）。
+    card_texts: message_id → 正文，_fetch_card_texts_as_user 借 user 身份捞回来的
+    卡片真身；缓存落空时用它兜底。
     """
     msg_type = msg.msg_type or ""
     body = msg.body
@@ -204,8 +301,11 @@ def _extract(msg, feishu: Optional["FeishuClient"] = None) -> tuple[str, list[di
                 cached = feishu.get_card_text(msg.message_id or "")
                 if cached:
                     return cached, []
-            # 缓存也没有：如果 content 是 Lark 那套「只给占位图不给正文」的退化形态，
-            # 留一行痕迹，别让这条消息在上下文里凭空消失。
+            # 缓存没有（转发进来的卡片 / bot 重启前的旧卡片）→ 用 user 身份捞回的真身
+            fetched = (card_texts or {}).get(msg.message_id or "")
+            if fetched:
+                return fetched, []
+            # 都落空：留一行痕迹，别让这条消息在上下文里凭空消失。
             return _degraded_card_text(obj, msg), []
         return text, []
 
@@ -259,9 +359,13 @@ async def build_thread_context(
     thread_id: str,
     last_seen_message_id: str,
     current_message_id: str,
+    cli_profile: str = "",
 ) -> tuple[str, list[str], Optional[str]]:
     """
     构建话题上下文文本块，并下载历史消息里的附件。
+
+    cli_profile: lark-cli 的 profile 名，用于借 user 身份补捞 bot 读不到的卡片正文
+    （转发进来的卡片、本 bot 重启前发的旧卡片）。空则跳过补捞，退回占位提示。
 
     Returns:
         (context_text, downloaded_paths, error)
@@ -315,6 +419,21 @@ async def build_thread_context(
     bot_names = _bot_names()
     self_app_id = getattr(feishu, "_app_id", "") or ""
 
+    # 正文读不到的卡片：借 owner 的 user 身份把真身捞回来（一次 mget 批量拿完）
+    need_fetch = [
+        (m.message_id or "") for m in unseen if _needs_user_fetch(m, feishu)
+    ]
+    card_texts = (
+        await _fetch_card_texts_as_user(need_fetch, cli_profile)
+        if need_fetch and cli_profile
+        else {}
+    )
+    if need_fetch:
+        print(
+            f"[thread] 卡片正文补捞: 需要 {len(need_fetch)} 条，捞到 {len(card_texts)} 条",
+            flush=True,
+        )
+
     # 并发下载所有附件
     download_tasks = []
     download_meta = []  # [(kind, display_name), ...]
@@ -322,7 +441,7 @@ async def build_thread_context(
 
     for m in unseen:
         att_indices = []
-        _text, atts = _extract(m, feishu)
+        _text, atts = _extract(m, feishu, card_texts)
         for att in atts:
             if not att["key"]:
                 continue
@@ -346,7 +465,7 @@ async def build_thread_context(
     lines = []
     all_paths = []
     for seq, m in enumerate(unseen, 1):
-        text, _atts = _extract(m, feishu)
+        text, _atts = _extract(m, feishu, card_texts)
         sender = _sender_label(m, name_map, bot_names, self_app_id)
         time_str = _fmt_time(m.create_time)
         header = f"[{seq}] {sender}"
