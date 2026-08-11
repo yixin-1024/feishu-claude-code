@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import codex_quota_watcher as cqw
 
 
@@ -47,7 +50,7 @@ def test_reset_via_resets_at_advance_notifies(monkeypatch):
         monkeypatch,
         {
             "primary": {
-                "usedPercent": 82,
+                "usedPercent": 40,
                 "windowDurationMins": 10080,
                 "resetsAt": 1_000_000 + 7 * 86400,
             }
@@ -104,3 +107,72 @@ def test_resets_at_microdrift_not_treated_as_reset(monkeypatch):
     sent = []
     cqw.poll_once(sent.append)
     assert sent == []
+
+
+def test_resets_at_advance_while_low_usage_climbs_is_not_reset(monkeypatch):
+    """截图回归：1% → 3% 明明在上涨，不能因 resets_at 后移就误报重置。"""
+    holder = {"state": {"primary": {"used": 1.0, "resets": 1_000_000}}}
+    _patch_state(monkeypatch, holder)
+    _patch_rate_limits(
+        monkeypatch,
+        {
+            "primary": {
+                "usedPercent": 3,
+                "windowDurationMins": 10080,
+                "resetsAt": 1_000_000 + 7 * 86400,
+            }
+        },
+    )
+    sent = []
+    cqw.poll_once(sent.append)
+    assert sent == []
+
+
+def test_resets_at_advance_while_still_near_full_is_not_reset(monkeypatch):
+    holder = {"state": {"primary": {"used": 90.0, "resets": 1_000_000}}}
+    _patch_state(monkeypatch, holder)
+    _patch_rate_limits(
+        monkeypatch,
+        {
+            "primary": {
+                "usedPercent": 85,
+                "windowDurationMins": 10080,
+                "resetsAt": 1_000_000 + 7 * 86400,
+            }
+        },
+    )
+    sent = []
+    cqw.poll_once(sent.append)
+    assert sent == []
+
+
+def test_concurrent_pollers_only_notify_once(monkeypatch, tmp_path):
+    """滚动部署短暂双进程时，两次并发 poll 只允许一条重置通报。"""
+    state_dir = tmp_path / "state"
+    monkeypatch.setattr(cqw, "_STATE_DIR", str(state_dir))
+    monkeypatch.setattr(cqw, "_STATE_FILE", str(state_dir / "quota.json"))
+    monkeypatch.setattr(cqw, "_STATE_LOCK_FILE", str(state_dir / "quota.lock"))
+    cqw._save_state({"primary": {"used": 100.0, "resets": 1_000_000}})
+
+    gate = Barrier(2)
+    snapshot = {
+        "primary": {
+            "usedPercent": 3,
+            "windowDurationMins": 10080,
+            "resetsAt": 1_000_000 + 7 * 86400,
+        }
+    }
+    import commands
+
+    def fetch_together():
+        gate.wait(timeout=5)
+        return snapshot
+
+    monkeypatch.setattr(commands, "_get_codex_rate_limits", fetch_together)
+    sent = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(cqw.poll_once, sent.append) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=5)
+
+    assert len(sent) == 1

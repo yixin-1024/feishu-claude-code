@@ -824,6 +824,13 @@ class SessionStore:
         cur["started_at"] = datetime.now().isoformat()
         await self._save_async()
 
+    async def set_model_override(self, user_id: str, chat_id: str, model: str):
+        """仅改 model_override、不动 session（safeguards 自动降级续跑用；
+        用户手动 /model 换模型仍走 set_model 开新会话）。"""
+        chat_data = await self._ensure_chat_data(user_id, chat_id)
+        chat_data["current"]["model_override"] = model or None
+        await self._save_async()
+
     async def set_effort(self, user_id: str, chat_id: str, effort: str):
         """Set a per-conversation reasoning-effort override without changing session."""
         chat_data = await self._ensure_chat_data(user_id, chat_id)

@@ -77,7 +77,7 @@ WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心�
 
 **健壮运行**
 
-- 三段式超时：5 分钟无输出且无子进程 → 杀；15 分钟有子进程但无输出 → 杀；任意情况 60 分钟 wall-clock → 杀。编译/下载不会被误杀，runaway loop 也兜得住
+- 三段式超时：5 分钟无输出且无子进程 → 杀；15 分钟有子进程但无输出 → 杀；任意情况 60 分钟 wall-clock → 杀。编译/下载不会被误杀，runaway loop 也兜得住。最后一段可调：`CLAUDE_WALL_CLOCK_LIMIT_SEC=7200`（2 小时）/ `=0`（永不因 wall-clock 强杀，长任务用），支持 `<PROFILE>_` 前缀单独配
 - 看门狗 6 小时自动重启，防止 WebSocket 假死
 - API 调用自动重试 (指数退避)
 - `cc-lark` 脚本封装 launchd + ngrok，一键 install/start/stop/restart/status/logs
@@ -263,7 +263,7 @@ python3 main.py
 | `FEISHU_APP_ID` | 是 | - | 飞书/Lark 应用 App ID |
 | `FEISHU_APP_SECRET` | 是 | - | 飞书/Lark 应用 App Secret |
 | `LARK_DOMAIN` | 否 | `https://open.feishu.cn` | Lark 国际版填 `https://open.larksuite.com` |
-| `DEFAULT_MODEL` | 否 | `claude-opus-4-6` | 默认 Claude 模型 |
+| `DEFAULT_MODEL` | 否 | `opus[1m]` | 默认 Claude 模型；可用 CLI 别名 `opus[1m]`/`sonnet[1m]`/`fable[1m]`/`haiku`（=系列最新）或钉死具体版本 |
 | `DEFAULT_CWD` | 否 | `~` | Claude CLI 默认工作目录 |
 | `PERMISSION_MODE` | 否 | `bypassPermissions` | 工具权限模式 |
 | `ALLOWED_OPEN_IDS` | 推荐 | 空=允许所有 | 用户 open_id 白名单，逗号分隔 |
@@ -338,6 +338,11 @@ python3 main.py
 cc-lark 会在 Claude 与 Codex 会话启动时注入 `cc_mcp_server.py`。它提供
 `wake_me_in`、`dispatch_task`、`read_thread`、`schedule_cron`、`list_crons`；stdio
 前端只把鉴权请求发到本机 control listener，真正的派工与调度由常驻 bot 兑现。
+
+`dispatch_task` 派出的子会话是**全新话题 + 全新 session**，不继承派发方 thread 的
+`/model` `/effort`，默认跑目标 bot 的 profile 默认模型。要按活儿分配算力就显式传
+`model` / `effort`（别名同 `/model`：`fable` / `opus` / `sonnet` / `haiku` …），
+配合 `agent` 还能混编：一路 Opus 实现、一路 Fable 复核、一路 `agent="gpt"` 交叉验证。
 
 这条路径只在话题群上下文可用；runner 会把当前 `profile / chat_id / thread_id /
 anchor_message_id / user_id / control port / token` 通过 `CC_LARK_*` 环境变量注入给

@@ -43,10 +43,21 @@ MODE_ALIASES = {
 }
 
 MODEL_ALIASES = {
-    "fable": "claude-fable-5[1m]",
-    "opus": "claude-opus-4-8[1m]",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
+    # Claude 系：直接用 CLI 自带的「系列最新」别名（`claude --model` 认
+    # sonnet / opus / haiku / fable / best / sonnet[1m] / opus[1m] /
+    # fable[1m] / opusplan），出新版自动跟上，不用改这张表。
+    # 想钉死具体版本用下面的 opus5 / opus-4-8 之类。
+    "fable": "fable[1m]",
+    "opus": "opus[1m]",
+    "sonnet": "sonnet[1m]",
+    "haiku": "haiku",  # haiku 只有 200K，没有 [1m] 变体
+    "opusplan": "opusplan",
+    "best": "best",
+    "opus5": "claude-opus-5[1m]",
+    "opus-4-8": "claude-opus-4-8[1m]",
+    "opus4.8": "claude-opus-4-8[1m]",
+    "sonnet-4-6": "claude-sonnet-4-6",
+    "sonnet4.6": "claude-sonnet-4-6",
     "codex-max": "gpt-5.1-codex-max",
     "codex": "gpt-5.1-codex",
     "gpt5": "gpt-5.1",
@@ -480,6 +491,12 @@ def fetch_quota_headers() -> dict:
             return {"ok": False,
                     "error": f"Anthropic 服务暂时不可用（HTTP {http_status}），稍后重试"}
         return {"ok": False, "error": "响应中无用量 headers"}
+    # 分模型周额度（Fable 7d 等）不在 headers 里，补一发 OAuth usage 端点
+    try:
+        from account_switcher import fetch_scoped_weekly_limits
+        out["scoped7d"] = fetch_scoped_weekly_limits(token)
+    except Exception:
+        out["scoped7d"] = []
     return out
 
 
@@ -530,6 +547,13 @@ def _usage_single_account_lines(data: dict, account_label: Optional[str] = None)
     lines.append(f"**7天窗口**（状态：{data.get('s7d', '?')}）")
     lines.append(_fmt_pct_bar(data.get("u7d")))
     lines.append(f"重置时间：{_fmt_reset_ts(data.get('r7d'))}")
+    for sc in data.get("scoped7d") or []:
+        if sc.get("u") is None:
+            continue
+        lines.append("")
+        lines.append(f"**7天窗口（{sc.get('name', '?')}）**（状态：{sc.get('sev', '?')}）")
+        lines.append(_fmt_pct_bar(sc.get("u")))
+        lines.append(f"重置时间：{_fmt_reset_ts(sc.get('r'))}")
     return lines
 
 
@@ -567,6 +591,7 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
         data = {
             "u5h": cur.u5h, "u7d": cur.u7d, "r5h": cur.r5h, "r7d": cur.r7d,
             "s5h": cur.s5h, "s7d": cur.s7d,
+            "scoped7d": getattr(cur, "scoped7d", None) or [],
         }
         lines.extend(_usage_single_account_lines(data, account_label=cur.name))
     else:
@@ -602,6 +627,10 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
             r7_part = ""
             if a.r7d:
                 r7_part = f" (重置 {_fmt_reset_short(a.r7d - now_ts)})"
+            sc_part = ""
+            for sc in getattr(a, "scoped7d", None) or []:
+                if sc.get("u") is not None:
+                    sc_part += f" · {sc.get('name', '?').lower()} `{sc['u']*100:.0f}%`"
             tail = ""
             if a is best_other and cur_usable and (a.score - cur_score) >= 0.15:
                 tail = "（推荐切换）"
@@ -610,7 +639,7 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
             elif not a.usable and a.reasons:
                 tail = f"（{a.reasons[0]}）"
             lines.append(
-                f"  `{a.name}` · 5h `{u5}`{r5_part} · 7d `{u7}`{r7_part} · score `{a.score:.2f}` {mark}{tail}"
+                f"  `{a.name}` · 5h `{u5}`{r5_part} · 7d `{u7}`{r7_part}{sc_part} · score `{a.score:.2f}` {mark}{tail}"
             )
 
     # 自动切换开关状态
@@ -953,7 +982,7 @@ def _runner_default_model(bot, runner: str) -> str:
         return "google/gemini-3.1-pro-preview"
     if runner == "mimo":
         return "quotio/claude-opus-4-8"
-    return "claude-sonnet-4-6"
+    return "sonnet[1m]"
 
 
 def _get_quota_compact() -> str:

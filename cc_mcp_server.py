@@ -178,7 +178,11 @@ DISPATCH_TASK_TOOL = {
         "agent=\"gpt\" runs it on the codex(GPT) bot, letting Claude delegate a sub-task to GPT "
         "(or \"gemini\"/\"mimo\", or an exact profile name). The target agent's bot must be a "
         "member of this group; if it isn't the dispatch returns a clear error. The auto-report "
-        "and wake still come back to YOU regardless of which agent ran the worker."
+        "and wake still come back to YOU regardless of which agent ran the worker. "
+        "MODEL/EFFORT: the worker starts a FRESH session and does NOT inherit the /model or "
+        "/effort of this thread — it runs on the bot's default model. Pass `model` / `effort` "
+        "to pick per-worker, e.g. model=\"opus\" for the heavy implementation worker and "
+        "model=\"fable\" for a second opinion, or model=\"haiku\" for cheap grunt work."
     ),
     "inputSchema": {
         "type": "object",
@@ -198,6 +202,22 @@ DISPATCH_TASK_TOOL = {
                     "Accepts a family alias — \"gpt\"/\"codex\" (GPT), \"claude\", "
                     "\"gemini\"/\"opencode\", \"mimo\" — or an exact loaded profile name. "
                     "Omit to run the worker on your own backend (default)."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model for THIS worker — an alias ('fable', 'opus', 'sonnet', "
+                    "'haiku', 'opusplan', 'codex', 'gemini', ...) or a full model id. Must "
+                    "belong to the target agent's backend (don't pass 'fable' with "
+                    "agent=\"gpt\"). Omit to use that bot's default model."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "description": (
+                    "Optional reasoning effort for THIS worker: low / medium / high / xhigh / "
+                    "max (codex also: ultra). Omit to use the bot's default."
                 ),
             },
         },
@@ -298,7 +318,10 @@ SCHEDULE_CRON_TOOL = {
         "day-of-month month day-of-week (timezone Asia/Shanghai), e.g. '0 9 * * *' = daily "
         "09:00, '*/30 * * * *' = every 30 min, '0 9 * * 1' = Mondays 09:00. Write `prompt` "
         "SELF-CONTAINED (each run is a fresh session). Group/recipient are supplied "
-        "automatically. Returns the task name + next run time; use list_crons to review."
+        "automatically. Because each run is a fresh session it does NOT inherit any /model "
+        "or /effort set in this thread — pass `model` / `effort` if the task needs a "
+        "specific model or reasoning depth. Returns the task name + next run time; use "
+        "list_crons to review."
     ),
     "inputSchema": {
         "type": "object",
@@ -306,6 +329,20 @@ SCHEDULE_CRON_TOOL = {
             "cron": {"type": "string", "description": "5-field cron: 'minute hour dom month dow' (Asia/Shanghai)."},
             "prompt": {"type": "string", "description": "Self-contained instruction run at each scheduled time."},
             "title": {"type": "string", "description": "Optional short title for the recurring topic."},
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model for each run — an alias ('opus', 'sonnet', 'haiku', "
+                    "'codex', ...) or a full model id. Omit to use the bot's default."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "description": (
+                    "Optional reasoning effort for each run: low / medium / high / xhigh / "
+                    "max (codex also: ultra). Omit to use the bot's default."
+                ),
+            },
         },
         "required": ["cron", "prompt"],
     },
@@ -415,6 +452,9 @@ def _tool_dispatch_task(args: dict) -> dict:
         "prompt": prompt.strip(),
         # 跨 agent：可选目标后端（"gpt"/"gemini"/"mimo"/profile 名）；空=同 agent
         "agent": (args.get("agent") or "").strip(),
+        # 子会话是全新 session，不继承本 thread 的 /model /effort；空=目标 bot 默认
+        "model": (args.get("model") or "").strip(),
+        "effort": (args.get("effort") or "").strip(),
         # 父上下文：让 bot 在子会话结束后回报本 thread + 批次全完时唤醒我（主 agent）
         "parent_thread": (os.environ.get("CC_LARK_THREAD_ID") or "").strip(),
         "parent_anchor": (os.environ.get("CC_LARK_ANCHOR") or os.environ.get("CC_LARK_MESSAGE_ID") or "").strip(),
@@ -429,6 +469,9 @@ def _tool_dispatch_task(args: dict) -> dict:
     agent_note = ""
     if body.get("agent"):
         agent_note = f" on agent {body.get('agent')}[{body.get('agent_runner')}]"
+    agent_note += "".join(
+        f" ({k}={body.get(k)})" for k in ("model", "effort") if body.get(k)
+    )
     return _ok(
         f"✅ Dispatched a sub-agent{agent_note} in a new thread. thread_id={body.get('thread_id')} "
         f"(active {body.get('active_after')}/{body.get('cap')}). "
@@ -520,6 +563,8 @@ def _tool_schedule_cron(args: dict) -> dict:
     payload = {
         "profile": profile, "chat_id": chat_id, "user_id": user_id,
         "cron": cron, "prompt": prompt.strip(), "title": (args.get("title") or "").strip(),
+        "model": (args.get("model") or "").strip(),
+        "effort": (args.get("effort") or "").strip(),
     }
     try:
         body = _post_json("/schedule_cron", payload)
@@ -528,8 +573,11 @@ def _tool_schedule_cron(args: dict) -> dict:
         return _err(f"Failed to reach cc-lark scheduler: {type(e).__name__}: {e}")
     if not body.get("ok"):
         return _err(f"schedule_cron rejected: {body.get('error', 'unknown error')}")
+    over = "".join(
+        f", {k}={body.get(k)}" for k in ("model", "effort") if body.get(k)
+    )
     return _ok(
-        f"✅ Recurring task created: {body.get('name')} — cron '{body.get('cron')}', "
+        f"✅ Recurring task created: {body.get('name')} — cron '{body.get('cron')}'{over}, "
         f"next run {body.get('next_run')}. It survives restarts. Use list_crons to review."
     )
 

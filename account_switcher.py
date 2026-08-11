@@ -69,6 +69,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Optional
 
 # ── 调参 ──────────────────────────────────────────────────────────
@@ -93,6 +94,10 @@ _KEYCHAIN_TOPLEVEL = ("claudeAiOauth", "mcpOAuth")
 _API_URL = "https://api.anthropic.com/v1/messages"
 _PROBE_MODEL = "claude-haiku-4-5-20251001"
 _PROBE_TIMEOUT_SEC = 10
+
+# OAuth usage 端点：分模型的周额度（如 Fable 7d）只在这里，
+# /v1/messages 的 rate-limit headers 只有 unified 5h/7d
+_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 # OAuth refresh endpoint（从 claude.exe 二进制扒出来，client_id 通用）
 _OAUTH_REFRESH_URL = "https://platform.claude.com/v1/oauth/token"
@@ -142,6 +147,9 @@ class Account:
     r7d: Optional[int] = None
     s5h: str = "unknown"
     s7d: str = "unknown"
+    # 分模型周额度（OAuth usage 端点 limits[] 里 kind=weekly_scoped），
+    # 每项 {"name": "Fable", "u": 0.08, "r": <epoch|None>, "sev": "normal"}
+    scoped7d: list[dict] = field(default_factory=list)
     probe_error: Optional[str] = None
     probed_at: float = 0.0
 
@@ -771,7 +779,58 @@ def _probe_one(acc: Account, is_current: bool = False) -> Account:
         else:
             acc.probe_error = "no rate-limit headers in response"
 
+    if not acc.probe_error:
+        acc.scoped7d = fetch_scoped_weekly_limits(acc.access_token)
+
     return acc
+
+
+def fetch_scoped_weekly_limits(token: str) -> list[dict]:
+    """拉分模型的周额度（limits[] 里 kind=weekly_scoped，如 Fable 7d）。
+
+    best-effort：任何失败返回 []，不影响主探测（这个额度只做展示，
+    不参与 evaluate 打分/硬筛）。percent 归一成 0~1 的 u，resets_at
+    ISO 串转 epoch，severity 原样带回。
+    """
+    req = urllib.request.Request(
+        _USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        ctx = ssl.create_default_context()
+        with urlopen_with_retry(req, context=ctx, timeout=_PROBE_TIMEOUT_SEC) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        return []
+    out: list[dict] = []
+    for lim in payload.get("limits") or []:
+        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+            continue
+        model = (lim.get("scope") or {}).get("model") or {}
+        name = model.get("display_name") or model.get("id") or "scoped"
+        u = None
+        try:
+            if lim.get("percent") is not None:
+                u = float(lim["percent"]) / 100.0
+        except Exception:
+            pass
+        reset_epoch = None
+        try:
+            if lim.get("resets_at"):
+                reset_epoch = int(datetime.fromisoformat(lim["resets_at"]).timestamp())
+        except Exception:
+            pass
+        out.append({
+            "name": str(name),
+            "u": u,
+            "r": reset_epoch,
+            "sev": lim.get("severity") or "unknown",
+        })
+    return out
 
 
 def probe_all(parallel: int = 4) -> dict[str, Account]:

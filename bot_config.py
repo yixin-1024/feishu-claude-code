@@ -60,6 +60,39 @@ _DOMAIN_MAP = {
 CLAUDE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 CODEX_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 
+# 定时任务 / dispatch 里 effort 字段的合法档位：claude ∪ codex（外加 codex 底层还认的
+# none/minimal）。这里不按 runner 分开校验——task 只绑 profile，profile 的 runner
+# 可能事后被改；填了本 runner 不支持的档位由 runner 自己报错。
+_EFFORT_LEVELS = {*CLAUDE_EFFORT_LEVELS, *CODEX_EFFORT_LEVELS, "none", "minimal"}
+
+
+# ── /model /effort 字符串归一 ────────────────────────────────
+# 定时任务（scheduled_tasks.yaml / schedule_cron）和 dispatch_task 起的都是**全新
+# session**，拿不到任何 /model /effort 历史设置，要指定模型/强度只能显式传串。
+# 两条路必须同一口径，所以归一逻辑放在这里共用，而不是各自实现一份。
+
+
+def normalize_model(raw: str) -> str:
+    """把 model 字段解析成 CLI 认的串，支持 /model 的别名（opus / sonnet / ...）。"""
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    # 局部 import：commands 会拉起一大票模块，顶层引入容易成环
+    from commands import MODEL_ALIASES
+    return MODEL_ALIASES.get(value.lower(), value)
+
+
+def normalize_effort(raw: str, ctx: str) -> str:
+    """校验并归一 effort；空 / "default" = 不覆盖（跟随 profile 或 CLI 默认）。"""
+    value = (raw or "").strip().lower()
+    if not value or value == "default":
+        return ""
+    if value not in _EFFORT_LEVELS:
+        raise ValueError(
+            f"{ctx}: effort {raw!r} 非法（可选：{', '.join(sorted(_EFFORT_LEVELS))}）"
+        )
+    return value
+
 
 def _split_csv(value: str) -> set[str]:
     return {s.strip() for s in (value or "").split(",") if s.strip()}
@@ -78,6 +111,12 @@ class Profile:
     # 走不同 agent；后续可在 chat 维度继续覆盖。
     runner: str = "claude"
     default_model: str = ""
+    # 可选：dispatch_task 派出的子会话默认用的模型（空=沿用 default_model）。
+    # 场景：主对话想用便宜/快的模型聊天，派出去干活的子 agent 想用最强的模型 ——
+    # 例如 DEFAULT_MODEL=fable[1m] + DISPATCH_MODEL=opus[1m]。派发方显式传
+    # dispatch_task(model=...) 时以显式值为准。
+    # ⚠️ 必须是**本 profile runner 认识的**模型串（codex profile 别填 opus）。
+    dispatch_model: str = ""
     # 可选：chat_id -> cwd 映射。新群初次进入时按此初始化 cwd（缺省回退到 default_cwd）。
     # 不影响 sessions.json 已记录的群——那些走持久化值，可被 /ws set / /ws use 继续覆盖。
     chat_default_cwd: dict[str, str] = field(default_factory=dict)
@@ -244,6 +283,7 @@ def _load_profile(name: str) -> Profile:
         default_cwd=default_cwd,
         runner=runner,
         default_model=env("DEFAULT_MODEL", os.getenv("DEFAULT_MODEL", "")),
+        dispatch_model=env("DISPATCH_MODEL", os.getenv("DISPATCH_MODEL", "")).strip(),
         chat_default_cwd=chat_default_cwd,
         allowed_open_ids=_split_csv(env("ALLOWED_OPEN_IDS")),
         allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
@@ -327,6 +367,7 @@ def _load_legacy_profile() -> Optional[Profile]:
         default_cwd=os.path.expanduser(os.getenv("DEFAULT_CWD", "~")),
         runner=os.getenv("RUNNER", "claude").strip().lower() or "claude",
         default_model=os.getenv("DEFAULT_MODEL", ""),
+        dispatch_model=os.getenv("DISPATCH_MODEL", "").strip(),
         allowed_open_ids=_split_csv(os.getenv("ALLOWED_OPEN_IDS", "")),
         allowed_group_chat_ids=_split_csv(os.getenv("ALLOWED_GROUP_CHAT_IDS", "")),
         verification_token=os.getenv("FEISHU_VERIFICATION_TOKEN", "").strip(),
@@ -422,7 +463,7 @@ PROFILES_BY_ROLE: dict[str, Profile] = (
 
 CLAUDE_CLI = os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude") or "claude"
 
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-opus-4-8[1m]")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "opus[1m]")
 DEFAULT_RUNNER = os.getenv("RUNNER", "claude").strip().lower() or "claude"
 PERMISSION_MODE = os.getenv("PERMISSION_MODE", "bypassPermissions")
 
@@ -536,6 +577,55 @@ def resolve_cc_lark_gates(profile_name: str = "") -> dict[str, str]:
         if val is not None:
             gates[flag] = val
     return gates
+
+
+# ── Claude 单轮 wall-clock 上限（支持 per-profile 覆盖 / 关闭）──────
+#
+# 历史上 claude_runner / claude_pty 各自硬编码 3600s：无论是否还在正常产出，
+# 到点一律强杀，理由是"防 runaway loop"。但真实长任务（大批量重构、批量开户、
+# 长 E2E）跑穿 60min 是常态，被这条兜底掐掉会丢掉整轮进度——runaway 已经有
+# IDLE_TIMEOUT / STUCK_CHILD_TIMEOUT / watchdog 三层在管，wall-clock 只是最后
+# 一道粗兜底，应该可配。
+# 优先级：extra_env（profile 注入的子进程 env）> <PROFILE>_<VAR> > <VAR> > 默认。
+#   CLAUDE_WALL_CLOCK_LIMIT_SEC=0     → 永不因 wall-clock 强杀
+#   CLAUDE_WALL_CLOCK_LIMIT_SEC=7200  → 2 小时
+# 非法值（负数 / 非数字）按 0（不限）处理，并且不抛异常——这条兜底本身
+# 不值得因为配置写错就让整轮跑不起来。
+
+CLAUDE_WALL_CLOCK_LIMIT_ENV = "CLAUDE_WALL_CLOCK_LIMIT_SEC"
+CLAUDE_WALL_CLOCK_LIMIT_DEFAULT = 3600.0  # 60 分钟，保持历史行为
+
+
+def resolve_claude_wall_clock_limit(
+    extra_env: Optional[dict] = None,
+    profile_name: str = "",
+) -> float:
+    """解析单轮 wall-clock 上限（秒）。返回 0 表示不限时。
+
+    profile_name 缺省时会从 extra_env["CC_LARK_PROFILE"] 取，调用点不必重复传。
+    """
+    raw = None
+    if extra_env:
+        raw = extra_env.get(CLAUDE_WALL_CLOCK_LIMIT_ENV)
+        if not profile_name:
+            profile_name = str(extra_env.get("CC_LARK_PROFILE") or "")
+    if raw is None:
+        prefix = _profile_env_prefix(profile_name)
+        if prefix:
+            raw = os.getenv(prefix + CLAUDE_WALL_CLOCK_LIMIT_ENV)
+    if raw is None:
+        raw = os.getenv(CLAUDE_WALL_CLOCK_LIMIT_ENV)
+    if raw is None or str(raw).strip() == "":
+        return CLAUDE_WALL_CLOCK_LIMIT_DEFAULT
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        print(
+            f"[bot_config] {CLAUDE_WALL_CLOCK_LIMIT_ENV}={raw!r} 不是数字，按不限时处理",
+            flush=True,
+        )
+        return 0.0
+    return val if val > 0 else 0.0
 
 
 # ── 旧代码兼容：有些模块可能仍读这些名字，保留向后兼容 ─────────

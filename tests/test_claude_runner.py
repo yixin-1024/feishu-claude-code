@@ -303,6 +303,93 @@ def test_rate_limit_result_raises_non_transient(monkeypatch):
     assert getattr(exc, "cc_retryable_resume", None) is False
 
 
+def test_connection_closed_result_is_transient_even_when_subtype_success(monkeypatch):
+    """线上实拍的另一种中断文案：subtype 仍是 'success'、只有 is_error=true，
+    result 里是 "Connection closed mid-response"。必须同样判为可 resume 续跑
+    （旧的白名单只认 "stalled mid-stream"，这条会被误判成不可恢复 → 直接中断）。"""
+    proc = FakeProc([
+        b'{"type":"system","session_id":"sid_cc"}\n',
+        b'{"type":"result","subtype":"success","is_error":true,'
+        b'"api_error_status":null,"session_id":"sid_cc",'
+        b'"result":"API Error: Connection closed mid-response. '
+        b'The response above may be incomplete."}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(run_claude("hi"))
+
+    exc = ei.value
+    assert getattr(exc, "cc_retryable_resume", None) is True
+    assert getattr(exc, "cc_session_id", None) == "sid_cc"
+    # 错误卡上不该出现误导性的 "success"
+    assert "success" not in str(exc)
+
+
+def test_auth_error_result_is_not_transient(monkeypatch):
+    """认证/请求侧错误（4xx）重试无益，不能标记为可续跑。"""
+    proc = FakeProc([
+        b'{"type":"result","subtype":"error_during_execution","is_error":true,'
+        b'"api_error_status":401,"session_id":"sid_auth",'
+        b'"result":"authentication_error: invalid api key"}\n',
+    ])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(run_claude("hi"))
+
+    assert getattr(ei.value, "cc_retryable_resume", None) is False
+
+
+def test_process_crash_marked_resumable(monkeypatch):
+    """CLI 进程级崩溃（rc>0、无输出、stderr 是网络错）也要带上可 resume 标记，
+    否则 dispatcher 只能报错中断。"""
+    proc = FakeProc(
+        [b'{"type":"system","session_id":"sid_crash"}\n'],
+        stderr=b"Error: fetch failed (ECONNRESET)",
+        returncode=1,
+    )
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(run_claude("hi"))
+
+    exc = ei.value
+    assert getattr(exc, "cc_session_id", None) == "sid_crash"
+    assert getattr(exc, "cc_retryable_resume", None) is True
+
+
+def test_process_crash_with_usage_limit_not_resumable(monkeypatch):
+    """rc>0 但 stderr 是用量墙：续跑无意义，不标可 resume。"""
+    proc = FakeProc(
+        [b'{"type":"system","session_id":"sid_rl2"}\n'],
+        stderr=b"Error: usage limit reached, resets 9pm",
+        returncode=1,
+    )
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(run_claude("hi"))
+
+    assert getattr(ei.value, "cc_retryable_resume", None) is None
+
+
 def test_normal_result_with_error_word_not_flagged(monkeypatch):
     """正常成功回复即便文本里含 'server_error' 字样也不能被误判为错误结果。"""
     proc = FakeProc([

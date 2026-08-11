@@ -264,3 +264,104 @@ def test_schedule_wake_reply_failure_does_not_break_scheduling(monkeypatch):
         loop.call_soon_threadsafe(loop.stop)
         t.join(timeout=3)
         loop.close()
+
+
+# ────────────────── model / effort：任务级模型与推理强度 ──────────────────
+
+def _raw_task(**extra):
+    raw = {"name": "t1", "profile": "spx", "cron": "0 0 * * *",
+           "chat_id": "oc_test", "user_id": "ou_user", "prompt": "hello"}
+    raw.update(extra)
+    return raw
+
+
+def test_from_dict_defaults_model_and_effort_to_empty():
+    """没写 model/effort 的老任务照常加载，语义 = 跟随 profile / CLI 默认。"""
+    task = scheduler.ScheduledTask.from_dict(_raw_task(), base_dir=".")
+    assert task.model == ""
+    assert task.effort == ""
+
+
+def test_from_dict_resolves_model_alias_and_effort():
+    task = scheduler.ScheduledTask.from_dict(
+        _raw_task(model="opus", effort="HIGH"), base_dir="."
+    )
+    from commands import MODEL_ALIASES
+    assert task.model == MODEL_ALIASES["opus"]
+    assert task.effort == "high"
+
+
+def test_from_dict_keeps_unknown_model_string_verbatim():
+    """非别名的完整模型串原样透传，别把新模型挡在外面。"""
+    task = scheduler.ScheduledTask.from_dict(
+        _raw_task(model="claude-something-new[1m]"), base_dir="."
+    )
+    assert task.model == "claude-something-new[1m]"
+
+
+def test_from_dict_effort_default_means_no_override():
+    task = scheduler.ScheduledTask.from_dict(_raw_task(effort="default"), base_dir=".")
+    assert task.effort == ""
+
+
+def test_from_dict_rejects_bogus_effort():
+    with pytest.raises(ValueError, match="effort"):
+        scheduler.ScheduledTask.from_dict(_raw_task(effort="turbo"), base_dir=".")
+
+
+def test_fire_passes_model_and_effort_to_spawn(monkeypatch):
+    """任务里声明的 model/effort 必须透传给 spawn —— 新话题不继承任何设置。"""
+    bot = _FakeBot()
+    task = scheduler.ScheduledTask.from_dict(
+        _raw_task(model="opus", effort="xhigh"), base_dir="."
+    )
+    spawn_called: list[dict] = []
+
+    async def spawn_fn(bot_, **kw):
+        spawn_called.append(kw)
+
+    import commands
+    monkeypatch.setattr(commands, "fetch_quota_headers",
+                        lambda: {"ok": True, "u5h": 0.2, "u7d": 0.1,
+                                 "r5h": 9999999999, "r7d": 9999999999,
+                                 "s5h": "allowed", "s7d": "allowed"})
+
+    asyncio.run(scheduler._make_async_fire(task, bot, spawn_fn)())
+
+    assert len(spawn_called) == 1
+    assert spawn_called[0]["model"] == commands.MODEL_ALIASES["opus"]
+    assert spawn_called[0]["effort"] == "xhigh"
+
+
+# ────────────────── user_id 归一：顶楼 @ 必须能落到人 ──────────────────
+
+def test_from_dict_takes_first_open_id_when_user_id_is_a_list():
+    """yaml 里 user_id 常直接引 ${*_ALLOWED_OPEN_IDS}（逗号串）。
+    at tag 只认单个 open_id，整串塞进去 Lark 不报错但解析不出 mention
+    → 渲染成光秃秃的「@」、归属人收不到通知。必须取第一个。"""
+    task = scheduler.ScheduledTask.from_dict(
+        _raw_task(user_id="ou_first, ou_second ,ou_third"), base_dir="."
+    )
+    assert task.user_id == "ou_first"
+
+
+def test_fire_mentions_single_open_id(monkeypatch):
+    """顶楼 post 的 mention_open_id 必须是单个 id，不能是逗号串。"""
+    bot = _FakeBot()
+    task = scheduler.ScheduledTask.from_dict(
+        _raw_task(user_id="ou_first,ou_second"), base_dir="."
+    )
+
+    async def spawn_fn(bot_, **kw):
+        pass
+
+    import commands
+    monkeypatch.setattr(commands, "fetch_quota_headers",
+                        lambda: {"ok": True, "u5h": 0.2, "u7d": 0.1,
+                                 "r5h": 9999999999, "r7d": 9999999999,
+                                 "s5h": "allowed", "s7d": "allowed"})
+
+    asyncio.run(scheduler._make_async_fire(task, bot, spawn_fn)())
+
+    assert len(bot.feishu.posts) == 1
+    assert bot.feishu.posts[0]["mention"] == "ou_first"

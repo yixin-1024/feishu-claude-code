@@ -273,7 +273,7 @@ def start_codex_quota_watcher(
 ) -> None:
     """启动 Codex 额度监控后台线程：窗口重置时给 owner 发 Lark 私信。
 
-    通报通过 `notify_profile` 这个 bot 的 send_text_to_user 发给 `notify_open_id`。
+    通报通过 `notify_profile` 这个 bot 的 Markdown 卡片发给 `notify_open_id`。
     watcher 跑在独立线程，send_fn 用 run_coroutine_threadsafe 投回 bot_loop。
     """
     if _bot_loop is None or not _bots:
@@ -293,7 +293,11 @@ def start_codex_quota_watcher(
     def _send(text: str) -> None:
         try:
             fut = asyncio.run_coroutine_threadsafe(
-                bot.feishu.send_text_to_user(notify_open_id, text),
+                bot.feishu.send_card_to_user(
+                    notify_open_id,
+                    content=text,
+                    loading=False,
+                ),
                 _bot_loop,
             )
             # 阻塞等发送真正落地：否则 Future 被丢弃，协程内抛的异常（如对方从未

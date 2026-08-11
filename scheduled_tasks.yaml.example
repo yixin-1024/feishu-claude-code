@@ -7,12 +7,20 @@
 #   cron         五段 cron 表达式（分 时 日 月 周）
 #   timezone     默认 Asia/Shanghai
 #   chat_id      话题群 chat_id（必须支持 thread；通常 = profile.dispatch_chat_id）
-#   user_id      任务归属人 open_id；顶楼消息 @ 这个人拉订阅
+#   user_id      任务归属人 open_id；顶楼消息 @ 这个人拉订阅。
+#                写成逗号串（比如直接引 ${WORK_ALLOWED_OPEN_IDS}）时只取第一个 —
+#                at tag 只认单个 open_id，塞整串进去会渲染成光秃秃的「@」且无人收到通知。
 #   topic_title  顶楼消息标题
 #   topic_body   顶楼消息正文（标题之后的一行）
 #   prompt       内联 prompt（短的）。
 #   prompt_file  prompt 文件路径（长的）。相对路径以 yaml 同目录为根。
 #                prompt / prompt_file 二选一。
+#   model        （可选）本任务用的模型。支持 /model 的别名（opus / sonnet / haiku /
+#                codex / gemini ...）或完整模型串。缺省 = profile 的 DEFAULT_MODEL。
+#   effort       （可选）本任务的推理强度：low / medium / high / xhigh / max
+#                （codex 另有 ultra）。缺省 = profile env 或 CLI 默认。
+#                每次 fire 都是全新话题 + 全新 session，不继承任何 /model /effort，
+#                所以要指定就得写在这里。
 #
 # yaml 文件支持 ${VAR} 引用 .env 里的变量，避免把 chat_id 写死到代码库。
 #
@@ -30,6 +38,8 @@
   topic_title: "📅 每日报"
   topic_body: "🧵 整理今天日报（昨天 18:00 → 现在）"
   prompt_file: prompts/work_daily_briefing.md
+  model: opus                        # 可选：别名或完整模型串
+  effort: high                       # 可选：low/medium/high/xhigh/max（codex 还有 ultra）
 
 # 内联 prompt 的写法：
 # - name: ping

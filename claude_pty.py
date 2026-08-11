@@ -34,7 +34,13 @@ import time
 import uuid
 from typing import Callable, Optional
 
-from bot_config import CLAUDE_CLI, CLAUDE_EFFORT_LEVELS, PERMISSION_MODE
+from bot_config import (
+    CLAUDE_CLI,
+    CLAUDE_EFFORT_LEVELS,
+    CLAUDE_WALL_CLOCK_LIMIT_DEFAULT,
+    PERMISSION_MODE,
+    resolve_claude_wall_clock_limit,
+)
 
 CLAUDE_PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CLAUDE_CONFIG_PATH = os.path.expanduser("~/.claude.json")
@@ -42,7 +48,12 @@ CLAUDE_CONFIG_PATH = os.path.expanduser("~/.claude.json")
 # 与 claude_runner.py 保持语义一致的超时参数
 IDLE_TIMEOUT = 300        # 第一条 assistant 之后又卡住的"空闲"阈值
 STUCK_CHILD_TIMEOUT = 900  # 有子进程但 Claude 端持续无新输出
-WALL_CLOCK_LIMIT = 3600   # 单轮 wall-clock 兜底
+# 单轮 wall-clock 兜底。默认 60 分钟，可用 CLAUDE_WALL_CLOCK_LIMIT_SEC（或
+# <PROFILE>_ 前缀）覆盖；设 0 = 永不因 wall-clock 强杀。见
+# bot_config.resolve_claude_wall_clock_limit。
+# ⚠️ 设 0 时，下面「/compact 类内置 slash 全程豁免 idle 判定」那条路径就彻底没有
+# 兜底了（真卡死只能靠 /stop 手动收）；其余路径仍有 IDLE/STUCK_CHILD/watchdog 兜。
+WALL_CLOCK_LIMIT = CLAUDE_WALL_CLOCK_LIMIT_DEFAULT  # 兼容旧引用；实际取值按 env 动态解析
 # 第一条 user/assistant 行都没落进 JSONL 就 spawn 后这么久 → 多半是输入被
 # 拒了（slash 等）。这是 idle-since-last-event 维度，meta 事件会 reset。
 # 历史调整：
@@ -1005,6 +1016,7 @@ async def run_claude(
 
             loop = asyncio.get_event_loop()
             start_time = loop.time()
+            wall_clock_limit = resolve_claude_wall_clock_limit(extra_env)
 
             # PTY drain 后台任务：**马上**挂，全程跑，避免空窗让 PTY 缓冲撑爆。
             # ready_event 在第一个字节到达时由 drain 内部 set——取代之前的两段式
@@ -1113,10 +1125,10 @@ async def run_claude(
 
                 while True:
                     now = loop.time()
-                    if now - start_time >= WALL_CLOCK_LIMIT:
+                    if wall_clock_limit > 0 and now - start_time >= wall_clock_limit:
                         raise RuntimeError(
                             f"Claude 单轮执行超过 wall-clock 最终上限"
-                            f"（{WALL_CLOCK_LIMIT}秒），已终止进程。"
+                            f"（{int(wall_clock_limit)}秒），已终止进程。"
                         )
 
                     if (
@@ -1223,10 +1235,16 @@ async def run_claude(
                                     exc = RuntimeError(
                                         f"Claude API 错误（{api_err}, HTTP {status_code}）：{detail}"
                                     )
-                                # 非 rate_limit 的 API 错误（server_error / overloaded /
-                                # "Response stalled mid-stream" 等）是服务端瞬时抖动，崩溃前
-                                # 的 session 干净可 --resume——标记出来让 dispatcher 自动续跑。
-                                exc.cc_retryable_resume = str(api_err) != "rate_limit"
+                                # 非 fatal 的 API 错误（server_error / overloaded /
+                                # "Response stalled mid-stream" / "Connection closed
+                                # mid-response" 等）是服务端瞬时抖动，崩溃前的 session
+                                # 干净可 --resume——标记出来让 dispatcher 自动续跑。
+                                # 判定与 print 后端共用同一张 fatal 黑名单（用量墙 /
+                                # 认证 / 4xx 才不续跑），避免两个后端行为分叉。
+                                from claude_runner import is_fatal_error_text
+                                exc.cc_retryable_resume = not is_fatal_error_text(
+                                    f"{api_err}\n{err_text}", status_code
+                                )
                                 # 崩在配额墙 / API 错误上的 session JSONL 是完整、干净、
                                 # 可 --resume 的（不像 watchdog hung 那样服务端 conversation
                                 # state 已脏）。把崩溃前已知的 session id 挂在异常上带出去，

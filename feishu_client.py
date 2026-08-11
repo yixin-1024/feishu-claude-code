@@ -48,6 +48,16 @@ class FeishuApiError(RuntimeError):
         super().__init__(f"{action}: {code} {msg}")
 
 
+def _err_desc(e: BaseException) -> str:
+    """异常的可读描述。
+
+    httpx 的超时/连接类异常（ReadTimeout / ConnectTimeout / ConnectError …）str() 是空串，
+    只打 {e} 会得到 "重试: " 这种看不出所以然的日志，必须带上类名。
+    """
+    text = str(e)
+    return f"{type(e).__name__}: {text}" if text else type(e).__name__
+
+
 def _load_non_retryable_codes() -> frozenset:
     """不可重试的错误码集合。
 
@@ -404,6 +414,7 @@ class FeishuClient:
         """
         delay = initial_delay
         last_error = None
+        op = getattr(coro_func, "__name__", "?").strip("_") or "?"
 
         for attempt in range(max_retries + 1):
             try:
@@ -416,11 +427,11 @@ class FeishuClient:
                     print(f"[retry] 错误码 {code} 不可重试（如额度耗尽），立即放弃: {e}", flush=True)
                     raise
                 if attempt < max_retries:
-                    print(f"[retry] 第 {attempt + 1} 次失败，{delay:.1f}s 后重试: {e}", flush=True)
+                    print(f"[retry] {op} 第 {attempt + 1} 次失败，{delay:.1f}s 后重试: {_err_desc(e)}", flush=True)
                     await asyncio.sleep(delay)
                     delay *= 2  # 指数退避
                 else:
-                    print(f"[retry] 已达最大重试次数 {max_retries + 1}，放弃", flush=True)
+                    print(f"[retry] {op} 已达最大重试次数 {max_retries + 1}，放弃: {_err_desc(e)}", flush=True)
 
         raise last_error
 
@@ -1066,7 +1077,7 @@ class FeishuClient:
             try:
                 await self._retry_with_backoff(_update, max_retries=1)
             except Exception as e:
-                print(f"[card] 按钮卡收尾确认写失败（忽略）: {e}", flush=True)
+                print(f"[card] 按钮卡收尾确认写失败（忽略）: {_err_desc(e)}", flush=True)
 
     async def update_card_elements(self, message_id: str, elements: list[dict]):
         """用自定义 elements 列表更新卡片（支持 markdown + button 混排）"""

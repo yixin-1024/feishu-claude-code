@@ -25,7 +25,13 @@ import subprocess as sp
 import sys
 from typing import Callable, Optional
 
-from bot_config import CLAUDE_CLI, CLAUDE_EFFORT_LEVELS, PERMISSION_MODE
+from bot_config import (
+    CLAUDE_CLI,
+    CLAUDE_EFFORT_LEVELS,
+    CLAUDE_WALL_CLOCK_LIMIT_DEFAULT,
+    PERMISSION_MODE,
+    resolve_claude_wall_clock_limit,
+)
 
 # ── 后端选择 ──────────────────────────────────────────────────
 # 默认走 PTY 后端；线上要回退到 -p 时设置 CLAUDE_RUNNER=print
@@ -38,7 +44,9 @@ _CHECK_INTERVAL = 30  # 静默时每 30 秒检查一次子进程
 # 留得比 IDLE_TIMEOUT 宽，避免误杀正常长编译/长安装。
 STUCK_CHILD_TIMEOUT = 900  # 15 分钟
 # 单轮 wall-clock 最终保险：无论是否还在产出，都会强杀，防 runaway loop。
-WALL_CLOCK_LIMIT = 3600  # 60 分钟
+# 默认 60 分钟，可用 CLAUDE_WALL_CLOCK_LIMIT_SEC（或 <PROFILE>_ 前缀）改；设 0 = 永不。
+# 具体解析见 bot_config.resolve_claude_wall_clock_limit。
+WALL_CLOCK_LIMIT = CLAUDE_WALL_CLOCK_LIMIT_DEFAULT  # 兼容旧引用；实际取值按 env 动态解析
 
 
 def _has_children(pid: int) -> bool:
@@ -63,17 +71,59 @@ def _extract_text_content(value) -> str:
     return ""
 
 
-# 上游流中断 / 服务端 5xx / overloaded 这类瞬时错误：崩溃前的 session JSONL 干净、
-# 可 --resume，自动续跑基本能恢复。rate_limit / 用量墙不算（重试无益，得等配额恢复）。
-_TRANSIENT_ERR_PATTERNS = (
-    "stalled mid-stream",
-    "overloaded",
-    "server_error",
-    "internal server error",
-    "service unavailable",
-    "bad gateway",
-    "gateway timeout",
+# 用量墙 / 限流：重试无益，得等配额恢复。
+_RATE_LIMIT_PATTERNS = (
+    "rate_limit",
+    "rate limit",
+    "usage limit",
+    "session limit",
+    "quota exceeded",
 )
+
+# 模型侧 safeguards 拦截（"Fable 5's safeguards flagged this message ...
+# change your model"）：同一模型重试 / 续跑必然再被拦，不属于瞬时抖动。
+# dispatcher 对它有专项处理：不重试，自动降级模型后 resume 续跑。
+_SAFEGUARDS_ERR_PATTERNS = (
+    "safeguards flagged",
+)
+
+
+def is_safeguards_error_text(blob: str) -> bool:
+    """错误文本是否为模型 safeguards 拦截（换模型才有救，重试无益）。"""
+    low = (blob or "").lower()
+    return any(p in low for p in _SAFEGUARDS_ERR_PATTERNS)
+
+
+# 重试无益的错误：认证 / 余额 / 请求本身不合法 / CLI 参数错。命中这些才不自动续跑；
+# 其余一律按「上游瞬时抖动」处理（流中断、5xx、overloaded、连接被掐、CLI 自己炸…），
+# 因为崩溃前的 session JSONL 是干净可 --resume 的，续跑基本能恢复。
+# ⚠️ 这里是「黑名单」而不是「白名单」：上游错误文案变来变去（"Response stalled
+# mid-stream" / "Connection closed mid-response" / …），白名单漏一个就等于中断不续跑。
+_FATAL_ERR_PATTERNS = _RATE_LIMIT_PATTERNS + _SAFEGUARDS_ERR_PATTERNS + (
+    "invalid api key",
+    "invalid_api_key",
+    "authentication_error",
+    "authentication failed",
+    "permission_error",
+    "credit balance",
+    "prompt is too long",
+    "context_length",
+    "invalid_request_error",
+    "unknown option",
+    "unknown argument",
+)
+
+
+def is_fatal_error_text(blob: str, status=None) -> bool:
+    """错误文本 / HTTP 状态码是否属于「重试无益」（不该自动续跑）。
+
+    4xx（除 408/409/425/429 这类可重试的）视为请求侧问题；429 与文案里的用量墙
+    信号同样算 fatal。其余（5xx、无状态码的流中断、连接错误）都算瞬时抖动。
+    """
+    low = (blob or "").lower()
+    if isinstance(status, int) and 400 <= status < 500 and status not in (408, 409, 425):
+        return True
+    return any(p in low for p in _FATAL_ERR_PATTERNS)
 
 
 def _classify_result_error(data: dict, text: str):
@@ -82,7 +132,8 @@ def _classify_result_error(data: dict, text: str):
     返回 (人类可读错误消息, 是否瞬时可 resume 恢复)；正常结果返回 None。
     字段以实测 CLI 2.1.201 为准：subtype='success'/'error_during_execution'…、
     is_error=bool、api_error_status=int|None、result=错误文本（流中断时是
-    "API Error: Response stalled mid-stream. ..."）。
+    "API Error: Response stalled mid-stream. ..." 或 "API Error: Connection closed
+    mid-response. ..."，此时 subtype 可能仍是 'success' 只有 is_error=true）。
     """
     subtype = str(data.get("subtype") or "")
     is_error = data.get("is_error") is True
@@ -90,16 +141,14 @@ def _classify_result_error(data: dict, text: str):
         return None
     status = data.get("api_error_status")
     detail = (text or "").strip() or subtype or "unknown error"
-    blob = f"{text}\n{subtype}".lower()
-    # 用量墙 / 限流：重试无益，标记为不可瞬时恢复
-    if status == 429 or "rate_limit" in blob or "usage limit" in blob or "session limit" in blob:
+    blob = f"{text}\n{subtype}"
+    if status == 429 or any(p in blob.lower() for p in _RATE_LIMIT_PATTERNS):
         return (f"Claude Max 用量已达上限：{detail}", False)
-    transient = (
-        subtype == "error_during_execution"
-        or (isinstance(status, int) and 500 <= status <= 599)
-        or any(p in blob for p in _TRANSIENT_ERR_PATTERNS)
-    )
-    return (f"Claude API 错误（{subtype or 'error'}, HTTP {status}）：{detail}", transient)
+    transient = not is_fatal_error_text(blob, status)
+    # 流被掐断时 subtype 仍可能是 'success'——别把这个词打到错误卡上误导用户
+    label = subtype if subtype and subtype != "success" else "stream_error"
+    http_part = f", HTTP {status}" if isinstance(status, int) else ""
+    return (f"Claude API 错误（{label}{http_part}）：{detail}", transient)
 
 
 def _runner_backend_from_env(extra_env: Optional[dict]) -> str:
@@ -343,15 +392,16 @@ async def _run_claude_print(
         idle_seconds = 0
         loop = asyncio.get_event_loop()
         start_time = loop.time()
+        wall_clock_limit = resolve_claude_wall_clock_limit(extra_env)
 
         try:
             while True:
-                # 60 分钟 wall-clock 最终保险，防 runaway loop
-                if loop.time() - start_time >= WALL_CLOCK_LIMIT:
+                # wall-clock 最终保险，防 runaway loop（默认 60 分钟；limit<=0 = 关掉）
+                if wall_clock_limit > 0 and loop.time() - start_time >= wall_clock_limit:
                     proc.kill()
                     await proc.wait()
                     raise RuntimeError(
-                        f"Claude 单轮执行超过 wall-clock 最终上限（{WALL_CLOCK_LIMIT}秒），已终止进程。"
+                        f"Claude 单轮执行超过 wall-clock 最终上限（{int(wall_clock_limit)}秒），已终止进程。"
                     )
 
                 try:
@@ -503,6 +553,13 @@ async def _run_claude_print(
         # 如果有部分输出，返回给用户看而不是抛异常
         if final_text:
             return final_text, new_session_id, used_fresh_session_fallback
-        raise RuntimeError(f"claude exited with code {returncode}: {detail}")
+        exc = RuntimeError(f"claude exited with code {returncode}: {detail}")
+        # 进程级崩溃（网络抖断、CLI 自己炸）同样让 dispatcher 能 resume 续跑：
+        # returncode < 0 = 被信号杀（/stop、restart），那是人为中断，不标可续跑；
+        # stderr 命中 fatal 模式（用量墙 / 认证 / 参数错）也不续跑。
+        if returncode > 0 and new_session_id and not is_fatal_error_text(stderr_text):
+            exc.cc_session_id = new_session_id
+            exc.cc_retryable_resume = True
+        raise exc
 
     return final_text, new_session_id, used_fresh_session_fallback

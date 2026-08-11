@@ -24,7 +24,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger, P2CardActionTriggerResponse, CallBackToast,
 )
 
-from bot_config import Profile
+from bot_config import Profile, normalize_effort, normalize_model
 from bot_instance import BotInstance
 from card_security import (
     card_action_allowed,
@@ -33,6 +33,7 @@ from card_security import (
     verify_action_value,
 )
 from agent_runner import run_agent
+from claude_runner import is_safeguards_error_text
 from commands import parse_command, handle_command
 from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
 from lark_prompts import render_lark_prompt
@@ -540,6 +541,65 @@ def _is_write_op_context(user_text: str, tool_history: list[str]) -> bool:
     return any(m in blob for m in _write_op_markers())
 
 
+def _env_int(name: str, default: int) -> int:
+    """读 env 里的非负整数，脏值 / 空值一律回落 default（别让配置笔误炸掉一轮对话）。"""
+    try:
+        return max(0, int(str(os.environ.get(name, "")).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+# ── 上游中断自动续跑预算 ───────────────────────────────────
+# 上游中断（流被掐断 / 5xx / 连接关闭 / CLI 进程炸）比 hung 安全得多——崩溃前的
+# session 干净，resume 同一会话就能接着跑，所以给独立且更宽的预算，冷却递增避免
+# 上游正在抖动时连撞。次数可用 CC_LARK_STALL_RETRY_MAX 调（0 = 关掉自动续跑）。
+_STALL_RETRY_MAX_DEFAULT = 3
+_STALL_COOLDOWNS = (10, 30, 60)
+
+# 上游中断后 resume 续跑用的提示：既补全被截断的回复，又明令别重复已做的副作用。
+_STALL_RESUME_NUDGE = (
+    "继续。上一轮回复在流式返回时被上游中断（API Error：连接中断 / 响应截断），"
+    "请基于已经完成的工作补全最终回复；"
+    "不要重复执行上一轮已经做过的写操作 / 命令 / 文件改动。"
+)
+# 写操作场景（开户 / 发卡 / 部署这类有外部副作用的）不能盲目续跑，但也不该直接
+# 断在半路——改成「先核实再继续」，把幂等判断交给带完整上下文的同一个会话。
+_STALL_RESUME_NUDGE_WRITE = (
+    "继续。上一轮回复在流式返回时被上游中断（API Error：连接中断 / 响应截断）。"
+    "本轮涉及写操作 / 外部接口调用：请先核实上一轮最后一步是否已经生效"
+    "（查库 / 查接口返回 / 看已有记录），已经生效的绝对不要重复执行，"
+    "只补做剩下的步骤，然后给出最终回复。"
+)
+
+
+# ── 模型 safeguards 拦截自动降级 ──────────────────────────────
+# Fable 5 的 safeguards 拦截（"...safeguards flagged this message... Try
+# rephrasing the request in a new session or change your model."）对同一模型
+# 重试 / 续跑必然复现，重试无益。命中时不走 stall 重试，直接把本对话模型切到
+# 降级模型（默认 opus[1m]，env CC_LARK_SAFEGUARDS_FALLBACK_MODEL 可改），
+# resume 同一 session 接着跑，并显式通知用户「因为这个错误已切换模型」。
+_SAFEGUARDS_FALLBACK_MODEL_DEFAULT = "opus[1m]"
+
+
+def _safeguards_fallback_model() -> str:
+    raw = os.environ.get("CC_LARK_SAFEGUARDS_FALLBACK_MODEL", "").strip()
+    # 支持 /model 同款别名（opus / sonnet / …）
+    return normalize_model(raw) or _SAFEGUARDS_FALLBACK_MODEL_DEFAULT
+
+
+_SAFEGUARDS_RESUME_NUDGE = (
+    "继续。上一轮消息被模型 safeguards 误拦截，已自动切换模型接管本会话；"
+    "请基于已经完成的工作继续任务并给出最终回复，"
+    "不要重复执行上一轮已经做过的写操作 / 命令 / 文件改动。"
+)
+_SAFEGUARDS_RESUME_NUDGE_WRITE = (
+    "继续。上一轮消息被模型 safeguards 误拦截，已自动切换模型接管本会话。"
+    "本轮涉及写操作 / 外部接口调用：请先核实上一轮最后一步是否已经生效"
+    "（查库 / 查接口返回 / 看已有记录），已经生效的绝对不要重复执行，"
+    "只补做剩下的步骤，然后给出最终回复。"
+)
+
+
 # ── 命令菜单（锁外即时响应）──────────────────────────────────
 
 _COMMAND_MENU_GROUPS = [
@@ -976,14 +1036,11 @@ async def _run_and_display(
         _AUTO_RETRY_MAX = 1
         _HUNG_MARKER = "客户端疑似 hung"
         _COOLDOWN_SECONDS = 10
-        # 上游流中断后 resume 续跑用的提示：既补全被截断的回复，又明令别重复已做的副作用。
-        _STALL_RESUME_NUDGE = (
-            "继续。上一轮回复在流式返回时被上游中断"
-            "（API Error: Response stalled mid-stream），"
-            "请基于已经完成的工作补全最终回复；"
-            "不要重复执行上一轮已经做过的写操作 / 命令 / 文件改动。"
-        )
+        # 上游中断续跑预算（次数 env 可调，冷却见模块常量 _STALL_COOLDOWNS）
+        _stall_max = _env_int("CC_LARK_STALL_RETRY_MAX", _STALL_RETRY_MAX_DEFAULT)
         retry_count = 0
+        stall_count = 0
+        safeguards_switched = False
         last_exc: Optional[Exception] = None
         success = False
         full_text = ""
@@ -1043,29 +1100,109 @@ async def _run_and_display(
                         isinstance(e, RuntimeError)
                         and getattr(e, "cc_retryable_resume", False) is True
                     )
-                    blacklisted = _is_write_op_context(claude_msg, tool_history)
+                    # 用原始用户诉求判定（claude_msg 在续跑后已被换成「继续」提示，
+                    # 拿它判会让第二次续跑误判成非写操作场景）
+                    blacklisted = _is_write_op_context(text, tool_history)
 
-                    # 上游流中断 / 服务端瞬时错误：崩溃前的 session 干净可 --resume，
+                    # 上游中断 / 服务端瞬时错误：崩溃前的 session 干净可 --resume，
                     # 直接 resume 同一会话、用「继续」提示补全被截断的最终回复即可恢复
                     # （不像 hung 那样服务端 state 已脏、必须清 session 走 fresh）。
-                    # 写操作场景仍跳过，避免续跑重复 commit（black list 兜底）。
-                    if is_stall and retry_count < _AUTO_RETRY_MAX and not blacklisted:
-                        retry_count += 1
-                        resumable = getattr(e, "cc_session_id", None) or session.session_id
+                    # 写操作场景不再直接放弃——有 session 可 resume 时用「先核实再继续」
+                    # 的提示续跑（同一会话看得到自己已做过什么，比停在半路更可控）；
+                    # 只有连 session 都没有、只能原样重发时才跳过，避免 double-write。
+                    resumable = getattr(e, "cc_session_id", None) or session.session_id
+
+                    # ── safeguards 拦截 → 不重试，自动降级模型续跑 ──
+                    # 同一模型重发必然再被拦（is_fatal_error_text 已把它挡在 stall
+                    # 重试外）。切到降级模型 resume 同一 session 接着跑；override 落
+                    # 盘（不动 session），本对话后续轮次也用降级模型，避免复撞。
+                    # 一轮只切一次：切完仍被拦（降级模型也拦）就交回用户。
+                    is_safeguards = is_safeguards_error_text(str(e))
+                    fallback_model = _safeguards_fallback_model()
+                    if (
+                        is_safeguards
+                        and not safeguards_switched
+                        and (session.model or "") != fallback_model
+                        and (resumable or not blacklisted)
+                    ):
+                        safeguards_switched = True
+                        old_model = session.model
+                        session.model = fallback_model
                         if resumable:
                             session.session_id = resumable
-                        claude_msg = _STALL_RESUME_NUDGE
+                            claude_msg = (
+                                _SAFEGUARDS_RESUME_NUDGE_WRITE if blacklisted
+                                else _SAFEGUARDS_RESUME_NUDGE
+                            )
+                        else:
+                            # 首轮就被拦、连 session 都没有：原样重发用户诉求
+                            claude_msg = text
+                        try:
+                            await bot.store.set_model_override(
+                                user_id, chat_id, fallback_model,
+                            )
+                        except Exception:
+                            pass
                         log(bot.profile.name, "claude", "warn",
-                            f"上游流中断，resume 自动续跑 "
-                            f"({retry_count}/{_AUTO_RETRY_MAX}) session={(resumable or '')[:8]}")
+                            f"safeguards 拦截，不重试，模型 {old_model} → "
+                            f"{fallback_model} 续跑 "
+                            f"session={(resumable or 'fresh')[:8]} "
+                            f"write_op={blacklisted}")
+                        notice = (
+                            f"⚠️ 本条消息被 `{old_model}` 的 safeguards 拦截"
+                            f"（重试无益），已自动切换模型为 `{fallback_model}` "
+                            f"继续本任务（本对话后续也用它，/model default 可恢复）。"
+                        )
+                        # 清掉被拦那轮流式出来的残片（可能含 CLI 的 "API Error…"
+                        # 文本），让降级续跑后的卡片只显示恢复出来的完整回复。
+                        accumulated = ""
+                        await push(f"🔄 {notice}")
+                        # 卡片会被后续流式内容覆盖，额外发一条独立消息显式告知
+                        try:
+                            if is_group and notify_msg_id:
+                                await bot.feishu.reply_text(notify_msg_id, notice)
+                            else:
+                                await bot.feishu.send_text_to_user(user_id, notice)
+                        except Exception:
+                            pass
+                        if active_run.stop_requested:
+                            return
+                        last_output_ts = time.time()
+                        last_push_time = 0.0
+                        start_ts = time.time()
+                        current_tool = None
+                        pty_warning = None
+                        heartbeat_task = asyncio.create_task(_heartbeat())
+                        continue
+
+                    if is_stall and stall_count < _stall_max and (
+                        resumable or not blacklisted
+                    ):
+                        stall_count += 1
+                        if resumable:
+                            session.session_id = resumable
+                            claude_msg = (
+                                _STALL_RESUME_NUDGE_WRITE if blacklisted
+                                else _STALL_RESUME_NUDGE
+                            )
+                        else:
+                            # 无 session 可 resume（首轮就断在建会话前）：原样重发用户诉求
+                            claude_msg = text
+                        _cds = _STALL_COOLDOWNS or (_COOLDOWN_SECONDS,)
+                        cooldown = _cds[min(stall_count - 1, len(_cds) - 1)]
+                        log(bot.profile.name, "claude", "warn",
+                            f"上游中断，{cooldown}s 后自动续跑 "
+                            f"({stall_count}/{_stall_max}) "
+                            f"session={(resumable or 'fresh')[:8]} "
+                            f"write_op={blacklisted}")
                         # 清掉被中断那轮流式出来的残片（可能含半截回答或 CLI 的
                         # "API Error…" 文本），让续跑后的卡片只显示恢复出来的完整回复。
                         accumulated = ""
                         await push(
-                            f"🔄 上游响应中断，正在自动续跑 "
-                            f"({retry_count}/{_AUTO_RETRY_MAX})..."
+                            f"🔄 上游响应中断，{cooldown}s 后自动续跑 "
+                            f"({stall_count}/{_stall_max})..."
                         )
-                        await asyncio.sleep(_COOLDOWN_SECONDS)
+                        await asyncio.sleep(cooldown)
                         if active_run.stop_requested:
                             return
                         last_output_ts = time.time()
@@ -1114,6 +1251,12 @@ async def _run_and_display(
                     if is_hung and blacklisted and retry_count == 0:
                         log(bot.profile.name, "claude", "warn",
                             "hung 但本轮涉及写操作 skill，跳过 auto-retry")
+                    if is_stall and stall_count >= _stall_max:
+                        log(bot.profile.name, "claude", "warn",
+                            f"上游中断已自动续跑 {stall_count} 次仍失败，交回用户")
+                    elif is_stall and blacklisted and not resumable:
+                        log(bot.profile.name, "claude", "warn",
+                            "上游中断但无可 resume 的 session 且涉及写操作，跳过自动续跑")
                     log(bot.profile.name, "claude", "error",
                         f"运行失败: {type(e).__name__}: {e}")
                     traceback.print_exc()
@@ -1147,9 +1290,10 @@ async def _run_and_display(
                 except Exception:
                     pass
             clean = _format_run_error(last_exc)
+            attempts = retry_count + stall_count
             err_brief = (
-                f"❌ 自动重试 {retry_count} 次后仍失败：{clean}"
-                if retry_count > 0
+                f"❌ 自动重试 {attempts} 次后仍失败：{clean}"
+                if attempts > 0
                 else f"❌ Agent 执行出错：{clean}"
             )
             if resumable_sid:
@@ -2130,6 +2274,7 @@ async def handle_spawn(
     anchor_message_id: str,
     prompt: str,
     model: str = "",
+    effort: str = "",
 ) -> tuple[bool, str]:
     """在 (user, chat_id_raw:thread_id) 这一格强制开新 session 跑 prompt。
 
@@ -2200,6 +2345,9 @@ async def handle_spawn(
             await bot.store.new_session(user_id, chat_id)
             if model:
                 await bot.store.set_model(user_id, chat_id, model)
+            # 新话题的 effort_override 一律是 None，定时任务/派单要指定强度只能在这里落
+            if effort:
+                await bot.store.set_effort(user_id, chat_id, effort)
             session = await bot.store.get_current(user_id, chat_id)
 
             try:
@@ -2410,6 +2558,7 @@ async def dispatch_task(
     title: str, prompt: str, cap: int = DISPATCH_CONCURRENCY_CAP,
     parent_thread: str = "", parent_anchor: str = "",
     target_bot: "BotInstance | None" = None,
+    model: str = "", effort: str = "",
 ) -> dict:
     """在 group_chat_id 新开一条 thread 派一个独立 cc-lark 子会话跑 prompt。
 
@@ -2424,6 +2573,12 @@ async def dispatch_task(
     缺省 = bot（同 agent 派发，原行为）。target_bot 必须是同进程已加载、且是本群成员的
     bot；建话题 + 跑子会话都用 target_bot，而回报父 thread + 唤醒父 agent 仍用 bot
     （派发方自己）——因为唤醒父 = resume 父自己的 session，必须父 bot @ 父自己。
+
+    model/effort：**指定子会话的模型 / 推理强度**（支持 /model 的别名：fable / opus /
+    sonnet / haiku / codex ...）。子会话是全新 thread + 全新 session，不继承派发方
+    thread 里的 /model /effort，缺省就是目标 bot 的 profile 默认；要让一路跑 Opus、
+    另一路跑 Fable 交叉验证，只能在这里显式指定。跨 agent 时 model 是给 **target_bot 的
+    runner** 用的（别给 codex 传 fable），这里不按 runner 校验，错配由 runner 自己报错。
     """
     if not group_chat_id:
         log(bot.profile.name, "dispatch", "warn", "派发被拒：缺少 group_chat_id")
@@ -2432,6 +2587,13 @@ async def dispatch_task(
         log(bot.profile.name, "dispatch", "warn",
             f"派发被拒：prompt 为空 chat={group_chat_id[:12]}...")
         return {"ok": False, "error": "prompt 不能为空"}
+    # 先归一 model/effort 再建话题：非法值不该留下一条空话题在群里。
+    try:
+        model = normalize_model(model)
+        effort = normalize_effort(effort, "dispatch_task")
+    except ValueError as e:
+        log(bot.profile.name, "dispatch", "warn", f"派发被拒：{e}")
+        return {"ok": False, "error": str(e)}
     active = _dispatch_active(group_chat_id)
     if active >= cap:
         log(bot.profile.name, "dispatch", "warn",
@@ -2448,6 +2610,11 @@ async def dispatch_task(
     # open_id 是按 app 维度的——父的 open_id 在异 app 子 bot 里无效。跨 agent 时
     # 用子 bot 自己的 primary user 作 @/session 归属；拿不到就不 @（post 仍可发）。
     child_user = user if not cross else (child_bot.store.find_primary_user() or "")
+    # 没显式指定就用**子 bot** profile 的 dispatch 默认模型（DISPATCH_MODEL）——
+    # 让"主对话用便宜模型聊天、派出去的活用最强模型"成为配置保证，而不是靠派发方
+    # 每次记得传 model。取 child_bot 的：model 属于跑它的那个后端。
+    if not model:
+        model = normalize_model(child_bot.profile.dispatch_model)
 
     topic_title = (title.strip() if (title and title.strip())
                    else prompt.strip().splitlines()[0])[:60]
@@ -2493,6 +2660,7 @@ async def dispatch_task(
     t = asyncio.create_task(handle_spawn(
         child_bot, user_id=(child_user or user), chat_id_raw=group_chat_id,
         thread_id=thread_id, anchor_message_id=anchor, prompt=prompt,
+        model=model, effort=effort,
     ))
     _DISPATCH_CHILDREN.setdefault(group_chat_id, set()).add(t)
 
@@ -2561,14 +2729,16 @@ async def dispatch_task(
 
     t.add_done_callback(_on_child_done)
 
+    over = "".join(f" {k}={v}" for k, v in (("model", model), ("effort", effort)) if v)
     log(bot.profile.name, "dispatch", "info",
         f"派子会话 chat={group_chat_id[:12]}... thread={thread_id[:14]}... "
         f"agent={child_bot.profile.name}[{child_bot.profile.runner}]"
-        f"{'(cross)' if cross else ''} "
+        f"{'(cross)' if cross else ''}{over} "
         f"active={active + 1} parent={parent_thread[:12] + '...' if parent_thread else '-'}")
     return {"ok": True, "thread_id": thread_id, "anchor_message_id": anchor,
             "active_after": active + 1, "cap": cap,
-            "agent": child_bot.profile.name, "agent_runner": child_bot.profile.runner}
+            "agent": child_bot.profile.name, "agent_runner": child_bot.profile.runner,
+            "model": model, "effort": effort}
 
 
 async def read_thread(bot: BotInstance, *, thread_id: str, limit: int = 50) -> dict:

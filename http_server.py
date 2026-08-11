@@ -220,6 +220,7 @@ def _resolve_spawn_request(
     profile_name = (params.get("profile") or "").strip()
     user_id_in = (params.get("user_id") or "").strip()
     model = (params.get("model") or "").strip()
+    effort = (params.get("effort") or "").strip().lower()
 
     missing = [
         n for n, v in (
@@ -265,6 +266,7 @@ def _resolve_spawn_request(
         "anchor_message_id": anchor_message_id,
         "prompt": prompt,
         "model": model,
+        "effort": effort,
     }, None
 
 
@@ -592,6 +594,10 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                     parent_thread=(p.get("parent_thread") or "").strip(),
                     parent_anchor=(p.get("parent_anchor") or "").strip(),
                     target_bot=target_bot,
+                    # 子会话是全新 session，不继承派发方的 /model /effort —— 要指定
+                    # 只能显式带上（别名解析 + 校验在 dispatcher 侧统一做）。
+                    model=(p.get("model") or "").strip(),
+                    effort=(p.get("effort") or "").strip(),
                 ),
                 timeout=30,
             )
@@ -691,6 +697,8 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                 cron=(p.get("cron") or "").strip(),
                 prompt=p.get("prompt") or "",
                 title=(p.get("title") or "").strip(),
+                model=(p.get("model") or "").strip(),
+                effort=(p.get("effort") or "").strip(),
             )
         except Exception as e:
             self._mcp_error("schedule_cron", _prof, e)

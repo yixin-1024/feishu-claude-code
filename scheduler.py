@@ -45,6 +45,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
+# model / effort 的别名解析 + 校验挪去了 bot_config（dispatch_task 也要用同一套口径）。
+# 这里保留私有别名，调用点不变。
+from bot_config import _EFFORT_LEVELS  # noqa: F401  （沿用旧名，测试/调试可见）
+from bot_config import normalize_effort as _normalize_effort
+from bot_config import normalize_model as _normalize_model
+
 # ── 后台 lock reaper：兜底清 stale lock，让链能自愈 ───────────
 # 背景：每个定时 task prompt STEP 0 里都有 `mkdir $LOCK` 的并发互斥。正常路径下
 # session 跑完会 rmdir，链就续上下一轮；但 PTY runner 早退 / Claude CLI 启动卡死 /
@@ -118,6 +124,27 @@ class ScheduledTask:
     topic_title: str
     topic_body: str
     prompt: str
+    # 每轮 fire 起的是全新 session（新话题），拿不到任何 /model /effort 历史设置，
+    # 所以模型和推理强度只能在任务里声明。空 = 跟随 profile / CLI 默认。
+    model: str = ""
+    effort: str = ""
+
+    @staticmethod
+    def _primary_user(raw_user_id: str, name: str) -> str:
+        """user_id 归一成单个 open_id。
+
+        yaml 里常直接引 ${SPX_ALLOWED_OPEN_IDS} 这类 env，而它是逗号分隔的白名单串。
+        顶楼 post 的 at tag 只认单个 open_id：塞逗号串进去 Lark 不报错，但解析不出
+        mention，渲染成一个光秃秃的「@」，归属人收不到任何通知（实测 message.mentions 为空）。
+        取第一个 id 当归属人。"""
+        parts = [p.strip() for p in str(raw_user_id).split(",") if p.strip()]
+        if len(parts) > 1:
+            print(
+                f"[scheduler] task {name!r}: user_id 给了 {len(parts)} 个 open_id，"
+                f"取第一个 {parts[0]} 作归属人（@ 只能 at 单人）",
+                flush=True,
+            )
+        return parts[0] if parts else ""
 
     @classmethod
     def from_dict(cls, raw: dict, base_dir: str) -> "ScheduledTask":
@@ -151,10 +178,12 @@ class ScheduledTask:
             cron=str(raw["cron"]),
             timezone=str(raw.get("timezone") or "Asia/Shanghai"),
             chat_id=str(raw["chat_id"]),
-            user_id=str(raw["user_id"]),
+            user_id=cls._primary_user(raw["user_id"], str(raw["name"])),
             topic_title=str(raw.get("topic_title") or raw["name"]),
             topic_body=str(raw.get("topic_body") or "🧵 定时任务"),
             prompt=prompt_text,
+            model=_normalize_model(str(raw.get("model") or "")),
+            effort=_normalize_effort(str(raw.get("effort") or ""), f"task {raw.get('name')!r}"),
         )
 
 
@@ -344,6 +373,8 @@ def schedule_cron(
     prompt: str,
     title: str = "",
     timezone: str = "Asia/Shanghai",
+    model: str = "",
+    effort: str = "",
 ) -> dict:
     """新增一条**重复**定时任务（真·"每天几点干个啥"）—— cc_mcp_server 的 schedule_cron 后端。
 
@@ -384,6 +415,13 @@ def schedule_cron(
     except Exception as e:
         return {"ok": False, "error": f"cron 非法: {e}"}
 
+    # model / effort 同样先校验再落盘，否则一条写坏的 entry 会让整个 yaml 加载不了
+    try:
+        model = _normalize_model(model)
+        effort = _normalize_effort(effort, "schedule_cron")
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
     # uuid 后缀：同一秒批量创建两条也不会撞 job id
     name = f"agent_cron_{int(time.time())}_{uuid.uuid4().hex[:4]}"
     base_dir = os.path.dirname(os.path.abspath(config_path))
@@ -407,6 +445,11 @@ def schedule_cron(
         "topic_body": "🧵 定时任务（agent 创建）",
         "prompt_file": rel_prompt,
     }
+    # 只在显式指定时落字段，保持 yaml 干净（缺省 = 跟随 profile / CLI 默认）
+    if model:
+        entry["model"] = model
+    if effort:
+        entry["effort"] = effort
     # yaml.safe_dump 负责所有转义/引号；append-only 保留既有内容与注释。
     chunk = yaml.safe_dump([entry], allow_unicode=True, sort_keys=False, default_flow_style=False)
     try:
@@ -431,8 +474,12 @@ def schedule_cron(
 
     job = sched.get_job(name)
     nxt = str(job.next_run_time) if (job and job.next_run_time) else "?"
-    print(f"[scheduler/cron] ✅ 新增 {name} profile={prof} cron='{cron}' → next {nxt}", flush=True)
-    return {"ok": True, "name": name, "cron": cron, "next_run": nxt, "prompt_file": rel_prompt}
+    over = "".join(f" {k}={v}" for k, v in (("model", model), ("effort", effort)) if v)
+    print(f"[scheduler/cron] ✅ 新增 {name} profile={prof} cron='{cron}'{over} → next {nxt}", flush=True)
+    return {
+        "ok": True, "name": name, "cron": cron, "next_run": nxt,
+        "prompt_file": rel_prompt, "model": model, "effort": effort,
+    }
 
 
 def list_crons(chat_id: str = "") -> dict:
@@ -703,7 +750,10 @@ def _make_async_fire(task: ScheduledTask, bot, spawn_fn: SpawnFn):
                 body_text=task.topic_body,
                 mention_open_id=task.user_id,
             )
-            print(f"{tag} anchor={anchor_msg_id[:14]}... → /spawn", flush=True)
+            over = "".join(
+                f" {k}={v}" for k, v in (("model", task.model), ("effort", task.effort)) if v
+            )
+            print(f"{tag} anchor={anchor_msg_id[:14]}... → /spawn{over}", flush=True)
 
             # /spawn 服务端会把 om_xxx 自动转成 omt_xxx
             await spawn_fn(
@@ -713,6 +763,8 @@ def _make_async_fire(task: ScheduledTask, bot, spawn_fn: SpawnFn):
                 thread_id=anchor_msg_id,
                 anchor_message_id=anchor_msg_id,
                 prompt=task.prompt,
+                model=task.model,
+                effort=task.effort,
             )
             print(f"{tag} done", flush=True)
         except Exception as e:
