@@ -2277,12 +2277,18 @@ async def handle_spawn(
     prompt: str,
     model: str = "",
     effort: str = "",
+    cwd: str = "",
+    workspace: str = "",
 ) -> tuple[bool, str]:
     """在 (user, chat_id_raw:thread_id) 这一格强制开新 session 跑 prompt。
 
     设计场景：大群里的"调度 session"读完上下文后，用 lark-cli 在会话群创建新话题，
     再 curl 这个端点把后续工作派给独立 session。和 WS 路径不冲突——这是绕过 WS 的
     内部触发入口。
+
+    cwd/workspace：**强制这条 session 的工作目录**。新话题的 cwd 默认来自
+    `<PROFILE>_CHAT_CWD_<chat_id>` / DEFAULT_CWD，而外部触发 API 的 route 要求
+    "群 → workspace" 由配置钉死，所以在这里显式落一次，不依赖 env 里那份映射。
 
     返回 (ok, text)：ok=True 时 text 是子会话最终响应文本；ok=False 时 text 是
     失败原因（忙被拒 / 卡片失败 / agent 出错等）。此前所有失败路径都裸 return None，
@@ -2350,6 +2356,8 @@ async def handle_spawn(
             # 新话题的 effort_override 一律是 None，定时任务/派单要指定强度只能在这里落
             if effort:
                 await bot.store.set_effort(user_id, chat_id, effort)
+            if cwd:
+                await bot.store.set_cwd(user_id, chat_id, cwd, workspace or None)
             session = await bot.store.get_current(user_id, chat_id)
 
             try:
@@ -2428,10 +2436,14 @@ _DISPATCH_PARENTS: dict[str, dict] = {}
 _BOT_OPEN_ID_CACHE: dict[str, str] = {}   # app_id -> bot 自身 open_id（@自己触发用）
 
 
-def _format_dispatch_body(prompt: str) -> str:
-    """新建子任务 thread 顶楼展示：状态 + 完整 worker prompt。"""
+def _format_dispatch_body(prompt: str, header: str = "") -> str:
+    """新建子任务 thread 顶楼展示：状态 + 完整 worker prompt。
+
+    header 可换掉默认那行状态说明（外部触发 API 用它标出 route / client / 来源），
+    让群里一眼看出这条话题是谁派的。
+    """
     return (
-        "（cc-lark 子任务已派发，正在独立处理…）\n\n"
+        f"{header.strip() or '（cc-lark 子任务已派发，正在独立处理…）'}\n\n"
         "【完整任务提示词】\n"
         f"{prompt.strip()}"
     )
@@ -2561,6 +2573,7 @@ async def dispatch_task(
     parent_thread: str = "", parent_anchor: str = "",
     target_bot: "BotInstance | None" = None,
     model: str = "", effort: str = "",
+    cwd: str = "", workspace: str = "", body_header: str = "",
 ) -> dict:
     """在 group_chat_id 新开一条 thread 派一个独立 cc-lark 子会话跑 prompt。
 
@@ -2581,6 +2594,9 @@ async def dispatch_task(
     thread 里的 /model /effort，缺省就是目标 bot 的 profile 默认；要让一路跑 Opus、
     另一路跑 Fable 交叉验证，只能在这里显式指定。跨 agent 时 model 是给 **target_bot 的
     runner** 用的（别给 codex 传 fable），这里不按 runner 校验，错配由 runner 自己报错。
+
+    cwd/workspace/body_header：外部事件触发 API（external_api）用——workspace 由
+    route 配置钉死并强制落到子会话，body_header 换掉顶楼那行状态说明以标出触发来源。
     """
     if not group_chat_id:
         log(bot.profile.name, "dispatch", "warn", "派发被拒：缺少 group_chat_id")
@@ -2626,7 +2642,7 @@ async def dispatch_task(
         anchor = await child_bot.feishu.send_post_to_chat(
             chat_id=group_chat_id,
             title=f"🤖 {topic_title}",
-            body_text=_format_dispatch_body(prompt),
+            body_text=_format_dispatch_body(prompt, body_header),
             mention_open_id=child_user,
         )
     except Exception as e:
@@ -2662,7 +2678,7 @@ async def dispatch_task(
     t = asyncio.create_task(handle_spawn(
         child_bot, user_id=(child_user or user), chat_id_raw=group_chat_id,
         thread_id=thread_id, anchor_message_id=anchor, prompt=prompt,
-        model=model, effort=effort,
+        model=model, effort=effort, cwd=cwd, workspace=workspace,
     ))
     _DISPATCH_CHILDREN.setdefault(group_chat_id, set()).add(t)
 

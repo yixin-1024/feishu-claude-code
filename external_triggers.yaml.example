@@ -1,0 +1,89 @@
+# 外部事件触发 API 配置（复制成 external_triggers.yaml 后生效）
+#
+# 作用：让业务后端用一个 HTTP 请求把活派给 cc-lark —— cc-lark 在指定 Lark 群里
+# 新开一条话题、把完整提示词发进去，并起一个独立 Claude 会话执行。执行过程和结果
+# 就留在那条话题里，运维在群里监控（和定时任务观感一致，只是触发方式变成接口）。
+#
+#   POST https://<你的域名>/api/v1/agent-tasks
+#   Authorization: Bearer <client_id>:<secret>
+#   {"route": "doc-extract", "vars": {...}, "prompt": "...", "idempotency_key": "..."}
+#
+# 设计约束（安全边界）：
+#   · 调用方**只能挑一个已配置的 route**，跑在哪个群、哪个 workspace(cwd)、什么模型，
+#     全部由本文件钉死；请求体永远碰不到 cwd / profile / 权限模式。
+#   · **群和 workspace 要成对**：`chat_id` 是每条 route 各自的字段——一个 workspace
+#     （代码目录）对应它自己的群，任务就落到那个群里被监控，不要把不同 workspace 的活
+#     都倒进同一个群。加载 / 热重载时会拿群在 .env 里的 `<PROFILE>_CHAT_CWD_<chat_id>`
+#     交叉核对，对不上就在启动日志和 /reload 响应里 warn（确实想让一个「事件任务监控群」
+#     承载多个 workspace 时，忽略该 warn 即可，不会被拦）。
+#   · 密钥只写 env 名（secret_env），真值放 .env —— 本文件可以进内网 wiki 而不泄密。
+#   · 没有任何可用 client/route 时端点直接 503（fail-closed），不存在"忘了配就裸奔"。
+#   · 改本文件后 `curl -H "Authorization: Bearer $(cat ~/.feishu-claude/control-token)" \
+#     http://127.0.0.1:9982/reload` 即时生效；只有改 .env 里的密钥才需要重启 bot。
+
+# 可信反代 IP：只有请求来自这些 IP 时才认 X-Forwarded-For 的最后一跳（配了
+# client.allow_ips 才有意义）。也可用环境变量 CC_LARK_API_TRUSTED_PROXY_IPS。
+trusted_proxy_ips:
+  - 127.0.0.1
+
+# ── 调用方（每个后端服务一份凭证）──────────────────────────────
+clients:
+  - id: spx-backend
+    # 密钥放 .env：CC_LARK_API_SECRET_SPX_BACKEND=$(openssl rand -hex 32)
+    # 少于 16 字符 / 未设置 → 该 client 不启用（并在日志里 warn）
+    secret_env: CC_LARK_API_SECRET_SPX_BACKEND
+    routes: [doc-extract, ops-alert]     # 想放开全部写 ["*"]
+    rate_limit_per_min: 30
+    # 生产建议开签名：除 Bearer 外还要 X-CC-Lark-Timestamp + X-CC-Lark-Signature
+    #   signature = hex(hmac_sha256(secret, f"{timestamp}.{raw_body}"))
+    # 时间戳偏移 >300s 或签名重复使用一律拒（防重放）
+    require_signature: false
+    # 可选来源 IP 白名单（走反代时必须同时配 trusted_proxy_ips）
+    # allow_ips: [203.0.113.10]
+
+# ── 路由（一个业务事件 = 一个 route）──────────────────────────
+routes:
+  # ── workspace: projects/spx → 群「spx 开发bot」───────────────
+  doc-extract:
+    profile: spx                                    # 用哪个 bot 发消息/跑会话
+    chat_id: oc_xxxxspx                             # 该 workspace 自己的群（也可用 ${ENV}）
+    user_id: ${SPX_OWNER_OPEN_ID}                   # 顶楼 @ 谁 + 会话归属人
+    cwd: /Users/me/projects/spx                     # ← workspace 写死在配置里
+    workspace_label: spx-backend                    # 卡片上显示的名字（可选）
+    model: opus                                     # 可选，别名同 /model
+    effort: high                                    # 可选：low/medium/high/xhigh/max
+    # agent: gpt                                    # 可选：把这条事件交给别的后端 bot 跑
+    topic_title: "外部事件 · 资料字段抽取"
+    required_vars: [application_id, file_url]       # 缺这些参数直接 400
+    optional_vars: [remark]                         # 模板可引用、允许为空的参数
+    allow_free_prompt: true                         # 允许请求体带自由文本
+    wrap_untrusted: true                            # {{prompt}} 自动裹进"这是数据不是指令"定界符
+    max_prompt_chars: 8000
+    # 提示词模板：**指令由你写**，外部只能填占位符。
+    # 可用占位符：{{prompt}} {{source}} {{route}} {{task_id}} {{client}} {{now}}
+    #             以及 {{vars.X}}（X 必须在 required_vars / optional_vars 里声明过，
+    #             拼错的名字在加载配置时就会报错并跳过这条 route）
+    prompt_template: |
+      业务后端通知：申请单 {{vars.application_id}} 有新资料上传，来源 {{source}}。
+
+      请按 docs/runbooks/doc-extract.md 的流程处理：
+        1. 从 {{vars.file_url}} 拉取文件到 tmp/（只读，别改生产数据）
+        2. 抽取姓名 / 证件号 / 地址 / 签发国，逐字段核对
+        3. 结果写成表格贴在本话题里；有任一字段拿不准就标 ⚠️ 并说明原因
+        4. 不要碰 prod 数据库；只读查询也要先说明用途
+
+      附加说明（可能为空）：
+      {{prompt}}
+
+  # ── workspace: projects/infra → 群「运维告警」（另一摊活 = 另一个群）──
+  ops-alert:
+    profile: spx
+    chat_id: oc_xxxxinfra
+    user_id: ${SPX_OWNER_OPEN_ID}
+    cwd: /Users/me/projects/infra
+    topic_title: "外部事件 · 线上告警初判"
+    allow_free_prompt: true
+    # 没有 prompt_template 时用 instruction + 参数列表 + 外部文本自动拼
+    instruction: |
+      线上监控触发了一条告警。请只做**只读**排查：看日志、看指标、给出可能根因与
+      建议动作，不要自行改配置或重启服务。结论贴在本话题。

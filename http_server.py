@@ -1,7 +1,8 @@
 """卡片回调 + 控制端点的 HTTP 服务。
 
 提供端点：
-    POST /callback        Lark 卡片按钮回调（公网 listener 唯一业务端点）
+    POST /callback        Lark 卡片按钮回调（公网 listener）
+    /api/v1/*             外部事件触发 API（公网 listener，API key/HMAC 鉴权，见 external_api.py）
     POST /spawn           （本机 control listener）派单进新 session
     GET  /spawn           （仅本机）派单（query string 版本）
     POST /trigger         （仅本机）手动触发已注册的 cron 任务
@@ -11,7 +12,9 @@
     GET  /handover        （仅本机）CLI session 接管
 
 安全边界：公网 callback listener 与本机 control listener 是两个独立 HTTPServer。
-ngrok 只转发 callback 端口；control 端口仅绑定 127.0.0.1 且要求 Bearer token。
+ngrok / 反代只转发 callback 端口；control 端口仅绑定 127.0.0.1 且要求 Bearer token。
+公网 listener 上除 `/callback` 只多出 `/api/v1/*`（外部事件触发），它自带 API key +
+可选 HMAC 鉴权，未配置时整个前缀直接 503 —— control 端点永远不会在公网侧出现。
 
 设计：本模块**不 import** dispatcher / business logic，所有业务回调通过
 `configure(...)` 注入，避免循环 import + 让单元测试只 mock callbacks 即可。
@@ -33,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse, parse_qs
 
+import external_api
 from bot_instance import BotInstance
 from card_security import (
     card_action_allowed,
@@ -295,6 +299,13 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         if not self.control_plane:
             # `/` 是旧部署的 callback 兼容别名；其余公网路径一律 404，尤其不能再
             # 因 ngrok 转发的 socket peer=127.0.0.1 而落进 control handlers。
+            # 例外只有外部事件触发 API：它自己做 API key / HMAC 鉴权。
+            if parsed.path.startswith(external_api.API_PREFIX):
+                body = self._read_body()
+                if body is None:
+                    return
+                self._handle_external_api("POST", parsed.path, body)
+                return
             if parsed.path not in ("/callback", "/"):
                 self._respond(404, {"error": "not found"})
                 return
@@ -395,6 +406,9 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if not self.control_plane:
+            if parsed.path.startswith(external_api.API_PREFIX):
+                self._handle_external_api("GET", parsed.path, b"")
+                return
             self._respond(404, {"error": "not found"})
             return
         if not self._authorize_control():
@@ -414,6 +428,21 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             return
 
         self._respond(404, {"error": "not found"})
+
+    def _handle_external_api(self, method: str, path: str, body: bytes):
+        """外部事件触发 API：鉴权 + 业务判定全在 external_api，这里只搬 HTTP。"""
+        peer = ""
+        try:
+            peer = self.client_address[0]
+        except Exception:
+            pass
+        try:
+            code, payload = external_api.handle(method, path, self.headers, body, peer)
+        except Exception as e:
+            log("global", "extapi", "error", f"{method} {path} 异常: {type(e).__name__}: {e}")
+            self._respond(500, {"ok": False, "error": "internal error"})
+            return
+        self._respond(code, payload)
 
     def _authorize_control(self) -> bool:
         """control API 双重校验：loopback listener + constant-time token。"""

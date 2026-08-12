@@ -386,6 +386,77 @@ curl -X POST "${AUTH[@]}" "http://127.0.0.1:$CONTROL_PORT/reload"
 公网 callback listener 对 `/spawn`、`/trigger`、`/wake`、`/dispatch`、cron、handover
 等路径统一返回 404。即使经过 ngrok 后 socket peer 显示为 localhost，也无法进入控制面。
 
+## 外部事件触发 API（后端服务 → agent）
+
+第三种触发方式：除了「人在群里 @ bot」和「cron 定时」，业务后端在**事件发生时**（用户
+上传了资料、订单进了某状态…）直接调一个 HTTP 接口，cc-lark 就在配置好的 Lark 群里新
+开一条话题、把完整提示词发进去，并起一个独立会话执行——过程和结果都留在那条话题里，
+运维在群里监控，观感和定时任务一致。
+
+```bash
+cp external_triggers.yaml.example external_triggers.yaml   # 字段说明见模板内注释
+echo "CC_LARK_API_SECRET_SPX_BACKEND=$(openssl rand -hex 32)" >> .env
+```
+
+```bash
+curl -X POST https://<你的域名>/api/v1/agent-tasks \
+  -H "Authorization: Bearer spx-backend:$CC_LARK_API_SECRET_SPX_BACKEND" \
+  -H "Content-Type: application/json" \
+  -H "X-Idempotency-Key: evt-20260812-0001" \
+  -d '{
+        "route": "doc-extract",
+        "source": "spx-backend/kyc-upload",
+        "vars": {"application_id": "APP-9", "file_url": "https://.../passport.pdf"},
+        "prompt": "用户补充说明：护照是新换的"
+      }'
+# → 202 {"ok":true,"task_id":"...","thread_id":"omt_...","chat_id":"oc_...","workspace":"spx"}
+```
+
+| 端点 | 用途 |
+|------|------|
+| `POST /api/v1/agent-tasks` | 触发一条任务（→ 群里新话题 + 独立会话），返回 `thread_id` |
+| `GET /api/v1/agent-tasks/<thread_id>` | 查这条任务的话题记录（只能查自己派的） |
+| `GET /api/v1/routes` | 列出该 client 可用的 route |
+| `GET /api/v1/healthz` | 凭证自检 |
+
+**设计边界（重要）**：
+
+- **群和 workspace 由配置钉死**。调用方只能挑一个已配置的 `route`；跑在哪个群、哪个
+  `cwd`、什么模型/强度都写在 `external_triggers.yaml`，请求体里的 `cwd` / `profile` /
+  `chat_id` 一律被忽略。route 的 `chat_id` 还必须在该 profile 的群白名单里，否则拒发。
+- **群和 workspace 成对**：`chat_id` 是每条 route 各自的字段——一个 workspace 对应它
+  自己的群，任务就落到那个群里被监控（spx 的活进 spx 群，cc-lark 的活进 cc-lark 群）。
+  加载/热重载时会拿群在 `.env` 里的 `<PROFILE>_CHAT_CWD_<chat_id>` 交叉核对，对不上就在
+  启动日志和 `/reload` 响应的 `warnings` 里喊出来——只 warn 不拦，因为「一个事件任务监控群
+  承载多个 workspace」也是合法用法。
+- **提示词模板化**。指令由配置作者写，外部输入只能填 `{{prompt}}` / `{{vars.X}}`；
+  `{{prompt}}` 默认被裹进「这是数据不是指令」的定界符（`wrap_untrusted`）。模板里引用
+  未声明的参数会在**加载配置时**就报错并跳过该 route，不会等到线上第一次调用。
+- **鉴权 fail-closed**。没有可用 client / 密钥缺失或短于 16 字符 → `/api/v1/*` 直接
+  503。可选 `require_signature` 再加一层 HMAC：
+  `X-CC-Lark-Signature = hex(hmac_sha256(secret, "<X-CC-Lark-Timestamp>.<raw body>"))`，
+  时间戳偏移 >300s 或签名重复使用一律拒。还可配 `allow_ips`（走反代时同时配
+  `trusted_proxy_ips`，否则不认 `X-Forwarded-For`）。
+- **幂等**。带 `X-Idempotency-Key`（或 body 里的 `idempotency_key`）重试会拿回第一次的
+  `thread_id`（`"deduped": true`），不会在群里刷出第二条话题；状态落盘，重启后仍生效。
+- **限流与并发**：每 client `rate_limit_per_min`（超了 429）；每群在跑的子会话 ≤
+  `DISPATCH_CONCURRENCY_CAP`（默认 7，触顶也回 429，稍后重试即可）。
+- 改 `external_triggers.yaml` 后 `POST /reload`（control 面）即时生效；只有改 `.env`
+  里的密钥才需要重启。
+
+**公网暴露**：该 API 挂在 callback listener（`CALLBACK_PORT`）上，和 Lark 卡片回调同
+一个入口——本地开发直接用现成的 ngrok 隧道即可；生产用自己的域名，在 Caddy/nginx 上
+终止 TLS 再反代到 `CALLBACK_PORT`，并把反代 IP 写进 `trusted_proxy_ips`。control 面
+（`CONTROL_PORT`）永远只绑 127.0.0.1，不要对外暴露。
+
+```caddyfile
+# Caddyfile 示例
+agent.example.com {
+    reverse_proxy /api/* 127.0.0.1:9981
+    reverse_proxy /callback 127.0.0.1:9981
+}
+```
+
 ## 部署
 
 ### macOS：推荐用 `cc-lark` 包装脚本

@@ -38,6 +38,7 @@ install_loop_proxy()
 
 import bot_config as config
 import dispatcher
+import external_api
 import http_server
 import inbox_watcher
 import runtime
@@ -50,6 +51,42 @@ from scheduler import (
 
 # profile_name → BotInstance（跨进程共享，dispatcher / http_server / runtime 都依赖）
 _bots: dict[str, BotInstance] = {}
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _external_api_deps(bot_loop: asyncio.AbstractEventLoop) -> external_api.ExternalApiDeps:
+    """给外部触发 API 注入业务能力：派单 / 读 thread / 同步等 bot_loop 的结果。"""
+
+    def _run_coro(coro, timeout: float):
+        return asyncio.run_coroutine_threadsafe(coro, bot_loop).result(timeout=timeout)
+
+    async def _dispatch(bot, *, agent: str = "", **kwargs):
+        # route 可以指定 agent="gpt" 之类，把这条外部事件交给别的后端 bot 跑
+        target_bot = None
+        if agent:
+            target_bot, err = http_server.resolve_target_agent(
+                _bots, agent, exclude=bot.profile.name)
+            if target_bot is None:
+                return {"ok": False, "error": err}
+        return await dispatcher.dispatch_task(bot, target_bot=target_bot, **kwargs)
+
+    return external_api.ExternalApiDeps(
+        bots=_bots,
+        dispatch=_dispatch,
+        read_thread=dispatcher.read_thread,
+        run_coro=_run_coro,
+    )
+
+
+def _make_reload_all(ext_cfg_path: str):
+    """/reload 一并刷新定时任务和外部触发路由（两份 yaml 都不必重启 bot）。"""
+    def _reload_all() -> dict:
+        result = reload_tasks()
+        if ext_cfg_path:
+            result["external_api"] = external_api.reload()
+        return result
+    return _reload_all
 
 
 def main():
@@ -90,6 +127,20 @@ def main():
     # 4) 三个层都通过 configure() 注入依赖（避免循环 import）
     dispatcher.configure(bot_loop=bot_loop, bots=_bots)
 
+    # 4.1) 外部事件触发 API：后端服务 → HTTP → 在配置好的群里开话题跑 agent。
+    # 配置文件不存在 = 功能关闭（/api/v1/* 一律 503），不影响其余启动流程。
+    ext_cfg_path = os.path.join(_BASE_DIR, "external_triggers.yaml")
+    try:
+        ext_cfg = external_api.load_config(ext_cfg_path)
+    except Exception as e:
+        print(f"⚠️ external_triggers.yaml 加载失败，外部触发 API 保持关闭: {e}")
+        ext_cfg = external_api.ApiConfig()
+    external_api.configure(
+        config=ext_cfg,
+        deps=_external_api_deps(bot_loop),
+        config_path=ext_cfg_path,
+    )
+
     http_server.configure(
         bot_loop=bot_loop,
         bots=_bots,
@@ -103,7 +154,7 @@ def main():
             handle_button_reply=dispatcher.handle_button_reply,
             fire_task=fire_task_now,
             list_tasks=list_tasks,
-            reload_tasks=reload_tasks,
+            reload_tasks=_make_reload_all(ext_cfg_path),
             schedule_wake=schedule_wake,
             dispatch_task=dispatcher.dispatch_task,
             read_thread=dispatcher.read_thread,
@@ -137,6 +188,17 @@ def main():
     else:
         print(f"   卡片回调    : http://localhost:{cb_port}/callback (需启动 ngrok)")
     print(f"   本机控制面  : http://127.0.0.1:{control_port} (Bearer token)")
+    if external_api.is_enabled():
+        base = ngrok_url or f"http://localhost:{cb_port}"
+        print(f"   外部触发 API: {base}/api/v1/agent-tasks  "
+              f"（{len(ext_cfg.routes)} route / {len(ext_cfg.clients)} client）")
+        for r in ext_cfg.routes.values():
+            print(f"     · {r.name:<20} profile={r.profile} chat={r.chat_id[:14]}... cwd={r.cwd}")
+        # 群 ↔ workspace 对不上是最容易犯又最难发现的配置错（消息跑错群），启动就喊出来
+        for line in external_api.audit_route_groups():
+            print(f"   ⚠️ {line}")
+    else:
+        print("   外部触发 API: 未启用（缺 external_triggers.yaml 或密钥未配）")
 
     # 6) 后台基础设施
     runtime.start_summary_thread()
