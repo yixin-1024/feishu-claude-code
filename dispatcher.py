@@ -34,6 +34,7 @@ from card_security import (
 )
 from agent_runner import run_agent
 from claude_runner import is_safeguards_error_text
+from feishu_client import _err_desc
 from commands import parse_command, handle_command
 from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
 from lark_prompts import render_lark_prompt
@@ -128,6 +129,19 @@ async def _is_current_bot_mentioned(bot: BotInstance, msg) -> bool:
 
 # ── /stop 命令处理 ───────────────────────────────────────────
 
+async def _acquire_card_lock(active_run: ActiveRun, timeout: float) -> bool:
+    """限时抢卡片锁。抢不到返回 False，让调用方自己决定跳过还是硬写。
+
+    /stop 和 /restart 是"救火通道"，绝不能被一次卡住的卡片请求反锁死——那会让
+    整个重启流程停在「中断任务」阶段永远出不来。
+    """
+    try:
+        await asyncio.wait_for(active_run.card_update_lock.acquire(), timeout=timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
 async def _announce_stopped_run(bot: BotInstance, active_run: ActiveRun):
     # 保留停止前流式渲染出的进度（工具轨迹 + 部分回答），仅在末尾追加「已停止」
     # 标记，而不是整卡覆盖成一句"已停止"。与错误路径的"保留旧内容 + 追加"一致。
@@ -136,7 +150,12 @@ async def _announce_stopped_run(bot: BotInstance, active_run: ActiveRun):
         content = f"{body}\n\n---\n\n⏹ **任务已被停止**（以上为停止前的进度）"
     else:
         content = "⏹ 已停止当前任务（尚无输出）"
-    async with active_run.card_update_lock:
+    # 抢不到锁也照写：此时 stop_requested 已置位，push() 会自己 return，不存在
+    # 被流式帧覆盖的竞态；持锁的那位多半是一次永远回不来的请求。
+    locked = await _acquire_card_lock(active_run, _PUSH_TIMEOUT)
+    if not locked:
+        log(bot.profile.name, "stop", "warn", "卡片锁被占住，改为无锁写停止卡")
+    try:
         try:
             await bot.feishu.update_card(active_run.card_msg_id, content)
         except Exception as exc:
@@ -145,6 +164,9 @@ async def _announce_stopped_run(bot: BotInstance, active_run: ActiveRun):
             await bot.feishu.finalize_streaming_card(active_run.card_msg_id)
         except Exception as exc:
             log(bot.profile.name, "stop", "warn", f"finalize stopped card failed: {exc}")
+    finally:
+        if locked:
+            active_run.card_update_lock.release()
 
 
 async def _handle_stop_command(bot: BotInstance, sender_open_id: str, chat_id: str) -> str:
@@ -176,7 +198,12 @@ async def _handle_restart_command(originating_bot: BotInstance) -> int:
         async def _announce(r):
             if not r.card_msg_id:
                 return
-            async with r.card_update_lock:
+            # 锁被一次挂死的卡片请求占着也要能重启：限时抢，抢不到就无锁写。
+            locked = await _acquire_card_lock(r, _RESTART_CARD_LOCK_TIMEOUT)
+            if not locked:
+                log(prof_name, "restart", "warn",
+                    f"卡片锁被占住，改为无锁写中断卡 chat={r.chat_id[:12]}")
+            try:
                 try:
                     await asyncio.wait_for(
                         b.feishu.update_card(r.card_msg_id, RESTART_MSG),
@@ -196,6 +223,9 @@ async def _handle_restart_command(originating_bot: BotInstance) -> int:
                     except Exception as e:
                         log(prof_name, "restart", "warn",
                             f"finalize streaming card 失败 chat={r.chat_id[:12]}: {e}")
+            finally:
+                if locked:
+                    r.card_update_lock.release()
         try:
             await stop_run(
                 b.active_runs, run.user_id, run.chat_id,
@@ -557,6 +587,16 @@ def _env_int(name: str, default: int) -> int:
 _STALL_RETRY_MAX_DEFAULT = 3
 _STALL_COOLDOWNS = (10, 30, 60)
 
+# ── 卡片推送的看门狗 ───────────────────────────────────────
+# 单帧（含 SDK 内部重试）的硬上限；超时就放弃这一帧并把锁还回去。必须大于
+# 一次 SDK 请求的 timeout，否则正常网络下的慢请求会被误判。
+_PUSH_TIMEOUT = 20.0
+# 连续失败到这个数就静音一段时间，而不是永久关掉本 run 的卡片刷新。
+_PUSH_FAILURE_LIMIT = 3
+_PUSH_MUTE_SECONDS = 30.0
+# /restart 抢卡片锁的上限：重启要快，抢不到就无锁写，别让一个 run 拖住全局。
+_RESTART_CARD_LOCK_TIMEOUT = 1.5
+
 # 上游中断后 resume 续跑用的提示：既补全被截断的回复，又明令别重复已做的副作用。
 _STALL_RESUME_NUDGE = (
     "继续。上一轮回复在流式返回时被上游中断（API Error：连接中断 / 响应截断），"
@@ -876,6 +916,7 @@ async def _run_and_display(
     final_usage: dict = {}
     last_push_time = 0.0
     push_failures = 0
+    push_muted_until = 0.0
     _PUSH_INTERVAL = 0.4
     _MAX_STREAM_DISPLAY = 2500
 
@@ -895,17 +936,42 @@ async def _run_and_display(
         return f"{h}h{m:02d}m"
 
     async def push(content: str):
-        nonlocal push_failures
-        async with active_run.card_update_lock:
-            if _stopping() or push_failures >= 3:
+        """推一帧卡片。三条硬约束，缺一个就会出现"任务还在跑、卡片永久定格"：
+
+        1. 拿锁要有上限 —— 上一帧还挂在网络里时，直接跳过这一帧，绝不能把调用方
+           （心跳 / on_text_chunk，后者跑在 runner 的读流循环里）一起堵死。
+        2. 单帧要有上限 —— SDK 侧已配 timeout，这里再兜一层，保证锁一定还得回来。
+        3. 连续失败只"静音"一段时间，不永久关掉 —— 网络抖 10 秒不该让接下来
+           40 分钟的卡片全哑掉（老逻辑 push_failures>=3 后此 run 再不推送）。
+        """
+        nonlocal push_failures, push_muted_until
+        if _stopping():
+            return
+        if push_failures >= _PUSH_FAILURE_LIMIT and time.time() < push_muted_until:
+            return
+        try:
+            await asyncio.wait_for(
+                active_run.card_update_lock.acquire(), timeout=_PUSH_TIMEOUT)
+        except asyncio.TimeoutError:
+            log(bot.profile.name, "stream", "warn",
+                f"push 跳过：上一帧仍未返回（等锁 >{_PUSH_TIMEOUT:.0f}s）")
+            return
+        try:
+            if _stopping():
                 return
-            try:
-                await bot.feishu.update_card(card_msg_id, content)
-                push_failures = 0
-            except Exception as push_err:
-                push_failures += 1
-                log(bot.profile.name, "stream", "warn",
-                    f"push 失败 ({push_failures}/3): {push_err}")
+            await asyncio.wait_for(
+                bot.feishu.update_card(card_msg_id, content), timeout=_PUSH_TIMEOUT)
+            push_failures = 0
+        except Exception as push_err:
+            push_failures += 1
+            if push_failures >= _PUSH_FAILURE_LIMIT:
+                push_muted_until = time.time() + _PUSH_MUTE_SECONDS
+            log(bot.profile.name, "stream", "warn",
+                f"push 失败 ({push_failures}): {_err_desc(push_err)}"
+                + (f"，静音 {_PUSH_MUTE_SECONDS:.0f}s 后重试"
+                   if push_failures >= _PUSH_FAILURE_LIMIT else ""))
+        finally:
+            active_run.card_update_lock.release()
 
     def _build_display() -> str:
         parts = []

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import lark_oapi as lark
 
@@ -20,6 +21,22 @@ from bot_config import Profile
 from feishu_client import FeishuClient
 from run_control import ActiveRunRegistry
 from session_store import SessionStore
+
+
+def _api_timeout() -> float:
+    """单次 Lark HTTP 请求的超时（秒）。
+
+    lark_oapi 的 Config.timeout 默认是 None —— 直接透传给 httpx/requests 就是
+    「永不超时」。网络通路被掐断（ClashX TUN 切节点 / WiFi 抖动）时，已发出的
+    请求收不到 RST，会永久挂住：卡片 patch 卡在 in-flight，持锁的那个 run 心跳
+    再也推不动，卡片就此定格（而且连收尾的 ✅ 都写不进去）。给它一个上限，让
+    死连接变成一个可重试的异常。httpx/requests 的 timeout 是「两次收字节之间的
+    间隔」而非请求总时长，所以大文件上传不受影响。
+    """
+    try:
+        return max(1.0, float(str(os.environ.get("CC_LARK_API_TIMEOUT", "")).strip()))
+    except (TypeError, ValueError):
+        return 15.0
 
 
 class BotInstance:
@@ -33,6 +50,7 @@ class BotInstance:
             .app_secret(profile.app_secret)
             .domain(profile.domain)
             .log_level(lark.LogLevel.INFO)
+            .timeout(_api_timeout())
             .build()
         )
         self.feishu = FeishuClient(
