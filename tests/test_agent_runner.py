@@ -196,3 +196,91 @@ def test_run_agent_applies_profile_claude_runner(monkeypatch):
     assert sid == "sid_1"
     assert fallback is False
     assert captured["extra_env"]["CLAUDE_RUNNER"] == "print"
+
+
+def test_run_agent_dispatches_to_grok(monkeypatch):
+    captured = {}
+
+    async def fake_grok(**kwargs):
+        captured.update(kwargs)
+        return "ok", "01a01f72-e413-77c1-b4fa-9bd4f61ba9f7", False
+
+    async def fake_claude(**kwargs):
+        raise AssertionError("claude runner should not be called")
+
+    async def fake_codex(**kwargs):
+        raise AssertionError("codex runner should not be called")
+
+    monkeypatch.setattr("agent_runner.run_grok", fake_grok)
+    monkeypatch.setattr("agent_runner.run_claude", fake_claude)
+    monkeypatch.setattr("agent_runner.run_codex", fake_codex)
+
+    profile = _profile("grok")
+    profile.grok_api_key = "sk-test"
+    profile.grok_api_key_env = "WOWAPI_API_KEY"
+    text, sid, fallback = asyncio.run(run_agent(
+        profile=profile,
+        runner="grok",
+        message="hi",
+        model="wow-gpt",
+        effort="high",
+        cwd="/tmp",
+        wake_context={"CC_LARK_THREAD_ID": "omt_grok"},
+    ))
+
+    assert text == "ok"
+    assert sid == "01a01f72-e413-77c1-b4fa-9bd4f61ba9f7"
+    assert fallback is False
+    assert captured["model"] == "wow-gpt"
+    assert captured["effort"] == "high"
+    assert captured["api_key"] == "sk-test"
+    assert captured["api_key_env"] == "WOWAPI_API_KEY"
+    # grok 的 MCP 子进程继承父进程 env → wake_context 必须原样落到 extra_env
+    assert captured["extra_env"]["CC_LARK_THREAD_ID"] == "omt_grok"
+    assert captured["extra_env"]["CC_LARK_PROFILE"] == profile.name
+
+
+def test_run_agent_dispatches_to_maka(monkeypatch):
+    captured = {}
+
+    async def fake_maka(**kwargs):
+        captured.update(kwargs)
+        return "ok", "sess-maka", False
+
+    async def fake_claude(**kwargs):
+        raise AssertionError("claude runner should not be called")
+
+    async def fake_grok(**kwargs):
+        raise AssertionError("grok runner should not be called")
+
+    monkeypatch.setattr("agent_runner.run_maka", fake_maka)
+    monkeypatch.setattr("agent_runner.run_claude", fake_claude)
+    monkeypatch.setattr("agent_runner.run_grok", fake_grok)
+
+    profile = _profile("maka")
+    profile.maka_api_key = "sk-test"
+    profile.maka_base_url = "https://api.wowapi.ai/v1"
+    profile.maka_connection = "env-deepseek"
+    profile.maka_max_steps = 8
+    text, sid, fallback = asyncio.run(run_agent(
+        profile=profile,
+        runner="maka",
+        message="hi",
+        model="deepseek-v4-flash",
+        effort="high",
+        cwd="/tmp",
+        wake_context={"CC_LARK_THREAD_ID": "omt_maka"},
+    ))
+
+    assert (text, sid, fallback) == ("ok", "sess-maka", False)
+    assert captured["model"] == "deepseek-v4-flash"
+    assert captured["effort"] == "high"
+    assert captured["connection"] == "env-deepseek"
+    assert captured["api_key"] == "sk-test"
+    assert captured["api_key_env"] == "DEEPSEEK_API_KEY"
+    assert captured["base_url"] == "https://api.wowapi.ai/v1"
+    assert captured["base_url_env"] == "DEEPSEEK_BASE_URL"
+    assert captured["max_steps"] == 8
+    # maka 的 MCP 环境是白名单，CC_LARK_* 传不进 MCP 子进程；extra_env 仍要带
+    # profile 名，wall-clock 上限解析靠它
+    assert captured["extra_env"]["CC_LARK_PROFILE"] == profile.name

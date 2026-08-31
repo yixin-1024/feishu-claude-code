@@ -1,14 +1,16 @@
-"""Claude/Codex 后端分发入口。"""
+"""Claude / Codex / OpenCode / MiMo / Grok / Maka 后端分发入口。"""
 
 from __future__ import annotations
 
 from typing import Callable, Optional
 
-from bot_config import Profile, load_claude_extra_env
+from bot_config import Profile, load_claude_extra_env, resolve_cc_lark_gates
 from claude_runner import run_claude
 from codex_runner import run_codex
 from opencode_runner import run_opencode
 from mimo_runner import run_mimo
+from grok_runner import run_grok
+from maka_runner import run_maka
 
 
 async def run_agent(
@@ -76,6 +78,69 @@ async def run_agent(
             variant=profile.mimo_variant,
             dangerously_skip_permissions=bool(profile.mimo_dangerous_skip),
             idle_timeout_sec=profile.mimo_idle_timeout_sec,
+        )
+
+    if backend == "grok":
+        # grok 的 MCP 子进程继承父进程 env，所以 wake_context（CC_LARK_*）直接
+        # 塞进 extra_env 即可让 cc_mcp_server 定向到本话题，不用改写配置文件。
+        grok_env = dict(wake_context or {})
+        grok_env["CC_LARK_PROFILE"] = profile.name
+        # 能力闸门（per-profile 覆盖优先）也得进 env——grok 没有 --mcp-config，
+        # cc_mcp_server 全靠继承本进程环境拿到它们。
+        grok_env.update(resolve_cc_lark_gates(profile.name))
+        return await run_grok(
+            message=message,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            on_usage=on_usage,
+            on_status=on_status,
+            append_system_prompt=append_system_prompt,
+            grok_bin=profile.grok_bin,
+            grok_home=profile.grok_home,
+            api_key=profile.grok_api_key,
+            api_key_env=profile.grok_api_key_env,
+            max_turns=profile.grok_max_turns,
+            dangerously_skip_permissions=bool(profile.grok_dangerous_skip),
+            idle_timeout_sec=profile.grok_idle_timeout_sec,
+            extra_env=grok_env,
+        )
+
+    if backend == "maka":
+        # maka 给 MCP 子进程的环境是白名单（PATH/HOME/LC_*/XDG_* + mcp.json 里显式
+        # 写的 env），CC_LARK_* 传不进去，所以 cc-lark 运行时 MCP 还没接到这个后端上。
+        # extra_env 这里只用于 wall-clock 上限解析（resolve_claude_wall_clock_limit）。
+        maka_env = dict(wake_context or {})
+        maka_env["CC_LARK_PROFILE"] = profile.name
+        return await run_maka(
+            message=message,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            on_usage=on_usage,
+            on_status=on_status,
+            append_system_prompt=append_system_prompt,
+            maka_bin=profile.maka_bin,
+            workspace_root=profile.maka_workspace_root,
+            connection=profile.maka_connection,
+            api_key=profile.maka_api_key,
+            api_key_env=profile.maka_api_key_env,
+            base_url=profile.maka_base_url,
+            base_url_env=profile.maka_base_url_env,
+            max_steps=profile.maka_max_steps,
+            dangerously_skip_permissions=bool(profile.maka_dangerous_skip),
+            idle_timeout_sec=profile.maka_idle_timeout_sec,
+            extra_env=maka_env,
         )
 
     if backend == "codex":

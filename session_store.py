@@ -383,7 +383,7 @@ class SessionStore:
         )
         self._default_cwd = default_cwd or DEFAULT_CWD
         self._default_runner = (default_runner or DEFAULT_RUNNER or "claude").strip().lower()
-        if self._default_runner not in {"claude", "codex", "opencode", "mimo"}:
+        if self._default_runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka"}:
             self._default_runner = "claude"
         self._default_model = default_model or DEFAULT_MODEL
         self._chat_default_cwd = chat_default_cwd or {}
@@ -845,8 +845,10 @@ class SessionStore:
             normalized = "claude"
         if normalized in {"mimo-code", "mimocode"}:
             normalized = "mimo"
-        if normalized not in {"claude", "codex", "opencode", "mimo"}:
-            raise ValueError("runner must be 'claude', 'codex', 'opencode' or 'mimo'")
+        if normalized not in {"claude", "codex", "opencode", "mimo", "grok", "maka"}:
+            raise ValueError(
+                "runner must be 'claude', 'codex', 'opencode', 'mimo', 'grok' or 'maka'"
+            )
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
         runner_changed = cur.get("runner", self._default_runner) != normalized

@@ -23,6 +23,7 @@ from bot_config import (
     DEFAULT_CWD,
     load_claude_extra_env,
 )
+from grok_runner import GROK_EFFORT_LEVELS
 from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title, _find_session_file
 
 PLUGINS_DIR = os.path.expanduser("~/.claude/plugins")
@@ -85,6 +86,17 @@ MODEL_ALIASES = {
     "mimo": "quotio/claude-opus-4-8",
     "mimo-opus": "quotio/claude-opus-4-8",
     "mimo-sonnet": "quotio/claude-sonnet-4-6",
+    # Grok CLI（grok 只是 harness，模型取 ~/.grok/config.toml 的 [model.<name>]）
+    "grok": "wow-gpt",
+    "wow-gpt": "wow-gpt",
+    "wow-glm": "wow-glm",
+    "wow-deepseek": "wow-deepseek",
+    "wow-kimi": "wow-kimi",
+    # Apache Maka（模型 id 取 maka 连接目录里 enabled 的那些）
+    "maka": "deepseek-v4-flash",
+    "maka-free": "nemotron-3-ultra-free",
+    "maka-deepseek": "deepseek-v4-flash",
+    "maka-deepseek-pro": "deepseek-v4-pro",
 }
 
 
@@ -110,6 +122,13 @@ def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[s
         raw = profile_env.get("CLAUDE_EFFORT") or os.getenv("CLAUDE_EFFORT")
         value = (raw or "").strip().lower()
         return value if value in CLAUDE_EFFORT_LEVELS else None
+
+    if runner == "grok":
+        raw = os.getenv(f"{profile_name.upper()}_GROK_EFFORT") if profile_name else None
+        if raw is None:
+            raw = os.getenv("GROK_EFFORT")
+        value = (raw or "").strip().lower()
+        return value if value in GROK_EFFORT_LEVELS else None
 
     return None
 
@@ -150,7 +169,7 @@ HELP_TEXT = """\
 `/new` 或 `/clear` — 开始新 session
 `/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
-`/runner [codex|claude|opencode|mimo]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code
+`/runner [codex|claude|opencode|mimo|grok|maka]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka
 `/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID）
 `/effort [级别]` — 设置当前对话推理强度（default / low / medium / high / xhigh / max / ultra）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
@@ -982,6 +1001,10 @@ def _runner_default_model(bot, runner: str) -> str:
         return "google/gemini-3.1-pro-preview"
     if runner == "mimo":
         return "quotio/claude-opus-4-8"
+    if runner == "grok":
+        return "wow-gpt"
+    if runner == "maka":
+        return "deepseek-v4-flash"
     return "sonnet[1m]"
 
 
@@ -1693,6 +1716,8 @@ async def handle_command(
                     {"text": "Claude Code", "value": {"action": "run_cmd", "cmd": "/runner claude", "cid": chat_id}},
                     {"text": "opencode", "value": {"action": "run_cmd", "cmd": "/runner opencode", "cid": chat_id}},
                     {"text": "MiMo Code", "value": {"action": "run_cmd", "cmd": "/runner mimo", "cid": chat_id}},
+                    {"text": "Grok CLI", "value": {"action": "run_cmd", "cmd": "/runner grok", "cid": chat_id}},
+                    {"text": "Maka", "value": {"action": "run_cmd", "cmd": "/runner maka", "cid": chat_id}},
                 ],
             }
         requested = args.strip().lower().replace("_", "-")
@@ -1700,8 +1725,12 @@ async def handle_command(
             requested = "claude"
         if requested in {"mimo-code", "mimocode"}:
             requested = "mimo"
-        if requested not in {"codex", "claude", "opencode", "mimo"}:
-            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）".format(args)
+        if requested in {"grok-cli", "grokcli", "xai"}:
+            requested = "grok"
+        if requested in {"maka-agent", "apache-maka"}:
+            requested = "maka"
+        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka"}:
+            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）".format(args)
         model = _runner_default_model(bot, requested)
         await store.set_runner(user_id, chat_id, requested, model=model)
         return f"✅ 已切换 runner 为 `{requested}`，模型 `{model}`。已开始新 session。"
@@ -1730,6 +1759,19 @@ async def handle_command(
                 buttons = [
                     {"text": "🧠 Opus 4.8", "value": {"action": "run_cmd", "cmd": "/model mimo-opus", "cid": chat_id}},
                     {"text": "⚡ Sonnet 4.6", "value": {"action": "run_cmd", "cmd": "/model mimo-sonnet", "cid": chat_id}},
+                ]
+            elif runner == "maka":
+                buttons = [
+                    {"text": "🐋 DeepSeek V4 Flash", "value": {"action": "run_cmd", "cmd": "/model maka-deepseek", "cid": chat_id}},
+                    {"text": "🐋 DeepSeek V4 Pro", "value": {"action": "run_cmd", "cmd": "/model maka-deepseek-pro", "cid": chat_id}},
+                    {"text": "🆓 Nemotron 3 Ultra", "value": {"action": "run_cmd", "cmd": "/model maka-free", "cid": chat_id}},
+                ]
+            elif runner == "grok":
+                buttons = [
+                    {"text": "🤖 GPT-5.4", "value": {"action": "run_cmd", "cmd": "/model wow-gpt", "cid": chat_id}},
+                    {"text": "🇨🇳 GLM-5.2", "value": {"action": "run_cmd", "cmd": "/model wow-glm", "cid": chat_id}},
+                    {"text": "🐋 DeepSeek V4", "value": {"action": "run_cmd", "cmd": "/model wow-deepseek", "cid": chat_id}},
+                    {"text": "🌙 Kimi K2.7", "value": {"action": "run_cmd", "cmd": "/model wow-kimi", "cid": chat_id}},
                 ]
             else:
                 buttons = [
@@ -1765,8 +1807,13 @@ async def handle_command(
             levels = CLAUDE_EFFORT_LEVELS
         elif runner == "codex":
             levels = _codex_effort_levels(cur.model)
+        elif runner == "grok":
+            levels = GROK_EFFORT_LEVELS
+        elif runner == "maka":
+            # maka 的 --thinking 档位（off 对应 cc-lark 的 none，由 maka_runner 归一）
+            levels = ("minimal", "low", "medium", "high", "xhigh", "max")
         else:
-            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude` 或 `codex`。"
+            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok` 或 `maka`。"
 
         raw = await store.get_current_raw(user_id, chat_id)
         overridden = bool(raw.get("effort_override"))
@@ -1836,7 +1883,7 @@ async def handle_command(
         quota_line = (
             await asyncio.to_thread(_format_codex_rate_line, cur.get("session_id"))
             if runner == "codex"
-            else "" if runner in {"opencode", "mimo"}
+            else "" if runner in {"opencode", "mimo", "grok", "maka"}
             else await asyncio.to_thread(_get_quota_compact)
         )
 
@@ -1846,7 +1893,7 @@ async def handle_command(
             f"Runner: `{runner}`",
             f"模型: `{model}`",
         ]
-        if runner in {"claude", "codex"}:
+        if runner in {"claude", "codex", "grok", "maka"}:
             effort_override = cur.get("effort_override")
             effort = _effective_effort_label(store, bot, runner, effort_override)
             effort_status = "当前对话覆盖" if effort_override else "跟随默认"
@@ -1944,6 +1991,20 @@ async def handle_command(
             if ctx_line:
                 lines.append(ctx_line)
             lines.append(f"Runner: `opencode`")
+            lines.append(f"模型: `{model}`")
+            return "\n".join(lines)
+        if runner == "grok":
+            model = cur.get("model_override") or store.default_model
+            lines = ["📈 **Grok CLI 用量**"]
+            ctx_line = _format_context_line(
+                cur.get("session_id"),
+                model,
+                runner="grok",
+                current_usage=cur.get("last_usage") or None,
+            )
+            if ctx_line:
+                lines.append(ctx_line)
+            lines.append(f"Runner: `grok`")
             lines.append(f"模型: `{model}`")
             return "\n".join(lines)
         if runner == "mimo":

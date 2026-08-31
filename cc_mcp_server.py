@@ -200,7 +200,7 @@ DISPATCH_TASK_TOOL = {
                 "description": (
                     "Optional target agent/backend for the worker (CROSS-AGENT dispatch). "
                     "Accepts a family alias — \"gpt\"/\"codex\" (GPT), \"claude\", "
-                    "\"gemini\"/\"opencode\", \"mimo\" — or an exact loaded profile name. "
+                    "\"gemini\"/\"opencode\", \"mimo\", \"grok\"/\"xai\" — or an exact loaded profile name. "
                     "Omit to run the worker on your own backend (default)."
                 ),
             },

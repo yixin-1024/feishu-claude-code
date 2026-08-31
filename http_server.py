@@ -178,6 +178,8 @@ _AGENT_RUNNER_ALIASES = {
     "claude": "claude", "anthropic": "claude",
     "gemini": "opencode", "opencode": "opencode",
     "mimo": "mimo",
+    "grok": "grok", "xai": "grok",
+    "maka": "maka", "apache-maka": "maka",
 }
 
 
@@ -187,7 +189,8 @@ def resolve_target_agent(
     """把 dispatch_task 的 `agent` 解析成目标 bot。返回 (bot, err)。
 
     解析顺序：① 精确 profile 名（区分/不区分大小写）→ ② runner 家族别名
-    （gpt/codex→codex, claude→claude, gemini/opencode→opencode, mimo→mimo），
+    （gpt/codex→codex, claude→claude, gemini/opencode→opencode, mimo→mimo,
+    grok/xai→grok, maka→maka），
     别名命中多个时优先选 != 调用方(exclude) 的那个。命中不到返回 (None, 错误说明+可选项)。
     """
     spec = (spec or "").strip()

@@ -587,6 +587,12 @@ def _env_int(name: str, default: int) -> int:
 _STALL_RETRY_MAX_DEFAULT = 3
 _STALL_COOLDOWNS = (10, 30, 60)
 
+# ── 不流式的后端 ───────────────────────────────────────────
+# maka run 把整轮事件写进自己的 Runtime Event Log，只在收尾时一次性 print
+# finalOutput——正常干活期间 stdout 就是空的。对这些后端「无输出 N 分钟」是常态，
+# 显示成 ⚠️ 会让每个超过 30s 的正常任务看起来像卡死。
+_NON_STREAMING_RUNNERS = {"maka"}
+
 # ── 卡片推送的看门狗 ───────────────────────────────────────
 # 单帧（含 SDK 内部重试）的硬上限；超时就放弃这一帧并把锁还回去。必须大于
 # 一次 SDK 请求的 timeout，否则正常网络下的慢请求会被误判。
@@ -1001,7 +1007,11 @@ async def _run_and_display(
             footer.append(f"🔧 {tname} {_fmt_duration(now - t_started)}")
         idle = now - last_output_ts
         if idle >= 30:
-            footer.append(f"⚠️ 无输出 {_fmt_duration(idle)}")
+            if (session.runner or "").strip().lower() in _NON_STREAMING_RUNNERS:
+                # 这个后端天生不流式，别把常态渲染成"疑似卡死"
+                footer.append("🌀 无流式输出，整轮跑完才出正文")
+            else:
+                footer.append(f"⚠️ 无输出 {_fmt_duration(idle)}")
         if pty_warning:
             label, since = pty_warning
             footer.append(f"🚦 {label} {_fmt_duration(now - since)}")
@@ -2659,7 +2669,7 @@ async def dispatch_task(
     "子会话结束→回报父 thread + 批次全完→唤醒父 agent"的工程化闭环（见 _DISPATCH_PARENTS）。
 
     target_bot：**跨 agent 派发**——子会话在 target_bot 名下跑（可为异后端 bot，如
-    codex=GPT / opencode=Gemini / mimo），从而实现 claude 调 GPT 这类跨 agent 编排。
+    codex=GPT / opencode=Gemini / mimo / grok=Grok CLI），从而实现 claude 调 GPT 这类跨 agent 编排。
     缺省 = bot（同 agent 派发，原行为）。target_bot 必须是同进程已加载、且是本群成员的
     bot；建话题 + 跑子会话都用 target_bot，而回报父 thread + 唤醒父 agent 仍用 bot
     （派发方自己）——因为唤醒父 = resume 父自己的 session，必须父 bot @ 父自己。

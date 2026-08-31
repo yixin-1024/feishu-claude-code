@@ -159,6 +159,35 @@ class Profile:
     mimo_variant: str = ""  # 推理强度：high / max / minimal（provider 相关）
     mimo_dangerous_skip: int = 1
     mimo_idle_timeout_sec: int = 600
+    # grok runner 配置（xAI Grok CLI / Grok Build）。grok 只是 harness，模型可换：
+    # 自定义 OpenAI 兼容端点写在 ~/.grok/config.toml 的 [model.<name>]（base_url +
+    # env_key），这里的 model 传的就是那个 <name>。api_key 注入到子进程的
+    # grok_api_key_env（默认 XAI_API_KEY），供 config.toml 的 env_key 取用。
+    # grok_home 可把 bot 的 session/配置隔离到独立目录（默认沿用 ~/.grok）。
+    grok_bin: str = ""
+    grok_home: str = ""
+    grok_api_key: str = ""
+    grok_api_key_env: str = "XAI_API_KEY"
+    grok_max_turns: int = 0  # 0 = 不限；>0 时给 agent loop 加护栏
+    grok_dangerous_skip: int = 1
+    grok_idle_timeout_sec: int = 300
+    # maka runner 配置（Apache Maka Incubating）。maka 的模型连接存在 workspace 的
+    # connection-catalog.json 里；首次启动 bootstrap 会按环境变量种一条连接，所以
+    # maka_api_key 默认注入 DEEPSEEK_API_KEY、maka_base_url 注入 DEEPSEEK_BASE_URL
+    # （deepseek 是三个 bootstrap 通道里唯一能自定义 base_url 的，正好接中转站）。
+    # maka_connection 指定用哪条连接（如 opencode-free / env-deepseek）。
+    # ⚠️ maka_idle_timeout_sec 是整轮 wall-clock 上限，不是"多久没输出"——maka run
+    # 全程没有流式输出，idle 检测在这个后端上没有意义。
+    maka_bin: str = ""
+    maka_workspace_root: str = ""
+    maka_connection: str = ""
+    maka_api_key: str = ""
+    maka_api_key_env: str = "DEEPSEEK_API_KEY"
+    maka_base_url: str = ""
+    maka_base_url_env: str = "DEEPSEEK_BASE_URL"
+    maka_max_steps: int = 0  # 0 = 不限；>0 给工具步数加护栏
+    maka_dangerous_skip: int = 1
+    maka_idle_timeout_sec: int = 1800
     # "会话群" chat_id：bot 在其它群被 @ 时（=调度 session），会被指引把任务派单到
     # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
     dispatch_chat_id: str = ""
@@ -240,9 +269,10 @@ def _load_profile(name: str) -> Profile:
 
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
-    if runner not in {"claude", "codex", "opencode", "mimo"}:
+    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka"}:
         raise ValueError(
-            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo，当前: {runner}"
+            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka，"
+            f"当前: {runner}"
         )
     claude_runner = env("CLAUDE_RUNNER").strip().lower()
     if claude_runner and claude_runner not in {"pty", "print"}:
@@ -274,6 +304,30 @@ def _load_profile(name: str) -> Profile:
         mimo_idle = int(env("MIMO_IDLE_TIMEOUT_SEC", os.getenv("MIMO_IDLE_TIMEOUT_SEC", "600")) or "600")
     except ValueError:
         mimo_idle = 600
+    try:
+        grok_skip = int(env("GROK_DANGEROUS_SKIP", os.getenv("GROK_DANGEROUS_SKIP", "1")) or "1")
+    except ValueError:
+        grok_skip = 1
+    try:
+        grok_idle = int(env("GROK_IDLE_TIMEOUT_SEC", os.getenv("GROK_IDLE_TIMEOUT_SEC", "300")) or "300")
+    except ValueError:
+        grok_idle = 300
+    try:
+        grok_turns = int(env("GROK_MAX_TURNS", os.getenv("GROK_MAX_TURNS", "0")) or "0")
+    except ValueError:
+        grok_turns = 0
+    try:
+        maka_skip = int(env("MAKA_DANGEROUS_SKIP", os.getenv("MAKA_DANGEROUS_SKIP", "1")) or "1")
+    except ValueError:
+        maka_skip = 1
+    try:
+        maka_idle = int(env("MAKA_IDLE_TIMEOUT_SEC", os.getenv("MAKA_IDLE_TIMEOUT_SEC", "1800")) or "1800")
+    except ValueError:
+        maka_idle = 1800
+    try:
+        maka_steps = int(env("MAKA_MAX_STEPS", os.getenv("MAKA_MAX_STEPS", "0")) or "0")
+    except ValueError:
+        maka_steps = 0
     return Profile(
         name=name,
         app_id=app_id,
@@ -309,6 +363,23 @@ def _load_profile(name: str) -> Profile:
         mimo_variant=env("MIMO_VARIANT", os.getenv("MIMO_VARIANT", "")).strip(),
         mimo_dangerous_skip=max(0, min(1, mimo_skip)),
         mimo_idle_timeout_sec=max(0, mimo_idle),
+        grok_bin=env("GROK_BIN", os.getenv("GROK_BIN", "")).strip(),
+        grok_home=env("GROK_HOME_DIR", os.getenv("GROK_HOME_DIR", "")).strip(),
+        grok_api_key=env("GROK_API_KEY", os.getenv("GROK_API_KEY", "")).strip(),
+        grok_api_key_env=env("GROK_API_KEY_ENV", os.getenv("GROK_API_KEY_ENV", "XAI_API_KEY")).strip() or "XAI_API_KEY",
+        grok_max_turns=max(0, grok_turns),
+        grok_dangerous_skip=max(0, min(1, grok_skip)),
+        grok_idle_timeout_sec=max(0, grok_idle),
+        maka_bin=env("MAKA_BIN", os.getenv("MAKA_BIN", "")).strip(),
+        maka_workspace_root=env("MAKA_WORKSPACE_ROOT", os.getenv("MAKA_WORKSPACE_ROOT", "")).strip(),
+        maka_connection=env("MAKA_CONNECTION", os.getenv("MAKA_CONNECTION", "")).strip(),
+        maka_api_key=env("MAKA_API_KEY", os.getenv("MAKA_API_KEY", "")).strip(),
+        maka_api_key_env=env("MAKA_API_KEY_ENV", os.getenv("MAKA_API_KEY_ENV", "DEEPSEEK_API_KEY")).strip() or "DEEPSEEK_API_KEY",
+        maka_base_url=env("MAKA_BASE_URL", os.getenv("MAKA_BASE_URL", "")).strip(),
+        maka_base_url_env=env("MAKA_BASE_URL_ENV", os.getenv("MAKA_BASE_URL_ENV", "DEEPSEEK_BASE_URL")).strip() or "DEEPSEEK_BASE_URL",
+        maka_max_steps=max(0, maka_steps),
+        maka_dangerous_skip=max(0, min(1, maka_skip)),
+        maka_idle_timeout_sec=max(0, maka_idle),
         dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
         role=role,
         court_chat_id=env("COURT_CHAT_ID").strip(),
@@ -358,6 +429,30 @@ def _load_legacy_profile() -> Optional[Profile]:
         mimo_idle = int(os.getenv("MIMO_IDLE_TIMEOUT_SEC", "600") or "600")
     except ValueError:
         mimo_idle = 600
+    try:
+        grok_skip = int(os.getenv("GROK_DANGEROUS_SKIP", "1") or "1")
+    except ValueError:
+        grok_skip = 1
+    try:
+        grok_idle = int(os.getenv("GROK_IDLE_TIMEOUT_SEC", "300") or "300")
+    except ValueError:
+        grok_idle = 300
+    try:
+        grok_turns = int(os.getenv("GROK_MAX_TURNS", "0") or "0")
+    except ValueError:
+        grok_turns = 0
+    try:
+        maka_skip = int(os.getenv("MAKA_DANGEROUS_SKIP", "1") or "1")
+    except ValueError:
+        maka_skip = 1
+    try:
+        maka_idle = int(os.getenv("MAKA_IDLE_TIMEOUT_SEC", "1800") or "1800")
+    except ValueError:
+        maka_idle = 1800
+    try:
+        maka_steps = int(os.getenv("MAKA_MAX_STEPS", "0") or "0")
+    except ValueError:
+        maka_steps = 0
     return Profile(
         name=legacy_name,
         app_id=app_id,
@@ -392,6 +487,23 @@ def _load_legacy_profile() -> Optional[Profile]:
         mimo_variant=os.getenv("MIMO_VARIANT", "").strip(),
         mimo_dangerous_skip=max(0, min(1, mimo_skip)),
         mimo_idle_timeout_sec=max(0, mimo_idle),
+        grok_bin=os.getenv("GROK_BIN", "").strip(),
+        grok_home=os.getenv("GROK_HOME_DIR", "").strip(),
+        grok_api_key=os.getenv("GROK_API_KEY", "").strip(),
+        grok_api_key_env=os.getenv("GROK_API_KEY_ENV", "XAI_API_KEY").strip() or "XAI_API_KEY",
+        grok_max_turns=max(0, grok_turns),
+        grok_dangerous_skip=max(0, min(1, grok_skip)),
+        grok_idle_timeout_sec=max(0, grok_idle),
+        maka_bin=os.getenv("MAKA_BIN", "").strip(),
+        maka_workspace_root=os.getenv("MAKA_WORKSPACE_ROOT", "").strip(),
+        maka_connection=os.getenv("MAKA_CONNECTION", "").strip(),
+        maka_api_key=os.getenv("MAKA_API_KEY", "").strip(),
+        maka_api_key_env=os.getenv("MAKA_API_KEY_ENV", "DEEPSEEK_API_KEY").strip() or "DEEPSEEK_API_KEY",
+        maka_base_url=os.getenv("MAKA_BASE_URL", "").strip(),
+        maka_base_url_env=os.getenv("MAKA_BASE_URL_ENV", "DEEPSEEK_BASE_URL").strip() or "DEEPSEEK_BASE_URL",
+        maka_max_steps=max(0, maka_steps),
+        maka_dangerous_skip=max(0, min(1, maka_skip)),
+        maka_idle_timeout_sec=max(0, maka_idle),
     )
 
 
