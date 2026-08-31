@@ -922,6 +922,10 @@ async def _run_and_display(
 
     start_ts = time.time()
     last_output_ts = start_ts
+    # 2026-08-27 实测：一次 maka 轮次里 runner 已返回、"完成"已落日志，卡片却被心跳
+    # 一路刷到 12 分钟且始终停在流式帧（无终态、无 ✅），/stop 才解开。cancel 路径看不
+    # 出问题，所以这里加一道与取消无关的闸门：收尾一开始就置位，心跳自己退出。
+    run_finished = False
     current_tool: tuple[str, float] | None = None
     pty_warning: tuple[str, float] | None = None  # (label, since_ts) — PTY 抓到的 API 限流/过载提示
 
@@ -1080,7 +1084,7 @@ async def _run_and_display(
         try:
             while True:
                 await asyncio.sleep(1.0)
-                if _stopping():
+                if run_finished or _stopping():
                     return
                 if time.time() - last_push_time >= 1.5:
                     await push(_build_display())
@@ -1333,12 +1337,15 @@ async def _run_and_display(
             # 成功/失败路径统一：先等心跳协程完全退出再动最终卡片。只 cancel 不 await
             # 的话，一个 in-flight 的心跳 push（HTTP 已发出）可能在最终内容之后落地，
             # 把 ✅/❌ 覆盖回"进行中"画面（错误路径此前修过同款竞态，这里补齐成功路径）。
+            run_finished = True  # 先置闸门，再 cancel：两条路谁先生效都行
             if not heartbeat_task.done():
                 heartbeat_task.cancel()
             try:
                 await heartbeat_task
             except (asyncio.CancelledError, Exception):
                 pass
+            log(bot.profile.name, "card", "info",
+                f"心跳已停，开始收尾 success={success} 耗时={time.time() - start_ts:.0f}s")
 
         if not success:
             # claude_pty 撞用量上限 / API 错误时，会把崩溃前的 session id 挂在异常上
@@ -1499,6 +1506,8 @@ async def _run_and_display(
                         await bot.feishu.send_text_to_user(user_id, "✅")
                 except Exception:
                     pass
+            log(bot.profile.name, "card", "info",
+                f"收尾完成 patched={card_patched} 总耗时={time.time() - start_ts:.0f}s")
 
         if _stopping():
             return
