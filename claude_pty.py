@@ -1422,15 +1422,24 @@ async def run_claude(
     used_fresh_session_fallback = False
 
     orphan_resume = stderr_text == "_orphan_resume_no_response"
+    # session 的 JSONL 已被 Claude Code 的 30 天清理删掉（TUI 直接打
+    # "No conversation found with session ID: …" 然后 rc=1 退出）。tail_buffer 非空，
+    # 所以撞不上下面"failed without stderr"那条；不单独认出来的话，用户只会收到一坨
+    # ANSI 乱码的 exited with code 1，而且该话题从此每条消息都挂。永久错误，只能开新会话。
+    from claude_runner import is_session_missing_error_text
+    session_gone = is_session_missing_error_text(stderr_text)
     if session_id and (
         watchdog_hung_on_resume
         or (rc is not None and rc > 0 and not stderr_text and not final_text)
         or orphan_resume
+        or session_gone
     ):
         if watchdog_hung_on_resume:
             reason = "hung-by-watchdog"
         elif orphan_resume:
             reason = "orphaned"
+        elif session_gone:
+            reason = "gone (cleaned up by CLI retention)"
         else:
             reason = "failed without stderr"
         # 带上 code/sid/cwd 才能在 cc-lark.log 里直接看清真因（cwd 通常根本没变，

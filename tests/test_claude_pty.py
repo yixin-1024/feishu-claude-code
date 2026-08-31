@@ -1475,3 +1475,92 @@ def test_concurrent_fresh_same_cwd_no_crosstalk(tmp_path, monkeypatch):
     # 两个 run 各自独立的 session 文件
     assert sid_a and sid_b and sid_a != sid_b
     assert fb_a is False and fb_b is False
+
+
+# ────────────── resume 目标被 CLI 30 天清理删掉 的回归 ──────────────
+
+@pytest.mark.skipif(sys.platform == "win32", reason="PTY only on POSIX")
+def test_pty_runner_resume_missing_session_falls_back_to_fresh_session(tmp_path, monkeypatch):
+    """Claude Code 默认 cleanupPeriodDays=30 会删掉旧 session 的 JSONL，而 cc-lark 的
+    thread→session 绑定永不过期。老话题再来一条消息时，TUI 打
+    "No conversation found with session ID: …" 后 rc=1 退出。
+
+    修复前：tail_buffer 非空 → 撞不上"failed without stderr"那条兜底 → 直接抛
+            "claude (pty) exited with code 1: <一坨 ANSI>"，该话题从此每条消息都挂。
+    修复后：识别出这条永久错误 → 自动开新会话重跑 → 用户拿到真实回答。
+    """
+    project_root = tmp_path / "projects"
+    cwd = tmp_path / "wd"
+    cwd.mkdir()
+    project_dir = project_root / str(cwd).replace("/", "-")
+    project_dir.mkdir(parents=True)
+
+    dead_sid = str(uuid.uuid4())  # 故意不建对应的 .jsonl —— 就是"已被清理"
+
+    script = textwrap.dedent(f"""
+        #!{sys.executable}
+        import json, os, sys, time, select, uuid
+        PROJECT_DIR = {str(project_dir)!r}
+
+        if "--resume" in sys.argv:
+            sid = sys.argv[sys.argv.index("--resume") + 1]
+            # 真 TUI 的表现：明文原因夹在 ANSI 转义里，写 stdout 后非零退出
+            sys.stdout.write("\\x1b[?25l\\x1b[38;5;137m")
+            sys.stdout.write("No conversation found with session ID: " + sid)
+            sys.stdout.write("\\x1b[39m\\x1b[?25h\\n")
+            sys.stdout.flush()
+            os._exit(1)
+
+        sys.stdout.write("ready\\n"); sys.stdout.flush()
+        buf = b""
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            r, _, _ = select.select([sys.stdin.fileno()], [], [], 0.3)
+            if r:
+                c = os.read(sys.stdin.fileno(), 65536)
+                if not c: break
+                buf += c
+                if b"\\x1b[201~" in buf or b"\\r" in buf:
+                    break
+        paste_text = buf.decode("utf-8", errors="replace") \\
+            .replace("\\x1b[200~", "").replace("\\x1b[201~", "").strip("\\r\\n")
+        sid = (sys.argv[sys.argv.index("--session-id") + 1]
+               if "--session-id" in sys.argv else str(uuid.uuid4()))
+        with open(os.path.join(PROJECT_DIR, sid + ".jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({{"type": "system", "sessionId": sid}}) + "\\n")
+            f.write(json.dumps({{
+                "type": "user",
+                "message": {{"role": "user", "content": [{{"type": "text", "text": paste_text}}]}},
+            }}) + "\\n")
+            f.write(json.dumps({{
+                "type": "assistant",
+                "message": {{
+                    "content": [{{"type": "text", "text": "Fresh session real reply ✅"}}],
+                    "stop_reason": "end_turn",
+                    "usage": {{"input_tokens": 3, "output_tokens": 6, "iterations": [{{
+                        "input_tokens": 3, "output_tokens": 6
+                    }}]}},
+                }},
+            }}) + "\\n")
+        time.sleep(30)
+    """)
+    fake = tmp_path / "fake-claude-session-gone.py"
+    fake.write_text(script.lstrip())
+    fake.chmod(0o755)
+
+    monkeypatch.setattr(claude_pty, "CLAUDE_CLI", str(fake))
+    monkeypatch.setattr(claude_pty, "CLAUDE_PROJECTS_DIR", str(project_root))
+    monkeypatch.setattr(claude_pty, "_has_children", lambda _pid: False)
+
+    text, returned_sid, used_fallback = asyncio.run(
+        claude_pty.run_claude(
+            "这笔有计入台账吗？",
+            session_id=dead_sid,
+            cwd=str(cwd),
+            permission_mode="bypassPermissions",
+        )
+    )
+
+    assert text == "Fresh session real reply ✅"
+    assert used_fallback is True
+    assert returned_sid != dead_sid

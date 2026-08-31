@@ -94,12 +94,30 @@ def is_safeguards_error_text(blob: str) -> bool:
     return any(p in low for p in _SAFEGUARDS_ERR_PATTERNS)
 
 
+# --resume 的 session 已经不在本机：Claude Code 默认 cleanupPeriodDays=30 会删
+# ~/.claude/projects/*/<sid>.jsonl，而 thread→session 绑定永不过期，老话题一回消息
+# 就拿几十天前的 sid 去 resume。CLI 返回 subtype=error_during_execution +
+# duration_ms=0 + errors=["No conversation found with session ID: …"]（退出码 0，
+# result 为空），光看 subtype 完全看不出真因。重试同一个 sid 必然再挂，只能换新 session。
+_SESSION_MISSING_ERR_PATTERNS = (
+    "no conversation found with session id",
+)
+
+
+def is_session_missing_error_text(blob: str) -> bool:
+    """错误文本是否为「resume 的 session 已不存在」（换新 session 才有救）。"""
+    low = (blob or "").lower()
+    return any(p in low for p in _SESSION_MISSING_ERR_PATTERNS)
+
+
 # 重试无益的错误：认证 / 余额 / 请求本身不合法 / CLI 参数错。命中这些才不自动续跑；
 # 其余一律按「上游瞬时抖动」处理（流中断、5xx、overloaded、连接被掐、CLI 自己炸…），
 # 因为崩溃前的 session JSONL 是干净可 --resume 的，续跑基本能恢复。
 # ⚠️ 这里是「黑名单」而不是「白名单」：上游错误文案变来变去（"Response stalled
 # mid-stream" / "Connection closed mid-response" / …），白名单漏一个就等于中断不续跑。
-_FATAL_ERR_PATTERNS = _RATE_LIMIT_PATTERNS + _SAFEGUARDS_ERR_PATTERNS + (
+_FATAL_ERR_PATTERNS = (
+    _RATE_LIMIT_PATTERNS + _SAFEGUARDS_ERR_PATTERNS + _SESSION_MISSING_ERR_PATTERNS
+) + (
     "invalid api key",
     "invalid_api_key",
     "authentication_error",
@@ -126,6 +144,26 @@ def is_fatal_error_text(blob: str, status=None) -> bool:
     return any(p in low for p in _FATAL_ERR_PATTERNS)
 
 
+def _extract_errors_text(data: dict) -> str:
+    """把 result 事件的 errors[] 摊平成一行文本；没有就返回空串。"""
+    errors = data.get("errors")
+    if isinstance(errors, str):
+        return errors.strip()
+    if not isinstance(errors, list):
+        return ""
+    parts = []
+    for item in errors:
+        if isinstance(item, str):
+            piece = item.strip()
+        elif isinstance(item, dict):
+            piece = str(item.get("message") or item.get("error") or item).strip()
+        else:
+            piece = str(item).strip()
+        if piece:
+            parts.append(piece)
+    return "; ".join(parts)
+
+
 def _classify_result_error(data: dict, text: str):
     """判断 stream-json 的 result 事件是不是错误结果。
 
@@ -134,14 +172,19 @@ def _classify_result_error(data: dict, text: str):
     is_error=bool、api_error_status=int|None、result=错误文本（流中断时是
     "API Error: Response stalled mid-stream. ..." 或 "API Error: Connection closed
     mid-response. ..."，此时 subtype 可能仍是 'success' 只有 is_error=true）。
+
+    ⚠️ 有一类错误 result 是空的、真因只在 errors[] 里（如 resume 了已被清理的
+    session）。不读 errors 的话 detail 会回落成 subtype，错误卡变成
+    "error_during_execution：error_during_execution" 这种自我复读。
     """
     subtype = str(data.get("subtype") or "")
     is_error = data.get("is_error") is True
     if not is_error and subtype in ("", "success"):
         return None
     status = data.get("api_error_status")
-    detail = (text or "").strip() or subtype or "unknown error"
-    blob = f"{text}\n{subtype}"
+    errors_text = _extract_errors_text(data)
+    detail = (text or "").strip() or errors_text or subtype or "unknown error"
+    blob = f"{text}\n{errors_text}\n{subtype}"
     if status == 429 or any(p in blob.lower() for p in _RATE_LIMIT_PATTERNS):
         return (f"Claude Max 用量已达上限：{detail}", False)
     transient = not is_fatal_error_text(blob, status)
@@ -495,6 +538,13 @@ async def _run_claude_print(
                         exc = RuntimeError(msg)
                         exc.cc_session_id = new_session_id
                         exc.cc_retryable_resume = transient
+                        # resume 的 session 已被清理：外层据此换新 session 重跑一次，
+                        # 别把这个 sid 当"崩溃前可 resume 的会话"再传下去。
+                        if is_session_missing_error_text(
+                            f"{final_text or full_text}\n{_extract_errors_text(data)}"
+                        ):
+                            exc.cc_session_missing = True
+                            exc.cc_session_id = None
                         raise exc
                     if final_text:
                         full_text = final_text
@@ -528,8 +578,40 @@ async def _run_claude_print(
         stderr_text = stderr_output.decode("utf-8", errors="replace").strip()
         return full_text.strip(), new_session_id, proc.returncode, stderr_text
 
-    final_text, new_session_id, returncode, stderr_text = await _run_once(session_id)
     used_fresh_session_fallback = False
+
+    try:
+        final_text, new_session_id, returncode, stderr_text = await _run_once(session_id)
+    except RuntimeError as exc:
+        # resume 的 session 已被 CLI 的 30 天清理删掉（errors[] 里 "No conversation
+        # found with session ID"）。这条路径在 result 事件里就 raise 了，走不到下面
+        # 那段 rc>0 的兜底 —— 不在这里接住的话，dispatcher 会拿同一个死 sid 重试到
+        # 放弃，该话题从此每条消息都必挂。永久错误，只能换新 session 重跑一次。
+        if not (session_id and getattr(exc, "cc_session_missing", False)):
+            raise
+        print(
+            f"[run_claude] resume target gone ({exc}); retrying with fresh session; "
+            f"sid={session_id} cwd={cwd}",
+            flush=True,
+        )
+        final_text, new_session_id, returncode, stderr_text = await _run_once(None)
+        used_fresh_session_fallback = True
+
+    # 同一个"session 已被清理"，老 CLI 可能只落 stderr + 非零退出码、不吐 result
+    # 事件（那样上面的 except 接不到）。这里按 stderr 再兜一次，两种表现都能自愈。
+    if (
+        session_id
+        and not used_fresh_session_fallback
+        and returncode not in (0, None)
+        and is_session_missing_error_text(stderr_text)
+    ):
+        print(
+            f"[run_claude] resume target gone (stderr); retrying with fresh session; "
+            f"sid={session_id} cwd={cwd}",
+            flush=True,
+        )
+        final_text, new_session_id, returncode, stderr_text = await _run_once(None)
+        used_fresh_session_fallback = True
 
     # resume 旧 session "哑失败"的兜底：code>0 + stderr 空 + 无输出。
     # 成因不止 cwd 变（那只是其一）：上一轮被杀致 JSONL 写一半、session 被 CLI 清掉、
@@ -537,7 +619,14 @@ async def _run_claude_print(
     # 注意：用户文案别再写死"工作目录已变化"，那是误判（见 dispatcher fallback 提示）。
     # returncode 为负数 = 被信号杀（如 /stop 的 SIGTERM/SIGKILL），不能 fallback——
     # 否则用户 /stop 后会立刻在 lock 内拉起新进程，造成"队列说在跑、/stop 杀不死"的死循环。
-    if session_id and returncode is not None and returncode > 0 and not stderr_text and not final_text:
+    if (
+        session_id
+        and not used_fresh_session_fallback  # 上面已经换过新 session，别再换一次
+        and returncode is not None
+        and returncode > 0
+        and not stderr_text
+        and not final_text
+    ):
         print(
             f"[run_claude] resume failed (code={returncode}, empty stderr/output), "
             f"retrying with fresh session; sid={session_id} cwd={cwd}",

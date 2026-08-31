@@ -405,3 +405,84 @@ def test_normal_result_with_error_word_not_flagged(monkeypatch):
     text, session_id, _ = asyncio.run(run_claude("hi"))
     assert text == "the server_error happens when overloaded"
     assert session_id == "sid_ok"
+
+
+# --- resume 目标已被清理（Claude Code cleanupPeriodDays=30 删掉了 transcript） ---
+# 真实 CLI 输出（2026-08-24 财务机实测）：subtype=error_during_execution、
+# duration_ms=0、result 缺席、真因只在 errors[] 里，退出码 0。
+_SESSION_GONE_RESULT = (
+    b'{"type":"result","subtype":"error_during_execution","duration_ms":0,'
+    b'"duration_api_ms":0,"is_error":true,"num_turns":0,"session_id":"sid_dead",'
+    b'"total_cost_usd":0,"errors":["No conversation found with session ID: sid_dead"]}\n'
+)
+
+
+def test_resume_missing_session_falls_back_to_fresh_session(monkeypatch):
+    """resume 一个已被清理的 session：不能把错误交给用户（那会让该话题每条消息都挂），
+    要自动退回新 session 重跑一次。"""
+    first = FakeProc([_SESSION_GONE_RESULT])
+    second = FakeProc([
+        b'{"type":"system","session_id":"sid_new"}\n',
+        b'{"type":"result","session_id":"sid_new","result":"fresh answer"}\n',
+    ])
+    procs = iter([first, second])
+    seen_cmds = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        seen_cmds.append(list(args))
+        return next(procs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    text, session_id, used_fallback = asyncio.run(run_claude("hi", session_id="sid_dead"))
+
+    assert text == "fresh answer"
+    assert session_id == "sid_new"
+    assert used_fallback is True
+    assert len(seen_cmds) == 2
+    assert "--resume" in seen_cmds[0]
+    assert "--resume" not in seen_cmds[1]  # 第二次必须是全新会话，不能再带死 sid
+
+
+def test_resume_missing_session_reported_with_real_reason(monkeypatch):
+    """没有 session_id 可退回时（fallback 也失败）：错误文案要带 errors[] 里的真因，
+    不能只复读 subtype；且标记为不可重试（同一个死 sid 重试必然再挂）。"""
+    procs = iter([FakeProc([_SESSION_GONE_RESULT]), FakeProc([_SESSION_GONE_RESULT])])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return next(procs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(run_claude("hi", session_id="sid_dead"))
+
+    exc = ei.value
+    assert "No conversation found with session ID" in str(exc)
+    assert getattr(exc, "cc_retryable_resume", None) is False
+    # 死 sid 不能当"崩溃前可 resume 的会话"传给 dispatcher
+    assert getattr(exc, "cc_session_id", "unset") is None
+
+
+def test_resume_missing_session_via_stderr_falls_back(monkeypatch):
+    """同一根因的另一种表现：只落 stderr + 非零退出码、没有 result 事件。"""
+    first = FakeProc(
+        [],
+        stderr=b"No conversation found with session ID: sid_dead",
+        returncode=1,
+    )
+    second = FakeProc([
+        b'{"type":"result","session_id":"sid_new","result":"fresh answer"}\n',
+    ])
+    procs = iter([first, second])
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return next(procs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    text, session_id, used_fallback = asyncio.run(run_claude("hi", session_id="sid_dead"))
+
+    assert text == "fresh answer"
+    assert session_id == "sid_new"
+    assert used_fallback is True
