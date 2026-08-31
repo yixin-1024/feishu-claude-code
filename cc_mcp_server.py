@@ -33,6 +33,13 @@ import os
 import sys
 import urllib.request
 
+try:
+    # 定时任务的删/停/改：纯 stdlib、跟本文件同目录。缺失时只是少 4 个工具，
+    # 不能让整个 MCP server 起不来（那会连 wake/dispatch 一起赔进去）。
+    import cron_store
+except Exception:  # noqa: BLE001
+    cron_store = None
+
 SERVER_NAME = "cc-lark"
 SERVER_VERSION = "0.1.0"
 DEFAULT_PROTOCOL = "2025-06-18"
@@ -118,6 +125,23 @@ def _post_json(path: str, payload: dict, timeout: int = 35) -> dict:
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _get_json(path: str, timeout: int = 35) -> dict:
+    """GET 一个本机 control 端点（/reload 是 GET）。任何异常向上抛。"""
+    req = urllib.request.Request(
+        f"{_control_base()}{path}", headers=_control_headers(), method="GET"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8") or "{}")
+
+
+def _reload_tasks() -> dict:
+    """让常驻 scheduler 重读 scheduled_tasks.yaml 并全量重建 job。
+
+    这是「改完免重启」的关键：/reload 是**早就存在**的端点，所以删/停/改全部能在
+    不动 bot 进程的前提下即时生效（bot 侧一行代码都不用加）。"""
+    return _get_json("/reload")
 
 
 # ── 工具定义 ──────────────────────────────────────────────────
@@ -357,6 +381,91 @@ LIST_CRONS_TOOL = {
     "inputSchema": {"type": "object", "properties": {}},
 }
 
+_NAME_PROP = {
+    "type": "string",
+    "description": "Exact task name as shown by list_crons (e.g. 'agent_cron_1784525729_4f9a').",
+}
+
+CANCEL_CRON_TOOL = {
+    "name": "cancel_cron",
+    "description": (
+        "PERMANENTLY delete a recurring scheduled task by name. Takes effect immediately "
+        "(no bot restart). Only tasks belonging to THIS chat can be cancelled. The removed "
+        "entry is archived under data/agent_crons/removed/ so it can be restored by hand. "
+        "To stop a task only temporarily, use pause_cron instead."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"name": _NAME_PROP},
+        "required": ["name"],
+    },
+}
+
+PAUSE_CRON_TOOL = {
+    "name": "pause_cron",
+    "description": (
+        "Temporarily stop a recurring task without deleting it — it stops firing right away "
+        "(no bot restart) and stays paused across restarts. Resume later with resume_cron. "
+        "Paused tasks are shown by list_crons under a 'paused' section. Only tasks belonging "
+        "to THIS chat can be paused."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"name": _NAME_PROP},
+        "required": ["name"],
+    },
+}
+
+RESUME_CRON_TOOL = {
+    "name": "resume_cron",
+    "description": (
+        "Re-activate a task previously paused with pause_cron. It starts firing again "
+        "immediately (no bot restart), on its original cron schedule."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {"name": _NAME_PROP},
+        "required": ["name"],
+    },
+}
+
+UPDATE_CRON_TOOL = {
+    "name": "update_cron",
+    "description": (
+        "Edit an existing recurring task in place — change its schedule, its prompt, its "
+        "topic title, or the model/effort it runs with. Only the fields you pass are "
+        "touched; everything else (and the surrounding config file) is left untouched. "
+        "Takes effect immediately (no bot restart). If the new cron is invalid the change "
+        "is rolled back and an error is returned. Works on paused tasks too. Only tasks "
+        "belonging to THIS chat can be edited."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "name": _NAME_PROP,
+            "cron": {"type": "string", "description": "New 5-field cron: 'minute hour dom month dow' (Asia/Shanghai)."},
+            "prompt": {"type": "string", "description": "New self-contained instruction to run at each scheduled time (replaces the old one)."},
+            "title": {"type": "string", "description": "New topic title for each run."},
+            "model": {
+                "type": "string",
+                "description": (
+                    "New model for each run ('opus', 'sonnet', 'haiku', 'codex', ... or a "
+                    "full model id). Pass an empty string to clear the override and fall "
+                    "back to the bot default."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "description": (
+                    "New reasoning effort: low / medium / high / xhigh / max. Pass an empty "
+                    "string to clear the override."
+                ),
+            },
+        },
+        "required": ["name"],
+    },
+}
+
 # 按闸门装配 tools/list —— 关掉的能力这里就不出现，agent 看都看不到。
 TOOLS = []
 if _ALLOW_WAKE:
@@ -365,6 +474,9 @@ if _ALLOW_DISPATCH:
     TOOLS += [DISPATCH_TASK_TOOL, READ_THREAD_TOOL, APPEND_TASK_TOOL, STEER_TASK_TOOL]
 if _ALLOW_CRON:
     TOOLS += [SCHEDULE_CRON_TOOL, LIST_CRONS_TOOL]
+    # 删/停/改靠本地改 yaml + /reload 实现，没有 cron_store 就整组不暴露
+    if cron_store is not None:
+        TOOLS += [CANCEL_CRON_TOOL, PAUSE_CRON_TOOL, RESUME_CRON_TOOL, UPDATE_CRON_TOOL]
 
 
 # ── 工具实现 ──────────────────────────────────────────────────
@@ -593,13 +705,97 @@ def _tool_list_crons(args: dict) -> dict:
     if not body.get("ok"):
         return _err(f"list_crons failed: {body.get('error', 'unknown error')}")
     jobs = body.get("jobs", [])
-    if not jobs:
+    sections = []
+    if jobs:
+        sections.append("Scheduled jobs:\n" + "\n".join(
+            f"- {j.get('name')}　next={j.get('next_run')}"
+            + ("　(agent)" if j.get("agent_created") else "")
+            for j in jobs
+        ))
+    # 暂停中的任务已从 scheduler 摘掉，只有本地 sidecar 知道，得在这边补上。
+    paused = []
+    if cron_store is not None:
+        try:
+            paused = cron_store.list_paused(chat_id)
+        except Exception as e:  # noqa: BLE001 —— 列不出来也不该让 list_crons 整个失败
+            _log(f"list_paused failed: {type(e).__name__}: {e}")
+    if paused:
+        sections.append("Paused (not firing — resume_cron to re-activate):\n" + "\n".join(
+            f"- {p['name']}　cron='{p['cron']}'"
+            + (f"　{p['title']}" if p.get("title") else "")
+            for p in paused
+        ))
+    if not sections:
         return _ok("No scheduled jobs.")
-    lines = [
-        f"- {j.get('name')}　next={j.get('next_run')}" + ("　(agent)" if j.get("agent_created") else "")
-        for j in jobs
-    ]
-    return _ok("Scheduled jobs:\n" + "\n".join(lines))
+    return _ok("\n\n".join(sections))
+
+
+def _cron_chat() -> str:
+    return (os.environ.get("CC_LARK_CHAT_ID") or "").strip()
+
+
+def _cron_mutate(op, name: str, **kwargs) -> dict:
+    """删/停/改的公共外壳：校验入参 → 调 cron_store → 统一错误呈现。
+
+    真正的落盘与生效在 cron_store：改 scheduled_tasks.yaml 后调既有的 /reload，
+    常驻 bot 无需重启。"""
+    if cron_store is None:
+        return _err("cron management is unavailable (cron_store module missing).")
+    if not isinstance(name, str) or not name.strip():
+        return _err("`name` must be a non-empty task name (see list_crons).")
+    chat_id = _cron_chat()
+    if not chat_id:
+        return _err("No Lark group context — cron management only works inside a cc-lark group session.")
+    try:
+        res = op(name.strip(), chat_id=chat_id, reload_fn=_reload_tasks, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        _log(f"cron mutate {op.__name__} failed: {type(e).__name__}: {e}")
+        return _err(f"{op.__name__} failed: {type(e).__name__}: {e}")
+    if not res.get("ok"):
+        return _err(res.get("error", "unknown error"))
+    return res
+
+
+def _tool_cancel_cron(args: dict) -> dict:
+    res = _cron_mutate(cron_store.cancel if cron_store else None, args.get("name"))
+    if res.get("isError"):
+        return res
+    return _ok(
+        f"✅ Deleted recurring task {res['name']} — effective now, no restart needed. "
+        f"(Archived to {res.get('stash')} in case you need it back.)"
+    )
+
+
+def _tool_pause_cron(args: dict) -> dict:
+    res = _cron_mutate(cron_store.pause if cron_store else None, args.get("name"))
+    if res.get("isError"):
+        return res
+    return _ok(
+        f"⏸️ Paused {res['name']} — it stops firing now (and stays paused across "
+        f"restarts). Use resume_cron to re-activate."
+    )
+
+
+def _tool_resume_cron(args: dict) -> dict:
+    res = _cron_mutate(cron_store.resume if cron_store else None, args.get("name"))
+    if res.get("isError"):
+        return res
+    return _ok(f"▶️ Resumed {res['name']} — firing again on its original schedule.")
+
+
+def _tool_update_cron(args: dict) -> dict:
+    # 只把「显式传了的」字段往下送：没传 = 不动，传空串 = 清掉（model/effort）。
+    fields = {k: args[k] for k in ("cron", "prompt", "title", "model", "effort")
+              if isinstance(args.get(k), str)}
+    if not fields:
+        return _err("Pass at least one of: cron / prompt / title / model / effort.")
+    res = _cron_mutate(cron_store.update if cron_store else None, args.get("name"), **fields)
+    if res.get("isError"):
+        return res
+    changed = ", ".join(res.get("changed") or fields.keys())
+    if res.get("paused"):
+        return _ok(f"✅ Updated paused task {res['name']} ({changed}). It stays paused — resume_cron to run it.")
+    return _ok(f"✅ Updated {res['name']} ({changed}) — effective now, no restart needed.")
 
 
 # 只登记开着的能力（防御纵深：闸门关掉的工具即便被硬调也 Unknown tool 拒绝）。
@@ -614,6 +810,11 @@ if _ALLOW_DISPATCH:
 if _ALLOW_CRON:
     _HANDLERS["schedule_cron"] = _tool_schedule_cron
     _HANDLERS["list_crons"] = _tool_list_crons
+    if cron_store is not None:
+        _HANDLERS["cancel_cron"] = _tool_cancel_cron
+        _HANDLERS["pause_cron"] = _tool_pause_cron
+        _HANDLERS["resume_cron"] = _tool_resume_cron
+        _HANDLERS["update_cron"] = _tool_update_cron
 
 
 # ── JSON-RPC over stdio ───────────────────────────────────────

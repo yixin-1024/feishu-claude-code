@@ -20,6 +20,7 @@ def test_tools_list_exposes_all_runtime_tools():
     assert [t["name"] for t in tools] == [
         "wake_me_in", "dispatch_task", "read_thread", "append_to_task", "steer_task",
         "schedule_cron", "list_crons",
+        "cancel_cron", "pause_cron", "resume_cron", "update_cron",
     ]
     wake = tools[0]
     assert wake["inputSchema"]["required"] == ["minutes", "note"]
