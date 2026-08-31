@@ -668,34 +668,63 @@ def _wake_nudge_loop(scheduler: BackgroundScheduler) -> None:
             pass
 
 
+# ── 定时任务派单前的用量刹车线 ─────────────────────────────
+# 语义："定时任务最多把额度吃到这条线，剩下的留给人工交互"。所以刹车线低于
+# Anthropic 真正的 100%——不是等真耗尽才停，而是提前给自己留 headroom。
+# 两个窗口分开配：5h 是滚动小窗口（很快回血，可以早点让路给人），7d 是周配额
+# （稀缺，留太多余量反而浪费，所以线更高）。
+# 覆盖：环境变量写 0.95 或 95 都行。account_switcher 的 _HARD_LIMIT_UTIL(0.98)
+# 是另一套语义（判某账号还能不能用），不受这里影响。
+_DEFAULT_SKIP_UTIL = {"5h": 0.95, "7d": 0.97}
+_SKIP_UTIL_ENV = {"5h": "SCHED_QUOTA_SKIP_5H", "7d": "SCHED_QUOTA_SKIP_7D"}
+
+
+def _skip_util_threshold(label: str) -> float:
+    """取某个窗口的刹车线（每次调用现读 env，改 .env 后 /restart 即生效）。"""
+    default = _DEFAULT_SKIP_UTIL[label]
+    raw = os.environ.get(_SKIP_UTIL_ENV[label], "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        print(f"[scheduler] ⚠️ {_SKIP_UTIL_ENV[label]}={raw!r} 不是数字，回退 {default}", flush=True)
+        return default
+    if val > 1:  # 允许写百分数
+        val = val / 100.0
+    if not (0 < val <= 1):
+        print(f"[scheduler] ⚠️ {_SKIP_UTIL_ENV[label]}={raw!r} 越界，回退 {default}", flush=True)
+        return default
+    return val
+
+
 def _quota_skip_reason(q: dict) -> tuple[str, list[tuple[str, int | None]]] | None:
     """根据 fetch_quota_headers() 返回判断是否要跳过派单。
 
-    返回 None = 用量正常可派；否则返回 (整体说明, [(窗口标签, reset_ts), ...])。
-    判据：status 字段非 "allowed"（Anthropic 直接告诉我们已耗尽），或
-    utilization >= 0.98（再派一次极可能立刻撞 limit、Claude CLI 会注入
-    synthetic rate_limit 事件，相当于派出去就死）。
+    返回 None = 用量正常可派；否则返回 (整体说明, [文案行, ...])。
+    唯一判据：utilization >= 该窗口的刹车线（见 _skip_util_threshold）。
+    status 字段（exceeded/blocked 等）刻意不看——它误报起来会白白跳过整轮，
+    真撞上限有 PTY runner 的 rate_limit 兜底，让它派出去死一次也比不派好。
     """
     if not q.get("ok"):
         return None  # 拿不到 quota：不阻塞，让 spawn 正常跑
-    out: list[tuple[str, int | None]] = []
-    for label, util_key, reset_key, status_key in [
-        ("5h", "u5h", "r5h", "s5h"),
-        ("7d", "u7d", "r7d", "s7d"),
+    out: list[tuple[str, int | None, float, float]] = []
+    for label, util_key, reset_key in [
+        ("5h", "u5h", "r5h"),
+        ("7d", "u7d", "r7d"),
     ]:
         util = q.get(util_key)
-        status = q.get(status_key)
         reset_ts = q.get(reset_key)
-        bad_status = bool(status) and status != "allowed" and status != "unknown"
-        near_full = util is not None and util >= 0.98
-        if bad_status or near_full:
-            out.append((label, reset_ts))
+        thr = _skip_util_threshold(label)
+        if util is not None and util >= thr:
+            out.append((label, reset_ts, util, thr))
     if not out:
         return None
-    # 文案：列出每个窗口和它的 reset 时间
+    # 文案：列出每个窗口的用量/刹车线和它的 reset 时间
     from datetime import datetime
     lines: list[str] = []
-    for label, ts in out:
+    for label, ts, util, thr in out:
+        head = f"{label} {util*100:.0f}% ≥ 刹车线 {thr*100:.0f}%"
         if ts:
             try:
                 dt = datetime.fromtimestamp(int(ts))
@@ -703,14 +732,14 @@ def _quota_skip_reason(q: dict) -> tuple[str, list[tuple[str, int | None]]] | No
                 hh = int(diff.total_seconds() // 3600)
                 mm = int((diff.total_seconds() % 3600) // 60)
                 if diff.total_seconds() > 0:
-                    lines.append(f"{label} 重置：{dt.strftime('%m/%d %H:%M')}（{hh}h{mm}m 后）")
+                    lines.append(f"{head} · 重置：{dt.strftime('%m/%d %H:%M')}（{hh}h{mm}m 后）")
                 else:
-                    lines.append(f"{label} 已过重置时间，下次 poll 会刷新")
+                    lines.append(f"{head} · 已过重置时间，下次 poll 会刷新")
             except Exception:
-                lines.append(f"{label} 重置：{ts}")
+                lines.append(f"{head} · 重置：{ts}")
         else:
-            lines.append(f"{label} 已耗尽（无 reset 时间）")
-    return ("Claude Max 用量已达上限", lines)
+            lines.append(f"{head} · 已耗尽（无 reset 时间）")
+    return ("Claude Max 用量触及刹车线（留额度给人工交互）", lines)
 
 
 def _make_async_fire(task: ScheduledTask, bot, spawn_fn: SpawnFn):

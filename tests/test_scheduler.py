@@ -32,14 +32,12 @@ def test_quota_skip_reason_ignores_failed_fetch():
     assert scheduler._quota_skip_reason({"ok": False, "error": "x"}) is None
 
 
-def test_quota_skip_reason_blocks_when_status_not_allowed():
+def test_quota_skip_reason_ignores_status_field():
+    # status 非 allowed 但用量还在刹车线以下 → 照派。status 误报不该白跳一轮，
+    # 真撞上限由 PTY runner 的 rate_limit 处理兜底。
     q = {"ok": True, "u5h": 0.5, "u7d": 0.1,
-         "r5h": 9999999999, "r7d": 9999999999, "s5h": "exceeded", "s7d": "allowed"}
-    out = scheduler._quota_skip_reason(q)
-    assert out is not None
-    reason, lines = out
-    assert "用量" in reason
-    assert any("5h" in l for l in lines)
+         "r5h": 9999999999, "r7d": 9999999999, "s5h": "exceeded", "s7d": "blocked"}
+    assert scheduler._quota_skip_reason(q) is None
 
 
 def test_quota_skip_reason_blocks_when_near_full():
@@ -47,8 +45,46 @@ def test_quota_skip_reason_blocks_when_near_full():
          "r5h": 9999999999, "r7d": 9999999999, "s5h": "allowed", "s7d": "allowed"}
     out = scheduler._quota_skip_reason(q)
     assert out is not None
-    _, lines = out
+    reason, lines = out
+    assert "用量" in reason
     assert any("5h" in l for l in lines)
+
+
+def test_quota_skip_reason_blocks_at_default_5h_brake_line():
+    # 默认 5h 刹车线 95%：96% 就该停，别等 98%
+    q = {"ok": True, "u5h": 0.96, "u7d": 0.10,
+         "r5h": 9999999999, "r7d": 9999999999, "s5h": "allowed", "s7d": "allowed"}
+    out = scheduler._quota_skip_reason(q)
+    assert out is not None
+    _, lines = out
+    assert any("5h 96%" in l for l in lines)
+    assert not any(l.startswith("7d") for l in lines)
+
+
+def test_quota_skip_reason_7d_brake_line_is_higher_than_5h():
+    # 96% 在 5h 线(95%)之上、但在 7d 线(97%)之下 → 只有 5h 命中
+    q = {"ok": True, "u5h": 0.10, "u7d": 0.96,
+         "r5h": 9999999999, "r7d": 9999999999, "s5h": "allowed", "s7d": "allowed"}
+    assert scheduler._quota_skip_reason(q) is None
+    q["u7d"] = 0.97
+    assert scheduler._quota_skip_reason(q) is not None
+
+
+def test_skip_util_threshold_env_override(monkeypatch):
+    monkeypatch.setenv("SCHED_QUOTA_SKIP_5H", "80")      # 百分数写法
+    monkeypatch.setenv("SCHED_QUOTA_SKIP_7D", "0.5")     # 小数写法
+    assert scheduler._skip_util_threshold("5h") == 0.80
+    assert scheduler._skip_util_threshold("7d") == 0.50
+    q = {"ok": True, "u5h": 0.85, "u7d": 0.10,
+         "r5h": None, "r7d": None, "s5h": "allowed", "s7d": "allowed"}
+    assert scheduler._quota_skip_reason(q) is not None
+
+
+def test_skip_util_threshold_bad_env_falls_back(monkeypatch):
+    monkeypatch.setenv("SCHED_QUOTA_SKIP_5H", "abc")
+    assert scheduler._skip_util_threshold("5h") == 0.95
+    monkeypatch.setenv("SCHED_QUOTA_SKIP_5H", "0")       # 越界
+    assert scheduler._skip_util_threshold("5h") == 0.95
 
 
 def test_quota_skip_reason_unknown_status_does_not_block():
