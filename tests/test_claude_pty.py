@@ -1564,3 +1564,25 @@ def test_pty_runner_resume_missing_session_falls_back_to_fresh_session(tmp_path,
     assert text == "Fresh session real reply ✅"
     assert used_fallback is True
     assert returned_sid != dead_sid
+
+
+# ───────── _get_proc_cpu_seconds：macOS / Linux 两种 ps 时间格式 ─────────
+
+
+@pytest.mark.parametrize("ps_out,expected", [
+    ("0:05.44\n", 5.44),                      # macOS  MM:SS.ss
+    ("1:31.53\n", 91.53),                     # macOS  MM:SS.ss（分钟位 > 0）
+    ("  00:00:05\n", 5.0),                    # Linux  HH:MM:SS（带前导空格）
+    ("02:03:04\n", 2 * 3600 + 3 * 60 + 4),    # Linux  HH:MM:SS
+    ("2-03:04:05\n", 2 * 86400 + 3 * 3600 + 4 * 60 + 5),  # Linux 跑过一天：D-HH:MM:SS
+    ("garbage\n", -1.0),                      # 读不出来 → -1.0（watchdog 视为未知）
+])
+def test_get_proc_cpu_seconds_parses_both_ps_formats(monkeypatch, ps_out, expected):
+    """Linux 上 ps 对跑满一天的进程会输出 'D-HH:MM:SS'——漏解析就永远返回 -1.0，
+    watchdog 的"CPU 有没有在涨"这条腿直接瘸掉。"""
+    class _Proc:
+        returncode = 0
+        stdout = ps_out
+
+    monkeypatch.setattr(claude_pty.sp, "run", lambda *a, **kw: _Proc())
+    assert claude_pty._get_proc_cpu_seconds(4242) == pytest.approx(expected)

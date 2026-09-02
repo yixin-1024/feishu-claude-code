@@ -1,21 +1,45 @@
 [Unit]
-Description=Feishu Claude Code Bot
+Description=feishu-claude-code (cc-lark) Lark bot
 After=network-online.target
 Wants=network-online.target
+# 崩溃循环时不要被 systemd 的启动限流锁死（cc-lark 自己有退避）
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=YOUR_USER
-WorkingDirectory=/path/to/feishu-claude
-ExecStart=/path/to/feishu-claude/.venv/bin/python main.py
+Group=YOUR_USER
+WorkingDirectory=/path/to/feishu-claude-code
+ExecStart=/path/to/feishu-claude-code/.venv/bin/python main.py
+
+# ⚠️ 故意不写 EnvironmentFile=.env：cc-lark 自己在 bot_config.py 里
+# load_dotenv(override=True) 读仓库根的 .env，而 .env 里有大段带空格 / # / 引号的
+# prompt 文本，交给 systemd 的 EnvironmentFile 解析器只会被截断甚至让 unit 起不来。
+# 只需要保证 HOME / PATH 正确（systemd 默认 PATH 很窄，claude / codex / lark-cli
+# 都在 ~/.local/bin 或 /usr/bin 下）。
+Environment=HOME=/home/YOUR_USER
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/YOUR_USER/.local/bin
+
+# Restart=always 是群里发 `/restart` 能用的硬前提：commands._systemd_unit() 只在
+# 「unit active + bot 是 MainPID + Restart=always」三条同时成立时才敢退出让
+# systemd 拉起，否则 /restart 会拒绝执行以免把服务停死。
 Restart=always
-RestartSec=10
+RestartSec=5
 
-# 环境变量（也可以用 EnvironmentFile 指向 .env）
-EnvironmentFile=/path/to/feishu-claude/.env
-
-StandardOutput=journal
-StandardError=journal
+StandardOutput=append:/path/to/feishu-claude-code/cc-lark.log
+StandardError=append:/path/to/feishu-claude-code/cc-lark.log
 
 [Install]
 WantedBy=multi-user.target
+
+# 想用 CLAUDE_CODE_TOOL_MEMORY_LIMIT（给 claude 的工具调用限内存）还需要一个
+# drop-in 把 cgroup 子树委派出来，三条缺一不可：
+#
+#   # /etc/systemd/system/<unit>.service.d/10-cgroup-delegate.conf
+#   [Service]
+#   Delegate=memory pids
+#   DelegateSubgroup=supervisor
+#   ExecStartPost=/bin/sh -c "echo +memory > /sys/fs/cgroup/system.slice/<unit>.service/cgroup.subtree_control"
+#
+# 以上这些（含 drop-in）都可以让 `deploy/cc-lark-linux install [--cgroup-delegate]`
+# 自动生成，不用手抄本文件。

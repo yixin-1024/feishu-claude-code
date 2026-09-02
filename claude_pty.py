@@ -489,13 +489,25 @@ def _get_proc_cpu_seconds(pid: int) -> float:
         if result.returncode != 0:
             return -1.0
         s = result.stdout.strip()
-        # 格式：'MMM:SS.ss' 或 'HH:MM:SS' （macOS ps），如 '0:05.44' 或 '1:31.53'
+        # 格式差异：
+        #   macOS ps  → 'MMM:SS.ss' / 'HH:MM:SS'      如 '0:05.44' / '1:31.53'
+        #   Linux ps  → 'HH:MM:SS' / 'D-HH:MM:SS'     如 '00:00:05' / '2-03:04:05'
+        # 跑满一天的 claude 在 Linux 上会带 'D-' 前缀，不剥掉就 ValueError → -1.0，
+        # watchdog 从此再也读不到 CPU 增长（等于关掉了 hung 检测的一条腿）。
+        days = 0.0
+        if "-" in s:
+            head, _, s = s.partition("-")
+            try:
+                days = float(head)
+            except ValueError:
+                return -1.0
         parts = s.split(":")
         try:
+            base = days * 86400
             if len(parts) == 2:
-                return float(parts[0]) * 60 + float(parts[1])
+                return base + float(parts[0]) * 60 + float(parts[1])
             if len(parts) == 3:
-                return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+                return base + float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
         except ValueError:
             return -1.0
         return -1.0

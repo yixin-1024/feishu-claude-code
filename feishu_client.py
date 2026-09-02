@@ -835,11 +835,13 @@ class FeishuClient:
     @staticmethod
     def _find_ffmpeg() -> str:
         import shutil
-        # launchd 环境的 PATH 往往没有 homebrew，按常见安装位置兜底
+        # launchd / systemd 环境的 PATH 往往很窄（没有 homebrew、也可能没有
+        # /usr/local/bin），按常见安装位置兜底：前两条 macOS，后两条 Linux 发行版包。
         found = shutil.which("ffmpeg")
         if found:
             return found
-        for cand in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        for cand in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg",
+                     "/usr/bin/ffmpeg", "/snap/bin/ffmpeg"):
             if os.path.exists(cand):
                 return cand
         raise RuntimeError("未找到 ffmpeg（语音转写需要它把 opus 解码成 pcm）")

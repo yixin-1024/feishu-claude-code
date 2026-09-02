@@ -83,7 +83,7 @@ WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心�
 - **撞 Claude Max 用量墙自动兜底**：一轮在 API 上撞 "You've hit your session limit" → 自动切到有余量的 saved 账户并 resume 同一 session 续跑（`ACCOUNT_SWITCH_ON_LIMIT`，与主动切换 `ACCOUNT_AUTO_SWITCH` 独立）；没有可切的账户 → 在话题里排一个到配额重置时刻的自动唤醒，醒来自动『继续』（`CC_LARK_WAKE_ON_LIMIT`）
 - **prompt cache 友好**：注入的 Lark 系统提示在同一话题内逐轮字节一致（本轮消息 id / 提问者走用户消息开头的【本轮】行 + `CC_LARK_MESSAGE_ID` / `CC_LARK_USER_ID` env），续轮首调命中整段历史缓存，而不是每轮重写
 - **日志轮转**：bot 日志超过 `CC_LARK_LOG_MAX_MB`（默认 50）自动 copytruncate 轮转，保留 `CC_LARK_LOG_KEEP` 代
-- `cc-lark` 脚本封装 launchd + ngrok，一键 install/start/stop/restart/status/logs
+- 服务控制脚本一键 install/start/stop/restart/status/logs：macOS `deploy/cc-lark`（launchd + ngrok）、Linux `deploy/cc-lark-linux`（systemd）
 
 ## 快速开始
 
@@ -94,6 +94,27 @@ WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心�
 | Python | 3.11+ | `python3 --version` |
 | Claude Code CLI | 最新 | `claude --version` |
 | Claude Max/Pro 订阅 | - | `claude "hi"` 能正常回复 |
+
+### 平台支持
+
+macOS 和 Linux 都是一等公民，全部斜杠命令 / runner / 定时任务 / 运行时 MCP 行为一致
+（695 个单测在两个平台上都全绿）。差异只在"操作系统怎么存凭证、谁来当 supervisor"：
+
+| 能力 | macOS | Linux | 说明 |
+|------|-------|-------|------|
+| 全部 runner（claude / codex / opencode / mimo / grok / maka） | ✅ | ✅ | PTY 后端是纯 POSIX |
+| `/usage` `/accounts` `/switch` + 账户智能切换 | ✅ | ✅ | 凭证存储自动分流：macOS 读 login keychain，Linux 读 `~/.claude/.credentials.json`（见下） |
+| 群里 `/restart` | ✅ launchd | ✅ systemd | Linux 需 `Restart=always` + bot 是 `MainPID` |
+| 服务控制脚本 | `deploy/cc-lark` | `deploy/cc-lark-linux` | 同一套 install/start/stop/restart/status/logs |
+| 语音消息转文字 | ✅ | ✅ | 需要 `ffmpeg`（`sudo apt install ffmpeg`） |
+| 终端会话镜像（`claude_session_mirror.py`） | ✅ | ⚠️ | 守护进程本身跨平台，但 `SESSION_MIRROR.md` 里的安装步骤是 launchd 的 |
+| Lark 桌面通知转发（`lark_notif_forwarder.py`） | ✅ | ❌ | 直接读 macOS 通知中心 DB，Linux 上没有对应物 |
+
+**凭证存储**：Claude CLI 只在 macOS 用 keychain，Linux 把同一份 JSON 明文写在
+`~/.claude/.credentials.json`（0600）。`account_switcher.credentials_backend()`
+按平台自动选，两边 schema 一致，所以 `claude-switch save/use/list`、`/switch`
+按钮、用量探测、额度看门狗在 Linux 上是同一套代码路径。headless macOS（keychain
+取不到）可以用 `CC_LARK_CRED_BACKEND=file` 强制走文件模式。
 
 ### 安装
 
@@ -169,7 +190,7 @@ python3 main.py
 
 | 命令 | 说明 |
 |------|------|
-| `/usage` | 查看 Claude Max 用量和重置时间 (macOS) |
+| `/usage` | 查看当前 runner 的上下文/用量信息（Claude 系带 5h/7d 用量和重置时间）|
 | `/accounts` | 查看已保存的 Claude Max 账户及自动切换状态 |
 | `/switch <账户>` | 在 Claude runner 下切换本机全局 Claude Code 账户 |
 | `/skills` | 列出已安装的 Claude Skills |
@@ -283,6 +304,7 @@ python3 main.py
 | `CLAUDE_CLI_PATH` | 否 | 自动查找 | Claude CLI 可执行文件路径 |
 | `CC_LARK_MAX_CONCURRENT_RUNS` | 否 | `4` | **全局并发上限**：整机同时真正在跑的任务数（跨所有 profile / 群 / 话题）。超额的任务 FIFO 排队，卡片显示「排队中」，不丢不拒；`0` = 不限。默认 4 是给小机器 / 共享 API 额度的服务器兜底，开发机想放开写个大数（如 `100`）。别设 1（编排 agent 同轮等子会话会锁死） |
 | `CC_LARK_QUEUE_MAX_WAIT_SEC` | 否 | `0` | 排队最长等待秒数，超时放弃本次任务并在卡片说明；`0` = 一直等（保证不丢活） |
+| `CC_LARK_CRED_BACKEND` | 否 | 按平台 | Claude 凭证存储后端：`keychain`（macOS 默认）/ `file`（Linux 默认，读写 `~/.claude/.credentials.json`）。只在 headless macOS 这类特例下需要手动指定 |
 | `ACCOUNT_SWITCH_ON_LIMIT` | 否 | `1` | 撞 Claude Max 用量墙时一次性紧急切到有余量的 saved 账户并 resume 续跑（不依赖 `ACCOUNT_AUTO_SWITCH`） |
 | `CC_LARK_WAKE_ON_LIMIT` | 否 | `1` | 撞墙且无账户可切时，在本话题排一个到配额重置时刻的自动唤醒（仅话题群） |
 | `CODEX_MODEL_FALLBACK` | 否 | `gpt-5.5` | codex 模型被当前账户拒绝（400 "model is not supported…"）时本轮改用的模型；空串关闭 |
@@ -499,20 +521,41 @@ cp deploy/feishu-claude.plist ~/Library/LaunchAgents/com.feishu-claude.bot.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.feishu-claude.bot.plist
 ```
 
-### Linux (systemd)
+### Linux：推荐用 `cc-lark-linux` 包装脚本（systemd）
+
+与 macOS 版对应的 Linux 形态，一条命令写 unit + 开机自启：
 
 ```bash
-sudo cp deploy/feishu-claude.service /etc/systemd/system/
+./deploy/cc-lark-linux print-unit               # 先看要写什么（dry-run）
+sudo ./deploy/cc-lark-linux install             # 写 unit + daemon-reload + enable --now
+./deploy/cc-lark-linux status                   # 状态 + 群内 /restart 自检 + WS + 日志末尾
+./deploy/cc-lark-linux restart                  # systemctl restart
+./deploy/cc-lark-linux logs -n 100              # 看日志（logs journal 走 journalctl）
+sudo ./deploy/cc-lark-linux uninstall           # 停服 + 删 unit
+```
+
+`install --cgroup-delegate` 会额外写 cgroup 委派 drop-in（想用
+`CLAUDE_CODE_TOOL_MEMORY_LIMIT` 时需要）。可用 `CC_LARK_UNIT` 装多实例、
+`PYTHON_BIN` 指定解释器。
+
+### Linux：手动 systemd（不走包装）
+
+```bash
+sudo cp deploy/feishu-claude.service /etc/systemd/system/cc-lark.service
 # 修改 service 中的路径和 User
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now feishu-claude
-journalctl -u feishu-claude -f
+sudo systemctl enable --now cc-lark
+journalctl -u cc-lark -f
 ```
+
+unit 里**不要**写 `EnvironmentFile=.env`——`.env` 由 bot 自己 `load_dotenv()` 读，
+里面的多行 prompt 文本会把 systemd 的解析器噎住。
 
 群里的 `/restart` 会从 `/proc/self/cgroup` 自动识别当前 `.service`。为防止误停服，
 只有当 systemd 确认该 unit 处于 `active`、bot 是 `MainPID`、且配置了
-`Restart=always` 时才会执行；上面的示例 service 已满足这些条件。
+`Restart=always` 时才会执行；上面的示例 service 和包装脚本都已满足这些条件
+（`cc-lark-linux status` 会直接告诉你这三条是否成立）。
 
 服务会自动重启。看门狗每 6 小时主动重启一次进程，刷新 WebSocket 连接。
 
@@ -545,12 +588,13 @@ python3 handover.py "对话中的一段独特文本"
 - **Image / file / post support** — Screenshots, attachments, rich-text posts all downloaded and piped to Claude
 - **Skills passthrough** — `/commit`, `/review`, etc. work directly
 - **Smart idle timeout** — Detects active child processes, won't kill long compilations
-- **`cc-lark` launchctl wrapper** — One-command install/start/stop/restart/status/logs for macOS
+- **macOS and Linux both first-class** — Same commands, runners and cron behaviour on both; credential storage auto-routes (macOS keychain vs Linux `~/.claude/.credentials.json`), and in-chat `/restart` uses launchd on macOS / systemd on Linux
+- **Service wrappers** — One-command install/start/stop/restart/status/logs: `deploy/cc-lark` (macOS launchd) and `deploy/cc-lark-linux` (Linux systemd)
 - **Dispatch / session group** — Mention bot in any group, it auto-creates a thread in a designated "session group" and runs the task in an isolated session there
 - **Cron tasks** — YAML-defined cron jobs that fire posts into a thread group and spawn isolated sessions; hot-reload via `/reload` endpoint
 - **Split control plane** — Public ngrok listener serves card callbacks only; privileged local APIs use a loopback-only, Bearer-authenticated port
 
-Quick start: clone, `pip install -r requirements.txt`, configure `.env` with Feishu/Lark app credentials, run `python3 main.py` (or `./deploy/cc-lark install` on macOS).
+Quick start: clone, `pip install -r requirements.txt`, configure `.env` with Feishu/Lark app credentials, run `python3 main.py` (or `./deploy/cc-lark install` on macOS / `sudo ./deploy/cc-lark-linux install` on Linux).
 
 See Chinese sections above for detailed setup instructions.
 

@@ -435,19 +435,25 @@ def fetch_quota_headers() -> dict:
 
     quota_watcher 和 /usage / /status 都共用这一个入口。
     """
-    if sys.platform != "darwin":
-        return {"ok": False, "error": "目前只支持 macOS"}
-
     import urllib.request
     import urllib.error
     import ssl
 
+    # 凭证读取由 account_switcher 按平台分流（macOS keychain / Linux
+    # ~/.claude/.credentials.json），不再限定 macOS。
     try:
-        from account_switcher import _read_keychain_blob, ensure_keychain_intact
-        ensure_keychain_intact()  # /restart 周期里 keychain 被写丢时自愈
-        # 统一走 account_switcher 的读取（优先 -a <用户名>）：keychain 可能残留
-        # 同 service 名的历史死条目，无 -a 读取会长期命中过期 token → 永远 401
-        creds = json.loads(_read_keychain_blob() or "{}")
+        from account_switcher import (
+            _read_keychain_blob, credentials_store_label, ensure_keychain_intact,
+        )
+        ensure_keychain_intact()  # /restart 周期里凭证被写丢时自愈
+        # 统一走 account_switcher 的读取（macOS 上优先 -a <用户名>）：keychain 可能
+        # 残留同 service 名的历史死条目，无 -a 读取会长期命中过期 token → 永远 401
+        blob = _read_keychain_blob()
+        if not blob:
+            return {"ok": False,
+                    "error": f"读取凭证失败：{credentials_store_label()} 里没有 Claude 凭证，"
+                             f"先在本机 `claude` 登录一次"}
+        creds = json.loads(blob)
         token = creds["claudeAiOauth"]["accessToken"]
     except Exception as e:
         return {"ok": False, "error": f"读取凭证失败：{e}"}
@@ -480,7 +486,8 @@ def fetch_quota_headers() -> dict:
         # 401/403 = token 失效，明说要重登，别报成"无用量 headers"误导排障
         if e.code in (401, 403):
             return {"ok": False,
-                    "error": f"认证失败（HTTP {e.code}）：keychain 里的 token 已失效，请重新 `claude /login`"}
+                    "error": f"认证失败（HTTP {e.code}）：{credentials_store_label()} 里的 token "
+                             f"已失效，请重新 `claude /login`"}
         http_status = e.code
         headers = dict(e.headers)
     except Exception as e:
@@ -1461,7 +1468,12 @@ def _launchd_target() -> Optional[str]:
     判定：label 在 launchd 里可查到（`launchctl print` 成功）。生产部署下
     main.py 由该任务 exec 出来，父进程是 launchd(PID 1)；这里以 label 可查为准，
     PPID 仅作辅助信号（exec 部署下为 1）。
+
+    非 macOS 直接 None：launchd 是 macOS 独有的，Linux 上没必要每次 /restart 都
+    去 spawn 一个必然 ENOENT 的 `launchctl`（restart_strategy 会接着探 systemd）。
     """
+    if sys.platform != "darwin":
+        return None
     target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
     try:
         r = subprocess.run(

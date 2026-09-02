@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# cc-lark-linux — 飞书/Lark Claude Bot 服务控制（Linux systemd）
+#
+# 和 macOS 版 `deploy/cc-lark`（launchd + .app + ngrok）对应的 Linux 形态：
+# supervisor = system 级 systemd unit（默认 label `cc-lark`），`Restart=always`
+# 保证崩溃/OOM/被 SIGTERM 都自动拉起，机器重启由 `enable` 负责。
+#
+# 为什么 unit 里**不写 EnvironmentFile=.env**：cc-lark 自己在 bot_config.py 里
+# `load_dotenv(override=True)` 读 .env，而 .env 里有大段带空格/#/引号的 prompt 文本，
+# 交给 systemd 的 EnvironmentFile 解析器只会被截断或直接让 unit 起不来。
+#
+# 群里发 `/restart` 走的是 commands._systemd_unit()，它只在三个前提同时成立时才敢
+# 退出让 systemd 拉起（unit active + 本进程是 MainPID + Restart=always）——本脚本
+# 写出的 unit 满足全部三条，`status` 会把自检结果直接打出来。
+
+set -euo pipefail
+
+UNIT_NAME="${CC_LARK_UNIT:-cc-lark}"
+UNIT_FILE="/etc/systemd/system/${UNIT_NAME}.service"
+DROPIN_DIR="/etc/systemd/system/${UNIT_NAME}.service.d"
+
+REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
+ENV_FILE="$REPO_ROOT/.env"
+LOG_FILE="${CC_LARK_LOG:-$REPO_ROOT/cc-lark.log}"
+RUN_USER="${CC_LARK_USER:-$(id -un)}"
+RUN_GROUP="${CC_LARK_GROUP:-$(id -gn)}"
+
+# ── 工具 ────────────────────────────────────────────────────────────────
+
+_need_root() {
+    # 写 /etc/systemd/system 需要 root；已经是 root 就直接跑。
+    if [[ "$(id -u)" == "0" ]]; then SUDO=""; else SUDO="sudo"; fi
+    if [[ -n "$SUDO" ]] && ! sudo -n true 2>/dev/null; then
+        echo "ℹ️  需要 sudo 写 systemd unit，可能会提示输入密码" >&2
+    fi
+}
+
+_resolve_python() {
+    if [[ -n "${PYTHON_BIN:-}" ]]; then echo "$PYTHON_BIN"; return; fi
+    if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then echo "$REPO_ROOT/.venv/bin/python"; return; fi
+    command -v python3
+}
+
+# 末尾 `|| true`：set -e 下 `x="$(_unit_prop ...)"` 一旦 systemctl 非 0 就会中止整个
+# status，宁可拿到空串继续把已知信息打完。
+_unit_prop() { systemctl show --property="$1" --value --no-pager -- "${UNIT_NAME}.service" 2>/dev/null || true; }
+_unit_exists() { [[ -f "$UNIT_FILE" ]]; }
+_is_active() { systemctl is-active --quiet "${UNIT_NAME}.service"; }
+
+_print_unit() {
+    local py; py="$(_resolve_python)"
+    cat <<EOF
+[Unit]
+Description=feishu-claude-code (cc-lark) Lark bot
+After=network-online.target
+Wants=network-online.target
+# 崩溃循环时不要被 systemd 的启动限流锁死（cc-lark 自己有退避）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=${RUN_USER}
+Group=${RUN_GROUP}
+WorkingDirectory=${REPO_ROOT}
+# .env 由 bot_config.load_dotenv 自己读，别用 EnvironmentFile（见文件头注释）
+Environment=HOME=$(getent passwd "$RUN_USER" | cut -d: -f6)
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$(getent passwd "$RUN_USER" | cut -d: -f6)/.local/bin
+ExecStart=${py} main.py
+# Restart=always 是群里 /restart 能用的硬前提（commands._systemd_unit 会校验）
+Restart=always
+RestartSec=5
+StandardOutput=append:${LOG_FILE}
+StandardError=append:${LOG_FILE}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+_print_dropin() {
+    cat <<'EOF'
+# CLAUDE_CODE_TOOL_MEMORY_LIMIT 的三个前提，缺一不可：
+#  1) Delegate         —— 把 cgroup 子树交给运行用户，否则 claude 无权建子 cgroup
+#  2) DelegateSubgroup —— 主进程挪进 supervisor/，让委派根没有内部进程，
+#                         否则 cgroup v2 的 no-internal-processes 规则不许启用控制器
+#  3) ExecStartPost    —— 在委派根启用 memory 控制器；systemd 不会自动做，且重启即丢
+[Service]
+Delegate=memory pids
+DelegateSubgroup=supervisor
+EOF
+    echo "ExecStartPost=/bin/sh -c \"echo +memory > /sys/fs/cgroup/system.slice/${UNIT_NAME}.service/cgroup.subtree_control\""
+}
+
+_ws_info() {
+    [[ -f "$LOG_FILE" ]] || { printf "  %-14s %s\n" "WS 状态" "（无日志文件 $LOG_FILE）"; return; }
+    local rows last_conn
+    rows="$(tail -n 5000 "$LOG_FILE" 2>/dev/null | grep -E '\[Lark\] \[[^]]+\] \[(INFO|ERROR)\] (connected to wss://|trying to reconnect|connect failed)' || true)"
+    if [[ -z "$rows" ]]; then
+        printf "  %-14s %s\n" "WS 状态" "（日志里没有 Lark WS 记录）"
+        return
+    fi
+    last_conn="$(printf '%s\n' "$rows" | grep 'connected to wss://' | tail -1)"
+    printf "  %-14s %s\n" "WS 状态" "${last_conn:-（只见重连/失败，见日志）}"
+}
+
+# ── 子命令 ──────────────────────────────────────────────────────────────
+
+cmd_install() {
+    local with_cgroup=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --cgroup-delegate) with_cgroup=true; shift ;;
+            *) echo "❌ 未知参数: $1" >&2; exit 1 ;;
+        esac
+    done
+    [[ -f "$ENV_FILE" ]] || echo "⚠️  $ENV_FILE 不存在——bot 起来会因为缺 app 凭证退出（先 cp .env.example .env 填好）" >&2
+    _need_root
+    echo "📦 写 systemd unit: $UNIT_FILE"
+    _print_unit | $SUDO tee "$UNIT_FILE" >/dev/null
+    if $with_cgroup; then
+        echo "📦 写 cgroup 委派 drop-in: $DROPIN_DIR/10-cgroup-delegate.conf"
+        $SUDO mkdir -p "$DROPIN_DIR"
+        _print_dropin | $SUDO tee "$DROPIN_DIR/10-cgroup-delegate.conf" >/dev/null
+    fi
+    $SUDO systemctl daemon-reload
+    echo "🚀 enable + start ${UNIT_NAME}.service"
+    $SUDO systemctl enable --now "${UNIT_NAME}.service"
+    sleep 2
+    cmd_status || true
+}
+
+cmd_uninstall() {
+    _need_root
+    $SUDO systemctl disable --now "${UNIT_NAME}.service" 2>/dev/null || true
+    # 用 if 而不是 `[[ -f x ]] && rm`：后者在文件不存在时整条 && 链返回 1，
+    # set -e 会当场中止函数，daemon-reload 和收尾提示都跑不到。
+    if [[ -f "$UNIT_FILE" ]]; then
+        $SUDO rm -f "$UNIT_FILE"
+        echo "🗑  已删除 $UNIT_FILE"
+    fi
+    if [[ -d "$DROPIN_DIR" ]]; then
+        $SUDO rm -rf "$DROPIN_DIR"
+        echo "🗑  已删除 $DROPIN_DIR"
+    fi
+    $SUDO systemctl daemon-reload
+    echo "✅ 已卸载（unit + drop-in；日志 $LOG_FILE 保留）"
+}
+
+cmd_start() {
+    _unit_exists || { echo "❌ 未安装：$UNIT_FILE 不存在；先 cc-lark-linux install" >&2; exit 1; }
+    _need_root
+    $SUDO systemctl start "${UNIT_NAME}.service"
+    sleep 2
+    _is_active && echo "✅ 已启动（MainPID $(_unit_prop MainPID)）" \
+        || { echo "❌ 启动失败：systemctl status ${UNIT_NAME} / tail -n 50 $LOG_FILE" >&2; exit 1; }
+}
+
+cmd_stop() {
+    _need_root
+    # stop 会连带关掉 Restart=always 的自动拉起（systemd 认为这是主动停服）
+    $SUDO systemctl stop "${UNIT_NAME}.service"
+    echo "⏹  已停止（cc-lark-linux start 重新拉起）"
+}
+
+cmd_restart() {
+    _unit_exists || { echo "ℹ️  unit 未安装，走 install" >&2; cmd_install; return; }
+    _need_root
+    $SUDO systemctl restart "${UNIT_NAME}.service"
+    sleep 2
+    _is_active && echo "♻️  已重启（MainPID $(_unit_prop MainPID)）" \
+        || { echo "⚠️  重启后不是 active：systemctl status ${UNIT_NAME}" >&2; exit 1; }
+}
+
+cmd_status() {
+    if ! _unit_exists; then
+        echo "📊 未安装（cc-lark-linux install）"
+        return 1
+    fi
+    echo "📊 cc-lark 状态（systemd · ${UNIT_NAME}.service）"
+    local active mainpid restart
+    active="$(_unit_prop ActiveState)"; mainpid="$(_unit_prop MainPID)"; restart="$(_unit_prop Restart)"
+    printf "  %-14s %s\n" "unit"    "$active（$(_unit_prop SubState)）"
+    printf "  %-14s %s\n" "MainPID" "${mainpid:-0}"
+    printf "  %-14s %s\n" "Restart" "$restart"
+    printf "  %-14s %s\n" "开机自启" "$(systemctl is-enabled "${UNIT_NAME}.service" 2>/dev/null || echo unknown)"
+
+    # 群里 /restart 的可用性自检——三条缺一条就会被 commands._systemd_unit() 拒绝
+    if [[ "$active" == "active" && "$restart" == "always" && "${mainpid:-0}" != "0" ]]; then
+        printf "  %-14s %s\n" "群内 /restart" "✅ 可用（active + MainPID + Restart=always 都满足）"
+    else
+        printf "  %-14s %s\n" "群内 /restart" "❌ 不可用（需 active + Restart=always + bot 是 MainPID）"
+    fi
+
+    _ws_info
+    echo ""
+    echo "  日志: $LOG_FILE  （journal: journalctl -u ${UNIT_NAME} -n 50）"
+    if [[ -f "$LOG_FILE" ]]; then
+        echo ""
+        echo "── bot 最近 10 行 ──"
+        tail -n 10 "$LOG_FILE"
+    fi
+}
+
+cmd_logs() {
+    local follow=false n=50 use_journal=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--follow) follow=true; shift ;;
+            -n) n="$2"; shift 2 ;;
+            -n*) n="${1#-n}"; shift ;;
+            journal) use_journal=true; shift ;;
+            *) shift ;;
+        esac
+    done
+    if $use_journal || [[ ! -f "$LOG_FILE" ]]; then
+        if $follow; then journalctl -u "${UNIT_NAME}.service" -n "$n" -f
+        else journalctl -u "${UNIT_NAME}.service" -n "$n" --no-pager; fi
+        return
+    fi
+    if $follow; then tail -n "$n" -f "$LOG_FILE"; else tail -n "$n" "$LOG_FILE"; fi
+}
+
+usage() {
+    cat <<EOF
+cc-lark-linux — 飞书/Lark Claude Bot 服务控制（Linux systemd）
+
+用法:
+  cc-lark-linux install [--cgroup-delegate]   写 unit + daemon-reload + enable --now
+  cc-lark-linux uninstall                     停服 + 删 unit / drop-in
+  cc-lark-linux start | stop | restart        systemctl 同名操作
+  cc-lark-linux status                        运行状态 + 群内 /restart 自检 + WS + 日志末尾
+  cc-lark-linux logs [journal] [-n N] [-f]    看日志（默认读日志文件，journal 走 journalctl）
+  cc-lark-linux print-unit                    只打印将写入的 unit（dry-run，方便先 review）
+
+  --cgroup-delegate: 额外写 cgroup 委派 drop-in（想用 CLAUDE_CODE_TOOL_MEMORY_LIMIT 时需要）
+
+文件:
+  unit        : ${UNIT_FILE}
+  drop-in     : ${DROPIN_DIR}/10-cgroup-delegate.conf
+  仓库        : ${REPO_ROOT}
+  日志        : ${LOG_FILE}
+
+环境变量:
+  CC_LARK_UNIT    unit 名（默认 cc-lark；多实例可用 cc-lark-2 之类）
+  CC_LARK_USER    运行用户（默认当前用户）
+  CC_LARK_GROUP   运行组（默认当前用户主组）
+  CC_LARK_LOG     日志路径（默认 <repo>/cc-lark.log）
+  PYTHON_BIN      python 解释器（默认 <repo>/.venv/bin/python，没有则 python3）
+
+注意:
+  · macOS 请用同目录的 \`cc-lark\`（launchd + .app + ngrok），不是本脚本。
+  · unit 里故意不写 EnvironmentFile=.env —— .env 由 bot 自己 load_dotenv 读。
+EOF
+}
+
+case "${1:-}" in
+    install|uninstall|start|stop|restart|status|logs)
+        cmd="cmd_${1}"; shift
+        "$cmd" "$@"
+        ;;
+    print-unit)
+        _print_unit
+        echo ""
+        echo "# ── drop-in（--cgroup-delegate 时才写）: ${DROPIN_DIR}/10-cgroup-delegate.conf"
+        _print_dropin | sed 's/^/# /'
+        ;;
+    ""|-h|--help|help) usage ;;
+    *) echo "❌ 未知命令: $1" >&2; usage; exit 1 ;;
+esac

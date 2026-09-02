@@ -766,10 +766,116 @@ def test_read_keychain_blob_handles_hex_output(monkeypatch):
         returncode = 0
         stdout = hexed + "\n"
 
+    monkeypatch.setenv("CC_LARK_CRED_BACKEND", "keychain")  # 在 Linux 上跑也走 keychain 分支
     monkeypatch.setattr(accs.subprocess, "run", lambda *a, **kw: FakeProc())
     blob = accs._read_keychain_blob()
     assert blob == payload
     assert accs._token_fingerprint(blob) == "sk-ant-oat01-via"
+
+
+# ───────── 凭证后端分流（macOS keychain / Linux 凭证文件）─────────
+
+
+def test_credentials_backend_follows_platform(monkeypatch):
+    monkeypatch.delenv("CC_LARK_CRED_BACKEND", raising=False)
+    monkeypatch.setattr(accs.sys, "platform", "darwin")
+    assert accs.credentials_backend() == "keychain"
+    assert accs.credentials_store_label() == "keychain"
+    monkeypatch.setattr(accs.sys, "platform", "linux")
+    assert accs.credentials_backend() == "file"
+    assert accs.credentials_store_label() == accs.CREDENTIALS_FILE
+
+
+@pytest.mark.parametrize("forced,expected", [
+    ("file", "file"), ("keychain", "keychain"), ("KeyChain", "keychain"), ("bogus", None),
+])
+def test_credentials_backend_env_override(monkeypatch, forced, expected):
+    """CC_LARK_CRED_BACKEND 强制指定（headless macOS 用得上）；无效值忽略回落平台默认。"""
+    monkeypatch.setattr(accs.sys, "platform", "darwin")
+    monkeypatch.setenv("CC_LARK_CRED_BACKEND", forced)
+    assert accs.credentials_backend() == (expected or "keychain")
+
+
+def test_read_credentials_file_backend_never_shells_out(monkeypatch, tmp_path):
+    """file 后端下读凭证只碰文件，绝不 spawn `security`（Linux 上根本没这命令）。"""
+    creds = tmp_path / ".credentials.json"
+    payload = '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-linux"}}'
+    creds.write_text(payload + "\n")
+    monkeypatch.setattr(accs, "CREDENTIALS_FILE", str(creds))
+    monkeypatch.setenv("CC_LARK_CRED_BACKEND", "file")
+
+    def _boom(*a, **kw):
+        raise AssertionError("file 后端不该调用 subprocess")
+
+    monkeypatch.setattr(accs.subprocess, "run", _boom)
+    assert accs._read_keychain_blob() == payload
+    assert accs._token_fingerprint(accs._read_keychain_blob()) == "sk-ant-oat01-linux"
+
+
+def test_read_credentials_file_missing_or_empty(monkeypatch, tmp_path):
+    creds = tmp_path / ".credentials.json"
+    monkeypatch.setattr(accs, "CREDENTIALS_FILE", str(creds))
+    monkeypatch.setenv("CC_LARK_CRED_BACKEND", "file")
+    assert accs._read_keychain_blob() is None  # 文件不存在
+    creds.write_text("   \n")
+    assert accs._read_keychain_blob() is None  # 空文件当没凭证，不返回空串
+
+
+def test_write_credentials_file_is_atomic_and_0600(monkeypatch, tmp_path):
+    creds = tmp_path / "claude" / ".credentials.json"
+    monkeypatch.setattr(accs, "CREDENTIALS_FILE", str(creds))
+    monkeypatch.setenv("CC_LARK_CRED_BACKEND", "file")
+    blob = '{"claudeAiOauth": {"accessToken": "sk-ant-oat01-new"}}'
+    ok, msg = accs._write_keychain_blob(blob)
+    assert (ok, msg) == (True, "")
+    assert json.loads(creds.read_text())["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-new"
+    assert oct(creds.stat().st_mode & 0o777) == "0o600"  # 明文 token 不能是 0644
+    assert not list(creds.parent.glob("*.tmp"))  # 临时文件已 rename 掉
+    # 覆写：读回来必须是新 blob，不能残留旧内容尾巴
+    ok, _ = accs._write_keychain_blob('{"claudeAiOauth": {"accessToken": "sk-2"}}')
+    assert ok
+    assert json.loads(creds.read_text())["claudeAiOauth"]["accessToken"] == "sk-2"
+
+
+def test_write_credentials_file_reports_error(monkeypatch, tmp_path):
+    """父目录建不出来（如权限问题）时返回 (False, msg)，不抛。"""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file, not a dir")
+    monkeypatch.setattr(accs, "CREDENTIALS_FILE", str(blocker / ".credentials.json"))
+    monkeypatch.setenv("CC_LARK_CRED_BACKEND", "file")
+    ok, msg = accs._write_keychain_blob('{"claudeAiOauth": {"accessToken": "x"}}')
+    assert ok is False
+    assert ".credentials.json" in msg
+
+
+def test_use_account_on_file_backend_writes_creds_and_identity(monkeypatch, tmp_path):
+    """Linux 上 /switch 的完整落地：凭证文件 + ~/.claude.json identity 都要换。"""
+    saved = {
+        "claudeAiOauth": {"accessToken": "sk-ant-oat01-target", "subscriptionType": "max",
+                          "rateLimitTier": "default"},
+        "_meta": {"schema_version": 2,
+                  "identity": {"oauthAccount": {"accountUuid": "uuid-target"},
+                               "userID": "user-target"}},
+    }
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {"target": saved}))
+    creds = tmp_path / ".credentials.json"
+    identity = tmp_path / ".claude.json"
+    identity.write_text(json.dumps({"oauthAccount": {"accountUuid": "uuid-old"},
+                                    "userID": "user-old", "keepMe": 1}))
+    monkeypatch.setattr(accs, "CREDENTIALS_FILE", str(creds))
+    monkeypatch.setattr(accs, "IDENTITY_PATH", str(identity))
+    monkeypatch.setattr(accs, "_CLAUDE_LOCK_DIR", str(tmp_path / "claude.lock"))
+    monkeypatch.setenv("CC_LARK_CRED_BACKEND", "file")
+
+    ok, msg = accs.use_account("target")
+    assert ok, msg
+    written = json.loads(creds.read_text())
+    assert written["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-target"
+    assert "_meta" not in written  # _meta 只属于快照，不能写进凭证存储
+    ident = json.loads(identity.read_text())
+    assert ident["oauthAccount"]["accountUuid"] == "uuid-target"
+    assert ident["userID"] == "user-target"
+    assert ident["keepMe"] == 1  # 其余字段原样保留
 
 
 # ────────────────── ensure_keychain_intact (自愈) ──────────────────
@@ -1000,7 +1106,10 @@ def test_save_current_account_rejects_empty_keychain(monkeypatch, tmp_path):
     monkeypatch.setattr(accs, "ACCOUNTS_DIR", str(tmp_path / "accounts"))
     monkeypatch.setattr(accs, "_read_keychain_blob", lambda: None)
     ok, msg = accs.save_current_account("foo")
-    assert not ok and "keychain" in msg
+    # 文案带当前平台的凭证存储名：macOS "keychain" / Linux 凭证文件路径
+    assert not ok
+    assert accs.credentials_store_label() in msg  # macOS "keychain" / Linux 凭证文件路径
+    assert "claude /login" in msg
 
 
 def test_use_account_writes_keychain_and_patches_identity(monkeypatch, tmp_path):

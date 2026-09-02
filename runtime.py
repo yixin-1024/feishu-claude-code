@@ -369,27 +369,32 @@ def start_quota_watcher(
             log("global", "switcher", "error", f"account_switcher 启动失败: {e}")
             switcher = None
 
-    # 启动期 keychain 自愈：cc-lark /restart 周期里观察到 Claude CLI / MCP 子系统
-    # 偶发把 keychain blob 覆写为只剩 mcpOAuth，丢掉 claudeAiOauth。这里先自检
+    # 启动期凭证自愈：cc-lark /restart 周期里观察到 Claude CLI / MCP 子系统
+    # 偶发把凭证 blob 覆写为只剩 mcpOAuth，丢掉 claudeAiOauth。这里先自检
     # 一次，缺失就从 saved 账户文件恢复（同时 patch ~/.claude.json identity），
-    # 并 Lark 通报 owner。
+    # 并 Lark 通报 owner。凭证存储按平台分流（macOS keychain / Linux
+    # ~/.claude/.credentials.json），文案里用 store 变量说清是哪个。
     try:
-        from account_switcher import ensure_keychain_intact, auto_stash_identity_for_current
+        from account_switcher import (
+            ensure_keychain_intact, auto_stash_identity_for_current,
+            credentials_store_label,
+        )
+        store = credentials_store_label()
         status, name = ensure_keychain_intact()
         if status == "restored":
             log("global", "switcher", "warn",
-                f"keychain claudeAiOauth 缺失，已从 {name!r} 自动恢复")
+                f"{store} claudeAiOauth 缺失，已从 {name!r} 自动恢复")
             _send(
-                f"⚠️ **keychain 自愈**\n\n"
-                f"启动时发现 keychain 缺 `claudeAiOauth`，已从 saved 账户 `{name}` 写回。\n"
+                f"⚠️ **凭证自愈**\n\n"
+                f"启动时发现 `{store}` 缺 `claudeAiOauth`，已从 saved 账户 `{name}` 写回。\n"
                 f"根因怀疑是 Claude CLI / MCP 在 cc-lark 重启周期里只写 mcpOAuth 覆盖了 blob。"
             )
         elif status == "no_active":
             log("global", "switcher", "error",
-                "keychain claudeAiOauth 缺失且无可用 saved 账户")
-            _send("⚠️ keychain 缺 `claudeAiOauth` 且 `~/.claude/accounts/` 没有可用 saved 账户——请手动 `claude` 登录或 `claude-switch use <name>`")
+                f"{store} claudeAiOauth 缺失且无可用 saved 账户")
+            _send(f"⚠️ `{store}` 缺 `claudeAiOauth` 且 `~/.claude/accounts/` 没有可用 saved 账户——请手动 `claude` 登录或 `claude-switch use <name>`")
         elif status == "error":
-            log("global", "switcher", "error", f"keychain 自愈失败: {name}")
+            log("global", "switcher", "error", f"凭证自愈失败: {name}")
 
         # 顺便：当前账户的 saved file 如果没存 identity，把 ~/.claude.json 抠一份补上。
         # 用户手动 login 切到 reg 干了一阵子，cc-lark 启动时就能自动把当时的 reg
@@ -404,7 +409,7 @@ def start_quota_watcher(
         except Exception as e:
             log("global", "switcher", "warn", f"identity auto-stash 异常: {e}")
     except Exception as e:
-        log("global", "switcher", "error", f"keychain 自愈异常: {e}")
+        log("global", "switcher", "error", f"凭证自愈异常: {e}")
 
     start_watcher_thread(_send, interval=interval_sec, switcher=switcher)
     log(notify_profile, "quota", "info",

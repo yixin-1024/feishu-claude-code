@@ -11,6 +11,11 @@
 `anthropic-ratelimit-unified-5h-utilization` / `-7d-utilization` / `-5h-reset` /
 `-7d-reset`，就拿到了"全景"——不用真切到 keychain 就能比较所有账户。
 
+凭证存储按平台分流（见 `credentials_backend()`）：macOS = login keychain
+（service `Claude Code-credentials`），Linux / 其它 = Claude CLI 自己落盘的
+`~/.claude/.credentials.json`（0600 明文，schema 与 keychain blob 完全一致）。
+下文所有 "keychain" 字样都指"当前平台生效的那个凭证存储"。
+
 切换 (`use_account`) 必须同时换 keychain + ~/.claude.json.oauthAccount，否则
 Claude CLI 启动会发现 token 关联账户 ≠ oauthAccount.accountUuid → 触发 re-login
 把 keychain 写回旧账户（这是 2026-05-25 抓到的根因）。本模块取代了老的
@@ -63,6 +68,7 @@ import os
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -89,6 +95,11 @@ _IDENTITY_KEYS = ("oauthAccount", "userID")
 _SCHEMA_VERSION = 2
 # keychain 真正认的 top-level keys（写 keychain 前用 _strip_meta 过滤掉 _meta）
 _KEYCHAIN_TOPLEVEL = ("claudeAiOauth", "mcpOAuth")
+
+# 凭证存储位置：macOS 用 login keychain 的这个 service，其它平台（Linux）用
+# Claude CLI 自己落盘的明文文件。见 credentials_backend()。
+_KEYCHAIN_SERVICE = "Claude Code-credentials"
+CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
 
 # 探测 API endpoint
 _API_URL = "https://api.anthropic.com/v1/messages"
@@ -293,7 +304,31 @@ def decode_security_stdout(raw: str) -> str:
     return s
 
 
-def _read_keychain_blob() -> Optional[str]:
+def credentials_backend() -> str:
+    """当前平台的凭证后端：`"keychain"`（macOS）/ `"file"`（Linux 等）。
+
+    Claude CLI 只在 macOS 用 login keychain；Linux / 其它平台把同一份 JSON blob
+    明文写在 `~/.claude/.credentials.json`（0600）。两边 schema 完全一致
+    （`claudeAiOauth` + 可选 `mcpOAuth`），所以整套账户逻辑只需要在"读/写一个
+    blob"这一层分流。
+
+    `CC_LARK_CRED_BACKEND=keychain|file` 可强制指定——headless macOS（keychain
+    锁着、`security` 取不到）时把它设成 `file` 就能退回文件模式。
+    """
+    forced = (os.environ.get("CC_LARK_CRED_BACKEND") or "").strip().lower()
+    if forced in ("keychain", "file"):
+        return forced
+    return "keychain" if sys.platform == "darwin" else "file"
+
+
+def credentials_store_label() -> str:
+    """给用户看的凭证存储名（报错文案里用）——macOS 说 keychain，其它说文件路径。"""
+    if credentials_backend() == "keychain":
+        return "keychain"
+    return CREDENTIALS_FILE
+
+
+def _read_keychain_macos() -> Optional[str]:
     """读 macOS keychain 里当前 active 的凭证 blob 字符串。
 
     ⚠️ 必须先按 `-a <用户名>` 精确取：新版 Claude CLI 把凭证写在
@@ -307,7 +342,7 @@ def _read_keychain_blob() -> Optional[str]:
         try:
             r = subprocess.run(
                 ["security", "find-generic-password",
-                 "-s", "Claude Code-credentials", *extra, "-w"],
+                 "-s", _KEYCHAIN_SERVICE, *extra, "-w"],
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode == 0:
@@ -315,6 +350,30 @@ def _read_keychain_blob() -> Optional[str]:
         except Exception:
             return None
     return None
+
+
+def _read_credentials_file() -> Optional[str]:
+    """读 `~/.claude/.credentials.json`（Linux / 非 macOS 的 CLI 凭证落盘位置）。"""
+    try:
+        with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
+            blob = f.read().strip()
+    except OSError:
+        return None
+    return blob or None
+
+
+def _read_keychain_blob() -> Optional[str]:
+    """读当前 active 的 Claude 凭证 blob 字符串（按平台自动选后端）。
+
+    名字保留 `keychain` 是历史原因（macOS 是主部署形态），实际语义是"当前生效的
+    凭证存储"：macOS → login keychain，Linux 等 → `~/.claude/.credentials.json`。
+    两端不互相兜底——在 macOS 上退回读文件可能命中早年遗留的过期副本，导致
+    `current_account_name()` 认错账户、`save_current_account()` 把陈旧 token 存进
+    快照。需要在 macOS 上走文件模式请显式设 `CC_LARK_CRED_BACKEND=file`。
+    """
+    if credentials_backend() == "keychain":
+        return _read_keychain_macos()
+    return _read_credentials_file()
 
 
 def _token_fingerprint(blob_or_dict) -> str:
@@ -372,12 +431,12 @@ def current_account_name() -> Optional[str]:
     return None
 
 
-def _write_keychain_blob(blob: str) -> tuple[bool, str]:
+def _write_keychain_macos(blob: str) -> tuple[bool, str]:
     """用 `security add-generic-password -U` 覆写 keychain 凭证项。返回 (ok, msg)。"""
     try:
         r = subprocess.run(
             ["security", "add-generic-password", "-U",
-             "-s", "Claude Code-credentials",
+             "-s", _KEYCHAIN_SERVICE,
              "-a", os.environ.get("USER") or os.path.basename(os.path.expanduser("~")),
              "-w", blob],
             capture_output=True, text=True, timeout=5,
@@ -387,6 +446,37 @@ def _write_keychain_blob(blob: str) -> tuple[bool, str]:
         return True, ""
     except Exception as e:
         return False, f"exec failed: {e}"
+
+
+def _write_credentials_file(blob: str) -> tuple[bool, str]:
+    """原子覆写 `~/.claude/.credentials.json`，权限钉 0600。返回 (ok, msg)。
+
+    先 `os.open(..., 0o600)` 再写，避免明文 token 有一瞬间是 umask 默认权限；
+    `os.replace` 保证 Claude CLI 永远读不到半截文件。
+    """
+    tmp = CREDENTIALS_FILE + ".cc-lark.tmp"
+    try:
+        os.makedirs(os.path.dirname(CREDENTIALS_FILE), exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(blob if blob.endswith("\n") else blob + "\n")
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+        os.replace(tmp, CREDENTIALS_FILE)
+        os.chmod(CREDENTIALS_FILE, 0o600)
+        return True, ""
+    except OSError as e:
+        return False, f"write {CREDENTIALS_FILE}: {e}"
+
+
+def _write_keychain_blob(blob: str) -> tuple[bool, str]:
+    """覆写当前 active 的 Claude 凭证 blob（按平台自动选后端）。返回 (ok, msg)。"""
+    if credentials_backend() == "keychain":
+        return _write_keychain_macos(blob)
+    return _write_credentials_file(blob)
 
 
 # ── 跨进程凭证锁（与官方 Claude CLI 的 proper-lockfile 互通）──────────
@@ -984,14 +1074,15 @@ def save_current_account(name: str, *, overwrite: bool = True,
     if err:
         return False, err
     blob_str = _read_keychain_blob()
+    store = credentials_store_label()
     if not blob_str:
-        return False, "keychain has no Claude credentials (run `claude /login` first)"
+        return False, f"{store} has no Claude credentials (run `claude /login` first)"
     try:
         kc = json.loads(blob_str)
     except json.JSONDecodeError as e:
-        return False, f"keychain blob malformed: {e}"
+        return False, f"{store} blob malformed: {e}"
     if not kc.get("claudeAiOauth", {}).get("accessToken"):
-        return False, "keychain blob has no claudeAiOauth.accessToken"
+        return False, f"{store} blob has no claudeAiOauth.accessToken"
 
     target = os.path.join(ACCOUNTS_DIR, f"{name}.json")
     if os.path.exists(target) and not overwrite:
@@ -1096,7 +1187,7 @@ def use_account(name: str) -> tuple[bool, str]:
     with _claude_dir_lock():
         ok, msg = _write_keychain_blob(kc_blob)
     if not ok:
-        return False, f"keychain write failed: {msg}"
+        return False, f"{credentials_store_label()} write failed: {msg}"
 
     # 2) 同步 identity 到 ~/.claude.json
     ident = _account_identity(blob)
@@ -1605,7 +1696,8 @@ def _cli_main(argv: list[str]) -> int:
     import argparse
     p = argparse.ArgumentParser(
         prog="claude-switch",
-        description="Manage Claude Max accounts (keychain + ~/.claude.json identity).",
+        description="Manage Claude Max accounts "
+                    "(macOS keychain / Linux ~/.claude/.credentials.json + ~/.claude.json identity).",
     )
     sub = p.add_subparsers(dest="cmd")
 
@@ -1623,7 +1715,7 @@ def _cli_main(argv: list[str]) -> int:
 
     sub.add_parser("list", help="List saved accounts (* = active)")
     sub.add_parser("current", help="Show currently active saved account")
-    sub.add_parser("path", help="Print accounts storage directory")
+    sub.add_parser("path", help="Print accounts storage dir + active credential store")
 
     sr = sub.add_parser("rm", help="Delete a saved account file")
     sr.add_argument("name")
@@ -1676,7 +1768,8 @@ def _cli_main(argv: list[str]) -> int:
         return 0
 
     if args.cmd == "path":
-        print(ACCOUNTS_DIR)
+        print(f"accounts dir : {ACCOUNTS_DIR}")
+        print(f"credentials  : {credentials_store_label()} (backend={credentials_backend()})")
         return 0
 
     if args.cmd == "rm":
