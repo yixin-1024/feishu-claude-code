@@ -1333,6 +1333,98 @@ def maybe_switch_before_spawn(*, force: bool = False) -> Optional[str]:
         return None
 
 
+# ── 用量墙紧急切换（不依赖 ACCOUNT_AUTO_SWITCH）────────────────────
+# 场景：某轮 claude 在 API 上撞了 rate_limit（"You've hit your session limit"），
+# dispatcher 抓到后调这里：探测所有 saved 账户，切到最有余量的那个，然后 resume
+# 同一 session 续跑。与 AccountSwitcher 的「主动优化切换」是两回事：
+#   - 这里只在**已经撞墙**时触发，一轮一次；
+#   - 单独开关 ACCOUNT_SWITCH_ON_LIMIT（默认开），AUTO_SWITCH=0 也能用；
+#   - 不受 cooldown / manual_hold 约束——用户手选的账户既然撞墙了，换掉正是他要的。
+
+def switch_on_limit_enabled() -> bool:
+    raw = os.getenv("ACCOUNT_SWITCH_ON_LIMIT", "1")
+    return (raw or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def emergency_switch_on_limit(*, notify: bool = True) -> dict:
+    """撞用量墙时的一次性紧急切换。
+
+    返回 dict：
+      switched            切到的账户名；None = 没切（reason 说明为什么）
+      from                切换前的账户名（可能 None）
+      reason              人读文案（切成功时是新账户的余量摘要）
+      current_reset_epoch 原账户 5h 窗口重置时刻（epoch 秒），没切成时供调用方排
+                          「配额恢复自动唤醒」用；探测不到为 None
+    同步、走网络（probe_all）；在 asyncio 里请丢到 to_thread。
+    """
+    out: dict = {"switched": None, "from": None, "reason": "", "current_reset_epoch": None}
+    if not switch_on_limit_enabled():
+        out["reason"] = "ACCOUNT_SWITCH_ON_LIMIT=0（已关闭）"
+        return out
+    if not _ACCOUNT_SWITCH_LOCK.acquire(timeout=20):
+        out["reason"] = "另一个账户切换正在进行"
+        return out
+    try:
+        accounts = probe_all()
+        current = current_account_name()
+        out["from"] = current
+        if not accounts:
+            out["reason"] = "没有 saved 账户（~/.claude/accounts/ 为空）"
+            return out
+        now = time.time()
+        for acc in accounts.values():
+            evaluate(acc, current, now=now)
+        cur = accounts.get(current) if current else None
+        if cur is not None and cur.r5h:
+            out["current_reset_epoch"] = float(cur.r5h)
+        # 当前账户刚在 API 上撞墙，不管 headers 怎么说都不算候选
+        candidates = [a for a in accounts.values() if a.usable and a.name != current]
+        if not candidates:
+            why = "; ".join(
+                f"{a.name}: {', '.join(a.reasons) if a.reasons else 'ok'}"
+                for a in accounts.values() if a.name != current
+            ) or "只有当前这一个账户"
+            out["reason"] = f"无可切换账户（{why}）"
+            return out
+        best = max(candidates, key=lambda a: a.score)
+
+        if current:
+            stash_status, stash_msg = auto_stash_identity_for_current()
+            if stash_status == "error":
+                print(f"[switcher] on-limit identity auto-stash 失败: {stash_msg}", flush=True)
+        ok, msg = use_account(best.name)
+        if not ok:
+            out["reason"] = f"切换到 {best.name} 失败：{msg}"
+            return out
+
+        state = _load_state()
+        state["last_switch_at"] = now
+        state["last_switch_from"] = current or ""
+        state["last_switch_to"] = best.name
+        state["last_switch_source"] = "on_limit"
+        state.pop("manual_hold_until", None)
+        _save_state(state)
+        global _last_spawn_probe_at
+        with _spawn_probe_lock:
+            _last_spawn_probe_at = now
+
+        u5 = f"{best.u5h*100:.0f}%" if best.u5h is not None else "?"
+        u7 = f"{best.u7d*100:.0f}%" if best.u7d is not None else "?"
+        out["switched"] = best.name
+        out["reason"] = f"5h 已用 {u5} / 7d 已用 {u7}"
+        print(f"[switcher] 用量墙紧急切换 {current or '?'} → {best.name}（{out['reason']}）", flush=True)
+        if notify and _DEFAULT_SWITCHER is not None:
+            try:
+                _DEFAULT_SWITCHER._notify(
+                    f"🔁 **撞用量墙，账户已紧急切换**\n从 `{current or '?'}` → `{best.name}`（新账户 {out['reason']}）"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+    finally:
+        _ACCOUNT_SWITCH_LOCK.release()
+
+
 # ── Orchestrator ─────────────────────────────────────────────────
 
 

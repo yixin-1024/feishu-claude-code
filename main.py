@@ -202,6 +202,7 @@ def main():
 
     # 6) 后台基础设施
     runtime.start_summary_thread()
+    runtime.start_log_rotation_thread()
 
     # 7) 每个 profile 起一个 WS 客户端
     print("✅ 连接 WebSocket 长连接（自动重连）...")

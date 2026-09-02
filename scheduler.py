@@ -232,6 +232,193 @@ async def fire_task_now(name: str) -> None:
     await fn()
 
 
+# ── wake_me_in 落盘 ────────────────────────────────────────
+# 一次性唤醒以前只活在内存 BackgroundScheduler 里：/restart 一次，所有排队中的
+# wake 静默蒸发（等 CI 的那条话题永远醒不来，也没人通知）。这里把每条 pending
+# wake 写进 data/pending_wakes.json，启动时重装；重启期间错过时间的立即补跑。
+import json as _json
+
+_WAKE_STORE_LOCK = threading.Lock()
+
+
+def _wake_store_path() -> str:
+    override = (os.environ.get("CC_LARK_WAKE_STORE") or "").strip()
+    if override:
+        return override
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "pending_wakes.json")
+
+
+def _load_pending_wakes() -> dict[str, dict]:
+    path = _wake_store_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = _json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # noqa: BLE001
+        print(f"[scheduler/wake] ⚠️ 读取 {path} 失败: {type(e).__name__}: {e}", flush=True)
+        return {}
+
+
+def _save_pending_wakes(data: dict[str, dict]) -> None:
+    path = _wake_store_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        _json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def _persist_wake(rec: dict) -> None:
+    with _WAKE_STORE_LOCK:
+        data = _load_pending_wakes()
+        data[rec["job_id"]] = rec
+        try:
+            _save_pending_wakes(data)
+        except Exception as e:  # noqa: BLE001
+            print(f"[scheduler/wake] ⚠️ 落盘 {rec['job_id']} 失败: {type(e).__name__}: {e}", flush=True)
+
+
+def _unpersist_wake(job_id: str) -> None:
+    with _WAKE_STORE_LOCK:
+        data = _load_pending_wakes()
+        if job_id in data:
+            data.pop(job_id, None)
+            try:
+                _save_pending_wakes(data)
+            except Exception as e:  # noqa: BLE001
+                print(f"[scheduler/wake] ⚠️ 清理落盘 {job_id} 失败: {type(e).__name__}: {e}", flush=True)
+
+
+def list_pending_wakes() -> list[dict]:
+    """当前落盘的待触发唤醒（调试 / /status 用）。"""
+    with _WAKE_STORE_LOCK:
+        return sorted(_load_pending_wakes().values(), key=lambda r: r.get("fire_at", ""))
+
+
+def _build_wake_prompt(rec: dict) -> str:
+    minutes = rec.get("minutes")
+    note = (rec.get("note") or "").strip()
+    late = ""
+    if rec.get("late_from"):
+        late = (
+            f"（⚠️ bot 在原定时间 {rec['late_from']} 前重启过，这次唤醒是重启后的补跑，"
+            f"实际比原计划晚了一些）"
+        )
+    return (
+        f"[⏰ 自动唤醒] 你在大约 {minutes} 分钟前给自己排了这次唤醒。{late}\n"
+        f"你当时留下的待办 / 要检查的事：\n{note}\n\n"
+        f"请据此继续；需要更多上下文可读本话题历史或相关文件。处理完按正常方式回复即可。"
+    )
+
+
+def _arm_wake(bot, rec: dict, run_date: datetime, *, persist: bool = True) -> None:
+    """把一条 wake 记录挂到 scheduler（DateTrigger）。persist=True 时同时落盘。
+
+    fire 时走 send-as-user @bot（dispatcher.wake_thread_as_user）唤醒：经 WS 入站路径、
+    忙时排队不丢、且 resume 本话题 session。比 handle_spawn(reject-if-busy) 稳。
+    懒 import 避免 scheduler↔dispatcher 顶层循环依赖；失败兜底回退 spawn_fn(handle_spawn)。
+    """
+    sched = _STATE["scheduler"]
+    bot_loop = _STATE["bot_loop"]
+    spawn_fn = _STATE["spawn_fn"]
+    job_id = rec["job_id"]
+    chat_id, thread_id, anchor, user = rec["chat_id"], rec["thread_id"], rec["anchor"], rec["user_id"]
+    wake_prompt = _build_wake_prompt(rec)
+    _JOB_CHAT_SCOPE[job_id] = chat_id  # list_crons 按 chat 过滤用
+
+    def _fire():
+        async def _do():
+            try:
+                from dispatcher import wake_thread_as_user
+                ok = await wake_thread_as_user(bot, anchor, wake_prompt)
+                if ok:
+                    return
+                print(f"[scheduler/wake] ⚠️ {job_id} send-as-user 未成功，回退 handle_spawn", flush=True)
+            except Exception as e:
+                print(f"[scheduler/wake] ⚠️ {job_id} wake_thread_as_user 异常 {type(e).__name__}: {e}，回退 handle_spawn", flush=True)
+            try:
+                await spawn_fn(bot, user_id=user, chat_id_raw=chat_id,
+                               thread_id=thread_id, anchor_message_id=anchor, prompt=wake_prompt)
+            except Exception as e:
+                print(f"[scheduler/wake] ❌ {job_id} 回退 spawn 也失败: {type(e).__name__}: {e}", flush=True)
+        try:
+            asyncio.run_coroutine_threadsafe(_do(), bot_loop)
+            print(f"[scheduler/wake] 🔔 fire {job_id} → chat={chat_id[:12]}... thread={thread_id[:12]}...", flush=True)
+        except Exception as e:
+            print(f"[scheduler/wake] ❌ {job_id} submit 失败: {type(e).__name__}: {e}", flush=True)
+        finally:
+            _JOB_CHAT_SCOPE.pop(job_id, None)  # 一次性 job 跑完即出作用域表
+            _unpersist_wake(job_id)            # 已触发 → 从落盘里清掉
+
+    sched.add_job(
+        _fire,
+        trigger=DateTrigger(run_date=run_date),
+        id=job_id,
+        name=job_id,
+        # 系统睡眠跨过 fire 时间也补跑（醒来后 wake-nudger 会拉起）；一次性，跑完自删。
+        misfire_grace_time=None,
+        coalesce=True,
+        max_instances=1,
+    )
+    if persist:
+        _persist_wake(rec)
+
+
+def restore_pending_wakes() -> tuple[int, int]:
+    """启动时把落盘的 pending wake 重新挂上。返回 (恢复数, 其中已过期立即补跑数)。
+
+    过期的（重启期间错过 fire 时间）改到 5s 后补跑，并在 prompt 里注明是补跑。
+    profile 已不存在的记录直接丢弃。
+    """
+    bots = _STATE["bots"] or {}
+    tz = ZoneInfo("Asia/Shanghai")
+    now = datetime.now(tz)
+    with _WAKE_STORE_LOCK:
+        data = _load_pending_wakes()
+    if not data:
+        return (0, 0)
+    restored = late = 0
+    dropped: list[str] = []
+    for job_id, rec in sorted(data.items(), key=lambda kv: kv[1].get("fire_at", "")):
+        bot = bots.get(rec.get("profile") or "")
+        if bot is None or not (rec.get("chat_id") and rec.get("thread_id")):
+            dropped.append(job_id)
+            continue
+        try:
+            run_date = datetime.fromisoformat(rec.get("fire_at") or "")
+            if run_date.tzinfo is None:
+                run_date = run_date.replace(tzinfo=tz)
+        except ValueError:
+            dropped.append(job_id)
+            continue
+        if run_date <= now + timedelta(seconds=5):
+            rec["late_from"] = run_date.astimezone(tz).strftime("%m/%d %H:%M")
+            run_date = now + timedelta(seconds=5)
+            late += 1
+        try:
+            _arm_wake(bot, rec, run_date, persist=bool(rec.get("late_from")))
+            restored += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[scheduler/wake] ⚠️ 恢复 {job_id} 失败: {type(e).__name__}: {e}", flush=True)
+            dropped.append(job_id)
+    if dropped:
+        with _WAKE_STORE_LOCK:
+            data = _load_pending_wakes()
+            for job_id in dropped:
+                data.pop(job_id, None)
+            try:
+                _save_pending_wakes(data)
+            except Exception:  # noqa: BLE001
+                pass
+    print(
+        f"[scheduler/wake] 重启恢复 {restored} 个待触发唤醒（{late} 个已过期，5s 后补跑；丢弃 {len(dropped)} 个无效记录）",
+        flush=True,
+    )
+    return (restored, late)
+
+
 def schedule_wake(
     *,
     profile: str,
@@ -286,51 +473,20 @@ def schedule_wake(
     tz = ZoneInfo("Asia/Shanghai")
     run_date = datetime.now(tz) + timedelta(minutes=minutes)
     job_id = f"wake-{thread_id[-8:]}-{uuid.uuid4().hex[:6]}"
-    _JOB_CHAT_SCOPE[job_id] = chat_id  # list_crons 按 chat 过滤用
-
-    wake_prompt = (
-        f"[⏰ 自动唤醒] 你在大约 {minutes} 分钟前给自己排了这次唤醒。\n"
-        f"你当时留下的待办 / 要检查的事：\n{note.strip()}\n\n"
-        f"请据此继续；需要更多上下文可读本话题历史或相关文件。处理完按正常方式回复即可。"
-    )
-
-    # fire 时走 send-as-user @bot（dispatcher.wake_thread_as_user）唤醒：经 WS 入站路径、
-    # 忙时排队不丢、且 resume 本话题 session。比 handle_spawn(reject-if-busy) 稳。
-    # 懒 import 避免 scheduler↔dispatcher 顶层循环依赖；失败兜底回退 spawn_fn(handle_spawn)。
-    def _fire():
-        async def _do():
-            try:
-                from dispatcher import wake_thread_as_user
-                ok = await wake_thread_as_user(bot, anchor, wake_prompt)
-                if ok:
-                    return
-                print(f"[scheduler/wake] ⚠️ {job_id} send-as-user 未成功，回退 handle_spawn", flush=True)
-            except Exception as e:
-                print(f"[scheduler/wake] ⚠️ {job_id} wake_thread_as_user 异常 {type(e).__name__}: {e}，回退 handle_spawn", flush=True)
-            try:
-                await spawn_fn(bot, user_id=user, chat_id_raw=chat_id,
-                               thread_id=thread_id, anchor_message_id=anchor, prompt=wake_prompt)
-            except Exception as e:
-                print(f"[scheduler/wake] ❌ {job_id} 回退 spawn 也失败: {type(e).__name__}: {e}", flush=True)
-        try:
-            asyncio.run_coroutine_threadsafe(_do(), bot_loop)
-            print(f"[scheduler/wake] 🔔 fire {job_id} → chat={chat_id[:12]}... thread={thread_id[:12]}...", flush=True)
-        except Exception as e:
-            print(f"[scheduler/wake] ❌ {job_id} submit 失败: {type(e).__name__}: {e}", flush=True)
-        finally:
-            _JOB_CHAT_SCOPE.pop(job_id, None)  # 一次性 job 跑完即出作用域表
-
+    rec = {
+        "job_id": job_id,
+        "profile": bot.profile.name,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "anchor": anchor,
+        "user_id": user,
+        "minutes": minutes,
+        "note": note.strip(),
+        "fire_at": run_date.isoformat(),
+        "created_at": datetime.now(tz).isoformat(),
+    }
     try:
-        sched.add_job(
-            _fire,
-            trigger=DateTrigger(run_date=run_date),
-            id=job_id,
-            name=job_id,
-            # 系统睡眠跨过 fire 时间也补跑（醒来后 wake-nudger 会拉起）；一次性，跑完自删。
-            misfire_grace_time=None,
-            coalesce=True,
-            max_instances=1,
-        )
+        _arm_wake(bot, rec, run_date, persist=True)
     except Exception as e:
         return {"ok": False, "error": f"add_job 失败: {type(e).__name__}: {e}"}
 
@@ -645,6 +801,12 @@ def start_scheduler(
     initial_cleaned = _reap_stale_locks()
     if initial_cleaned:
         print(f"[reaper] startup pass cleaned {initial_cleaned} stale lock(s)", flush=True)
+
+    # 重装上次进程留下的 pending wake（/restart 不再吞掉排队中的 wake_me_in）
+    try:
+        restore_pending_wakes()
+    except Exception as e:  # noqa: BLE001
+        print(f"[scheduler/wake] ⚠️ 恢复落盘唤醒失败: {type(e).__name__}: {e}", flush=True)
 
     print(
         f"[scheduler] 已启动（BackgroundScheduler），加载 {len(scheduler.get_jobs())} 个定时任务，lock-reaper 已起",

@@ -80,6 +80,9 @@ WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心�
 - 三段式超时：5 分钟无输出且无子进程 → 杀；15 分钟有子进程但无输出 → 杀；任意情况 60 分钟 wall-clock → 杀。编译/下载不会被误杀，runaway loop 也兜得住。最后一段可调：`CLAUDE_WALL_CLOCK_LIMIT_SEC=7200`（2 小时）/ `=0`（永不因 wall-clock 强杀，长任务用），支持 `<PROFILE>_` 前缀单独配
 - 看门狗 6 小时自动重启，防止 WebSocket 假死
 - API 调用自动重试 (指数退避)
+- **撞 Claude Max 用量墙自动兜底**：一轮在 API 上撞 "You've hit your session limit" → 自动切到有余量的 saved 账户并 resume 同一 session 续跑（`ACCOUNT_SWITCH_ON_LIMIT`，与主动切换 `ACCOUNT_AUTO_SWITCH` 独立）；没有可切的账户 → 在话题里排一个到配额重置时刻的自动唤醒，醒来自动『继续』（`CC_LARK_WAKE_ON_LIMIT`）
+- **prompt cache 友好**：注入的 Lark 系统提示在同一话题内逐轮字节一致（本轮消息 id / 提问者走用户消息开头的【本轮】行 + `CC_LARK_MESSAGE_ID` / `CC_LARK_USER_ID` env），续轮首调命中整段历史缓存，而不是每轮重写
+- **日志轮转**：bot 日志超过 `CC_LARK_LOG_MAX_MB`（默认 50）自动 copytruncate 轮转，保留 `CC_LARK_LOG_KEEP` 代
 - `cc-lark` 脚本封装 launchd + ngrok，一键 install/start/stop/restart/status/logs
 
 ## 快速开始
@@ -140,6 +143,8 @@ python3 main.py
 | `/model opus` | 切换到 Opus |
 | `/model sonnet` | 切换到 Sonnet |
 | `/model haiku` | 切换到 Haiku |
+| `/fable 帮我查一下数据库` | 快捷指令：切到 Fable 并**直接执行后面的指令**，沿用当前 session（上下文不丢） |
+| `/opus …` `/sonnet …` `/haiku …` | 同上，分别切到 Opus / Sonnet / Haiku；不带指令时只切模型（仅 claude runner 可用） |
 | `/effort` | 查看当前推理强度并用按钮选择档位 |
 | `/effort high` | 当前对话改用 high（不重开 session） |
 | `/effort default` | 清除当前对话覆盖，跟随 profile/CLI 默认 |
@@ -276,6 +281,12 @@ python3 main.py
 | `NGROK_DOMAIN` | 否 | 随机 | ngrok 固定域名 (避免每次重启换 URL) |
 | `STREAM_CHUNK_SIZE` | 否 | `20` | 流式推送的字符积累阈值 |
 | `CLAUDE_CLI_PATH` | 否 | 自动查找 | Claude CLI 可执行文件路径 |
+| `CC_LARK_MAX_CONCURRENT_RUNS` | 否 | `4` | **全局并发上限**：整机同时真正在跑的任务数（跨所有 profile / 群 / 话题）。超额的任务 FIFO 排队，卡片显示「排队中」，不丢不拒；`0` = 不限。默认 4 是给小机器 / 共享 API 额度的服务器兜底，开发机想放开写个大数（如 `100`）。别设 1（编排 agent 同轮等子会话会锁死） |
+| `CC_LARK_QUEUE_MAX_WAIT_SEC` | 否 | `0` | 排队最长等待秒数，超时放弃本次任务并在卡片说明；`0` = 一直等（保证不丢活） |
+| `ACCOUNT_SWITCH_ON_LIMIT` | 否 | `1` | 撞 Claude Max 用量墙时一次性紧急切到有余量的 saved 账户并 resume 续跑（不依赖 `ACCOUNT_AUTO_SWITCH`） |
+| `CC_LARK_WAKE_ON_LIMIT` | 否 | `1` | 撞墙且无账户可切时，在本话题排一个到配额重置时刻的自动唤醒（仅话题群） |
+| `CODEX_MODEL_FALLBACK` | 否 | `gpt-5.5` | codex 模型被当前账户拒绝（400 "model is not supported…"）时本轮改用的模型；空串关闭 |
+| `CC_LARK_LOG_PATH` / `CC_LARK_LOG_MAX_MB` / `CC_LARK_LOG_KEEP` | 否 | `~/.feishu-claude/cc-lark.log` / `50` / `3` | bot 日志 copytruncate 轮转：超过阈值 MB 就轮转，保留 N 代；`CC_LARK_LOG_MAX_MB=0` 关闭 |
 
 > 查自己的 open_id / chat_id：bot 启动后发条消息，终端日志里会打印 `user=ou_...` / `chat=oc_...`。
 >
@@ -338,6 +349,10 @@ python3 main.py
 cc-lark 会在 Claude 与 Codex 会话启动时注入 `cc_mcp_server.py`。它提供
 `wake_me_in`、`dispatch_task`、`read_thread`、`schedule_cron`、`list_crons`；stdio
 前端只把鉴权请求发到本机 control listener，真正的派工与调度由常驻 bot 兑现。
+
+`wake_me_in` 排定的一次性唤醒**落盘到 `data/pending_wakes.json`**，bot 重启（`/restart`、
+崩溃拉起）后自动重装；重启期间错过时间的唤醒会在启动后几秒内补跑，并在 prompt 里注明
+是补跑。不再有"重启一次、排队中的唤醒全丢"的情况。
 
 `dispatch_task` 派出的子会话是**全新话题 + 全新 session**，不继承派发方 thread 的
 `/model` `/effort`，默认跑目标 bot 的 profile 默认模型。要按活儿分配算力就显式传
@@ -440,7 +455,8 @@ curl -X POST https://<你的域名>/api/v1/agent-tasks \
 - **幂等**。带 `X-Idempotency-Key`（或 body 里的 `idempotency_key`）重试会拿回第一次的
   `thread_id`（`"deduped": true`），不会在群里刷出第二条话题；状态落盘，重启后仍生效。
 - **限流与并发**：每 client `rate_limit_per_min`（超了 429）；每群在跑的子会话 ≤
-  `DISPATCH_CONCURRENCY_CAP`（默认 7，触顶也回 429，稍后重试即可）。
+  `DISPATCH_CONCURRENCY_CAP`（默认 7，触顶也回 429，稍后重试即可）。派进来的子会话同样
+  受全局并发闸门 `CC_LARK_MAX_CONCURRENT_RUNS`（默认 4）约束——超额的排队等额度，不丢。
 - 改 `external_triggers.yaml` 后 `POST /reload`（control 面）即时生效；只有改 `.env`
   里的密钥才需要重启。
 

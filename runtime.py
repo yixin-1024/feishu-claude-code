@@ -117,42 +117,188 @@ def profile_idle_seconds() -> dict[str, float]:
 
 # ── 后台定时摘要生成 ────────────────────────────────────────
 
+# 会话 jsonl 已被 Claude CLI 按 cleanupPeriodDays 清掉的，永远生成不了摘要。
+# 用这个占位摘要把它们标记掉，避免每 10 分钟对同一批死条目空转（线上曾积压 1883 个、
+# 7 天 0 成功——循环永远只取前 5 个，而这 5 个的文件早不存在了）。
+SUMMARY_MISSING_MARK = "（会话文件已被 CLI 清理，无法生成摘要）"
+_SUMMARY_API_BATCH = 5        # 每个 profile 每轮最多真调 API 生成几条
+_SUMMARY_MISSING_BATCH = 300  # 每个 profile 每轮最多标记几条“文件已不存在”
+_SUMMARY_INTERVAL_SEC = 600
+_summary_last_pending: dict[str, int] = {}
+_summary_token_warned_at = 0.0
+
+
+def _summary_pass(
+    bots: dict,
+    *,
+    api_batch: int = _SUMMARY_API_BATCH,
+    missing_batch: int = _SUMMARY_MISSING_BATCH,
+    sleep_fn=time.sleep,
+) -> dict[str, dict]:
+    """跑一遍所有 profile 的摘要补齐。返回 {profile: {"api": n, "missing": m, "pending": k}}。
+
+    与老实现的区别：① 文件不存在的会话直接标记 SUMMARY_MISSING_MARK 跳过；
+    ② 不再永远取前 5 个，而是顺着积压往后找可处理的；③ token 拿不到时本轮不空撞 API。
+    """
+    global _summary_token_warned_at
+    from session_store import _find_session_file, _get_api_token
+
+    stats: dict[str, dict] = {}
+    for bot in bots.values():
+        try:
+            unsummarized = bot.store.get_all_unsummarized()
+        except Exception as e:  # noqa: BLE001
+            log(bot.profile.name, "summary", "warn", f"扫描未摘要会话失败: {e}")
+            continue
+        if not unsummarized:
+            _summary_last_pending.pop(bot.profile.name, None)
+            continue
+        pending = len(unsummarized)
+        if _summary_last_pending.get(bot.profile.name) != pending:
+            log(bot.profile.name, "summary", "info", f"发现 {pending} 个未摘要会话")
+            _summary_last_pending[bot.profile.name] = pending
+
+        token = _get_api_token()
+        if not token and time.time() - _summary_token_warned_at > 3600:
+            _summary_token_warned_at = time.time()
+            log(bot.profile.name, "summary", "warn",
+                "拿不到 Claude API token（credentials 文件过期且 keychain 读不到），本轮只标记已清理的会话")
+
+        api_done = missing_done = 0
+        changed = False
+        seen: set[str] = set()
+        for user_id, sid in unsummarized:
+            if sid in seen:
+                continue
+            seen.add(sid)
+            if api_done >= api_batch and missing_done >= missing_batch:
+                break
+            summaries = (bot.store._data.setdefault(user_id, {})
+                         .setdefault("summaries", {}))
+            if summaries.get(sid):
+                continue
+            fpath = _find_session_file(sid)
+            if not fpath:
+                if missing_done < missing_batch:
+                    summaries[sid] = SUMMARY_MISSING_MARK
+                    missing_done += 1
+                    changed = True
+                continue
+            if api_done >= api_batch or not token:
+                continue
+            api_done += 1
+            try:
+                summary = generate_summary(sid, token)
+            except Exception as e:  # noqa: BLE001
+                log(bot.profile.name, "summary", "warn", f"#{sid[:8]} 失败: {e}")
+                summary = ""
+            if summary:
+                summaries[sid] = summary
+                try:
+                    _write_custom_title(sid, summary)
+                except Exception:  # noqa: BLE001
+                    pass
+                changed = True
+                log(bot.profile.name, "summary", "info", f"#{sid[:8]} → {summary}")
+            sleep_fn(5)
+        if changed:
+            try:
+                bot.store._save()
+            except Exception as e:  # noqa: BLE001
+                log(bot.profile.name, "summary", "warn", f"保存摘要失败: {e}")
+        if missing_done:
+            log(bot.profile.name, "summary", "info",
+                f"标记 {missing_done} 个已被清理的会话为不可摘要")
+        stats[bot.profile.name] = {"api": api_done, "missing": missing_done, "pending": pending}
+    return stats
+
+
 def _bg_summary_loop():
     """扫描所有 profile 下未摘要的会话，逐个生成摘要。"""
     time.sleep(60)
     while True:
         try:
-            for bot in _bots.values():
-                unsummarized = bot.store.get_all_unsummarized()
-                if not unsummarized:
-                    continue
-                log(bot.profile.name, "summary", "info",
-                    f"发现 {len(unsummarized)} 个未摘要会话")
-                count = 0
-                for user_id, sid in unsummarized[:5]:
-                    try:
-                        summary = generate_summary(sid)
-                        if summary:
-                            (bot.store._data
-                                .setdefault(user_id, {})
-                                .setdefault("summaries", {}))[sid] = summary
-                            _write_custom_title(sid, summary)
-                            count += 1
-                            log(bot.profile.name, "summary", "info",
-                                f"#{sid[:8]} → {summary}")
-                    except Exception as e:
-                        log(bot.profile.name, "summary", "warn",
-                            f"#{sid[:8]} 失败: {e}")
-                    time.sleep(5)
-                if count:
-                    bot.store._save()
-        except Exception as e:
+            _summary_pass(_bots)
+        except Exception as e:  # noqa: BLE001
             log("global", "summary", "error", f"定时任务异常: {e}")
-        time.sleep(600)
+        time.sleep(_SUMMARY_INTERVAL_SEC)
 
 
 def start_summary_thread() -> None:
     threading.Thread(target=_bg_summary_loop, daemon=True, name="bg-summary").start()
+
+
+# ── 日志轮转（copytruncate）────────────────────────────────────
+# bot 的 stdout 由 cc-lark.app 启动器 `>> ~/.feishu-claude/cc-lark.log` 追加重定向，
+# 没有任何轮转，线上单文件涨到 106MB。这里在进程内做 copytruncate：复制到 .1、
+# 原文件 truncate 到 0——fd 是 O_APPEND 打开的，truncate 后续写自动落到新文件头，
+# 不用重开 stdout、不用 newsyslog 的 root 权限。复制与 truncate 之间的几毫秒内
+# 写入的行会丢，日志场景可接受。
+#   CC_LARK_LOG_PATH    默认 ~/.feishu-claude/cc-lark.log
+#   CC_LARK_LOG_MAX_MB  默认 50；0 = 关闭
+#   CC_LARK_LOG_KEEP    保留几代（.1 .. .N），默认 3
+
+def rotate_log_if_needed(path: str, max_bytes: int, keep: int = 3) -> bool:
+    """超过 max_bytes 就轮转一次；返回是否发生了轮转。"""
+    import os
+    import shutil
+
+    if max_bytes <= 0 or not path or not os.path.isfile(path):
+        return False
+    try:
+        if os.path.getsize(path) < max_bytes:
+            return False
+    except OSError:
+        return False
+    keep = max(1, int(keep))
+    for i in range(keep - 1, 0, -1):
+        src, dst = f"{path}.{i}", f"{path}.{i + 1}"
+        if os.path.exists(src):
+            os.replace(src, dst)
+    shutil.copyfile(path, f"{path}.1")
+    with open(path, "r+b") as f:
+        f.truncate(0)
+    return True
+
+
+def _log_rotation_settings() -> tuple[str, int, int]:
+    import os
+    path = os.path.expanduser(
+        (os.getenv("CC_LARK_LOG_PATH") or "~/.feishu-claude/cc-lark.log").strip()
+    )
+    try:
+        max_mb = float(os.getenv("CC_LARK_LOG_MAX_MB", "50") or "50")
+    except ValueError:
+        max_mb = 50.0
+    try:
+        keep = int(os.getenv("CC_LARK_LOG_KEEP", "3") or "3")
+    except ValueError:
+        keep = 3
+    return path, int(max_mb * 1024 * 1024), keep
+
+
+def _log_rotate_loop(path: str, max_bytes: int, keep: int) -> None:
+    while True:
+        try:
+            if rotate_log_if_needed(path, max_bytes, keep):
+                log("global", "log", "info",
+                    f"日志已轮转：{path} 超过 {max_bytes // (1024 * 1024)}MB，旧内容移到 {path}.1")
+        except Exception as e:  # noqa: BLE001
+            log("global", "log", "warn", f"日志轮转失败: {e}")
+        time.sleep(600)
+
+
+def start_log_rotation_thread() -> None:
+    path, max_bytes, keep = _log_rotation_settings()
+    if max_bytes <= 0:
+        log("global", "log", "info", "日志轮转已关闭（CC_LARK_LOG_MAX_MB=0）")
+        return
+    threading.Thread(
+        target=_log_rotate_loop, args=(path, max_bytes, keep),
+        daemon=True, name="log-rotate",
+    ).start()
+    log("global", "log", "info",
+        f"日志轮转已启动：{path} > {max_bytes // (1024 * 1024)}MB 时轮转，保留 {keep} 代")
 
 
 # ── Claude Max 用量监控（5h/7d 跨阈值 + 重置通报）─────────────

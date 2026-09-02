@@ -35,12 +35,15 @@ from card_security import (
 from agent_runner import run_agent
 from claude_runner import is_safeguards_error_text
 from feishu_client import _err_desc
-from commands import parse_command, handle_command
+from commands import (
+    MODEL_SHORTCUTS, ModelShortcutUnavailable, apply_model_shortcut,
+    parse_command, handle_command,
+)
 from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
 from lark_prompts import render_lark_prompt
 from passthrough import is_builtin_passthrough
 from log_util import log
-from run_control import ActiveRun, stop_run
+from run_control import RUN_GATE, ActiveRun, stop_run
 from thread_context import build_thread_context
 from trinity_dispatch import maybe_handle_trinity, TrinityContext
 import inbox_watcher
@@ -647,6 +650,196 @@ _SAFEGUARDS_RESUME_NUDGE_WRITE = (
 )
 
 
+# ── 每轮用户消息开头的【本轮】行 ─────────────────────────────
+# 本轮消息 id / 提问者不再写进 system prompt（会打断 prompt cache，见
+# lark_prompts._build_lark_commands），改为放在用户消息最前面一行 + CC_LARK_* env。
+def _turn_header(message_id: str, asker_open_id: str) -> str:
+    parts = []
+    if message_id:
+        parts.append(f"消息 id: {message_id}")
+    if asker_open_id:
+        parts.append(f"提问者 open_id: {asker_open_id}")
+    if not parts:
+        return ""
+    return "【本轮 · " + " · ".join(parts) + "】\n\n"
+
+
+# ── Claude Max 用量墙：一次性紧急切账户 + resume 续跑 + 配额恢复自动唤醒 ──
+# 线上 7 天里 15 轮直接 ❌ 在用量墙上、用户手点 13 次切账户。这里把三件事自动化：
+#   1) 撞墙 → account_switcher.emergency_switch_on_limit() 切到有余量的 saved 账户，
+#      resume 崩溃前的 session 接着跑（不受 ACCOUNT_AUTO_SWITCH 影响，单独开关
+#      ACCOUNT_SWITCH_ON_LIMIT，默认开）；
+#   2) 没有可切的账户 → 在话题里排一个 wake_me_in 到配额重置时刻，醒来自动『继续』
+#      （CC_LARK_WAKE_ON_LIMIT，默认开；只在话题群里可用）。
+_RATE_LIMIT_MARKERS = (
+    "用量已达上限", "hit your session limit", "hit your weekly limit",
+    "hit your limit", "usage limit reached",
+)
+_LIMIT_RESUME_NUDGE = (
+    "继续。上一轮因 Claude Max 用量墙中断，已自动切换账户接管本会话；"
+    "请基于已经完成的工作继续任务并给出最终回复，"
+    "不要重复执行上一轮已经做过的写操作 / 命令 / 文件改动。"
+)
+_LIMIT_RESUME_NUDGE_WRITE = (
+    "继续。上一轮因 Claude Max 用量墙中断，已自动切换账户接管本会话。"
+    "本轮涉及写操作 / 外部接口调用：请先核实上一轮最后一步是否已经生效"
+    "（查库 / 查接口返回 / 看已有记录），已经生效的绝对不要重复执行，"
+    "只补做剩下的步骤，然后给出最终回复。"
+)
+_RESET_TEXT_RE = re.compile(
+    r"resets?\s+(?:([A-Z][a-z]{2})\s+(\d{1,2}),?\s+)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)",
+    re.IGNORECASE,
+)
+
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    return (os.environ.get(name, default) or default).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _is_rate_limit_error(exc: Optional[BaseException]) -> bool:
+    if exc is None:
+        return False
+    low = str(exc).lower()
+    return any(m.lower() in low for m in _RATE_LIMIT_MARKERS)
+
+
+def _limit_detail(exc: BaseException) -> str:
+    """把「Claude Max 用量已达上限：You've hit your session limit · resets 12:20pm」
+    里冒号后的那截抠出来给用户看。"""
+    text = str(exc)
+    if "：" in text:
+        text = text.split("：", 1)[1]
+    return text.strip()[:160]
+
+
+def _parse_reset_minutes(text: str, now: Optional[float] = None) -> Optional[int]:
+    """从 Anthropic 的限流文案里解析 "resets 12:20pm" / "resets 11pm" /
+    "resets Sep 5 at 3pm" → 距现在多少分钟（按 Asia/Shanghai，与文案一致）。
+    解析不出来或超过 24h（wake 上限）返回 None。"""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    m = _RESET_TEXT_RE.search(text or "")
+    if not m:
+        return None
+    mon, day, hh, mm, ampm = m.groups()
+    tz = ZoneInfo("Asia/Shanghai")
+    now_dt = datetime.fromtimestamp(now if now is not None else time.time(), tz)
+    hour = int(hh) % 12 + (12 if ampm.lower() == "pm" else 0)
+    minute = int(mm or 0)
+    try:
+        target = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if mon and day:
+            month = datetime.strptime(mon, "%b").month
+            target = target.replace(month=month, day=int(day))
+            if target < now_dt - timedelta(days=1):
+                target = target.replace(year=target.year + 1)
+        elif target <= now_dt:
+            target += timedelta(days=1)
+    except ValueError:
+        return None
+    return _minutes_until(target.timestamp(), now_dt.timestamp())
+
+
+def _minutes_until(epoch: Optional[float], now: Optional[float] = None) -> Optional[int]:
+    """epoch → 距现在的分钟数（向上取整 +2 分钟余量），落在 wake_me_in 的 1..1440 内；
+    过去 / 超 24h 返回 None。"""
+    if not epoch:
+        return None
+    now = now if now is not None else time.time()
+    delta = float(epoch) - now
+    if delta > 1440 * 60:
+        return None
+    minutes = int(delta // 60) + 2
+    return max(1, min(1440, minutes))
+
+
+def _emergency_account_switch() -> dict:
+    """同步、走网络（probe 所有账户）；调用方丢到 to_thread 里跑。"""
+    from account_switcher import emergency_switch_on_limit
+    return emergency_switch_on_limit()
+
+
+async def _schedule_limit_wake(
+    bot: BotInstance, raw_chat_id: str, thread_id: str, anchor: str, user_id: str,
+    exc: BaseException, limit_info: dict, original_text: str,
+) -> str:
+    """撞墙且没切成账户时：在本话题排一个到配额重置时刻的自动唤醒。
+    返回写进错误卡片的一行说明；排不了（私聊 / 解析不出重置时间 / 关闭）返回空串。"""
+    if not (thread_id and _env_flag("CC_LARK_WAKE_ON_LIMIT")):
+        return ""
+    minutes = _minutes_until(limit_info.get("current_reset_epoch")) if limit_info else None
+    if minutes is None:
+        minutes = _parse_reset_minutes(str(exc))
+    if minutes is None:
+        return ""
+    head = (original_text or "").strip().replace("\n", " ")[:300]
+    note = (
+        f"上一轮任务因 Claude Max 用量墙中断（{_limit_detail(exc)}），现在配额应已恢复。"
+        "请续跑上一轮：上下文已保留在本话题 session 里，先看本话题最近的用户消息和卡片里的进度，"
+        "已经生效的写操作不要重复，把剩下的做完并给出最终回复。"
+        f"原始任务开头：{head}"
+    )
+    try:
+        from scheduler import schedule_wake
+        res = schedule_wake(
+            profile=bot.profile.name, chat_id=raw_chat_id, thread_id=thread_id,
+            anchor_message_id=anchor or thread_id, user_id=user_id,
+            minutes=minutes, note=note,
+        )
+    except Exception as e:  # noqa: BLE001
+        log(bot.profile.name, "limit", "warn", f"排配额恢复唤醒失败: {type(e).__name__}: {e}")
+        return ""
+    if not res.get("ok"):
+        log(bot.profile.name, "limit", "warn", f"排配额恢复唤醒被拒: {res.get('error')}")
+        return ""
+    log(bot.profile.name, "limit", "info",
+        f"已排配额恢复唤醒 +{minutes}min → {res.get('fire_at_local')} thread={thread_id[:12]}...")
+    return f"⏰ 已排定 {res.get('fire_at_local')} 配额恢复后自动续跑本话题，无需手动唤醒。"
+
+
+# ── codex：模型不被当前账户支持（间歇性 400）→ 换 fallback 模型重发 ──
+# 实测 gpt-5.6-sol 在 ChatGPT 账户下大多数时候能跑，但会间歇性回
+# "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."
+# 请求在第一步就被拒、什么都没做，原样换个模型重发即可。默认不粘住（下一轮仍用
+# 原模型试）；CODEX_MODEL_FALLBACK 可改 fallback，空串 = 关掉。
+_CODEX_UNSUPPORTED_MARKERS = ("model is not supported", "model' is not supported", "not supported when using codex")
+_CODEX_FALLBACK_MODEL_DEFAULT = "gpt-5.5"
+
+
+def _is_codex_model_unsupported(exc: Optional[BaseException]) -> bool:
+    if exc is None:
+        return False
+    low = str(exc).lower()
+    return any(m in low for m in _CODEX_UNSUPPORTED_MARKERS)
+
+
+def _codex_fallback_model() -> str:
+    raw = os.environ.get("CODEX_MODEL_FALLBACK")
+    if raw is None:
+        return _CODEX_FALLBACK_MODEL_DEFAULT
+    return normalize_model(raw.strip()) or raw.strip()
+
+
+# ── ACL 拒绝日志去重 ───────────────────────────────────────
+# bot 常驻在几个不在白名单的群里，一周能刷 300 条「群不在白名单」；同一个群一小时只记一次。
+_ACL_LOG_INTERVAL_SEC = 3600
+_acl_log_last: dict[str, float] = {}
+_acl_log_suppressed: dict[str, int] = {}
+
+
+def _log_acl_group_skip(tag: str, raw_chat_id: str) -> None:
+    now = time.time()
+    last = _acl_log_last.get(raw_chat_id, 0.0)
+    if now - last < _ACL_LOG_INTERVAL_SEC:
+        _acl_log_suppressed[raw_chat_id] = _acl_log_suppressed.get(raw_chat_id, 0) + 1
+        return
+    suppressed = _acl_log_suppressed.pop(raw_chat_id, 0)
+    _acl_log_last[raw_chat_id] = now
+    extra = f"（过去 1h 另有 {suppressed} 条已省略）" if suppressed else ""
+    log(tag, "acl", "info", f"群不在白名单 chat={raw_chat_id[:10]}...{extra}")
+
+
 # ── 命令菜单（锁外即时响应）──────────────────────────────────
 
 _COMMAND_MENU_GROUPS = [
@@ -767,7 +960,7 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
             and "*" not in bot.profile.allowed_group_chat_ids
             and raw_chat_id not in bot.profile.allowed_group_chat_ids
         ):
-            log(tag, "acl", "info", f"群不在白名单 chat={raw_chat_id[:10]}...")
+            _log_acl_group_skip(tag, raw_chat_id)
             return
         if bot.profile.allowed_open_ids and user_id not in bot.profile.allowed_open_ids:
             log(tag, "acl", "info", f"user={user_id} 不在 allowlist")
@@ -854,6 +1047,60 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
                 pass
 
 
+def _queued_card_text() -> str:
+    return (
+        f"📬 **排队中** — 已到全局并发上限（同时最多 {RUN_GATE.limit} 个任务在跑，"
+        f"当前 {RUN_GATE.describe()}）。\n\n"
+        "前面腾出额度就自动开始，不用重发；`/stop` 可直接取消排队。"
+    )
+
+
+async def _push_queued_card(bot: BotInstance, active_run, card_msg_id: str):
+    """把「排队中」写进占位卡片。抢不到卡片锁 / 写失败都只 log，不影响排队本身。"""
+    locked = await _acquire_card_lock(active_run, _PUSH_TIMEOUT)
+    try:
+        await asyncio.wait_for(
+            bot.feishu.update_card(card_msg_id, _queued_card_text()),
+            timeout=_PUSH_TIMEOUT,
+        )
+    except Exception as e:
+        log(bot.profile.name, "gate", "warn", f"排队卡片更新失败: {_err_desc(e)}")
+    finally:
+        if locked:
+            active_run.card_update_lock.release()
+
+
+async def _abandon_queued_run(
+    bot: BotInstance, active_run, card_msg_id: str, state: str,
+):
+    """排队没排到就收尾卡片：aborted=被 /stop 或 /restart 取消，timeout=等太久放弃。
+
+    /stop 路径的 `_announce_stopped_run` 已经写过停止卡了，别覆盖它。
+    """
+    if state == "aborted" and getattr(active_run, "stop_announced", False):
+        return
+    if state == "aborted":
+        content = "⏹ 排队中的任务已取消（被停止或服务重启），未开始执行。"
+    else:
+        content = (
+            f"⚠️ 排队等了 {RUN_GATE.max_wait:.0f}s 仍没拿到并发额度，本条任务未执行。"
+            "等前面的任务跑完再重发一次。"
+        )
+    locked = await _acquire_card_lock(active_run, _PUSH_TIMEOUT)
+    try:
+        for coro in (
+            bot.feishu.update_card(card_msg_id, content),
+            bot.feishu.finalize_streaming_card(card_msg_id),
+        ):
+            try:
+                await asyncio.wait_for(coro, timeout=_PUSH_TIMEOUT)
+            except Exception as e:
+                log(bot.profile.name, "gate", "warn", f"排队收尾卡片失败: {_err_desc(e)}")
+    finally:
+        if locked:
+            active_run.card_update_lock.release()
+
+
 async def _run_and_display(
     bot: BotInstance,
     user_id: str, chat_id: str, is_group: bool,
@@ -861,7 +1108,13 @@ async def _run_and_display(
     preview_text: str = "",
     append_system_prompt: str = "",
 ):
-    """调用 Claude 并流式展示结果。消息处理和按钮回复共用此函数。"""
+    """入口层：重启闸门 → 注册 active run → **全局并发闸门** → 交给 _execute_run。
+
+    并发闸门只在这一层：整机同时真正在跑的 run 不超过 RUN_GATE.limit（默认 4，
+    CC_LARK_MAX_CONCURRENT_RUNS 可调，0=不限）。超额的 run 在这里 FIFO 排队 ——
+    消息不丢也不拒，卡片上写明"排队中"，排队期间 /stop、/restart 都能取消它
+    （active run 先注册再排队，就是为了这两条救火通道在排队态也能生效）。
+    """
     if _restart_in_progress:
         try:
             await bot.feishu.update_card(
@@ -878,6 +1131,47 @@ async def _run_and_display(
 
     active_run = bot.active_runs.start_run(user_id, chat_id, card_msg_id)
 
+    def _gate_aborted() -> bool:
+        return bool(active_run.stop_requested) or _restart_committed
+
+    if RUN_GATE.full():
+        log(bot.profile.name, "gate", "info",
+            f"排队等并发额度 chat={chat_id[:24]}（{RUN_GATE.describe()}）")
+        await _push_queued_card(bot, active_run, card_msg_id)
+
+    gate_state = await RUN_GATE.acquire(abort=_gate_aborted)
+    if gate_state != "ok":
+        log(bot.profile.name, "gate", "info",
+            f"排队结束但未执行（{gate_state}） chat={chat_id[:24]}")
+        await _abandon_queued_run(bot, active_run, card_msg_id, gate_state)
+        bot.active_runs.clear_run(user_id, chat_id, active_run)
+        return None
+
+    try:
+        return await _execute_run(
+            bot,
+            user_id, chat_id, is_group, text, card_msg_id, session, notify_msg_id,
+            preview_text=preview_text,
+            append_system_prompt=append_system_prompt,
+            active_run=active_run,
+        )
+    finally:
+        RUN_GATE.release()
+
+
+async def _execute_run(
+    bot: BotInstance,
+    user_id: str, chat_id: str, is_group: bool,
+    text: str, card_msg_id: str, session, notify_msg_id: str,
+    *, active_run: ActiveRun,
+    preview_text: str = "",
+    append_system_prompt: str = "",
+):
+    """调用 Claude 并流式展示结果。消息处理和按钮回复共用此函数。
+
+    调用方（_run_and_display）已经拿到并发额度、注册好 active_run。
+    """
+
     def _stopping() -> bool:
         # committed gate is raised once a supervisor is confirmed, before active
         # runs are drained. Re-check it after every potentially slow Lark request
@@ -888,8 +1182,20 @@ async def _run_and_display(
     # server 用这些默认值把 send_text / schedule_wakeup 定向到当前 Lark 话题。
     wake_context: Optional[dict] = None
     raw_chat_id, _, thread_id = chat_id.partition(":")
+    cli_profile = getattr(bot.profile, "lark_cli_profile", None) or bot.profile.name
+    if not is_group:
+        # 私聊：没有话题、不注入运行时 MCP（claude_pty / codex 都按 CC_LARK_THREAD_ID 判），
+        # 但 lark-cli 的回复锚点仍要以 env 形式给到 agent——system prompt 里不再嵌本轮
+        # 消息 id（会打断 prompt cache，见 lark_prompts._build_lark_commands）。
+        wake_context = {
+            "CC_LARK_PROFILE_NAME": bot.profile.name,
+            "CC_LARK_CLI_PROFILE": cli_profile,
+            "CC_LARK_MESSAGE_ID": notify_msg_id or "",
+            "CC_LARK_ANCHOR": notify_msg_id or "",
+            "CC_LARK_USER_ID": user_id or "",
+            "CC_LARK_IS_GROUP": "0",
+        }
     if is_group:
-        cli_profile = bot.profile.lark_cli_profile or bot.profile.name
         callback_port = str(os.getenv("CALLBACK_PORT", "9981"))
         control_port = str(os.getenv(
             "CC_LARK_CONTROL_PORT",
@@ -1104,7 +1410,8 @@ async def _run_and_display(
 
     heartbeat_task = asyncio.create_task(_heartbeat())
 
-    claude_msg = text
+    # 本轮消息 id / 提问者写在用户消息最前面（system prompt 里不放每轮都变的字段）
+    claude_msg = _turn_header(notify_msg_id, user_id) + text
     # 外层 try/finally 让 active_run 的生命周期对齐 lock —— 后处理（卡片 patch、发✅、
     # 写 session）期间 lock 仍然 held，active_run 也必须仍可被 /stop 找到，否则会出现
     # "队列说在跑、/stop 说没在跑" 的死区。
@@ -1122,6 +1429,9 @@ async def _run_and_display(
         retry_count = 0
         stall_count = 0
         safeguards_switched = False
+        limit_switched = False          # 用量墙紧急切账户，一轮只切一次
+        limit_info: dict = {}           # 切换探测结果（含当前账户 5h 重置时刻）
+        codex_model_switched = False    # codex 模型被拒 → fallback，一轮只换一次
         last_exc: Optional[Exception] = None
         success = False
         full_text = ""
@@ -1256,6 +1566,99 @@ async def _run_and_display(
                         heartbeat_task = asyncio.create_task(_heartbeat())
                         continue
 
+                    # ── Claude Max 用量墙 → 紧急切账户 + resume 续跑 ──
+                    is_rate_limit = _is_rate_limit_error(e)
+                    if (
+                        is_rate_limit
+                        and not limit_switched
+                        and (session.runner or "claude").lower() == "claude"
+                        and _env_flag("ACCOUNT_SWITCH_ON_LIMIT")
+                    ):
+                        limit_switched = True
+                        await push("🔁 撞到 Claude Max 用量墙，正在探测其他账户额度…")
+                        try:
+                            limit_info = await asyncio.to_thread(_emergency_account_switch)
+                        except Exception as sw_err:  # noqa: BLE001
+                            limit_info = {"switched": None,
+                                          "reason": f"{type(sw_err).__name__}: {sw_err}"}
+                        target = limit_info.get("switched")
+                        if target:
+                            if resumable:
+                                session.session_id = resumable
+                                claude_msg = (
+                                    _LIMIT_RESUME_NUDGE_WRITE if blacklisted
+                                    else _LIMIT_RESUME_NUDGE
+                                )
+                            else:
+                                claude_msg = _turn_header(notify_msg_id, user_id) + text
+                            log(bot.profile.name, "limit", "warn",
+                                f"用量墙：账户 {limit_info.get('from') or '?'} → {target}"
+                                f"（{limit_info.get('reason')}），续跑 "
+                                f"session={(resumable or 'fresh')[:8]} write_op={blacklisted}")
+                            notice = (
+                                f"🔁 账户 `{limit_info.get('from') or '?'}` 撞到 Claude Max 用量墙"
+                                f"（{_limit_detail(e)}），已自动切到 `{target}`"
+                                f"（{limit_info.get('reason')}）并续跑本任务。"
+                            )
+                            accumulated = ""
+                            await push(f"🔄 {notice}")
+                            try:
+                                if is_group and notify_msg_id:
+                                    await bot.feishu.reply_text(notify_msg_id, notice)
+                                else:
+                                    await bot.feishu.send_text_to_user(user_id, notice)
+                            except Exception:
+                                pass
+                            if active_run.stop_requested:
+                                return
+                            last_output_ts = time.time()
+                            last_push_time = 0.0
+                            start_ts = time.time()
+                            current_tool = None
+                            pty_warning = None
+                            heartbeat_task = asyncio.create_task(_heartbeat())
+                            continue
+                        log(bot.profile.name, "limit", "warn",
+                            f"用量墙但无法切换账户：{limit_info.get('reason') or '未知'}")
+
+                    # ── codex：模型被当前账户拒绝 → 换 fallback 模型原样重发 ──
+                    if (
+                        _is_codex_model_unsupported(e)
+                        and not codex_model_switched
+                        and (session.runner or "").lower() == "codex"
+                    ):
+                        fallback = _codex_fallback_model()
+                        if fallback and fallback != (session.model or ""):
+                            codex_model_switched = True
+                            old_model = session.model
+                            session.model = fallback
+                            # 请求在第一步就被拒、什么都没做：原样重发（沿用 session）
+                            claude_msg = _turn_header(notify_msg_id, user_id) + text
+                            log(bot.profile.name, "codex", "warn",
+                                f"模型 {old_model} 被拒（{str(e)[:120]}），本轮改用 {fallback} 重发")
+                            notice = (
+                                f"⚠️ 模型 `{old_model}` 被 Codex 拒绝（{_format_run_error(e)[:140]}），"
+                                f"本轮自动改用 `{fallback}` 重跑；下一轮仍按原模型试。"
+                            )
+                            accumulated = ""
+                            await push(f"🔄 {notice}")
+                            try:
+                                if is_group and notify_msg_id:
+                                    await bot.feishu.reply_text(notify_msg_id, notice)
+                                else:
+                                    await bot.feishu.send_text_to_user(user_id, notice)
+                            except Exception:
+                                pass
+                            if active_run.stop_requested:
+                                return
+                            last_output_ts = time.time()
+                            last_push_time = 0.0
+                            start_ts = time.time()
+                            current_tool = None
+                            pty_warning = None
+                            heartbeat_task = asyncio.create_task(_heartbeat())
+                            continue
+
                     if is_stall and stall_count < _stall_max and (
                         resumable or not blacklisted
                     ):
@@ -1382,6 +1785,13 @@ async def _run_and_display(
             )
             if resumable_sid:
                 err_brief += "\n\n💾 上下文已保留，配额恢复后发『继续』即可接着上次进度跑。"
+            if _is_rate_limit_error(last_exc):
+                wake_line = await _schedule_limit_wake(
+                    bot, raw_chat_id, thread_id, notify_msg_id, user_id,
+                    last_exc, limit_info, text,
+                )
+                if wake_line:
+                    err_brief += "\n\n" + wake_line
             # 出错前流式渲染出的内容（工具轨迹 + 部分回答）对用户仍有价值，
             # 不能整卡覆盖成错误信息——保留旧内容，把错误追加在末尾。
             partial_parts = []
@@ -1696,6 +2106,43 @@ async def _process_message(
 
     # ── 斜杠命令 ──────────────────────────────────────────────
     parsed = parse_command(text)
+
+    # `/fable xxx` `/opus xxx` `/sonnet xxx` `/haiku xxx`：一条消息完成「切模型 +
+    # 执行」。切完模型不回"已切换"卡片，把后面的指令当普通消息落到下面的 agent
+    # 分支去跑（沿用当前 session，上下文不丢）。裸 `/opus` 不在这里处理，仍走
+    # handle_command 只切模型。非 claude runner 用不了（runner 由 profile 钉死），
+    # 明确告知且不执行，绝不静默用错模型跑。
+    if parsed and parsed[0] in MODEL_SHORTCUTS and parsed[1]:
+        cmd, args = parsed
+        try:
+            model = await apply_model_shortcut(cmd, user_id, chat_id, bot.store)
+        except ModelShortcutUnavailable as e:
+            log(tag, "cmd", "warn", f"/{cmd} 快捷切模型不可用: {e}")
+            err = f"❌ {e}"
+            if is_group:
+                try:
+                    await bot.feishu.reply_card(msg.message_id, content=err, loading=False)
+                except Exception:
+                    pass
+            else:
+                await bot.feishu.send_card_to_user(user_id, content=err, loading=False)
+            return
+        except Exception as e:
+            log(tag, "cmd", "error", f"/{cmd} 快捷切模型失败: {e}")
+            err = f"❌ 切换模型失败：{e}（这条指令没有执行）"
+            if is_group:
+                try:
+                    await bot.feishu.reply_card(msg.message_id, content=err, loading=False)
+                except Exception:
+                    pass
+            else:
+                await bot.feishu.send_card_to_user(user_id, content=err, loading=False)
+            return
+        log(tag, "cmd", "info", f"/{cmd} 快捷切模型 → {model}（沿用当前 session），直接执行后续指令")
+        text = args
+        preview_text = args
+        parsed = None  # 命令部分已消费，剩下的按普通消息处理
+
     if parsed:
         cmd, args = parsed
         # 富文本或带参数的 /restart 不会命中 handle_message_async 的精确文本快路径，

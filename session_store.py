@@ -236,14 +236,17 @@ def _get_api_token() -> Optional[str]:
     except Exception:
         pass
     # 2) keychain（文件缺失或 token 过期时回落）
+    # ⚠️ 必须走 account_switcher._read_keychain_blob：它按 `-a <用户名>` 精确取条目。
+    # 新版 CLI 把凭证写在 acct=<macOS 用户名> 上，不带 -a 的 `security` 会随机命中
+    # 同 service 名的历史死条目 → 拿到过期 token → 这里返回 None → 后台摘要 7 天 0 成功
+    # 且不报错（/usage 的同款坑在 89b54bb 修过，这里当时漏了）。
     try:
-        from account_switcher import decode_security_stdout, ensure_keychain_intact
+        from account_switcher import _read_keychain_blob, ensure_keychain_intact
         ensure_keychain_intact()  # keychain 被外部进程写丢时自愈
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return _token_if_valid(json.loads(decode_security_stdout(result.stdout)))
+        blob = _read_keychain_blob()
+        if not blob:
+            return None
+        return _token_if_valid(json.loads(blob))
     except Exception:
         return None
 

@@ -24,6 +24,7 @@ from bot_config import (
     load_claude_extra_env,
 )
 from grok_runner import GROK_EFFORT_LEVELS
+from run_control import RUN_GATE
 from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title, _find_session_file
 
 PLUGINS_DIR = os.path.expanduser("~/.claude/plugins")
@@ -170,7 +171,8 @@ HELP_TEXT = """\
 `/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
 `/runner [codex|claude|opencode|mimo|grok|maka]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka
-`/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID）
+`/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID；会重开 session）
+`/fable` `/opus` `/sonnet` `/haiku` `[指令]` — 快捷切模型并**直接执行后面的指令**，沿用当前 session 不丢上下文（例：`/opus 帮我查一下数据库`；仅 claude runner 可用）
 `/effort [级别]` — 设置当前对话推理强度（default / low / medium / high / xhigh / max / ultra）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
 `/status` — 显示当前 session 信息
@@ -219,10 +221,17 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 
 
 # Bot 自身处理的命令，其余 /xxx 转发给 Claude
+# `/fable xxx` `/opus xxx` `/sonnet xxx` `/haiku xxx`：一条消息完成「切模型 + 执行指令」。
+# 与 `/model X` 的区别：不重开 session（Claude CLI 支持 --resume 时换 --model），
+# 用户在一个会话里临时换个模型接着问、上下文不丢。带指令时由 dispatcher 拦截、
+# 切完模型把指令当普通消息继续跑；不带指令时走 handle_command 只切模型。
+MODEL_SHORTCUTS: Tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
+
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "runner", "model", "effort", "mode", "status", "cd", "ls",
     "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "switch", "stop",
     "restart", "group", "defaults",
+    *MODEL_SHORTCUTS,
 }
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -1608,6 +1617,38 @@ def _trigger_restart() -> None:
     raise RuntimeError("no supported supervisor; refusing to stop the service")
 
 
+class ModelShortcutUnavailable(RuntimeError):
+    """当前 runner 不是 claude，`/fable` 等 Claude 系快捷指令不可用。message 可直接回给用户。"""
+
+
+async def apply_model_shortcut(
+    cmd: str, user_id: str, chat_id: str, store: SessionStore,
+) -> str:
+    """执行 `/fable` `/opus` `/sonnet` `/haiku` 的「切模型」部分，返回生效的模型串。
+
+    只改 model_override、**不动 session**——Claude CLI `--resume` 时可以换
+    `--model`，同一会话接着聊，上下文不丢（这正是它和 `/model X` 的区别）。
+
+    这四个都是 Claude 系模型，硬塞给 codex / opencode / mimo / grok / maka 只会
+    报错；而 runner 由 profile 钉死（SessionStore._ensure_current_defaults 每次都
+    把 runner 拉回 profile 默认），这里切不了 runner，所以非 claude runner 直接抛
+    ModelShortcutUnavailable，让调用方把话说清楚、别静默跑错模型。
+    """
+    key = (cmd or "").strip().lower()
+    if key not in MODEL_SHORTCUTS:
+        raise ValueError(f"not a model shortcut: {cmd!r}")
+    cur = await store.get_current(user_id, chat_id)
+    runner = (cur.runner or "claude").lower()
+    if runner != "claude":
+        raise ModelShortcutUnavailable(
+            f"`/{key}` 这类快捷指令只在 claude runner 下可用（当前 runner：`{runner}`）。"
+            f"这条消息**没有执行**；去掉 `/{key}` 前缀重发，或换用 `/model` 选本 runner 支持的模型。"
+        )
+    model = MODEL_ALIASES[key]
+    await store.set_model_override(user_id, chat_id, model)
+    return model
+
+
 async def handle_command(
     cmd: str,
     args: str,
@@ -1620,6 +1661,18 @@ async def handle_command(
 
     if cmd not in BOT_COMMANDS:
         return None  # 不认识的 /xxx → 转发给 Claude（如 /commit 等 skill）
+
+    if cmd in MODEL_SHORTCUTS:
+        # 带指令的形态（`/opus 帮我查一下`）在 dispatcher 里就被拦下：切完模型把
+        # 指令当普通消息继续跑，不会走到这里。这里只处理裸 `/opus`：只切模型。
+        try:
+            model = await apply_model_shortcut(cmd, user_id, chat_id, store)
+        except ModelShortcutUnavailable as e:
+            return f"❌ {e}"
+        return (
+            f"✅ 已切换模型为 `{model}`（沿用当前 session，上下文不丢；/model default 可清除）。\n"
+            f"直接发消息即可；也可以 `/{cmd} <指令>` 一步到位。"
+        )
 
     if cmd == "ws":
         cmd = "workspace"
@@ -1903,6 +1956,9 @@ async def handle_command(
             f"工作空间: `{workspace}`",
             f"工作目录: `{cwd}`",
             f"开始时间: {started}",
+            # 全局并发闸门现状（跨所有 profile / 群）：卡在"排队中"时看这行就知道
+            # 是被上限挡住了，还是真在跑。
+            f"全局并发: {RUN_GATE.describe()}",
         ])
         if context_line:
             lines.append(context_line)

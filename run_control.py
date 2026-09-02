@@ -138,3 +138,138 @@ async def stop_run(
         active_run.stop_announced = True
 
     return True
+
+
+# ── 全局并发闸门 ─────────────────────────────────────────────────────────
+# per-chat lock 只保证「同一话题串行」，整机层面没有任何刹车：定时任务批量到点、
+# 一波 dispatch_task 派 7 个子会话、多个群/多个 profile 同时来人，都能瞬间拉起十
+# 几个 agent 进程，把 CPU / 内存 / API 额度一起打满（实测 14 并发全卡死）。
+# 这里给所有 run 加一道跨 profile、跨群的全局上限：超额的 run 在闸门前 **FIFO 排队**
+# —— 不丢消息、不拒绝，卡片上明示"排队中"，排队期间照样能 /stop。
+# CC_LARK_MAX_CONCURRENT_RUNS=0（或负数）= 不限，回到无闸门的老行为。
+# ⚠️ 别设成 1：编排 agent 若在同一轮里派子会话又等子会话结果，1 个额度会真锁死
+#    （≥2 时父占一个、子仍有额度跑，只是慢）。
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, "")).strip() or default)
+    except ValueError:
+        return default
+
+
+MAX_CONCURRENT_RUNS = _env_int("CC_LARK_MAX_CONCURRENT_RUNS", 4)
+# 排队最长等待秒数，超时就放弃本次 run 并在卡片上说明；0 = 一直等（默认，保证不丢活）。
+QUEUE_MAX_WAIT_SECONDS = _env_int("CC_LARK_QUEUE_MAX_WAIT_SEC", 0)
+
+_ABORT_POLL_INTERVAL_SECONDS = 0.5
+
+
+class RunGate:
+    """全局 run 并发闸门（进程内、跨所有 profile）。
+
+    用 asyncio.Semaphore 拿 FIFO 语义 = 先排队的先跑。等待可被 abort 谓词打断
+    （/stop、/restart），打断时把排队位撤掉；撤销与"名额刚好到手"的竞态会把名额
+    还回去，绝不漏额度。limit <= 0 时整个闸门退化成无操作。
+    """
+
+    def __init__(self, limit: int, max_wait: float = 0):
+        self.limit = limit
+        self.max_wait = max_wait      # 排队上限秒数，0 = 一直等
+        self._sem: Optional[asyncio.Semaphore] = None
+        self.running = 0
+        self.waiting = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.limit > 0
+
+    def _semaphore(self) -> asyncio.Semaphore:
+        # 惰性创建：import 时还没有 event loop。
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self.limit)
+        return self._sem
+
+    def full(self) -> bool:
+        """当前是否已无空位（= 现在 acquire 会排队）。"""
+        return self.enabled and self._semaphore().locked()
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "并发不限"
+        s = f"{self.running}/{self.limit} 在跑"
+        if self.waiting:
+            s += f"，{self.waiting} 排队"
+        return s
+
+    async def acquire(
+        self,
+        *,
+        timeout: Optional[float] = None,
+        abort: Optional[Callable[[], bool]] = None,
+    ) -> str:
+        """占一个名额。返回 "ok" / "timeout" / "aborted"。只有 "ok" 才需要 release()。
+
+        timeout 不传时用 self.max_wait（0 = 一直等）。
+        """
+        if not self.enabled:
+            self.running += 1
+            return "ok"
+        if timeout is None:
+            timeout = self.max_wait
+
+        sem = self._semaphore()
+        if not sem.locked():          # 有空位：直接拿，不必起等待 task
+            await sem.acquire()
+            self.running += 1
+            return "ok"
+
+        acq = asyncio.ensure_future(sem.acquire())
+        watcher = (
+            asyncio.ensure_future(self._watch_abort(abort))
+            if abort is not None else None
+        )
+        waiters = [acq] + ([watcher] if watcher else [])
+        self.waiting += 1
+        try:
+            done, _pending = await asyncio.wait(
+                waiters,
+                timeout=timeout if timeout and timeout > 0 else None,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            self.waiting -= 1
+            if watcher is not None:
+                watcher.cancel()
+
+        if acq in done:
+            exc = acq.exception()
+            if exc is not None:
+                raise exc
+            self.running += 1
+            return "ok"
+
+        # 没等到名额：撤掉排队位。cancel 与"名额刚到手"存在窗口 —— 真到手了就立刻
+        # 还回去，否则这个额度会永久漏掉（跑久了并发上限自己越缩越小）。
+        acq.cancel()
+        await asyncio.gather(acq, return_exceptions=True)
+        if acq.done() and not acq.cancelled() and acq.exception() is None:
+            sem.release()
+        return "aborted" if (watcher is not None and watcher in done) else "timeout"
+
+    def release(self) -> None:
+        self.running = max(0, self.running - 1)
+        if self.enabled and self._sem is not None:
+            self._sem.release()
+
+    async def _watch_abort(self, abort: Callable[[], bool]) -> None:
+        """轮询 abort 谓词；返回即代表"别等了"。用轮询而不是 Event，是为了不给
+        ActiveRun 加状态、也让 mock 出来的 run 照样能走这条路径。"""
+        while True:
+            try:
+                if abort():
+                    return
+            except Exception:
+                return
+            await asyncio.sleep(_ABORT_POLL_INTERVAL_SECONDS)
+
+
+RUN_GATE = RunGate(MAX_CONCURRENT_RUNS, max_wait=QUEUE_MAX_WAIT_SECONDS)

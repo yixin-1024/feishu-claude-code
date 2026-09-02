@@ -24,3 +24,6 @@ def _isolate_sessions(tmp_path, monkeypatch):
     """自动隔离: 将 SESSIONS_DIR 指向临时目录"""
     monkeypatch.setattr(_ss, "SESSIONS_DIR", str(tmp_path))
     monkeypatch.setattr(_ss, "LEGACY_SESSIONS_FILE", str(tmp_path / "sessions.json"))
+    # wake_me_in 的落盘也隔离到临时目录，别让测试往仓库 data/pending_wakes.json 写假记录
+    # （否则下次 bot 启动会把它们当真唤醒去 fire）。
+    monkeypatch.setenv("CC_LARK_WAKE_STORE", str(tmp_path / "pending_wakes.json"))
