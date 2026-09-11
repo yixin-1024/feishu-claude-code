@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  external-watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile.external
+    container_name: lark-external-watcher
+    restart: unless-stopped
+    volumes:
+      - ~/.feishu-claude/web_session:/root/.feishu-claude/web_session
+      - ./external_groups.yaml:/app/external_groups.yaml
+      - ~/.lark-cli:/root/.lark-cli
+    environment:
+      - PYTHONUNBUFFERED=1

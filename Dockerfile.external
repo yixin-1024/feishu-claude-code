@@ -1,0 +1,16 @@
+# 外部群协议监听器独立运行容器
+FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
+
+WORKDIR /app
+
+# 安装系统依赖与 Python 依赖
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir playwright protobuf pyyaml aiohttp
+
+# 安装 Chromium 浏览器
+RUN playwright install chromium
+
+COPY . .
+
+CMD ["python3", "run_external_watcher.py"]

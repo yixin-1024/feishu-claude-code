@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package feishu;
+
+// --- 外部请求/响应定义 ---
+
+message GetMessagesRequest {
+    string chat_id = 1;
+    int32 count = 2;
+    string cursor = 3;
+    enum Scene {
+        UNKNOWN = 0;
+        SCENE_CHAT = 2;
+    }
+    Scene scene = 4;
+}
+
+message Sender {
+    string sender_id = 1;
+    string name = 2;
+    string avatar_url = 3;
+}
+
+message TextContent {
+    string text = 1;
+}
+
+message Message {
+    string message_id = 1;
+    string chat_id = 2;
+    Sender sender = 3;
+    int64 create_time = 4;
+    oneof content {
+        TextContent text_content = 5;
+    }
+}
+
+message GetMessagesResponse {
+    repeated Message items = 1;
+    bool has_more = 2;
+    string next_cursor = 3;
+}
+
+message StreamResponse {
+    repeated Message new_messages = 1;
+}
+
+// --- 内部网络帧协议定义 ---
+
+message BizRequest {
+    int32 service = 1;
+    int32 method = 2;
+    bytes payload = 15;
+}
+
+message BizResponse {
+    int32 code = 1;
+    string message = 2;
+    bytes payload = 15;
+}
+
+message Frame {
+    int32 sequence_id = 1;
+    int32 log_id = 2;
+    int32 service_id = 3;
+    bytes payload = 5; // BizRequest 序列化后放在这里
+    string device_id = 6; // 对应 HTTP Header 中的 x-request-id
+}

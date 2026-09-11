@@ -1,0 +1,43 @@
+# 外部群「个人号代答」监听配置
+#
+# bot 账号进不了外部群，所以整条链路都借机主本人的 user token（lark-cli）走：
+# 轮询白名单群 → 有人 @ 机主 → 跑本地 agent → 以机主身份回到话题里。
+# 需要 user 身份已授权的 profile（`lark-cli auth login` 过的那个）。
+# ⚠️ 已知限制：Lark 会硬拦「应用以用户身份往外部群写消息」(code 230027)——读得到、
+# 写不进去。要真正用起来，得先在开放平台开「应用外部共享」把 bot 本体拉进外部群
+# 走 bot 身份发消息。默认 enabled: false。
+enabled: false
+
+lark_domain: "larksuite.com"
+user_profile: "你的 profile 名"
+owner_name: "你的姓名（与通讯录一致）"
+# 留空 = 启动时用 `lark-cli auth status` 自动解析。
+# 判定 @ 一律按 open_id，不做正文文本匹配（文本匹配会让自己的回复触发自己）。
+owner_open_id: ""
+
+# 会话持久化目录（浏览器登录态 + watcher_state.json 都在这，迁服务器打包这一个目录）
+session_dir: "~/.feishu-claude/web_session"
+# 图片 / 附件落盘目录，必须在 lark-cli 允许的根目录内（cwd、/tmp、~/files）
+download_dir: "/tmp/cc-lark-ext"
+
+poll_interval_sec: 5
+page_size: 20
+max_concurrent: 3
+
+# Playwright 常驻页面：目前只开着页面、还没解 WebSocket 帧，对触发没有贡献，
+# 却要常驻一个 headless Chromium。等真要做协议监听时再打开。
+browser_listener: false
+
+# 自动回复出错时私聊机主通报（外部群里绝不发错误信息）
+notify_owner_on_error: true
+
+groups:
+  - chat_id: "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    name: "某外部客户群"
+    runner: "agy"
+    model: ""
+    cwd: "/Users/me/projects/proj-a"
+    # 别人发的消息：必须显式 @ 机主才触发
+    require_mention: true
+    # 机主自己 @ 自己也触发（用来在群里直接指挥）
+    allow_self_mention: true
