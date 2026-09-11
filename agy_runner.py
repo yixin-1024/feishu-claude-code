@@ -740,7 +740,7 @@ async def _run_agy_once(
             step_type = step.get("step_type")
             state = str(step.get("state") or "").upper()
 
-            if state == "ERROR":
+            if state == "ERROR" and step_type != "tool":
                 current_turn_has_error_step = True
 
             if step_type == "agent_response":

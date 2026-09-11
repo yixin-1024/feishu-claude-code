@@ -543,6 +543,57 @@ def test_run_agy_stale_user_location_contamination_suppressed(monkeypatch):
     assert used_fresh is False
 
 
+def test_run_agy_tool_error_does_not_block_stale_history_suppression(monkeypatch):
+    """验证工具执行报错（如 grep 退出码 1）不应作为致命 step 错误阻碍历史旧错误模版的净化"""
+    captured = {}
+    tool_err_event = json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": "test-cid-tool-err",
+            "step_index": 100,
+            "state": "ERROR",
+            "step_type": "tool",
+            "tool_name": "run_command",
+            "tool_info": {"name": "run_command", "parameters": {"CommandLine": "grep nonexistent"}},
+        },
+    }).encode("utf-8") + b"\n"
+
+    step_done_event = json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": "test-cid-tool-err",
+            "step_index": 101,
+            "state": "DONE",
+            "step_type": "agent_response",
+            "text_delta": "RECOVERED_AFTER_TOOL_ERROR\n",
+        },
+    }).encode("utf-8") + b"\n"
+
+    stale_error_result_event = json.dumps({
+        "event": "result",
+        "result": {
+            "conversation_id": "test-cid-tool-err",
+            "status": "ERROR",
+            "response": "RECOVERED_AFTER_TOOL_ERROR\n",
+            "error": "The stream was interrupted. Please continue the task you were working on.",
+        },
+    }).encode("utf-8") + b"\n"
+
+    fake_proc = FakeProc([tool_err_event, step_done_event, stale_error_result_event])
+    fake_proc.returncode = 0
+    _patch_exec(monkeypatch, fake_proc, captured)
+    monkeypatch.setattr(
+        agy_runner,
+        "_extract_agy_log_error",
+        lambda *args, **kwargs: "",
+    )
+
+    text, cid, used_fresh = asyncio.run(run_agy(message="probe", cwd="/tmp"))
+    assert text == "RECOVERED_AFTER_TOOL_ERROR"
+    assert cid == "test-cid-tool-err"
+    assert used_fresh is False
+
+
 
 def test_extract_agy_log_error_unexpected_eof():
     """验证从日志中提取 unexpected EOF 原始网络错误"""
