@@ -23,9 +23,15 @@ store/
 scheduled_tasks.yaml
 inbox_config.yaml
 external_triggers.yaml
+external_groups.yaml
+# 改 cron 前留的手动快照（scheduled_tasks.yaml.bak-<日期> 等），不进历史
+*.yaml.bak-*
 
 # 私有规划目录（GSD 等），不进版本控制
 .planning/
+
+# Claude 写作/演示工具在 cwd 里落的草稿目录（draft_<hash>_folder/），纯临时产物
+draft_*_folder/
 
 # 本地运行时产物 / 工作区（不进 git）：
 # data/ = agent 创建的 cron prompt 等运行时落盘；output/ = 会话产物；
@@ -45,5 +51,7 @@ prompts/*
 !prompts/verify.md
 !prompts/_runtime_mcp_claude.md
 !prompts/_runtime_mcp_other.md
+!prompts/_runtime_env.md
+!prompts/telegram.md
 # 但 .bak.<TS> 仍然忽略（应急快速回滚快照，不该污染历史）
 prompts/*.bak.*
