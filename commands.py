@@ -7,11 +7,13 @@ import asyncio
 import getpass
 import glob
 import json
+import math
 import os
 import select
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from typing import Optional, Tuple
@@ -24,6 +26,7 @@ from bot_config import (
     load_claude_extra_env,
 )
 from grok_runner import GROK_EFFORT_LEVELS
+from agy_runner import AGY_EFFORT_LEVELS, resolve_agy_bin
 from run_control import RUN_GATE
 from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title, _find_session_file
 
@@ -63,7 +66,18 @@ MODEL_ALIASES = {
     "codex-max": "gpt-5.1-codex-max",
     "codex": "gpt-5.1-codex",
     "gpt5": "gpt-5.1",
-    "gemini": "google/gemini-3.1-pro-preview-customtools",
+    "gemini": "google/gemini-3.8-flash",
+    "gemini38": "google/gemini-3.8-flash",
+    "gemini-3.8-flash": "google/gemini-3.8-flash",
+    "g38": "google/gemini-3.8-flash",
+    "flash38": "google/gemini-3.8-flash",
+    "gemini37": "google/gemini-3.7-flash",
+    "gemini-3.7-flash": "google/gemini-3.7-flash",
+    "gemini36": "google/gemini-3.6-flash",
+    "gemini-3.6-flash": "google/gemini-3.6-flash",
+    "gemini35": "google/gemini-3.5-flash",
+    "gemini-3.5-flash": "google/gemini-3.5-flash",
+    "gemini-pro-ct-31": "google/gemini-3.1-pro-preview-customtools",
     "gemini-pro": "google/gemini-3.1-pro-preview",
     "customtools": "google/gemini-3.1-pro-preview-customtools",
     "gemini-ct": "google/gemini-3.1-pro-preview-customtools",
@@ -82,7 +96,7 @@ MODEL_ALIASES = {
     "gemini-flash": "google/gemini-2.5-flash",
     "gemini25flash": "google/gemini-2.5-flash",
     "gemini-2.5-flash": "google/gemini-2.5-flash",
-    "flash": "google/gemini-2.5-flash",
+    "flash": "google/gemini-3.8-flash",
     # MiMo Code（quotio 本地 OpenAI 兼容中转）
     "mimo": "quotio/claude-opus-4-8",
     "mimo-opus": "quotio/claude-opus-4-8",
@@ -98,6 +112,23 @@ MODEL_ALIASES = {
     "maka-free": "nemotron-3-ultra-free",
     "maka-deepseek": "deepseek-v4-flash",
     "maka-deepseek-pro": "deepseek-v4-pro",
+    # Antigravity CLI（agy）：Gemini 官方 harness，档位由 /effort 单独给
+    "agy": "gemini-3.8-flash",
+    "agy-flash": "gemini-3.8-flash",
+    "agy-38": "gemini-3.8-flash",
+    "agy-37": "gemini-3.7-flash",
+    "agy-36": "gemini-3.6-flash",
+    # 3.1 Pro 只有 high/low 两档（没有 medium），直接钉带档位的 id，
+    # 免得裸名 + /effort medium 被 agy 判成 invalid model selection
+    "agy-pro": "gemini-3.1-pro-high",
+    "agy-pro-low": "gemini-3.1-pro-low",
+    # agy 内置的第三方模型：走 "Claude and GPT models" 配额池（与 Gemini 池
+    # 独立计量），且**都不接受 /effort**——见 agy_runner._MODELS_WITHOUT_EFFORT。
+    # 必须用 agy- 前缀的别名，不能复用 opus/sonnet：那两个是 Claude Code 的模型，
+    # agy 里并不存在。
+    "agy-opus": "claude-opus-4-6-thinking",
+    "agy-sonnet": "claude-sonnet-4-6",
+    "agy-gpt": "gpt-oss-120b-medium",
 }
 
 
@@ -130,6 +161,13 @@ def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[s
             raw = os.getenv("GROK_EFFORT")
         value = (raw or "").strip().lower()
         return value if value in GROK_EFFORT_LEVELS else None
+
+    if runner == "agy":
+        raw = os.getenv(f"{profile_name.upper()}_AGY_EFFORT") if profile_name else None
+        if raw is None:
+            raw = os.getenv("AGY_EFFORT")
+        value = (raw or "").strip().lower()
+        return value if value in AGY_EFFORT_LEVELS else None
 
     return None
 
@@ -215,6 +253,11 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
     if not text.startswith("/"):
         return None
     parts = text[1:].split(None, 1)
+    if not parts:
+        # 裸 "/"（Telegram 手机端点开命令菜单最容易手滑发出来的东西）。
+        # 不返回 None 的话 parts[0] 直接越界，异常一路冒出 handler，用户什么都收不到，
+        # 连 "/" 的命令菜单也永远出不来。
+        return None
     cmd = parts[0].lower()
     args = parts[1].strip() if len(parts) > 1 else ""
     return cmd, args
@@ -1007,6 +1050,77 @@ def _codex_usage_bar_lines(rate_limits: dict) -> list[str]:
     return lines
 
 
+# agy 的 /usage 在 print 模式下可用（slash command 默认展开，要禁才用
+# --disable-slash-commands），输出是每行 tab 分隔的四段：
+#   Gemini Models\tWeekly Limit Remaining\t100%\t2026-09-14T04:41:43Z
+# 实测连跑两次百分比不变 → 查额度本身不消耗额度。只有 OAuth 登录才有额度概念，
+# API key 模式（modelProvider=gemini）拿不到，此时返回空列表。
+_AGY_QUOTA_TIMEOUT = 60
+
+
+def _agy_iso_to_unix(text: str) -> Optional[int]:
+    """agy 的重置时刻是 ISO8601 UTC（...Z）→ unix 秒，好复用 codex 那套渲染。"""
+    if not text:
+        return None
+    try:
+        return int(datetime.fromisoformat(text.strip().replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+
+def _fetch_agy_quota() -> list[dict]:
+    """实时拉 agy 的订阅额度快照；拿不到就返回空列表（调用方降级提示）。"""
+    try:
+        proc = subprocess.run(
+            [
+                resolve_agy_bin(),
+                "--add-dir", tempfile.gettempdir(),
+                "--print-timeout", f"{_AGY_QUOTA_TIMEOUT}s",
+                "-p", "/usage",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_AGY_QUOTA_TIMEOUT + 15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows: list[dict] = []
+    for line in (proc.stdout or "").splitlines():
+        parts = [p.strip() for p in line.split("\t")]
+        if len(parts) < 3 or not parts[2].endswith("%"):
+            continue
+        try:
+            pct = float(parts[2].rstrip("%"))
+        except ValueError:
+            continue
+        # float() 会接受 "NaN"/"inf"，放过去会渲染成 `nan%` 和错乱的条形
+        if not math.isfinite(pct):
+            continue
+        pct = max(0.0, min(100.0, pct))
+        rows.append({
+            "group": parts[0],
+            "window": parts[1],
+            "remaining_pct": pct,
+            "resets_at": parts[3] if len(parts) > 3 else "",
+        })
+    return rows
+
+
+def _agy_usage_bar_lines(rows: list[dict]) -> list[str]:
+    """按模型组分节渲染。注意 agy 报的是**剩余**，条形填充即剩余量。"""
+    lines: list[str] = []
+    for group in dict.fromkeys(r["group"] for r in rows):  # 去重但保留出现顺序
+        lines.append("")
+        lines.append(f"**{group}**")
+        for row in (r for r in rows if r["group"] == group):
+            label = row["window"].replace("Limit Remaining", "").strip() or row["window"]
+            lines.append(f"{label} 剩余 {_fmt_pct_bar(row['remaining_pct'] / 100)}")
+            ts = _agy_iso_to_unix(row["resets_at"])
+            if ts:
+                lines.append(f"重置时间：{_fmt_codex_reset_ts(ts)}")
+    return lines
+
+
 def _runner_default_model(bot, runner: str) -> str:
     profile = getattr(bot, "profile", None)
     if profile and getattr(profile, "runner", "") == runner and getattr(profile, "default_model", ""):
@@ -1014,13 +1128,15 @@ def _runner_default_model(bot, runner: str) -> str:
     if runner == "codex":
         return "gpt-5.5"
     if runner == "opencode":
-        return "google/gemini-3.1-pro-preview"
+        return "google/gemini-3.8-flash"
     if runner == "mimo":
         return "quotio/claude-opus-4-8"
     if runner == "grok":
         return "wow-gpt"
     if runner == "maka":
         return "deepseek-v4-flash"
+    if runner == "agy":
+        return "gemini-3.8-flash"
     return "sonnet[1m]"
 
 
@@ -1783,6 +1899,7 @@ async def handle_command(
                     {"text": "MiMo Code", "value": {"action": "run_cmd", "cmd": "/runner mimo", "cid": chat_id}},
                     {"text": "Grok CLI", "value": {"action": "run_cmd", "cmd": "/runner grok", "cid": chat_id}},
                     {"text": "Maka", "value": {"action": "run_cmd", "cmd": "/runner maka", "cid": chat_id}},
+                    {"text": "Antigravity", "value": {"action": "run_cmd", "cmd": "/runner agy", "cid": chat_id}},
                 ],
             }
         requested = args.strip().lower().replace("_", "-")
@@ -1794,8 +1911,10 @@ async def handle_command(
             requested = "grok"
         if requested in {"maka-agent", "apache-maka"}:
             requested = "maka"
-        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka"}:
-            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）".format(args)
+        if requested in {"antigravity", "antigravity-cli"}:
+            requested = "agy"
+        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka", "agy"}:
+            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）、`agy`（Antigravity CLI）".format(args)
         model = _runner_default_model(bot, requested)
         await store.set_runner(user_id, chat_id, requested, model=model)
         return f"✅ 已切换 runner 为 `{requested}`，模型 `{model}`。已开始新 session。"
@@ -1814,10 +1933,10 @@ async def handle_command(
                 ]
             elif runner == "opencode":
                 buttons = [
+                    {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model gemini38", "cid": chat_id}},
+                    {"text": "Gemini 3.7 Flash", "value": {"action": "run_cmd", "cmd": "/model gemini37", "cid": chat_id}},
                     {"text": "🛠 3.1 Pro CustomTools", "value": {"action": "run_cmd", "cmd": "/model customtools", "cid": chat_id}},
                     {"text": "💎 Gemini 3.1 Pro", "value": {"action": "run_cmd", "cmd": "/model gemini-pro", "cid": chat_id}},
-                    {"text": "Gemini 3 Pro", "value": {"action": "run_cmd", "cmd": "/model gemini3", "cid": chat_id}},
-                    {"text": "Gemini 2.5 Pro", "value": {"action": "run_cmd", "cmd": "/model gemini25pro", "cid": chat_id}},
                     {"text": "⚡ Gemini 2.5 Flash", "value": {"action": "run_cmd", "cmd": "/model gemini-flash", "cid": chat_id}},
                 ]
             elif runner == "mimo":
@@ -1830,6 +1949,15 @@ async def handle_command(
                     {"text": "🐋 DeepSeek V4 Flash", "value": {"action": "run_cmd", "cmd": "/model maka-deepseek", "cid": chat_id}},
                     {"text": "🐋 DeepSeek V4 Pro", "value": {"action": "run_cmd", "cmd": "/model maka-deepseek-pro", "cid": chat_id}},
                     {"text": "🆓 Nemotron 3 Ultra", "value": {"action": "run_cmd", "cmd": "/model maka-free", "cid": chat_id}},
+                ]
+            elif runner == "agy":
+                buttons = [
+                    {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-38", "cid": chat_id}},
+                    {"text": "Gemini 3.7 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-37", "cid": chat_id}},
+                    {"text": "Gemini 3.6 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-36", "cid": chat_id}},
+                    {"text": "💎 Gemini 3.1 Pro", "value": {"action": "run_cmd", "cmd": "/model agy-pro", "cid": chat_id}},
+                    {"text": "🧠 Claude Opus 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-opus", "cid": chat_id}},
+                    {"text": "⚡ Claude Sonnet 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-sonnet", "cid": chat_id}},
                 ]
             elif runner == "grok":
                 buttons = [
@@ -1862,6 +1990,13 @@ async def handle_command(
             await store.set_model(user_id, chat_id, "")
             return f"✅ 已清除模型覆盖，跟随 profile 默认 `{store.default_model}`。已开始新 session。"
         model = MODEL_ALIASES.get(args.lower(), args)
+        cur = await store.get_current(user_id, chat_id)
+        from bot_config import is_model_compatible_with_runner
+        if not is_model_compatible_with_runner(model, cur.runner):
+            return (
+                f"❌ 模型 `{model}` 与当前 runner `{cur.runner}` 不兼容。\n"
+                f"请使用适用于 `{cur.runner}` 的模型（输入 `/model` 查看可选列表）。"
+            )
         await store.set_model(user_id, chat_id, model)
         return f"✅ 已切换模型为 `{model}`（仅本 session 覆盖，/model default 可清除）。已开始新 session。"
 
@@ -1877,8 +2012,19 @@ async def handle_command(
         elif runner == "maka":
             # maka 的 --thinking 档位（off 对应 cc-lark 的 none，由 maka_runner 归一）
             levels = ("minimal", "low", "medium", "high", "xhigh", "max")
+        elif runner == "agy":
+            # agy 的第三方模型（Claude/GPT-OSS）自带固定推理深度，传 --effort 会被
+            # agy 判成 invalid model selection，所以这里直接挡掉而不是静默无效。
+            from agy_runner import model_ignores_effort
+
+            if model_ignores_effort(cur.model):
+                return (
+                    f"ℹ️ 当前模型 `{cur.model}` 不支持 `/effort`——它自带固定推理深度。\n"
+                    f"要调档位请先切到 Gemini 系列（如 `/model agy-38`）。"
+                )
+            levels = AGY_EFFORT_LEVELS
         else:
-            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok` 或 `maka`。"
+            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok`、`maka` 或 `agy`。"
 
         raw = await store.get_current_raw(user_id, chat_id)
         overridden = bool(raw.get("effort_override"))
@@ -1948,7 +2094,7 @@ async def handle_command(
         quota_line = (
             await asyncio.to_thread(_format_codex_rate_line, cur.get("session_id"))
             if runner == "codex"
-            else "" if runner in {"opencode", "mimo", "grok", "maka"}
+            else "" if runner in {"opencode", "mimo", "grok", "maka", "agy"}
             else await asyncio.to_thread(_get_quota_compact)
         )
 
@@ -1958,7 +2104,7 @@ async def handle_command(
             f"Runner: `{runner}`",
             f"模型: `{model}`",
         ]
-        if runner in {"claude", "codex", "grok", "maka"}:
+        if runner in {"claude", "codex", "grok", "maka", "agy"}:
             effort_override = cur.get("effort_override")
             effort = _effective_effort_label(store, bot, runner, effort_override)
             effort_status = "当前对话覆盖" if effort_override else "跟随默认"
@@ -2073,6 +2219,31 @@ async def handle_command(
             if ctx_line:
                 lines.append(ctx_line)
             lines.append(f"Runner: `grok`")
+            lines.append(f"模型: `{model}`")
+            return "\n".join(lines)
+        if runner == "agy":
+            model = cur.get("model_override") or store.default_model
+            lines = ["📈 **Antigravity CLI 用量**"]
+            ctx_line = _format_context_line(
+                cur.get("session_id"),
+                model,
+                runner="agy",
+                current_usage=cur.get("last_usage") or None,
+            )
+            if ctx_line:
+                lines.append(ctx_line)
+            bar_lines = _agy_usage_bar_lines(await asyncio.to_thread(_fetch_agy_quota))
+            lines.append("")
+            if bar_lines:
+                lines.append("**订阅额度**")
+                lines.extend(bar_lines)
+            else:
+                lines.append(
+                    "订阅额度: `拿不到——agy 未 OAuth 登录，或在 API key 模式"
+                    "（AGY_MODEL_PROVIDER=gemini）下按量计费、没有额度概念`"
+                )
+            lines.append("")
+            lines.append(f"Runner: `agy`")
             lines.append(f"模型: `{model}`")
             return "\n".join(lines)
         if runner == "mimo":

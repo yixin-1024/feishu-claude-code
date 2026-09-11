@@ -78,6 +78,10 @@ _RATE_LIMIT_PATTERNS = (
     "usage limit",
     "session limit",
     "quota exceeded",
+    "resource_exhausted",
+    "resource has been exhausted",
+    "429 too many requests",
+    "error 429",
 )
 
 # 模型侧 safeguards 拦截（"Fable 5's safeguards flagged this message ...

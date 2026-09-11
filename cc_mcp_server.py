@@ -107,7 +107,8 @@ def _allow(flag: str, default: str = "1") -> bool:
 
 
 # 三个独立闸门（bot 经 --mcp-config 的 env 块注入；未设=开）：
-#   CC_LARK_ALLOW_DISPATCH —— 主动派子 agent（dispatch_task + read_thread）
+#   CC_LARK_ALLOW_DISPATCH —— 主动派子 agent / 移交整项任务（dispatch_task +
+#                            handover + read_thread + append/steer）
 #   CC_LARK_ALLOW_WAKE     —— 定时/等事件自我唤醒（wake_me_in）
 #   CC_LARK_ALLOW_CRON     —— 重复定时任务（schedule_cron + list_crons）
 _ALLOW_DISPATCH = _allow("CC_LARK_ALLOW_DISPATCH")
@@ -176,6 +177,36 @@ WAKE_TOOL = {
             },
         },
         "required": ["minutes", "note"],
+    },
+}
+
+CANCEL_WAKE_TOOL = {
+    "name": "cancel_wake",
+    "description": (
+        "Cancel a scheduled wake in THIS Lark thread (or by job_id). "
+        "Use this when a prior wake_me_in is no longer needed — for example, "
+        "because the user re-engaged and addressed the task early, the waiting condition "
+        "(CI/deploy) finished sooner than expected, or the user asked to abort the waiting. "
+        "If no arguments are passed, it automatically cancels all pending wakes for the current thread. "
+        "Returns details of the cancelled wake(s)."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "thread_id": {
+                "type": "string",
+                "description": (
+                    "Optional Lark thread id (omt_…). Defaults to the current thread."
+                ),
+            },
+            "job_id": {
+                "type": "string",
+                "description": (
+                    "Optional specific wake job id (wake-…). If omitted, cancels all pending "
+                    "wakes for the thread."
+                ),
+            },
+        },
     },
 }
 
@@ -249,6 +280,105 @@ DISPATCH_TASK_TOOL = {
     },
 }
 
+HANDOVER_TOOL = {
+    "name": "handover",
+    "description": (
+        "HAND OFF THIS WHOLE TASK — with its ownership — to a FRESH agent session in a new "
+        "thread, then finish your turn for good. Use this when YOUR OWN context has grown too "
+        "large / cluttered to keep working in (or when the task should continue on a different "
+        "agent): you manually COMPRESS the state into a structured brief (goal / completed / "
+        "remaining / gotchas / key files) and the successor picks the work up from there with a "
+        "clean context. "
+        "DIFFERENCE FROM dispatch_task — this is the key point: dispatch_task delegates a "
+        "SUB-task and the worker reports back to you (completion line + auto-wake with results), "
+        "so you must stick around to aggregate. A handover transfers OWNERSHIP: there is NO "
+        "report back, NO completion notice and NO wake — the successor talks to the user "
+        "DIRECTLY in its own thread and owns the task to the end, while you simply stop. Any "
+        "pending wake_me_in on your thread is cancelled automatically so you cannot come back "
+        "and fight the successor over the same work. "
+        "WRITE THE BRIEF FOR SOMEONE WHO HAS NONE OF YOUR CONTEXT: absolute paths, exact "
+        "commands, decisions already made and WHY, dead ends already ruled out, what is verified "
+        "vs assumed. It is persisted to a file so the successor can re-read it later, and it is "
+        "also posted in the new thread so the user can see what was handed over. Keep it "
+        "compressed (a briefing, not a context dump) — oversized briefs are rejected. "
+        "CROSS-AGENT: pass `agent` to hand the task to a DIFFERENT backend — e.g. agent=\"gpt\" "
+        "hands it to the codex(GPT) bot, or \"gemini\"/\"mimo\"/an exact profile name. The "
+        "target agent's bot must be a member of this group. "
+        "After a successful handover: tell the user in one line that the task moved (include the "
+        "returned thread_id) and END YOUR TURN — do not keep working on it."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": (
+                    "What the task is trying to achieve and how it will be judged done "
+                    "(acceptance criteria). Self-contained — no references to 'the above'."
+                ),
+            },
+            "completed": {
+                "type": "string",
+                "description": (
+                    "What is already DONE (and where the evidence is: files changed, tests "
+                    "passing, things deployed). Write '（无，刚开始）' if genuinely nothing yet."
+                ),
+            },
+            "remaining": {
+                "type": "string",
+                "description": (
+                    "What is still LEFT, in the order it should be tackled — the actual work "
+                    "the successor is taking over."
+                ),
+            },
+            "notes": {
+                "type": "string",
+                "description": (
+                    "Optional but strongly recommended: gotchas, constraints, decisions already "
+                    "made and why, approaches already ruled out, 'do not touch prod' guards, "
+                    "credentials/env quirks."
+                ),
+            },
+            "files": {
+                "type": "string",
+                "description": (
+                    "Optional: key absolute file paths, working directory, commands to run "
+                    "(build/test/deploy), and artifacts produced so far."
+                ),
+            },
+            "title": {
+                "type": "string",
+                "description": "Optional short thread title (defaults to the first line of `goal`).",
+            },
+            "agent": {
+                "type": "string",
+                "description": (
+                    "Optional target agent/backend to hand the task to (CROSS-AGENT handover). "
+                    "Family alias — \"gpt\"/\"codex\", \"claude\", \"gemini\"/\"opencode\", "
+                    "\"mimo\", \"grok\"/\"xai\" — or an exact loaded profile name. Omit to hand "
+                    "it to a fresh session of your own backend."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model for the successor — alias ('opus', 'fable', 'sonnet', "
+                    "'haiku', ...) or full id. Must belong to the target agent's backend. Omit "
+                    "for that bot's default."
+                ),
+            },
+            "effort": {
+                "type": "string",
+                "description": (
+                    "Optional reasoning effort for the successor: low / medium / high / xhigh / "
+                    "max (codex also: ultra)."
+                ),
+            },
+        },
+        "required": ["goal", "completed", "remaining"],
+    },
+}
+
 READ_THREAD_TOOL = {
     "name": "read_thread",
     "description": (
@@ -285,7 +415,8 @@ APPEND_TASK_TOOL = {
         "clarification while letting the current step complete. `thread_id` is the omt_… "
         "returned by dispatch_task. For steering a task that has gone off-course and should be "
         "REDIRECTED NOW (stop the current work first), use steer_task instead. Target "
-        "group/recipient are supplied automatically."
+        "group/recipient are supplied automatically. Execution stays with the original "
+        "task's bot, including cross-agent tasks; unresolved ownership is rejected."
     ),
     "inputSchema": {
         "type": "object",
@@ -470,8 +601,10 @@ UPDATE_CRON_TOOL = {
 TOOLS = []
 if _ALLOW_WAKE:
     TOOLS.append(WAKE_TOOL)
+    TOOLS.append(CANCEL_WAKE_TOOL)
 if _ALLOW_DISPATCH:
-    TOOLS += [DISPATCH_TASK_TOOL, READ_THREAD_TOOL, APPEND_TASK_TOOL, STEER_TASK_TOOL]
+    TOOLS += [DISPATCH_TASK_TOOL, HANDOVER_TOOL, READ_THREAD_TOOL,
+              APPEND_TASK_TOOL, STEER_TASK_TOOL]
 if _ALLOW_CRON:
     TOOLS += [SCHEDULE_CRON_TOOL, LIST_CRONS_TOOL]
     # 删/停/改靠本地改 yaml + /reload 实现，没有 cron_store 就整组不暴露
@@ -535,6 +668,53 @@ def _tool_wake_me_in(args: dict) -> dict:
     )
 
 
+def _tool_cancel_wake(args: dict) -> dict:
+    """取消当前话题或指定 job_id 的定时唤醒任务。"""
+    job_id = (args.get("job_id") or "").strip() or None
+    thread_id = (args.get("thread_id") or "").strip() or None
+
+    # 如果两者都没传，默认使用当前话题
+    if not thread_id and not job_id:
+        thread_id = (os.environ.get("CC_LARK_THREAD_ID") or "").strip() or None
+
+    chat_id = (os.environ.get("CC_LARK_CHAT_ID") or "").strip() or None
+    profile = (os.environ.get("CC_LARK_PROFILE") or "").strip() or None
+
+    if not thread_id and not job_id:
+        return _err(
+            "No Lark thread context available. Pass `thread_id` or `job_id` explicitly."
+        )
+
+    payload = {
+        "profile": profile,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "job_id": job_id,
+    }
+    try:
+        body = _post_json("/wake/cancel", payload, timeout=10)
+    except Exception as e:
+        _log(f"/wake/cancel POST failed: {type(e).__name__}: {e}")
+        return _err(f"Failed to reach cc-lark scheduler: {type(e).__name__}: {e}")
+
+    if not body.get("ok"):
+        return _err(f"Scheduler rejected the cancel request: {body.get('error', 'unknown error')}")
+
+    count = body.get("count", 0)
+    if count == 0:
+        return _ok("ℹ️ No pending wake found for the specified criteria.")
+
+    cancelled = body.get("cancelled", [])
+    lines = [f"🛑 Successfully cancelled {count} scheduled wake(s):"]
+    for c in cancelled:
+        jid = c.get("job_id", "")
+        note = c.get("note", "")
+        fire_at = c.get("fire_at", "")
+        lines.append(f"- [{jid}] fire_at={fire_at}, note={note!r}")
+
+    return _ok("\n".join(lines))
+
+
 def _ok(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": False}
 
@@ -592,6 +772,71 @@ def _tool_dispatch_task(args: dict) -> dict:
     )
 
 
+def _tool_handover(args: dict) -> dict:
+    """把整项任务移交给一个全新会话（可跨 agent），移交方随后收工。
+
+    与 _tool_dispatch_task 的差别在**语义**而非管道：这里不传父上下文（parent_thread /
+    parent_anchor），所以 bot 侧不登记回报闭环——接手方对用户负责，不回报移交方。
+    """
+    def _field(name: str):
+        # 模型也爱把 completed / remaining 写成 list；原样转给 bot 侧统一归一。
+        value = args.get(name)
+        return value.strip() if isinstance(value, str) else value
+
+    brief = {k: _field(k) for k in ("goal", "completed", "remaining", "notes", "files")}
+    missing = [k for k in ("goal", "completed", "remaining") if not brief.get(k)]
+    if missing:
+        return _err(
+            f"handover requires a real brief — missing: {', '.join(missing)}. "
+            "The successor has NONE of your context: state the goal + acceptance criteria, "
+            "what is already done (with evidence), and what is left to do."
+        )
+    chat_id = (os.environ.get("CC_LARK_CHAT_ID") or "").strip()
+    profile = (os.environ.get("CC_LARK_PROFILE") or "").strip()
+    user_id = (os.environ.get("CC_LARK_USER_ID") or "").strip()
+    if not chat_id:
+        return _err(
+            "No Lark group context — handover only works inside a cc-lark group session. "
+            "(CC_LARK_CHAT_ID unset.)"
+        )
+    payload = {
+        "profile": profile,
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "title": (args.get("title") or "").strip(),
+        "brief": brief,
+        # 跨 agent：可选目标后端（"gpt"/"gemini"/"mimo"/profile 名）；空=同 agent 的新会话
+        "agent": (args.get("agent") or "").strip(),
+        "model": (args.get("model") or "").strip(),
+        "effort": (args.get("effort") or "").strip(),
+        # 移交方所在话题：给 bot 用来取消本话题待触发的唤醒 + 贴一条移交标记。
+        # **不是** parent_thread —— 移交没有回报闭环，这点正是它与 dispatch_task 的分界。
+        "from_thread": (os.environ.get("CC_LARK_THREAD_ID") or "").strip(),
+        "from_anchor": (os.environ.get("CC_LARK_ANCHOR") or os.environ.get("CC_LARK_MESSAGE_ID") or "").strip(),
+    }
+    try:
+        body = _post_json("/handover_task", payload)
+    except Exception as e:  # noqa: BLE001
+        _log(f"/handover_task POST failed: {type(e).__name__}: {e}")
+        return _err(f"Failed to reach cc-lark dispatcher: {type(e).__name__}: {e}")
+    if not body.get("ok"):
+        return _err(f"Handover rejected: {body.get('error', 'unknown error')}")
+    where = f"{body.get('agent')}[{body.get('agent_runner')}]"
+    where += "".join(f" ({k}={body.get(k)})" for k in ("model", "effort") if body.get(k))
+    extra = ""
+    if body.get("cancelled_wakes"):
+        extra += f" Cancelled {body['cancelled_wakes']} pending wake(s) on your thread."
+    if body.get("brief_path"):
+        extra += " Brief persisted for the successor to re-read."
+    return _ok(
+        f"✅ Handed this task over to {where} in a new thread. "
+        f"thread_id={body.get('thread_id')} (active {body.get('active_after')}/{body.get('cap')}).{extra} "
+        f"A notice with the new thread id was posted to this thread, so just tell the user in "
+        f"one line that the task moved there — then END YOUR TURN. The successor owns it now "
+        f"and will NOT report back to you; do not keep working on it or wait for it."
+    )
+
+
 def _tool_read_thread(args: dict) -> dict:
     """拉回某 thread 的消息 transcript（supervise / 取结果）。"""
     thread_id = (args.get("thread_id") or "").strip()
@@ -644,7 +889,8 @@ def _post_steer(args: dict, *, stop_first: bool, verb: str) -> dict:
         detail = "queued after the current run" if body.get("queued") else \
                  "no run was active — it will run directly"
     return _ok(
-        f"✅ {verb} delivered to thread {thread_id} ({detail}). "
+        f"✅ {verb} delivered to thread {body.get('thread_id') or thread_id} "
+        f"by task owner {body.get('agent') or '(unspecified)'} ({detail}). "
         f"Poll read_thread(thread_id=\"{thread_id}\") to see how it continues."
     )
 
@@ -802,8 +1048,10 @@ def _tool_update_cron(args: dict) -> dict:
 _HANDLERS = {}
 if _ALLOW_WAKE:
     _HANDLERS["wake_me_in"] = _tool_wake_me_in
+    _HANDLERS["cancel_wake"] = _tool_cancel_wake
 if _ALLOW_DISPATCH:
     _HANDLERS["dispatch_task"] = _tool_dispatch_task
+    _HANDLERS["handover"] = _tool_handover
     _HANDLERS["read_thread"] = _tool_read_thread
     _HANDLERS["append_to_task"] = _tool_append_to_task
     _HANDLERS["steer_task"] = _tool_steer_task

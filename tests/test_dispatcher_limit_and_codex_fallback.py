@@ -185,6 +185,102 @@ def test_rate_limit_detection():
     assert dispatcher._limit_detail(_limit_exc()).startswith("You've hit your session limit")
 
 
+def _auth_exc(session_id="sid_auth",
+              text='API Error: 401 {"type":"error","error":{"type":"authentication_error",'
+                   '"message":"OAuth token revoked"}}'):
+    """凭证被另一台机器的 refresh 顶掉 / 被吊销 —— 不带任何用量墙文案。"""
+    exc = RuntimeError(text)
+    exc.cc_session_id = session_id
+    exc.cc_retryable_resume = False
+    return exc
+
+
+async def test_auth_failure_switches_account_and_resumes_same_session(monkeypatch):
+    """凭证失效（401 / refresh token invalid）也要切号续跑，跟用量墙同一套机制。"""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    bot = _bot()
+    session = _session()
+    calls, switch_calls = [], []
+
+    def fake_switch():
+        switch_calls.append(1)
+        return {"switched": "info", "from": "mar", "reason": "5h 已用 3% / 7d 已用 1%",
+                "current_reset_epoch": None}
+
+    monkeypatch.setattr(dispatcher, "_emergency_account_switch", fake_switch)
+
+    async def fake_run_agent(**kwargs):
+        calls.append((kwargs["message"], kwargs["session_id"]))
+        if len(calls) == 1:
+            raise _auth_exc("sid_auth")
+        return "余额 100 USD", "sid_auth", False
+
+    await _run(bot, session, fake_run_agent)
+
+    assert switch_calls == [1]
+    assert len(calls) == 2, "凭证失效后应切账户并自动续跑"
+    assert calls[1][1] == "sid_auth" and calls[1][0] == dispatcher._AUTH_RESUME_NUDGE
+    assert any("info" in t and "凭证已失效" in t for t in _notices(bot)), _notices(bot)
+    body = _final_body(bot)
+    assert "余额 100 USD" in body and "❌" not in body
+
+
+async def test_auth_failure_does_not_switch_when_credentials_pinned(monkeypatch):
+    """env 钉死了 setup-token / 三方 key 时账户池被架空 —— 不许瞎切。"""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-pinned")
+    bot = _bot()
+    session = _session()
+    calls, switch_calls = [], []
+    monkeypatch.setattr(dispatcher, "_emergency_account_switch",
+                        lambda: switch_calls.append(1) or {"switched": "info"})
+
+    async def fake_run_agent(**kwargs):
+        calls.append(kwargs["session_id"])
+        raise _auth_exc("sid_auth")
+
+    await _run(bot, session, fake_run_agent)
+
+    assert switch_calls == [] and len(calls) == 1, "凭证被 env 钉死时不该切账户"
+    assert "❌" in _final_body(bot)
+
+
+async def test_auth_failure_without_spare_account_hints_sync(monkeypatch):
+    """没号可切时，错误卡要告诉人去跑 cc-acct-sync（而不是排配额唤醒）。"""
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    bot = _bot()
+    session = _session()
+    monkeypatch.setattr(dispatcher, "_emergency_account_switch",
+                        lambda: {"switched": None, "from": "mar", "reason": "无可切换账户",
+                                 "current_reset_epoch": None})
+    wakes = []
+    monkeypatch.setattr(scheduler, "schedule_wake", lambda **kw: wakes.append(kw) or {"ok": True})
+
+    async def fake_run_agent(**kwargs):
+        raise _auth_exc("sid_auth")
+
+    await _run(bot, session, fake_run_agent, chat_id="oc_1:omt_thread1")
+
+    body = _final_body(bot)
+    assert "cc-acct-sync" in body and "凭证失效" in body, body
+    assert wakes == [], "凭证失效不是额度问题，不该排配额恢复唤醒"
+
+
+def test_auth_failure_detection(monkeypatch):
+    assert dispatcher._is_auth_failure_error(_auth_exc())
+    assert dispatcher._is_auth_failure_error(
+        RuntimeError("400 Refresh token not found or invalid"))
+    assert not dispatcher._is_auth_failure_error(_limit_exc())
+    assert not dispatcher._is_rate_limit_error(_auth_exc())
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert not dispatcher._account_pool_pinned(None)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-relay")
+    assert dispatcher._account_pool_pinned(None)
+
+
 async def test_codex_unsupported_model_falls_back_and_resends(monkeypatch):
     monkeypatch.delenv("CODEX_MODEL_FALLBACK", raising=False)
     bot = _bot()

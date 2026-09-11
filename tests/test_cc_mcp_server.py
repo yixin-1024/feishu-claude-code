@@ -16,14 +16,16 @@ def test_tools_list_exposes_all_runtime_tools():
     resp = cc_mcp_server._handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 
     tools = resp["result"]["tools"]
-    # 默认三个闸门全开 → 全部工具注册（dispatch 闸门含 dispatch/read/append/steer 四件套）
     assert [t["name"] for t in tools] == [
-        "wake_me_in", "dispatch_task", "read_thread", "append_to_task", "steer_task",
+        "wake_me_in", "cancel_wake",
+        "dispatch_task", "handover", "read_thread", "append_to_task", "steer_task",
         "schedule_cron", "list_crons",
         "cancel_cron", "pause_cron", "resume_cron", "update_cron",
     ]
     wake = tools[0]
     assert wake["inputSchema"]["required"] == ["minutes", "note"]
+    cancel = tools[1]
+    assert cancel["name"] == "cancel_wake"
 
 
 def test_wake_me_in_posts_current_context(monkeypatch):
@@ -77,6 +79,56 @@ def test_wake_me_in_posts_current_context(monkeypatch):
 def req_headers(captured):
     """urllib 会规范化 header 大小写，统一转 dict 供断言。"""
     return dict(captured["headers"])
+
+
+def test_cancel_wake_posts_to_cancel_endpoint(monkeypatch):
+    captured = {}
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ok": true, "count": 1, "cancelled": [{"job_id": "wake-1", "note": "task"}]}'
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        captured["headers"] = req.header_items()
+        return FakeResp()
+
+    monkeypatch.setenv("CC_LARK_CONTROL_PORT", "9988")
+    monkeypatch.setenv("CC_LARK_CONTROL_TOKEN", "control-secret")
+    monkeypatch.setenv("CC_LARK_PROFILE", "work")
+    monkeypatch.setenv("CC_LARK_CHAT_ID", "oc_1")
+    monkeypatch.setenv("CC_LARK_THREAD_ID", "omt_1")
+    monkeypatch.setattr(cc_mcp_server.urllib.request, "urlopen", fake_urlopen)
+
+    # 1) 默认不传参数：自动取消当前话题
+    result = cc_mcp_server._tool_cancel_wake({})
+    assert result["isError"] is False
+    assert "Successfully cancelled 1 scheduled wake" in result["content"][0]["text"]
+    assert captured["url"] == "http://127.0.0.1:9988/wake/cancel"
+    assert captured["body"]["thread_id"] == "omt_1"
+    assert captured["body"]["chat_id"] == "oc_1"
+    assert captured["body"]["job_id"] is None
+
+    # 2) 显式传 job_id
+    result2 = cc_mcp_server._tool_cancel_wake({"job_id": "wake-specific"})
+    assert result2["isError"] is False
+    assert captured["body"]["job_id"] == "wake-specific"
+
+
+def test_cancel_wake_without_context_fails(monkeypatch):
+    monkeypatch.delenv("CC_LARK_THREAD_ID", raising=False)
+    monkeypatch.delenv("CC_LARK_CHAT_ID", raising=False)
+    result = cc_mcp_server._tool_cancel_wake({})
+    assert result["isError"] is True
+    assert "No Lark thread context available" in result["content"][0]["text"]
 
 
 def _fake_steer_urlopen(captured, resp_body=b'{"ok": true, "stopped": true, "queued": false}'):

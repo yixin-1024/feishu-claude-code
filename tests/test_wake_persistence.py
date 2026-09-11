@@ -45,9 +45,13 @@ class _Sched:
 
     def __init__(self):
         self.jobs: list[tuple] = []
+        self.removed_jobs: list[str] = []
 
     def add_job(self, fn, **kw):
         self.jobs.append((fn, kw))
+
+    def remove_job(self, job_id):
+        self.removed_jobs.append(job_id)
 
 
 def _state(monkeypatch, sched, bots, loop):
@@ -149,3 +153,119 @@ def test_restore_with_empty_store_is_noop(monkeypatch):
     assert scheduler.restore_pending_wakes() == (0, 0)
     assert sched.jobs == []
     loop.close()
+
+
+def test_cancel_wake_by_thread_and_job_id(monkeypatch):
+    loop = asyncio.new_event_loop()
+    sched = _Sched()
+    bot = _Bot()
+    _state(monkeypatch, sched, {"spx": bot}, loop)
+
+    # 排 3 个 wake，其中 2 个在同一 thread
+    r1 = scheduler.schedule_wake(
+        profile="spx", chat_id="oc_x", thread_id="omt_thread1",
+        anchor_message_id="om_1", user_id="ou_u", minutes=10, note="task 1",
+    )
+    r2 = scheduler.schedule_wake(
+        profile="spx", chat_id="oc_x", thread_id="omt_thread1",
+        anchor_message_id="om_2", user_id="ou_u", minutes=20, note="task 2",
+    )
+    r3 = scheduler.schedule_wake(
+        profile="spx", chat_id="oc_x", thread_id="omt_thread2",
+        anchor_message_id="om_3", user_id="ou_u", minutes=15, note="task 3",
+    )
+    assert len(_store()) == 3
+
+    # 1) 查询 thread1 的 pending wakes
+    pending_t1 = scheduler.get_pending_wakes_for_thread("omt_thread1")
+    assert len(pending_t1) == 2
+    assert {p["job_id"] for p in pending_t1} == {r1["job_id"], r2["job_id"]}
+
+    # 2) 精确按 job_id 取消 r1
+    c1 = scheduler.cancel_wake(job_id=r1["job_id"])
+    assert c1["ok"] is True and c1["count"] == 1
+    assert r1["job_id"] in sched.removed_jobs
+    assert r1["job_id"] not in _store()
+    assert len(_store()) == 2
+
+    # 3) 按 thread_id 批量取消 omt_thread1 剩余的任务（r2）
+    c2 = scheduler.cancel_wake(thread_id="omt_thread1")
+    assert c2["ok"] is True and c2["count"] == 1
+    assert c2["cancelled"][0]["job_id"] == r2["job_id"]
+    assert r2["job_id"] in sched.removed_jobs
+    assert r2["job_id"] not in _store()
+    assert len(_store()) == 1
+
+    # 4) 重复取消已不存在的任务：安全返回 0
+    c_noop = scheduler.cancel_wake(thread_id="omt_thread1")
+    assert c_noop["ok"] is True and c_noop["count"] == 0
+
+    # 5) omt_thread2 的任务仍保留
+    assert r3["job_id"] in _store()
+    loop.close()
+
+
+def test_cancel_wake_prevents_firing_if_job_executed(monkeypatch):
+    loop = asyncio.new_event_loop()
+    t = threading.Thread(target=loop.run_forever, daemon=True)
+    t.start()
+    sched = _Sched()
+    bot = _Bot()
+    _state(monkeypatch, sched, {"spx": bot}, loop)
+
+    fired = threading.Event()
+
+    async def fake_wake(bot_, anchor, prompt):
+        fired.set()
+        return True
+
+    import dispatcher
+    monkeypatch.setattr(dispatcher, "wake_thread_as_user", fake_wake)
+    try:
+        res = scheduler.schedule_wake(
+            profile="spx", chat_id="oc_x", thread_id="omt_cancel_test",
+            anchor_message_id="om_anchor", user_id="ou_user", minutes=5, note="will cancel",
+        )
+        assert len(sched.jobs) == 1
+        fn, _kw = sched.jobs[0]
+
+        # 在执行前先取消
+        c = scheduler.cancel_wake(thread_id="omt_cancel_test")
+        assert c["count"] == 1
+
+        # 模拟 APScheduler 触发此前已注册的闭包
+        fn()
+
+        # 等待 1 秒，确认 fake_wake 根本没有被触发
+        assert not fired.wait(timeout=1.0), "已被取消的 wake 绝不应执行唤醒"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        t.join(timeout=3)
+        loop.close()
+
+
+def test_dispatcher_turn_header_wake_reminder(monkeypatch):
+    import dispatcher
+
+    # 1) 没有 pending wake 时，只包含消息 ID 和提问者
+    header_none = dispatcher._turn_header("om_123", "ou_456", thread_id="omt_empty")
+    assert "om_123" in header_none
+    assert "ou_456" in header_none
+    assert "待办唤醒提醒" not in header_none
+
+    # 2) 构造 1 条 pending wake
+    loop = asyncio.new_event_loop()
+    sched = _Sched()
+    bot = _Bot()
+    _state(monkeypatch, sched, {"spx": bot}, loop)
+    scheduler.schedule_wake(
+        profile="spx", chat_id="oc_x", thread_id="omt_with_wake",
+        anchor_message_id="om_a", user_id="ou_u", minutes=15, note="等待CI跑完",
+    )
+
+    header_with = dispatcher._turn_header("om_123", "ou_456", thread_id="omt_with_wake")
+    assert "【⏰ 待办唤醒提醒】" in header_with
+    assert "等待CI跑完" in header_with
+    assert "cancel_wake" in header_with
+    loop.close()
+

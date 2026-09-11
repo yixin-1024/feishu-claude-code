@@ -45,7 +45,7 @@ import runtime
 from bot_instance import BotInstance
 from log_util import log
 from scheduler import (
-    fire_task_now, list_tasks, reload_tasks, schedule_wake, schedule_cron, list_crons,
+    fire_task_now, list_tasks, reload_tasks, schedule_wake, cancel_wake, schedule_cron, list_crons,
 )
 
 
@@ -93,14 +93,19 @@ def main():
     print("🚀 飞书/Lark Agent Bot 启动中...")
     print(f"   已加载 {len(config.PROFILES)} 个 profile")
     for p in config.PROFILES:
-        allow_desc = f"{len(p.allowed_open_ids)} 人" if p.allowed_open_ids else "⚠️ 所有人"
+        if p.allowed_open_ids:
+            allow_desc = f"{len(p.allowed_open_ids)} 人"
+        else:
+            # Telegram bot 的用户名是公开的，白名单为空时网关一律拒绝（见 acl_reject）
+            allow_desc = "⛔ 空=全拒" if p.is_telegram else "⚠️ 所有人"
         group_desc = (
             f"{len(p.allowed_group_chat_ids)} 群" if p.allowed_group_chat_ids else "禁用"
         )
         role_desc = f"role={p.role}" if p.role else "—"
+        ident = f"bot_id={p.app_id}" if p.is_telegram else f"app={p.app_id}"
         print(
             f"   · {p.name:<10} {p.brand_label}  "
-            f"app={p.app_id}  runner={p.runner} model={p.default_model or config.DEFAULT_MODEL}  "
+            f"{ident}  runner={p.runner} model={p.default_model or config.DEFAULT_MODEL}  "
             f"cwd={p.default_cwd}  "
             f"allow={allow_desc}  groups={group_desc}  "
             f"lark-cli profile={p.lark_cli_profile}  {role_desc}"
@@ -156,8 +161,10 @@ def main():
             list_tasks=list_tasks,
             reload_tasks=_make_reload_all(ext_cfg_path),
             schedule_wake=schedule_wake,
+            cancel_wake=cancel_wake,
             dispatch_task=dispatcher.dispatch_task,
             read_thread=dispatcher.read_thread,
+            handover_task=dispatcher.handover_task,
             steer_thread=dispatcher.steer_or_append_thread,
             schedule_cron=schedule_cron,
             list_crons=list_crons,
@@ -204,10 +211,38 @@ def main():
     runtime.start_summary_thread()
     runtime.start_log_rotation_thread()
 
-    # 7) 每个 profile 起一个 WS 客户端
-    print("✅ 连接 WebSocket 长连接（自动重连）...")
+    # 6.5) Telegram profile 先握手拿 bot 身份：@username 决定"怎样算 @ 到我"，
+    # 所以必须在开始收消息之前拿到，不能等第一条消息来了再补。
     for bot in _bots.values():
-        runtime.start_profile_ws(bot)
+        if not bot.profile.is_telegram:
+            continue
+        try:
+            me = asyncio.run_coroutine_threadsafe(
+                bot.feishu.get_me(), bot_loop).result(timeout=20)
+            print(f"   Telegram    : {bot.profile.name} → @{me.get('username', '?')} "
+                  f"(id={me.get('id')})")
+            if not bot.feishu.can_read_all_group_messages:
+                print("   ⚠️ privacy mode 开着：群里只能收到「@ bot / 回复 bot / 斜杠命令」，"
+                      "读全群上下文需 BotFather → /setprivacy → Disable")
+            # 顺手把斜杠命令菜单注册上（手机上就有 "/" 菜单可点）。
+            # CC_TG_SET_COMMANDS=0 可关（想在 BotFather 里自己维护菜单时）。
+            if os.getenv("CC_TG_SET_COMMANDS", "1").strip().lower() not in (
+                    "0", "false", "no", "off"):
+                asyncio.run_coroutine_threadsafe(
+                    bot.feishu.set_my_commands(), bot_loop).result(timeout=20)
+        except Exception as e:
+            print(f"   ⚠️ Telegram profile {bot.profile.name} getMe 失败: {e}")
+        # Telegram 自己没有语音识别：借本进程里任一 Lark profile 的 ASR 通道
+        asr_name = os.getenv("CC_TG_ASR_PROFILE", "").strip()
+        asr_bot = _bots.get(asr_name) if asr_name else next(
+            (b for b in _bots.values() if not b.profile.is_telegram), None)
+        if asr_bot is not None and not asr_bot.profile.is_telegram:
+            bot.feishu.asr_client = asr_bot.feishu
+
+    # 7) 每个 profile 起入站通道（Lark=WS 长连接 / Telegram=getUpdates 长轮询）
+    print("✅ 连接入站通道（自动重连）...")
+    for bot in _bots.values():
+        runtime.start_profile_channel(bot)
 
     # 8) 定时任务调度器（独立后台线程，绕开 asyncio monotonic timer 的 macOS 睡眠坑）
     sched_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduled_tasks.yaml")
@@ -216,6 +251,14 @@ def main():
     # 8.1) inbox_watcher：事件驱动的"任务派单扫描器"
     inbox_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inbox_config.yaml")
     inbox_watcher.start(inbox_cfg_path, _bots, bot_loop)
+
+    # 8.2) external_web_watcher：外部群个人号协议监听器
+    ext_cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "external_groups.yaml")
+    if os.path.exists(ext_cfg_path):
+        from external_watcher.watcher import ExternalWebWatcher
+        ext_watcher = ExternalWebWatcher(ext_cfg_path)
+        asyncio.run_coroutine_threadsafe(ext_watcher.start(), bot_loop)
+
 
     # 9) Claude Max 用量监控：跨阈值 / 窗口重置时主动给 owner 私聊通报
     # 通报通道：QUOTA_NOTIFY_PROFILE / QUOTA_NOTIFY_OPEN_ID 显式指定，

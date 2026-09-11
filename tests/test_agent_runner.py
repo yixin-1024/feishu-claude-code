@@ -284,3 +284,42 @@ def test_run_agent_dispatches_to_maka(monkeypatch):
     # maka 的 MCP 环境是白名单，CC_LARK_* 传不进 MCP 子进程；extra_env 仍要带
     # profile 名，wall-clock 上限解析靠它
     assert captured["extra_env"]["CC_LARK_PROFILE"] == profile.name
+
+
+def test_run_agent_dispatches_to_agy(monkeypatch):
+    captured = {}
+
+    async def fake_agy(**kwargs):
+        captured.update(kwargs)
+        return "ok", "conv-agy", False
+
+    async def fake_claude(**kwargs):
+        raise AssertionError("claude runner should not be called")
+
+    monkeypatch.setattr("agent_runner.run_agy", fake_agy)
+    monkeypatch.setattr("agent_runner.run_claude", fake_claude)
+
+    profile = _profile("agy")
+    profile.agy_api_key = "AIza-test"
+    profile.agy_proxy = "http://127.0.0.1:7899"
+    profile.agy_print_timeout = "24h"
+    text, sid, fallback = asyncio.run(run_agent(
+        profile=profile,
+        runner="agy",
+        message="hi",
+        model="gemini-3.8-flash",
+        effort="high",
+        cwd="/tmp",
+        wake_context={"CC_LARK_THREAD_ID": "omt_agy"},
+    ))
+
+    assert (text, sid, fallback) == ("ok", "conv-agy", False)
+    assert captured["model"] == "gemini-3.8-flash"
+    assert captured["effort"] == "high"
+    assert captured["api_key"] == "AIza-test"
+    assert captured["api_key_env"] == "GEMINI_API_KEY"
+    assert captured["proxy"] == "http://127.0.0.1:7899"
+    assert captured["print_timeout"] == "24h"
+    # agy 的 MCP 子进程继承 env，wake_context 直接透传就能定向到本话题
+    assert captured["extra_env"]["CC_LARK_THREAD_ID"] == "omt_agy"
+    assert captured["extra_env"]["CC_LARK_PROFILE"] == profile.name

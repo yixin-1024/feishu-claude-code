@@ -50,6 +50,16 @@ WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心�
 - `/ws` 为不同群绑定不同项目
 - **访问控制**：`ALLOWED_OPEN_IDS` 用户白名单、`ALLOWED_GROUP_CHAT_IDS` 群聊白名单，未授权者静默忽略
 
+**Telegram 渠道（和 Lark 共用一套底座）**
+
+- 同一个进程里既能挂 Lark bot 也能挂 Telegram bot：`<PROFILE>_PLATFORM=telegram` + `<PROFILE>_BOT_TOKEN` 就是一个新渠道
+- runner / session / 斜杠命令 / 队列 / 按钮 / 图片文件 / 定时任务 / 派单**全部复用**，不是另写一套
+- 私聊直答，群里只有「@ bot / 回复 bot 的消息 / 斜杠命令」才触发
+- Telegram 没有话题群，所以**一个群 = 一条会话 = 一个工作目录**（`/ws` 或 `<PROFILE>_CHAT_CWD_<chat_id>`）
+- 「自动读上下文」：bot 把群里的消息落盘成会话缓冲，被 @ 时把「上次回复之后的新消息」拼进 prompt（跨重启不丢）
+- 白名单填数字 user id，**为空 = 全部拒绝**（bot 用户名是公开的，不能默认放开）
+- agent 侧的手脚是 `tg-cli`（发图/发文件/读上下文），对标 Lark 那边的 `lark-cli`
+
 **消息队列**
 
 - 新消息不再打断当前任务，而是排队等待（同 chat 串行，跨 chat 并发）
@@ -79,6 +89,7 @@ WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心�
 
 - 三段式超时：5 分钟无输出且无子进程 → 杀；15 分钟有子进程但无输出 → 杀；任意情况 60 分钟 wall-clock → 杀。编译/下载不会被误杀，runaway loop 也兜得住。最后一段可调：`CLAUDE_WALL_CLOCK_LIMIT_SEC=7200`（2 小时）/ `=0`（永不因 wall-clock 强杀，长任务用），支持 `<PROFILE>_` 前缀单独配
 - 看门狗 6 小时自动重启，防止 WebSocket 假死
+- **重启 / 崩溃后自动续跑**：`/restart`、进程崩溃、机器重启打断的任务会落盘（`data/pending_resumes.json`），下次启动自动投回**原话题原 session** 接着跑——人不用回来把指令再发一遍。续跑指令带原始指令 + 中断前的卡片进度，并硬性要求「先核实写操作是否已生效再继续」，不会重复开户 / 发消息 / 提交。连续被打断 3 次或中断超过 2 小时就只在话题里提示一句、不再自动重投（`CC_LARK_RESUME_*` 可调，`CC_LARK_RESUME_AFTER_RESTART=0` 关掉）
 - API 调用自动重试 (指数退避)
 - **撞 Claude Max 用量墙自动兜底**：一轮在 API 上撞 "You've hit your session limit" → 自动切到有余量的 saved 账户并 resume 同一 session 续跑（`ACCOUNT_SWITCH_ON_LIMIT`，与主动切换 `ACCOUNT_AUTO_SWITCH` 独立）；没有可切的账户 → 在话题里排一个到配额重置时刻的自动唤醒，醒来自动『继续』（`CC_LARK_WAKE_ON_LIMIT`）
 - **prompt cache 友好**：注入的 Lark 系统提示在同一话题内逐轮字节一致（本轮消息 id / 提问者走用户消息开头的【本轮】行 + `CC_LARK_MESSAGE_ID` / `CC_LARK_USER_ID` env），续轮首调命中整段历史缓存，而不是每轮重写
@@ -102,7 +113,7 @@ macOS 和 Linux 都是一等公民，全部斜杠命令 / runner / 定时任务 
 
 | 能力 | macOS | Linux | 说明 |
 |------|-------|-------|------|
-| 全部 runner（claude / codex / opencode / mimo / grok / maka） | ✅ | ✅ | PTY 后端是纯 POSIX |
+| 全部 runner（claude / codex / opencode / mimo / grok / maka / agy） | ✅ | ✅ | PTY 后端是纯 POSIX |
 | `/usage` `/accounts` `/switch` + 账户智能切换 | ✅ | ✅ | 凭证存储自动分流：macOS 读 login keychain，Linux 读 `~/.claude/.credentials.json`（见下） |
 | 群里 `/restart` | ✅ launchd | ✅ systemd | Linux 需 `Restart=always` + bot 是 `MainPID` |
 | 服务控制脚本 | `deploy/cc-lark` | `deploy/cc-lark-linux` | 同一套 install/start/stop/restart/status/logs |
@@ -205,16 +216,19 @@ python3 main.py
 
 ```
 ┌──────────┐  WebSocket  ┌────────────────┐  subprocess  ┌────────────┐
-│  飞书 App │◄───────────►│ feishu-claude  │─────────────►│ claude CLI │
+│ 飞书/Lark │◄───────────►│ feishu-claude  │─────────────►│ claude CLI │
 │  (用户)   │  长连接      │  (main.py)     │ stream-json  │  (本机)     │
-└──────────┘             └────────────────┘              └────────────┘
-                                 │
+└──────────┘             └───────┬────────┘              └────────────┘
+┌──────────┐  getUpdates         │
+│ Telegram │◄────────────────────┤   ← 渠道只换"入站通道 + 出站客户端"
+│  (用户)   │  长轮询              │      业务层（dispatcher）完全共用
+└──────────┘                     │
                     ┌────────────┼────────────┐
                     │            │            │
-              ┌─────▼──┐  ┌────▼─────┐  ┌──▼───────┐
-              │commands│  │ session  │  │ feishu   │
-              │        │  │ store    │  │ client   │
-              └────────┘  └──────────┘  └──────────┘
+              ┌─────▼──┐  ┌────▼─────┐  ┌──▼──────────────────┐
+              │commands│  │ session  │  │ feishu_client  或    │
+              │        │  │ store    │  │ telegram_client     │
+              └────────┘  └──────────┘  └─────────────────────┘
 ```
 
 **工作原理:**
@@ -304,6 +318,9 @@ python3 main.py
 | `CLAUDE_CLI_PATH` | 否 | 自动查找 | Claude CLI 可执行文件路径 |
 | `CC_LARK_MAX_CONCURRENT_RUNS` | 否 | `4` | **全局并发上限**：整机同时真正在跑的任务数（跨所有 profile / 群 / 话题）。超额的任务 FIFO 排队，卡片显示「排队中」，不丢不拒；`0` = 不限。默认 4 是给小机器 / 共享 API 额度的服务器兜底，开发机想放开写个大数（如 `100`）。别设 1（编排 agent 同轮等子会话会锁死） |
 | `CC_LARK_QUEUE_MAX_WAIT_SEC` | 否 | `0` | 排队最长等待秒数，超时放弃本次任务并在卡片说明；`0` = 一直等（保证不丢活） |
+| `CC_LARK_RESUME_AFTER_RESTART` | 否 | `1` | **重启后自动续跑**：`/restart`、崩溃、机器重启打断的任务，下次启动自动投回原话题接着跑（带原指令 + 中断前进度，并要求先核实写操作是否已生效）。`0` = 关掉，回到「请再发一遍」 |
+| `CC_LARK_RESUME_DELAY_SEC` / `CC_LARK_RESUME_STAGGER_SEC` | 否 | `15` / `5` | 启动后隔多久投第一条续跑、多条之间的间隔（留时间给入站通道连上，也别一开机顶满并发闸门） |
+| `CC_LARK_RESUME_MAX_ATTEMPTS` / `CC_LARK_RESUME_MAX_AGE_MIN` | 否 | `3` / `120` | 同一条任务连续被打断几次后不再自动重投 / 中断超过多少分钟就不再续跑（只在原话题提示一句）。两道闸都是防「续跑→又崩→再续跑」空烧额度 |
 | `CC_LARK_CRED_BACKEND` | 否 | 按平台 | Claude 凭证存储后端：`keychain`（macOS 默认）/ `file`（Linux 默认，读写 `~/.claude/.credentials.json`）。只在 headless macOS 这类特例下需要手动指定 |
 | `ACCOUNT_SWITCH_ON_LIMIT` | 否 | `1` | 撞 Claude Max 用量墙时一次性紧急切到有余量的 saved 账户并 resume 续跑（不依赖 `ACCOUNT_AUTO_SWITCH`） |
 | `CC_LARK_WAKE_ON_LIMIT` | 否 | `1` | 撞墙且无账户可切时，在本话题排一个到配额重置时刻的自动唤醒（仅话题群） |
@@ -313,6 +330,92 @@ python3 main.py
 > 查自己的 open_id / chat_id：bot 启动后发条消息，终端日志里会打印 `user=ou_...` / `chat=oc_...`。
 >
 > 多 profile 模式下，所有变量都加 profile 前缀，例如 `WORK_DISPATCH_CHAT_ID`、`PERSONAL_ALLOWED_OPEN_IDS`。
+
+## Telegram 渠道
+
+一个 profile 就是一个渠道。`<PROFILE>_PLATFORM=telegram` 时这个 profile 走 Bot API
+长轮询，其余（runner / 模型 / session / 斜杠命令 / 队列 / 派单 / 定时任务 / 运行时 MCP）
+与 Lark profile 完全一致 —— 实现上只是把 `bot.feishu` 换成同名方法的
+`telegram_client.TelegramClient`，dispatcher 一行没改。
+
+### 1. 建 bot
+
+BotFather → `/newbot` 拿 token，然后**务必**再做两件事：
+
+| BotFather 命令 | 为什么必须做 |
+|---|---|
+| `/setprivacy` → **Disable** | 不关的话群里只能收到「@ bot / 回复 bot / 斜杠命令」，别人的闲聊 bot 收不到，"自动读上下文"就只有这几类消息。**改完要把 bot 重新拉一次群**才生效 |
+| （命令菜单免手工） | bot 启动时会自动 `setMyCommands` 注册斜杠命令菜单；想自己在 BotFather 里维护就设 `CC_TG_SET_COMMANDS=0` |
+
+### 2. 配 .env
+
+```bash
+PROFILES=work,tg                 # 加进 profile 列表
+
+TG_PLATFORM=telegram
+TG_BOT_TOKEN=123456789:AAE...    # BotFather 给的
+TG_DEFAULT_CWD=/Users/me/projects/default
+TG_ALLOWED_OPEN_IDS=123456789            # 数字 user id；⚠️ 空 = 全部拒绝
+TG_ALLOWED_GROUP_CHAT_IDS=-1001234567890 # 数字 chat id（超级群是 -100 开头）；* = 任意群
+TG_CHAT_CWD_-1001234567890=/Users/me/projects/proj-a   # 每个群一个工作目录
+```
+
+不知道自己的 user id？两条路：
+
+- **自助授权（推荐）**：配一个 `TG_CLAIM_CODE=<随机串>`，启动后私聊 bot 把这串口令
+  原样发过去 → bot 当场把你的 user id 记进白名单并落盘
+  （`~/.feishu-claude/tg-allowed-<profile>.json`，重启后仍有效），下一条消息就能干活。
+  不用先知道自己的 id、也不用为了填白名单再重启一次。
+  只在私聊里认、必须整条消息就是口令；群里发无效（免得口令留在群历史里还长期生效）。
+- 手动：先别填白名单，私聊 bot 一句，它会回一句「你的 Telegram user id 是 X」
+  （日志里也有），填进 `.env` 再重启。
+
+### 3. 用法差异
+
+| | Lark | Telegram |
+|---|---|---|
+| 群里触发 | @ bot（话题群里可补 @ 捡回上一条） | @ bot / 回复 bot 的消息 / 斜杠命令 |
+| 会话粒度 | 每个话题一条 session | 每个群一条 session（没有话题群） |
+| 上下文 | 现拉话题历史 | bot 自己落盘的会话缓冲（`~/.feishu-claude/tg/<profile>.jsonl`） |
+| 长回复 | 自动建 Lark 文档给链接 | 4096 字符自动分段；建议写成文件用 `tg-cli send --file` |
+| 富文本 | 卡片（表格/按钮/markdown） | HTML 子集：标题→加粗、表格→等宽块、按钮→inline keyboard |
+| agent 的手脚 | `lark-cli` | `tg-cli`（同目录下的脚本） |
+| 语音消息 | 飞书 ASR | 借同进程 Lark profile 的 ASR（`CC_TG_ASR_PROFILE`），没有 Lark profile 时明确报错 |
+
+`tg-cli` 用法（bot 会把 chat / 回复锚点注入 agent 的环境变量，所以一般不用传 `--chat`）：
+
+```bash
+./tg-cli send --text "跑完了"
+./tg-cli send --image out.png --caption "对比图"
+./tg-cli send --file report.pdf
+./tg-cli context --limit 30      # 读当前会话最近的消息
+```
+
+### 4. 触发规则细节
+
+群里这几种算"在跟 bot 说话"：`@bot`（`@bot帮我看看` 这种中文紧贴也认）、**回复 bot 的
+任意一条消息**、以及斜杠命令（裸 `/cmd` 也算，`<PROFILE>_COMMANDS_IMPLY_MENTION=0` 可关）。
+白名单群里**所有人**的发言都会进上下文缓冲（否则被 @ 时读不到别人说了什么），但只有
+`<PROFILE>_ALLOWED_OPEN_IDS` 里的人能触发 agent。
+
+一次发多张图（相册）会被合并成**一条**消息再交给 agent（攒 `CC_TG_ALBUM_WINDOW_SEC`
+秒等同组到齐），不会把同一份相册跑 N 遍。
+
+### 5. 已知边界
+
+- **不支持 webhook**，只有长轮询（本机/内网都不需要公网入口，反而更省事）
+- 同一个 token 只能有一个进程在轮询：另一个实例或残留 webhook 会让 `getUpdates` 报
+  409，日志会明确写出来
+- Telegram Bot API 没有"读历史"接口，所以 bot 加群之前、以及 privacy mode 开着时
+  漏掉的消息，永远读不回来
+- **编辑消息不触发 bot**：`edited_message` 的 message_id 与原消息相同，当新消息投进去
+  会被去重表吞掉。改错字请**重发一条**
+- **匿名管理员发言被忽略**（Telegram 不给 `from`，没有可鉴权的自然人；日志有记录）
+- 按钮的 `callback_data` 只有 64 字节，业务 value 存在 bot 内存里：重启后旧按钮点了
+  会提示「按钮已过期」，重发一次命令即可；同一个按钮 3 秒内连点两次只算一次（防手滑）
+- 流式过程中的中间帧会按 `CC_TG_EDIT_MIN_INTERVAL` 合并（撞不到 Telegram 的 flood
+  control），最终结果一定落地
+- 长回复按 4096 自动切段续在后面；**很长的内容建议写成文件用 `tg-cli send --file` 发**
 
 ## Trinity 三省体系（实验性 · 5 角色协作）
 
@@ -369,8 +472,8 @@ python3 main.py
 ## 内置 cc-lark 运行时 MCP
 
 cc-lark 会在 Claude 与 Codex 会话启动时注入 `cc_mcp_server.py`。它提供
-`wake_me_in`、`dispatch_task`、`read_thread`、`schedule_cron`、`list_crons`；stdio
-前端只把鉴权请求发到本机 control listener，真正的派工与调度由常驻 bot 兑现。
+`wake_me_in`、`dispatch_task`、`handover`、`read_thread`、`schedule_cron`、`list_crons`；
+stdio 前端只把鉴权请求发到本机 control listener，真正的派工与调度由常驻 bot 兑现。
 
 `wake_me_in` 排定的一次性唤醒**落盘到 `data/pending_wakes.json`**，bot 重启（`/restart`、
 崩溃拉起）后自动重装；重启期间错过时间的唤醒会在启动后几秒内补跑，并在 prompt 里注明
@@ -380,6 +483,18 @@ cc-lark 会在 Claude 与 Codex 会话启动时注入 `cc_mcp_server.py`。它�
 `/model` `/effort`，默认跑目标 bot 的 profile 默认模型。要按活儿分配算力就显式传
 `model` / `effort`（别名同 `/model`：`fable` / `opus` / `sonnet` / `haiku` …），
 配合 `agent` 还能混编：一路 Opus 实现、一路 Fable 复核、一路 `agent="gpt"` 交叉验证。
+
+`handover` 是**会话移交**：把整项任务连所有权一起交给一条新话题里的新会话，移交方随后收工。
+它和 `dispatch_task` 只差一件事——**移交不要回报**：`dispatch_task` 派的是子任务，子会话
+跑完回报父话题、整波跑完唤醒父 agent 收口；`handover` 交的是所有权，没有完成通知、没有唤醒，
+接手方直接对用户负责。典型场景是当前会话上下文已经太大、翻历史都费劲，但活还没干完：移交方
+把状态手工压成一份结构化简报（`goal` / `completed` / `remaining` 必填，`notes` / `files`
+选填），接手方带着干净上下文接着做。
+
+移交时 bot 额外做三件收尾：简报渲染后**落盘到 `data/handovers/`**（接手方自己上下文再变大
+时可重读，`CC_LARK_HANDOVER_DIR` 可改目录）；**取消原话题所有待触发的 `wake_me_in`**（否则
+移交方会带着已经爆掉的上下文醒回来抢同一件活）；在原话题贴一条带新 thread id 的移交标记。
+`agent` 参数同样支持跨后端移交（`agent="gpt"` 把活交给 GPT 接着干），前提是那个 bot 在本群里。
 
 这条路径只在话题群上下文可用；runner 会把当前 `profile / chat_id / thread_id /
 anchor_message_id / user_id / control port / token` 通过 `CC_LARK_*` 环境变量注入给
@@ -405,7 +520,9 @@ mkdir prompts && vim prompts/work_daily_briefing.md
 | `GET /trigger?name=xxx` 或 `POST /trigger` | 手动触发任务（绕过 cron） |
 | `GET/POST /reload` | 热加载 yaml + prompt 文件，不打断进行中的任务 |
 | `POST /spawn` | 派单进独立 session |
-| `GET /handover` | CLI session 接管 |
+| `POST /dispatch` | 派子任务（跑完回报派发方）|
+| `POST /handover_task` | 移交整项任务的所有权（不回报）|
+| `GET /handover` | CLI session 接管（与上一行是两件事）|
 
 ```bash
 set -a; source .env; set +a
@@ -420,8 +537,8 @@ curl "${AUTH[@]}" "http://127.0.0.1:$CONTROL_PORT/trigger?name=work_daily_briefi
 curl -X POST "${AUTH[@]}" "http://127.0.0.1:$CONTROL_PORT/reload"
 ```
 
-公网 callback listener 对 `/spawn`、`/trigger`、`/wake`、`/dispatch`、cron、handover
-等路径统一返回 404。即使经过 ngrok 后 socket peer 显示为 localhost，也无法进入控制面。
+公网 callback listener 对 `/spawn`、`/trigger`、`/wake`、`/dispatch`、`/handover_task`、
+cron、handover 等路径统一返回 404。即使经过 ngrok 后 socket peer 显示为 localhost，也无法进入控制面。
 
 ## 外部事件触发 API（后端服务 → agent）
 

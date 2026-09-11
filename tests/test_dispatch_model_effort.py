@@ -153,3 +153,26 @@ async def test_bad_effort_rejected_before_creating_topic(spawns):
     assert "effort" in res["error"]
     assert bot.feishu.posts == []
     assert spawns == []
+
+
+async def test_incompatible_model_auto_corrected_for_target_runner(spawns):
+    """跨/同 agent 派发：若指定了与目标 runner 不兼容的模型（如传 opus 给 agy），自动纠正为目标 runner 默认模型。"""
+    bot = _FakeBot()
+    bot.profile.runner = "agy"
+    bot.profile.dispatch_model = "gemini-3.8-flash"
+    res = await _dispatch(bot, model="opus", effort="high")
+    assert res["ok"] is True
+    # 不应该把 opus[1m] 传给 agy 后端，应纠正为 gemini-3.8-flash
+    assert spawns[0]["model"] == "gemini-3.8-flash"
+    assert spawns[0]["effort"] == "high"
+
+
+async def test_cross_agent_incompatible_model_auto_corrected(spawns):
+    """Claude bot 派发给 agy bot，但误传了 model="fable"：自动修正为 agy 的 dispatch_model。"""
+    parent = _FakeBot()
+    child = _FakeBot(dispatch_model="gemini-3.8-flash")
+    child.profile.name = "agy"
+    child.profile.runner = "agy"
+    res = await _dispatch(parent, target_bot=child, model="fable", effort="high")
+    assert res["ok"] is True
+    assert spawns[0]["model"] == "gemini-3.8-flash"

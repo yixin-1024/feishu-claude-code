@@ -113,6 +113,28 @@ def _reap_loop() -> None:
 SpawnFn = Callable[..., Awaitable[None]]
 
 
+def _as_bool(raw, default: bool) -> bool:
+    """yaml / env 的布尔归一：认 true/false/1/0/yes/no/on/off；缺省或看不懂 → default。"""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def _mention_owner_default() -> bool:
+    """顶楼 post 是否 @ 归属人的全局默认。SCHED_MENTION_OWNER=0 全局关掉。
+
+    每条任务可用 yaml 里的 `mention: true/false` 单独覆盖。
+    """
+    return _as_bool(os.environ.get("SCHED_MENTION_OWNER"), True)
+
+
 @dataclass
 class ScheduledTask:
     name: str
@@ -128,6 +150,11 @@ class ScheduledTask:
     # 所以模型和推理强度只能在任务里声明。空 = 跟随 profile / CLI 默认。
     model: str = ""
     effort: str = ""
+    # 顶楼 post 要不要 @ 归属人。@ 的真正作用是把人拉进这条话题的订阅（之后话题内
+    # 的回复才会推送到他）；不想被每轮 cron 戳一下就写 mention: false —— 代价是话题
+    # 后续消息不再主动推给你，得自己点进群里的话题看。默认跟随
+    # SCHED_MENTION_OWNER（未设 = 开）。
+    mention: bool = True
 
     @staticmethod
     def _primary_user(raw_user_id: str, name: str) -> str:
@@ -184,6 +211,7 @@ class ScheduledTask:
             prompt=prompt_text,
             model=_normalize_model(str(raw.get("model") or "")),
             effort=_normalize_effort(str(raw.get("effort") or ""), f"task {raw.get('name')!r}"),
+            mention=_as_bool(raw.get("mention"), _mention_owner_default()),
         )
 
 
@@ -297,6 +325,94 @@ def list_pending_wakes() -> list[dict]:
         return sorted(_load_pending_wakes().values(), key=lambda r: r.get("fire_at", ""))
 
 
+def get_pending_wakes_for_thread(thread_id: str, chat_id: str | None = None) -> list[dict]:
+    """查询指定 thread_id（及可选 chat_id）下所有未触发的 wake 记录。"""
+    if not thread_id:
+        return []
+    with _WAKE_STORE_LOCK:
+        data = _load_pending_wakes()
+        matched = []
+        for r in data.values():
+            if r.get("thread_id") == thread_id:
+                if chat_id and r.get("chat_id") != chat_id:
+                    continue
+                matched.append(dict(r))
+        return sorted(matched, key=lambda x: x.get("fire_at", ""))
+
+
+def cancel_wake(
+    *,
+    job_id: str | None = None,
+    thread_id: str | None = None,
+    chat_id: str | None = None,
+) -> dict:
+    """取消排定的待触发唤醒任务。
+
+    可按 job_id 精确取消，或按 thread_id 批量取消本话题下的所有待唤醒。
+    提供 chat_id 时做群组作用域校验（防止跨群操作）。
+    """
+    job_id = (job_id or "").strip() or None
+    thread_id = (thread_id or "").strip() or None
+    chat_id = (chat_id or "").strip() or None
+
+    if not job_id and not thread_id:
+        return {
+            "ok": False,
+            "error": "Either `job_id` or `thread_id` must be provided to cancel a wake.",
+            "cancelled": [],
+            "count": 0,
+        }
+
+    sched = _STATE.get("scheduler")
+    cancelled = []
+
+    with _WAKE_STORE_LOCK:
+        data = _load_pending_wakes()
+        to_cancel_ids = []
+        for jid, rec in data.items():
+            if job_id and jid != job_id:
+                continue
+            if thread_id and rec.get("thread_id") != thread_id:
+                continue
+            if chat_id and rec.get("chat_id") != chat_id:
+                continue
+            to_cancel_ids.append(jid)
+
+        for jid in to_cancel_ids:
+            rec = data.pop(jid)
+            cancelled.append({
+                "job_id": jid,
+                "thread_id": rec.get("thread_id"),
+                "chat_id": rec.get("chat_id"),
+                "fire_at": rec.get("fire_at"),
+                "minutes": rec.get("minutes"),
+                "note": rec.get("note"),
+            })
+            _JOB_CHAT_SCOPE.pop(jid, None)
+
+            # 从 APScheduler 内存中删除 job
+            if sched is not None and hasattr(sched, "remove_job"):
+                try:
+                    sched.remove_job(jid)
+                except Exception:
+                    pass
+
+        if to_cancel_ids:
+            try:
+                _save_pending_wakes(data)
+            except Exception as e:
+                print(f"[scheduler/wake] ⚠️ 落盘保存 cancel 结果失败: {type(e).__name__}: {e}", flush=True)
+
+    for c in cancelled:
+        print(f"[scheduler/wake] 🛑 已取消 {c['job_id']} (thread={c['thread_id']}, note={c['note']!r})", flush=True)
+
+    return {
+        "ok": True,
+        "count": len(cancelled),
+        "cancelled": cancelled,
+    }
+
+
 def _build_wake_prompt(rec: dict) -> str:
     minutes = rec.get("minutes")
     note = (rec.get("note") or "").strip()
@@ -329,15 +445,29 @@ def _arm_wake(bot, rec: dict, run_date: datetime, *, persist: bool = True) -> No
     _JOB_CHAT_SCOPE[job_id] = chat_id  # list_crons 按 chat 过滤用
 
     def _fire():
+        # 若已被取消（不再处于落盘记录中），直接跳过
+        with _WAKE_STORE_LOCK:
+            if job_id not in _load_pending_wakes():
+                print(f"[scheduler/wake] ℹ️ {job_id} 已在触发前被取消，跳过执行", flush=True)
+                _JOB_CHAT_SCOPE.pop(job_id, None)
+                return
+
         async def _do():
             try:
-                from dispatcher import wake_thread_as_user
+                from dispatcher import wake_thread_as_user, wake_thread_internal
                 ok = await wake_thread_as_user(bot, anchor, wake_prompt)
                 if ok:
                     return
-                print(f"[scheduler/wake] ⚠️ {job_id} send-as-user 未成功，回退 handle_spawn", flush=True)
+                # 非 spx profile 的 lark-cli 没有 user 身份，send-as-user 必败。先试进程内直投：
+                # 同样 resume 本话题 session（上下文保留），比 handle_spawn 开新 session 好。
+                print(f"[scheduler/wake] ⚠️ {job_id} send-as-user 未成功，改走进程内直投", flush=True)
+                if await wake_thread_internal(bot, user_id=user, chat_id_raw=chat_id,
+                                              thread_id=thread_id, anchor_msg_id=anchor,
+                                              prompt=wake_prompt):
+                    return
+                print(f"[scheduler/wake] ⚠️ {job_id} 进程内直投未成功，回退 handle_spawn", flush=True)
             except Exception as e:
-                print(f"[scheduler/wake] ⚠️ {job_id} wake_thread_as_user 异常 {type(e).__name__}: {e}，回退 handle_spawn", flush=True)
+                print(f"[scheduler/wake] ⚠️ {job_id} 唤醒异常 {type(e).__name__}: {e}，回退 handle_spawn", flush=True)
             try:
                 await spawn_fn(bot, user_id=user, chat_id_raw=chat_id,
                                thread_id=thread_id, anchor_message_id=anchor, prompt=wake_prompt)
@@ -417,6 +547,148 @@ def restore_pending_wakes() -> tuple[int, int]:
         flush=True,
     )
     return (restored, late)
+
+
+# ── 重启后自动续跑（resume_store 的兑现端）──────────────────
+# 磁盘上残留的 resume 记录 == 上个进程没跑完就没了（/restart、崩溃、机器重启）。
+# 启动时按记录把任务投回原话题续跑：投递走 dispatcher.resume_run_internal（进程内
+# 直投，不依赖 WS 已连、resume 原 session 保上下文），失败才回退 handle_spawn。
+
+
+def restore_pending_resumes() -> tuple[int, int]:
+    """启动时重投上个进程没跑完的 run。返回 (已排续跑数, 跳过数)。"""
+    import resume_store
+
+    if not resume_store.enabled():
+        print("[scheduler/resume] 自动续跑已关（CC_LARK_RESUME_AFTER_RESTART=0）", flush=True)
+        return (0, 0)
+
+    sched = _STATE["scheduler"]
+    bots = _STATE["bots"] or {}
+    bot_loop = _STATE["bot_loop"]
+    if sched is None or bot_loop is None:
+        return (0, 0)
+
+    try:
+        recs = resume_store.load_all()
+    except Exception as e:  # noqa: BLE001
+        print(f"[scheduler/resume] ⚠️ 读取续跑记录失败: {type(e).__name__}: {e}", flush=True)
+        return (0, 0)
+    if not recs:
+        return (0, 0)
+
+    tz = ZoneInfo("Asia/Shanghai")
+    now = datetime.now(tz)
+    delay = resume_store.delay_seconds()
+    stagger = resume_store.stagger_seconds()
+    max_attempts = resume_store.max_attempts()
+    max_age = resume_store.max_age_minutes()
+
+    armed = skipped = 0
+    for rec in recs:
+        bot = bots.get(rec.get("profile") or "")
+        key = rec.get("key") or ""
+        if bot is None or not key:
+            resume_store.drop(key)
+            skipped += 1
+            continue
+        age = resume_store.age_minutes(rec)
+        attempt = int(rec.get("attempt") or 0)
+        why = ""
+        if attempt >= max_attempts:
+            why = f"这条任务已经连续被中断 {attempt} 次（上限 {max_attempts}），不再自动重投"
+        elif age > max_age:
+            why = f"距离中断已经过去 {age / 60:.1f} 小时（上限 {max_age / 60:.1f} 小时），重投可能已经没意义"
+        if why:
+            print(f"[scheduler/resume] ⏭ 跳过 {key[:40]}：{why}", flush=True)
+            resume_store.drop(key)
+            skipped += 1
+            _submit_resume_notice(bot, bot_loop, rec, why)
+            continue
+
+        run_date = now + timedelta(seconds=delay + armed * stagger)
+        job_id = f"resume-{uuid.uuid4().hex[:8]}"
+        _JOB_CHAT_SCOPE[job_id] = rec.get("chat_id", "").partition(":")[0]
+        try:
+            sched.add_job(
+                _make_resume_fire(bot, bot_loop, rec, job_id),
+                trigger=DateTrigger(run_date=run_date),
+                id=job_id, name=job_id,
+                misfire_grace_time=None, coalesce=True, max_instances=1,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[scheduler/resume] ⚠️ 排 {key[:40]} 失败: {type(e).__name__}: {e}", flush=True)
+            skipped += 1
+            continue
+        armed += 1
+        print(
+            f"[scheduler/resume] ♻️ {run_date.strftime('%H:%M:%S')} 自动续跑 "
+            f"profile={rec.get('profile')} chat={(rec.get('chat_id') or '')[:24]} "
+            f"reason={rec.get('reason') or '-'} attempt={attempt}",
+            flush=True,
+        )
+
+    print(f"[scheduler/resume] 重启续跑：{armed} 条已排，{skipped} 条跳过", flush=True)
+    return (armed, skipped)
+
+
+def _submit_resume_notice(bot, bot_loop, rec: dict, why: str) -> None:
+    """把"这条没自动续跑"的提示投到 bot_loop 发出去（best-effort）。"""
+    try:
+        from dispatcher import notify_resume_skipped
+        asyncio.run_coroutine_threadsafe(notify_resume_skipped(bot, rec, why), bot_loop)
+    except Exception as e:  # noqa: BLE001
+        print(f"[scheduler/resume] ⚠️ 跳过提示发送失败: {type(e).__name__}: {e}", flush=True)
+
+
+def _make_resume_fire(bot, bot_loop, rec: dict, job_id: str):
+    """构造一次性续跑 job 的同步 wrapper（scheduler 线程 → bot_loop）。"""
+    import resume_store
+
+    prompt = resume_store.build_resume_prompt(rec)
+    spawn_fn = _STATE["spawn_fn"]
+    chat_id = rec.get("chat_id") or ""
+    raw_chat_id = chat_id.partition(":")[0]
+    thread_id = rec.get("thread_id") or ""
+    anchor = rec.get("anchor") or ""
+    user_id = rec.get("user_id") or ""
+    is_group = bool(rec.get("is_group"))
+
+    def _fire():
+        async def _do():
+            # attempt 先加：续跑过程中再被打断时，新 run 落盘的记录会带上累加后的
+            # 次数，达到上限就不再自动重投（防"续跑→崩→续跑"死循环）。
+            # 同时登记**原始指令**，让下一次续跑还是包它，而不是包这一版续跑指令。
+            resume_store.bump_attempt(rec.get("key") or "", rec.get("prompt") or "")
+            try:
+                from dispatcher import resume_run_internal
+                ok = await resume_run_internal(
+                    bot, user_id=user_id, chat_id=chat_id, is_group=is_group,
+                    thread_id=thread_id, anchor_msg_id=anchor, prompt=prompt,
+                )
+                if ok:
+                    return
+            except Exception as e:  # noqa: BLE001
+                print(f"[scheduler/resume] ⚠️ {job_id} 直投异常 {type(e).__name__}: {e}", flush=True)
+            if not (is_group and spawn_fn):
+                print(f"[scheduler/resume] ❌ {job_id} 续跑未成功且无法回退 spawn", flush=True)
+                return
+            print(f"[scheduler/resume] ⚠️ {job_id} 直投未成功，回退 handle_spawn", flush=True)
+            try:
+                await spawn_fn(bot, user_id=user_id, chat_id_raw=raw_chat_id,
+                               thread_id=thread_id, anchor_message_id=anchor, prompt=prompt)
+            except Exception as e:  # noqa: BLE001
+                print(f"[scheduler/resume] ❌ {job_id} 回退 spawn 也失败: {type(e).__name__}: {e}", flush=True)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_do(), bot_loop)
+            print(f"[scheduler/resume] 🔔 fire {job_id} → chat={chat_id[:24]}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[scheduler/resume] ❌ {job_id} submit 失败: {type(e).__name__}: {e}", flush=True)
+        finally:
+            _JOB_CHAT_SCOPE.pop(job_id, None)
+
+    return _fire
 
 
 def schedule_wake(
@@ -808,6 +1080,12 @@ def start_scheduler(
     except Exception as e:  # noqa: BLE001
         print(f"[scheduler/wake] ⚠️ 恢复落盘唤醒失败: {type(e).__name__}: {e}", flush=True)
 
+    # 重投上个进程没跑完的 run（/restart / 崩溃 / 机器重启后自动接着跑，不用人再发一遍）
+    try:
+        restore_pending_resumes()
+    except Exception as e:  # noqa: BLE001
+        print(f"[scheduler/resume] ⚠️ 恢复续跑失败: {type(e).__name__}: {e}", flush=True)
+
     print(
         f"[scheduler] 已启动（BackgroundScheduler），加载 {len(scheduler.get_jobs())} 个定时任务，lock-reaper 已起",
         flush=True,
@@ -928,7 +1206,7 @@ def _make_async_fire(task: ScheduledTask, bot, spawn_fn: SpawnFn):
                         chat_id=task.chat_id,
                         title=f"⏸️ 跳过本轮 · {task.topic_title}",
                         body_text=body,
-                        mention_open_id=task.user_id,
+                        mention_open_id=(task.user_id if task.mention else ""),
                     )
                 except Exception as e:
                     print(f"{tag} ⚠️ 发跳过通报失败: {type(e).__name__}: {e}", flush=True)
@@ -939,7 +1217,7 @@ def _make_async_fire(task: ScheduledTask, bot, spawn_fn: SpawnFn):
                 chat_id=task.chat_id,
                 title=task.topic_title,
                 body_text=task.topic_body,
-                mention_open_id=task.user_id,
+                mention_open_id=(task.user_id if task.mention else ""),
             )
             over = "".join(
                 f" {k}={v}" for k, v in (("model", task.model), ("effort", task.effort)) if v

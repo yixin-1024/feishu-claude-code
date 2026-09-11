@@ -100,6 +100,7 @@ def test_resolve_spawn_request_passes_optional_model(monkeypatch):
     ("POST", "/reload"),
     ("POST", "/wake"),
     ("POST", "/dispatch"),
+    ("POST", "/handover_task"),
     ("POST", "/read_thread"),
     ("POST", "/schedule_cron"),
     ("POST", "/list_crons"),

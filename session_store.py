@@ -386,7 +386,7 @@ class SessionStore:
         )
         self._default_cwd = default_cwd or DEFAULT_CWD
         self._default_runner = (default_runner or DEFAULT_RUNNER or "claude").strip().lower()
-        if self._default_runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka"}:
+        if self._default_runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy"}:
             self._default_runner = "claude"
         self._default_model = default_model or DEFAULT_MODEL
         self._chat_default_cwd = chat_default_cwd or {}
@@ -548,6 +548,19 @@ class SessionStore:
             current["preview"] = ""
             current["started_at"] = datetime.now().isoformat()
             changed = True
+
+        # 模型 override 与当前 runner 不兼容时（如 agy 话题被误写 opus[1m]）：自动清除，自愈回落
+        override = current.get("model_override")
+        active_runner = current.get("runner", self._default_runner)
+        if override:
+            try:
+                from bot_config import is_model_compatible_with_runner
+                if not is_model_compatible_with_runner(override, active_runner):
+                    current["model_override"] = None
+                    changed = True
+            except Exception:
+                pass
+
         for key, value in defaults.items():
             if key not in current:
                 current[key] = value
@@ -593,6 +606,23 @@ class SessionStore:
             await self._save_async()
 
         return chat_data
+
+    def thread_owner(self, chat_id: str) -> Optional[str]:
+        """Read-only legacy ownership lookup, including sessions still awaiting an ID.
+
+        Never adopt another user's bucket or create a default session during routing.
+        Multiple non-shared owners are ambiguous and must not be guessed.
+        """
+        owners = [uid for uid, data in self._data.items()
+                  if isinstance(data, dict) and isinstance(data.get(chat_id), dict)
+                  and isinstance(data[chat_id].get("current"), dict)]
+        if self._shared_threads and owners:
+            return self.find_primary_user() or None
+        if len(owners) == 1 and owners[0] != SHARED_THREAD_UID:
+            return owners[0]
+        if owners and not self._shared_threads:
+            raise ValueError("目标话题存在多个或不兼容的用户归属，不能选择默认用户")
+        return None
 
     def has_chat_record(self, user_id: str, chat_id: str) -> bool:
         """只读检查：这个 chat（含话题复合 key "oc_xxx:omt_yyy"）是否已有会话记录。
@@ -820,6 +850,11 @@ class SessionStore:
             })
             chat_data["history"] = chat_data["history"][-20:]
         # model 为空 → 清除 override，回落 profile 默认
+        active_runner = cur.get("runner", self._default_runner)
+        if model:
+            from bot_config import is_model_compatible_with_runner
+            if not is_model_compatible_with_runner(model, active_runner):
+                model = ""
         cur["model_override"] = model or None
         cur["session_id"] = None
         cur["preview"] = ""
@@ -831,7 +866,13 @@ class SessionStore:
         """仅改 model_override、不动 session（safeguards 自动降级续跑用；
         用户手动 /model 换模型仍走 set_model 开新会话）。"""
         chat_data = await self._ensure_chat_data(user_id, chat_id)
-        chat_data["current"]["model_override"] = model or None
+        cur = chat_data["current"]
+        active_runner = cur.get("runner", self._default_runner)
+        if model:
+            from bot_config import is_model_compatible_with_runner
+            if not is_model_compatible_with_runner(model, active_runner):
+                model = ""
+        cur["model_override"] = model or None
         await self._save_async()
 
     async def set_effort(self, user_id: str, chat_id: str, effort: str):
@@ -848,9 +889,11 @@ class SessionStore:
             normalized = "claude"
         if normalized in {"mimo-code", "mimocode"}:
             normalized = "mimo"
-        if normalized not in {"claude", "codex", "opencode", "mimo", "grok", "maka"}:
+        if normalized in {"antigravity", "antigravity-cli", "gemini"}:
+            normalized = "agy"
+        if normalized not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy"}:
             raise ValueError(
-                "runner must be 'claude', 'codex', 'opencode', 'mimo', 'grok' or 'maka'"
+                "runner must be 'claude', 'codex', 'opencode', 'mimo', 'grok', 'maka' or 'agy'"
             )
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
@@ -1038,9 +1081,16 @@ class SessionStore:
         return {"old_session_id": old_sid or "", "old_summary": old_summary}
 
     def find_primary_user(self) -> Optional[str]:
-        """找到主用户（第一个有 private chat 且 open_id 格式的用户）"""
+        """找到主用户（第一个有 private chat 的真实用户）。
+
+        Lark 的 open_id 是 `ou_` 前缀，Telegram 的 user id 是纯数字 —— 两种都要认，
+        否则 telegram profile 上 dispatch_task / schedule_wake 的"归属人兜底"永远为空。
+        `ou_` 优先，保持 Lark 侧行为不变。"""
         for uid in self._data:
             if uid.startswith("ou_") and "private" in self._data[uid]:
+                return uid
+        for uid in self._data:
+            if uid.isdigit() and "private" in self._data[uid]:
                 return uid
         return None
 

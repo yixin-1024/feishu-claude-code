@@ -481,3 +481,42 @@ async def test_commands_restart_fallback_never_triggers_directly():
 
     trigger.assert_not_called()
     assert "消息分发器" in reply
+
+
+async def test_restart_card_appends_to_progress_instead_of_overwriting():
+    """重启中断卡要保留中断前的流式进度，只在末尾追加重启说明（与 /stop 一致）。"""
+    from run_control import ActiveRunRegistry
+
+    bot = _bot(active_runs=0)
+    registry = ActiveRunRegistry()
+    bot.active_runs = registry
+    run = registry.start_run("ou_user", "oc_chat", "om_card")
+    run.last_body = "🔧 Bash(ls)\n\n已经跑了一半"
+
+    affected = await dispatcher._handle_restart_command(bot)
+
+    assert affected == 1
+    bot.feishu.update_card.assert_awaited_once()
+    _, content = bot.feishu.update_card.await_args.args
+    assert content.startswith("🔧 Bash(ls)\n\n已经跑了一半")
+    assert "本次任务被中断" in content
+    assert "以上为中断前的进度" in content
+    bot.feishu.finalize_streaming_card.assert_awaited_once_with("om_card")
+
+
+@pytest.mark.parametrize("body", ["", "   ", "⏳ 思考中..."])
+async def test_restart_card_falls_back_to_plain_notice_without_progress(body, monkeypatch):
+    from run_control import ActiveRunRegistry
+
+    # 自动续跑关掉时才是"请再发一遍"的老措辞（开着的变体见下一个用例）。
+    monkeypatch.setenv("CC_LARK_RESUME_AFTER_RESTART", "0")
+    bot = _bot(active_runs=0)
+    registry = ActiveRunRegistry()
+    bot.active_runs = registry
+    run = registry.start_run("ou_user", "oc_chat", "om_card")
+    run.last_body = body
+
+    await dispatcher._handle_restart_command(bot)
+
+    _, content = bot.feishu.update_card.await_args.args
+    assert content == dispatcher._RESTART_MSG

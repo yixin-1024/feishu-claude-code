@@ -383,6 +383,8 @@ def test_from_dict_takes_first_open_id_when_user_id_is_a_list():
 
 def test_fire_mentions_single_open_id(monkeypatch):
     """顶楼 post 的 mention_open_id 必须是单个 id，不能是逗号串。"""
+    # 显式打开 @（本机 .env 可能把 SCHED_MENTION_OWNER 关了，这条测的是归一不是默认）
+    monkeypatch.setenv("SCHED_MENTION_OWNER", "1")
     bot = _FakeBot()
     task = scheduler.ScheduledTask.from_dict(
         _raw_task(user_id="ou_first,ou_second"), base_dir="."
@@ -401,3 +403,83 @@ def test_fire_mentions_single_open_id(monkeypatch):
 
     assert len(bot.feishu.posts) == 1
     assert bot.feishu.posts[0]["mention"] == "ou_first"
+
+
+# ────────────────── mention 开关：顶楼要不要 @ 归属人 ──────────────────
+
+def test_from_dict_mentions_owner_by_default(monkeypatch):
+    monkeypatch.delenv("SCHED_MENTION_OWNER", raising=False)
+    assert scheduler.ScheduledTask.from_dict(_raw_task(), base_dir=".").mention is True
+
+
+def test_from_dict_mention_false_disables_at(monkeypatch):
+    monkeypatch.delenv("SCHED_MENTION_OWNER", raising=False)
+    task = scheduler.ScheduledTask.from_dict(_raw_task(mention=False), base_dir=".")
+    assert task.mention is False
+
+
+def test_env_can_turn_mention_off_globally(monkeypatch):
+    """SCHED_MENTION_OWNER=0 → 所有任务（含 agent 自己 schedule_cron 建的、
+    yaml 里没写 mention 的）都不再 @ 归属人。"""
+    monkeypatch.setenv("SCHED_MENTION_OWNER", "0")
+    assert scheduler.ScheduledTask.from_dict(_raw_task(), base_dir=".").mention is False
+    # 单条任务可以把它顶回来
+    assert scheduler.ScheduledTask.from_dict(
+        _raw_task(mention=True), base_dir="."
+    ).mention is True
+
+
+def test_from_dict_mention_accepts_yaml_strings(monkeypatch):
+    monkeypatch.delenv("SCHED_MENTION_OWNER", raising=False)
+    for raw, want in (("false", False), ("no", False), ("off", False),
+                      ("true", True), ("1", True), ("绝对不行", True)):
+        # 看不懂的值不该把任务弄坏 —— 回落到默认（此处 = 开）
+        task = scheduler.ScheduledTask.from_dict(_raw_task(mention=raw), base_dir=".")
+        assert task.mention is want, raw
+
+
+def test_fire_omits_at_tag_when_mention_disabled(monkeypatch):
+    """mention=false：顶楼照发、spawn 照走（user_id 仍是归属人），只是不带 at tag。"""
+    monkeypatch.delenv("SCHED_MENTION_OWNER", raising=False)
+    bot = _FakeBot()
+    task = scheduler.ScheduledTask.from_dict(_raw_task(mention=False), base_dir=".")
+    spawn_called: list[dict] = []
+
+    async def spawn_fn(bot_, **kw):
+        spawn_called.append(kw)
+
+    import commands
+    monkeypatch.setattr(commands, "fetch_quota_headers",
+                        lambda: {"ok": True, "u5h": 0.2, "u7d": 0.1,
+                                 "r5h": 9999999999, "r7d": 9999999999,
+                                 "s5h": "allowed", "s7d": "allowed"})
+
+    asyncio.run(scheduler._make_async_fire(task, bot, spawn_fn)())
+
+    assert len(bot.feishu.posts) == 1
+    assert bot.feishu.posts[0]["mention"] == ""
+    assert bot.feishu.posts[0]["title"] == "t1", "顶楼本身照发，只是没了 at tag"
+    assert len(spawn_called) == 1
+    assert spawn_called[0]["user_id"] == "ou_user", "归属人不能因为不 @ 就丢"
+
+
+def test_fire_omits_at_tag_on_quota_skip_notice(monkeypatch):
+    """「⏸️ 跳过本轮」那条通报也要遵守 mention 开关。"""
+    monkeypatch.delenv("SCHED_MENTION_OWNER", raising=False)
+    bot = _FakeBot()
+    task = scheduler.ScheduledTask.from_dict(_raw_task(mention=False), base_dir=".")
+
+    async def spawn_fn(bot_, **kw):
+        raise AssertionError("quota 耗尽时不该派单")
+
+    import commands
+    monkeypatch.setattr(commands, "fetch_quota_headers",
+                        lambda: {"ok": True, "u5h": 0.99, "u7d": 0.1,
+                                 "r5h": 9999999999, "r7d": 9999999999,
+                                 "s5h": "allowed", "s7d": "allowed"})
+
+    asyncio.run(scheduler._make_async_fire(task, bot, spawn_fn)())
+
+    assert len(bot.feishu.posts) == 1
+    assert "跳过本轮" in bot.feishu.posts[0]["title"]
+    assert bot.feishu.posts[0]["mention"] == ""

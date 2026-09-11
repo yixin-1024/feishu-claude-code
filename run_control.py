@@ -42,6 +42,15 @@ class ActiveRun:
     # 流式 push、最终落卡与 /stop|/restart 中断提示共用这把锁。
     # 中断提示会等待已在途的旧写入结束后最后落卡，后续写入看到 stop flag 跳过。
     card_update_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # ── 重启后自动续跑用（resume_store）──────────────────────
+    # /restart 广播时只拿得到 ActiveRun，续跑需要的原始指令 / 回复锚点都得挂在这里。
+    prompt: str = ""
+    anchor_msg_id: str = ""
+    is_group: bool = False
+    thread_id: str = ""
+    resume_key: str = ""
+    # True = 收尾时别删落盘记录（重启中断，留给下个进程续跑）。
+    keep_resume: bool = False
 
 
 def _key(user_id: str, chat_id: str) -> str:

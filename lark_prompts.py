@@ -6,7 +6,9 @@ string.Template 会把 `$ANCHOR` 也识别成 identifier。
 
 模板放在 prompts/ 目录：
     prompts/default.md         — 兜底模板（兼容当前单一 profile 行为）
+    prompts/telegram.md        — Telegram 渠道模板（platform=telegram 时用）
     prompts/_dispatch.md       — 派单段落（条件性注入到 default 的 ${dispatch_section}）
+    prompts/_runtime_env.md    — 运行环境约束（default / telegram 共用）
     prompts/{role}.md          — Trinity 角色模板（yushitai / zhongshu / ...）
 
 调用入口：render_lark_prompt(profile, request_ctx) → str
@@ -126,12 +128,51 @@ def _build_location_block(
     return "\n".join(lines)
 
 
+def _build_tg_location_block(
+    raw_chat_id: str,
+    thread_id: str,
+    is_group: bool,
+    bot_username: str,
+    profile_name: str,
+) -> str:
+    """Telegram 版"当前会话信息"。同样只放同一会话内逐轮不变的字段（prompt cache）。"""
+    lines = [f"- chat_id: {raw_chat_id}"]
+    if thread_id:
+        lines.append(
+            f"- 会话键: {thread_id}"
+            "（Telegram 没有话题群，这是 bot 为本群合成的会话 id）"
+        )
+    lines.append(
+        "- 本轮用户消息 id 与提问者 id：见用户消息开头的【本轮 · …】行；"
+        "在 Bash 里也可直接用环境变量 `$CC_LARK_MESSAGE_ID`（回复锚点，形如 "
+        "`<chat_id>:<message_id>`）/ `$CC_LARK_USER_ID`（提问者）"
+    )
+    lines.append(f"- 场景: {'群聊' if is_group else '私聊'}")
+    lines.append(f"- 平台: Telegram（bot @{bot_username or '?'}）")
+    lines.append(f"- 对应 cc-lark profile: **{profile_name}**")
+    return "\n".join(lines)
+
+
 def _fmt_minutes(seconds: float) -> str:
     """秒 → 「N 分钟」/「N 小时」的短文本。"""
     seconds = float(seconds)
     if seconds >= 3600 and seconds % 3600 == 0:
         return f"{int(seconds // 3600)} 小时"
     return f"{int(round(seconds / 60))} 分钟"
+
+
+# agy(Antigravity CLI) 的 MCP 调用形态：工具不叫 mcp__cc-lark__xxx，而是统一
+# 经 call_mcp_tool 转发。下面这段贴在 claude 版说明前面做名字转译。
+_AGY_MCP_ADAPTER = (
+    "【本后端（Antigravity CLI / agy）怎么调下面这些工具】\n"
+    "下文按 Claude 的命名写作 `mcp__cc-lark__<tool>`；在 agy 里它们**不是**独立工具，"
+    "而是统一用内置的 `call_mcp_tool` 转发：server 名 `cc-lark`，tool 名就是去掉 "
+    "`mcp__cc-lark__` 前缀那部分（`wake_me_in` / `cancel_wake` / `dispatch_task` / `handover` / "
+    "`read_thread` / "
+    "`schedule_cron` / `list_crons` / `cancel_cron` / `pause_cron` / `resume_cron` / "
+    "`update_cron`），参数原样传。**它们是真能用的**，别因为工具列表里看不到那个长名字"
+    "就当成不存在。\n\n"
+)
 
 
 def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
@@ -148,7 +189,7 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
     except Exception:  # noqa: BLE001 — 常量拿不到就退回历史默认
         _idle, _stuck = 300, 900
 
-    if backend in {"claude", "codex"} or backend not in {"opencode", "mimo", "grok", "maka"}:
+    if backend in {"claude", "codex"} or backend not in {"opencode", "mimo", "grok", "maka", "agy"}:
         if backend == "codex":
             idle = int(getattr(profile, "codex_idle_timeout_sec", 3600) or 3600)
             rules = [f"连续 {_fmt_minutes(idle)}没有任何新输出 → 强杀"]
@@ -173,6 +214,7 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
             "mimo": "mimo_idle_timeout_sec",
             "grok": "grok_idle_timeout_sec",
             "maka": "maka_idle_timeout_sec",
+            "agy": "agy_idle_timeout_sec",
         }[backend]
         idle = int(getattr(profile, idle_attr, 300) or 300)
         stuck_minutes = int(round(idle / 60))
@@ -232,6 +274,7 @@ def render_lark_prompt(
     ticket_id: str = "",
     ticket_history: str = "",
     runner: str = "",
+    bot_username: str = "",
 ) -> str:
     """构造注入到 Claude 的 Lark 系统提示。
 
@@ -249,16 +292,35 @@ def render_lark_prompt(
 
     backend = (runner or "claude").strip().lower()
     timeout_ctx = _build_timeout_ctx(profile, backend)
-    runtime_mcp_section = render(
-        "_runtime_mcp_claude" if backend in {"claude", "codex"} else "_runtime_mcp_other",
-        timeout_ctx,
-    )
+    # 共用段落里唯一一处"渠道相关"的命令示例（AskUserQuestion 的替代方案）：
+    # Lark 用 lark-cli，Telegram 用 tg-cli。其余文案两个渠道通用。
+    shared_ctx = {
+        **timeout_ctx,
+        "ask_cmd": (
+            f"{os.path.join(os.path.dirname(PROMPTS_DIR), 'tg-cli')} send "
+            '--text "<问题>"'
+            if profile.is_telegram
+            else 'lark-cli ... im +messages-reply ... --text "<问题>"'
+        ),
+    }
+    if backend in {"claude", "codex", "agy"}:
+        runtime_mcp_section = render("_runtime_mcp_claude", shared_ctx)
+        if backend == "agy":
+            # agy 不把 MCP 工具铺平成 mcp__<server>__<tool>，而是统一走 call_mcp_tool，
+            # 所以照抄 claude 版介绍前先给一句调用方式的转译，免得它照着
+            # `mcp__cc-lark__wake_me_in` 这个名字去找工具然后放弃。
+            runtime_mcp_section = _AGY_MCP_ADAPTER + runtime_mcp_section
+    else:
+        runtime_mcp_section = render("_runtime_mcp_other", shared_ctx)
 
     # ⚠️ user_message_id 故意不进 system prompt（只在 Trinity 角色模板里保留
     # ${message_id}）：它每轮都变，会把 Claude API 的 prompt cache 前缀打断。
     # 默认路径下本轮 id 走用户消息开头的【本轮】行 + CC_LARK_MESSAGE_ID env。
     base_ctx = {
         "runtime_mcp_section": runtime_mcp_section,
+        # 「运行环境约束（通用）」是 Lark / Telegram 两套模板共用的一大段，抽成
+        # partial 单独维护，避免两边各改一份漂移。
+        "runtime_env_section": render("_runtime_env", shared_ctx),
         "brand": brand,
         "cli_profile": cli_profile,
         "location_block": _build_location_block(
@@ -272,6 +334,18 @@ def render_lark_prompt(
     }
 
     role = getattr(profile, "role", None)
+    if not role and profile.is_telegram:
+        # Telegram 渠道有自己的一套"手脚"（tg-cli）和渲染限制，模板另开一份；
+        # 运行时 MCP / 运行环境约束两段仍与 Lark 共用。
+        return render("telegram", {
+            **base_ctx,
+            "tg_cli": os.path.join(os.path.dirname(PROMPTS_DIR), "tg-cli"),
+            "bot_username": bot_username or "bot",
+            "profile_name": profile.name,
+            "location_block": _build_tg_location_block(
+                raw_chat_id, thread_id, is_group, bot_username, profile.name,
+            ),
+        })
     if not role:
         return render("default", base_ctx)
 
@@ -296,6 +370,103 @@ def render_lark_prompt(
     }
     return render(role, role_ctx)
 
+
+# ── 外部群（机主个人号代答）────────────────────────────────────────
+# 与 default 模板的关键区别：说话人是**机主本人**而不是 bot，所有 lark-cli 都必须
+# `--as user`（bot 账号根本不在那个外部群里），且不注入 dispatch / 运行时 MCP
+# ——wake/dispatch 要往 bot 能看见的话题里发卡片，外部群没有这个前提。
+
+
+def _build_external_location_block(
+    chat_id: str,
+    thread_id: str,
+    group_name: str,
+    owner_name: str,
+    brand: str,
+    cli_profile: str,
+) -> str:
+    lines = [f"- 群: {group_name or '(未命名外部群)'}（chat_id: {chat_id}）"]
+    if thread_id:
+        lines.append(f"- thread_id: {thread_id}（话题群 / topic thread）")
+    lines.append(f"- 你的发言身份: **{owner_name} 本人**（user token，非 bot）")
+    lines.append(
+        "- 本轮消息 id 与提问者 open_id：见用户消息开头的【本轮 · …】行；"
+        "Bash 里也可用 `$CC_LARK_MESSAGE_ID` / `$CC_LARK_USER_ID`"
+    )
+    lines.append(f"- 场景: 外部群聊")
+    lines.append(f"- 平台: {brand}")
+    lines.append(f"- 对应 lark-cli profile: **{cli_profile}**（必须 `--as user`）")
+    return "\n".join(lines)
+
+
+def _build_external_commands(cli_profile: str, thread_id: str) -> dict:
+    reply_flag = "--reply-in-thread " if thread_id else ""
+    profile_flag = f"--profile {cli_profile} "
+    anchor = '"$CC_LARK_MESSAGE_ID"'
+    return {
+        "reply_cmd_image": (
+            f"cd <文件所在目录> && lark-cli {profile_flag}im +messages-reply --as user "
+            f"--message-id {anchor} {reply_flag}--image <相对路径>"
+        ),
+        "reply_cmd_file": (
+            f"cd <文件所在目录> && lark-cli {profile_flag}im +messages-reply --as user "
+            f"--message-id {anchor} {reply_flag}--file <相对路径>"
+        ),
+        "create_doc": (
+            f"lark-cli {profile_flag}docs +create --as user "
+            f'--title "<简短标题>" --doc-format markdown --content @<本地 .md 文件路径>'
+        ),
+    }
+
+
+# 「这条不用回」的逃生阀。只在 require_mention=False（群里任何人说话都会触发）
+# 时才给——那种场景确实需要 agent 自己判断该不该插嘴。
+# ⚠️ 默认（require_mention=True）**不给**：被 @ 了还教它可以不回，实测 agy 会
+# 对"@ 我 + 没什么正文"的消息一律吐 `-`，表现就是"艾特了没反应"。
+_SKIP_SECTION = """【什么时候干脆别回】
+本群里不是只有 @ 你才会唤醒你，所以有些消息本来就不该你接（别人之间在对话、纯寒暄、只有本人能拍板的事）。这种情况**只输出一个字符 `-`**，监听器会跳过本轮、群里一个字都不发。宁可不回，也不要替本人瞎答。
+
+"""
+
+
+def render_external_prompt(
+    profile: Profile,
+    *,
+    chat_id: str,
+    thread_id: str,
+    group_name: str,
+    owner_name: str,
+    cli_profile: str,
+    runner: str = "",
+    allow_skip: bool = False,
+) -> str:
+    """外部群代答用的 system prompt（prompts/external_user.md）。
+
+    allow_skip: 是否告诉 agent 可以用 `-` 跳过本轮。只有 require_mention=False
+    的群才该开——被 @ 了就得答，给了逃生阀反而变成"艾特没反应"。
+    """
+    backend = (runner or "claude").strip().lower()
+    timeout_ctx = _build_timeout_ctx(profile, backend)
+    shared_ctx = {
+        **timeout_ctx,
+        "ask_cmd": 'lark-cli ... im +messages-reply --as user ... --text "<问题>"',
+    }
+    ctx = {
+        **timeout_ctx,
+        "brand": profile.brand_label,
+        "owner_name": owner_name,
+        "cli_profile": cli_profile,
+        "location_block": _build_external_location_block(
+            chat_id, thread_id, group_name, owner_name, profile.brand_label, cli_profile,
+        ),
+        # 外部群不给运行时 MCP：wake/dispatch 的落点是 bot 能发卡片的话题，
+        # 这里 bot 不在群里，排了也送不到，不如明确告诉它没有。
+        "runtime_mcp_section": render("_runtime_mcp_other", shared_ctx),
+        "runtime_env_section": render("_runtime_env", shared_ctx),
+        "skip_section": _SKIP_SECTION if allow_skip else "",
+        **_build_external_commands(cli_profile, thread_id),
+    }
+    return render("external_user", ctx)
 
 # ── 自检 ───────────────────────────────────────────────────────────
 

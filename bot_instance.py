@@ -1,8 +1,10 @@
 """BotInstance：一个 profile 的运行时状态封装。
 
 每个 profile 启动后构造一个 BotInstance，持有：
-    - Lark SDK 长连接 client
-    - FeishuClient（业务包装，发消息 / 上传文件等）
+    - Lark SDK 长连接 client（Telegram profile 为 None，它走长轮询）
+    - FeishuClient（业务包装，发消息 / 上传文件等）；
+      platform=telegram 时换成 TelegramClient —— 同名方法的鸭子类型替身，
+      所以 dispatcher / commands / scheduler 一行都不用改
     - SessionStore（per-profile 持久化）
     - ActiveRunRegistry（per-chat 正在跑的 Claude run）
     - chat_locks（同一 chat 内串行，跨 chat 并行）
@@ -44,22 +46,28 @@ class BotInstance:
 
     def __init__(self, profile: Profile):
         self.profile = profile
-        self.lark_client = (
-            lark.Client.builder()
-            .app_id(profile.app_id)
-            .app_secret(profile.app_secret)
-            .domain(profile.domain)
-            .log_level(lark.LogLevel.INFO)
-            .timeout(_api_timeout())
-            .build()
-        )
-        self.feishu = FeishuClient(
-            self.lark_client,
-            app_id=profile.app_id,
-            app_secret=profile.app_secret,
-            domain=profile.domain,
-            label=profile.name,
-        )
+        if profile.is_telegram:
+            from telegram_client import TelegramClient
+
+            self.lark_client = None
+            self.feishu = TelegramClient(profile.bot_token, label=profile.name)
+        else:
+            self.lark_client = (
+                lark.Client.builder()
+                .app_id(profile.app_id)
+                .app_secret(profile.app_secret)
+                .domain(profile.domain)
+                .log_level(lark.LogLevel.INFO)
+                .timeout(_api_timeout())
+                .build()
+            )
+            self.feishu = FeishuClient(
+                self.lark_client,
+                app_id=profile.app_id,
+                app_secret=profile.app_secret,
+                domain=profile.domain,
+                label=profile.name,
+            )
         self.store = SessionStore(
             profile=profile.name,
             default_cwd=profile.default_cwd,

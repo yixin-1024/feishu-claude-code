@@ -1,4 +1,4 @@
-"""Claude / Codex / OpenCode / MiMo / Grok / Maka 后端分发入口。"""
+"""Claude / Codex / OpenCode / MiMo / Grok / Maka / agy 后端分发入口。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from opencode_runner import run_opencode
 from mimo_runner import run_mimo
 from grok_runner import run_grok
 from maka_runner import run_maka
+from agy_runner import run_agy
 
 
 async def run_agent(
@@ -141,6 +142,36 @@ async def run_agent(
             dangerously_skip_permissions=bool(profile.maka_dangerous_skip),
             idle_timeout_sec=profile.maka_idle_timeout_sec,
             extra_env=maka_env,
+        )
+
+    if backend == "agy":
+        # agy 的 MCP 子进程继承父进程 env（已实测），所以 wake_context（CC_LARK_*）
+        # 直接塞进 extra_env 就能让 cc_mcp_server 定向到本话题，不用改写配置文件。
+        agy_env = dict(wake_context or {})
+        agy_env["CC_LARK_PROFILE"] = profile.name
+        agy_env.update(resolve_cc_lark_gates(profile.name))
+        return await run_agy(
+            message=message,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            on_usage=on_usage,
+            on_status=on_status,
+            append_system_prompt=append_system_prompt,
+            agy_bin=profile.agy_bin,
+            model_provider=profile.agy_model_provider,
+            api_key=profile.agy_api_key,
+            api_key_env=profile.agy_api_key_env,
+            proxy=profile.agy_proxy,
+            print_timeout=profile.agy_print_timeout,
+            dangerously_skip_permissions=bool(profile.agy_dangerous_skip),
+            idle_timeout_sec=profile.agy_idle_timeout_sec,
+            extra_env=agy_env,
         )
 
     if backend == "codex":

@@ -67,11 +67,14 @@ class HttpHandlers:
     # async：通用多 agent 派发 / 监工（cc_mcp_server 的 dispatch_task / read_thread 后端）
     dispatch_task: Callable[..., Awaitable[dict]]
     read_thread: Callable[..., Awaitable[dict]]
+    # async：整项任务的所有权移交给新会话（cc_mcp_server 的 handover 后端）
+    handover_task: Callable[..., Awaitable[dict]]
     # async：往已有 thread 的 session 实时插话（cc_mcp_server 的 append_to_task / steer_task 后端）
     steer_thread: Callable[..., Awaitable[dict]]
     # 同步：重复定时任务（cc_mcp_server 的 schedule_cron / list_crons 后端）
     schedule_cron: Callable[..., dict]
     list_crons: Callable[..., dict]
+    cancel_wake: Optional[Callable[..., dict]] = None
 
 
 _bot_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -180,6 +183,7 @@ _AGENT_RUNNER_ALIASES = {
     "mimo": "mimo",
     "grok": "grok", "xai": "grok",
     "maka": "maka", "apache-maka": "maka",
+    "agy": "agy", "antigravity": "agy",
 }
 
 
@@ -190,7 +194,7 @@ def resolve_target_agent(
 
     解析顺序：① 精确 profile 名（区分/不区分大小写）→ ② runner 家族别名
     （gpt/codex→codex, claude→claude, gemini/opencode→opencode, mimo→mimo,
-    grok/xai→grok, maka→maka），
+    grok/xai→grok, maka→maka, agy/antigravity→agy），
     别名命中多个时优先选 != 调用方(exclude) 的那个。命中不到返回 (None, 错误说明+可选项)。
     """
     spec = (spec or "").strip()
@@ -340,8 +344,18 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             self._handle_wake(body)
             return
 
+        if parsed.path in ("/wake/cancel", "/cancel_wake"):
+            self._handle_wake_cancel(body)
+            return
+
         if parsed.path == "/dispatch":
             self._handle_dispatch(body)
+            return
+
+        # GET /handover 是 CLI session 接管（另一件事）；POST /handover_task 才是
+        # "把整项活的所有权交给新会话"。路径特意不同名，免得两者被看成同一个端点。
+        if parsed.path == "/handover_task":
+            self._handle_handover_task(body)
             return
 
         if parsed.path == "/read_thread":
@@ -576,6 +590,36 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             return
         self._mcp_respond("wake", _prof, result)
 
+    def _handle_wake_cancel(self, body: bytes):
+        """cc_mcp_server 的 cancel_wake → 取消常驻 scheduler 里挂的一次性唤醒任务。
+
+        仅本机：MCP server 跑在 bot spawn 的子进程里，必经 127.0.0.1。
+        支持按 job_id 或 thread_id 取消，同时支持按 chat_id 做安全隔离。
+        """
+        if not _is_localhost(self.client_address):
+            self._respond(403, {"ok": False, "error": "wake cancel is localhost only"})
+            return
+        try:
+            params = json.loads(body) if body else {}
+            if not isinstance(params, dict):
+                raise ValueError("body must be a JSON object")
+        except Exception as e:
+            self._respond(400, {"ok": False, "error": f"bad json: {e}"})
+            return
+        _prof = (params.get("profile") or "").strip()
+        try:
+            if not _handlers or not _handlers.cancel_wake:
+                raise RuntimeError("cancel_wake handler is not configured")
+            result = _handlers.cancel_wake(
+                job_id=(params.get("job_id") or "").strip() or None,
+                thread_id=(params.get("thread_id") or "").strip() or None,
+                chat_id=(params.get("chat_id") or "").strip() or None,
+            )
+        except Exception as e:
+            self._mcp_error("wake/cancel", _prof, e)
+            return
+        self._mcp_respond("wake/cancel", _prof, result)
+
     def _resolve_bot_by_profile(self, name: str) -> Optional[BotInstance]:
         name = (name or "").strip()
         if name and name in _bots:
@@ -589,32 +633,43 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         fut = asyncio.run_coroutine_threadsafe(coro, _bot_loop)
         return fut.result(timeout=timeout)
 
-    def _handle_dispatch(self, body: bytes):
-        """cc_mcp_server 的 dispatch_task → 在目标群新开 thread 派独立子会话。"""
+    def _resolve_dispatch_family(self, endpoint: str, body: bytes):
+        """/dispatch 与 /handover_task 的共享入口校验：本机 + JSON + profile + 目标 agent。
+
+        返回 (payload, bot, target_bot)；校验没过时**已经回过错误响应**并返回全 None。
+        """
         if not _is_localhost(self.client_address):
-            self._respond(403, {"ok": False, "error": "dispatch is localhost only"})
-            return
+            self._respond(403, {"ok": False, "error": f"{endpoint} is localhost only"})
+            return None, None, None
         try:
             p = json.loads(body) if body else {}
             if not isinstance(p, dict):
                 raise ValueError("body must be a JSON object")
         except Exception as e:
             self._respond(400, {"ok": False, "error": f"bad json: {e}"})
-            return
+            return None, None, None
         _prof = (p.get("profile") or "").strip()
         bot = self._resolve_bot_by_profile(_prof)
         if bot is None:
-            self._mcp_respond("dispatch", _prof,
+            self._mcp_respond(endpoint, _prof,
                               {"ok": False, "error": "profile 未加载（多 bot 必须指定 profile）"})
-            return
-        # 跨 agent 派发：agent 参数指定异后端目标 bot（如 "gpt"→codex）。缺省=同 bot。
+            return None, None, None
+        # 跨 agent：agent 参数指定异后端目标 bot（如 "gpt"→codex）。缺省=同 bot。
         _agent = (p.get("agent") or "").strip()
         target_bot = None
         if _agent:
             target_bot, err = resolve_target_agent(_bots, _agent, exclude=bot.profile.name)
             if target_bot is None:
-                self._mcp_respond("dispatch", _prof, {"ok": False, "error": err})
-                return
+                self._mcp_respond(endpoint, _prof, {"ok": False, "error": err})
+                return None, None, None
+        return p, bot, target_bot
+
+    def _handle_dispatch(self, body: bytes):
+        """cc_mcp_server 的 dispatch_task → 在目标群新开 thread 派独立子会话。"""
+        p, bot, target_bot = self._resolve_dispatch_family("dispatch", body)
+        if p is None:
+            return
+        _prof = (p.get("profile") or "").strip()
         try:
             result = self._run_on_loop(
                 _handlers.dispatch_task(
@@ -637,6 +692,44 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             self._mcp_error("dispatch", _prof, e)
             return
         self._mcp_respond("dispatch", _prof, result)
+
+    def _handle_handover_task(self, body: bytes):
+        """cc_mcp_server 的 handover → 把整项任务的所有权交给新话题的新会话。
+
+        与 /dispatch 的唯一实质差别：**不带父上下文**（不回报、不批次唤醒），且要求
+        一份结构化简报（brief）。移交方调完就该收工。
+        """
+        p, bot, target_bot = self._resolve_dispatch_family("handover", body)
+        if p is None:
+            return
+        _prof = (p.get("profile") or "").strip()
+        brief = p.get("brief")
+        if not isinstance(brief, dict):
+            self._mcp_respond("handover", _prof, {
+                "ok": False,
+                "error": "brief 必须是对象（goal / completed / remaining 必填，notes / files 选填）",
+            })
+            return
+        try:
+            result = self._run_on_loop(
+                _handlers.handover_task(
+                    bot,
+                    user_id=(p.get("user_id") or "").strip(),
+                    group_chat_id=(p.get("chat_id") or p.get("group_chat_id") or "").strip(),
+                    brief=brief,
+                    title=(p.get("title") or "").strip(),
+                    target_bot=target_bot,
+                    model=(p.get("model") or "").strip(),
+                    effort=(p.get("effort") or "").strip(),
+                    from_thread=(p.get("from_thread") or "").strip(),
+                    from_anchor=(p.get("from_anchor") or "").strip(),
+                ),
+                timeout=30,
+            )
+        except Exception as e:
+            self._mcp_error("handover", _prof, e)
+            return
+        self._mcp_respond("handover", _prof, result)
 
     def _handle_read_thread(self, body: bytes):
         """cc_mcp_server 的 read_thread → 拉回某 thread 的消息 transcript。"""

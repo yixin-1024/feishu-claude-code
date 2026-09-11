@@ -466,6 +466,48 @@ def start_codex_quota_watcher(
 
 # ── 为 profile 启动 WebSocket 客户端 ─────────────────────────
 
+def start_profile_channel(bot: BotInstance) -> None:
+    """按渠道起这个 profile 的入站通道：Lark 走 WS 长连接，Telegram 走长轮询。
+
+    两条通道最后都把事件投给同一个 `_bindings.on_lark_message`（Telegram 侧由
+    telegram_gateway 把 update 翻成 Lark 事件的形状），所以业务层无感。
+    """
+    if bot.profile.is_telegram:
+        start_profile_polling(bot)
+        return
+    start_profile_ws(bot)
+
+
+def start_profile_polling(bot: BotInstance) -> None:
+    """Telegram：getUpdates 长轮询（独立线程，异常自愈）。"""
+    if _bindings is None or _bot_loop is None:
+        raise RuntimeError("runtime not configured; call configure() first")
+    import telegram_gateway
+
+    name = bot.profile.name
+
+    def _submit(coro):
+        return asyncio.run_coroutine_threadsafe(coro, _bot_loop)
+
+    def _touch():
+        touch_event()
+        _touch_profile_event(name)
+
+    _touch_profile_event(name)
+    telegram_gateway.start_polling(
+        bot,
+        submit=_submit,
+        on_message=_bindings.on_lark_message,
+        touch=_touch,
+    )
+    hint = "" if bot.feishu.can_read_all_group_messages else (
+        "；⚠️ privacy mode 开着，群里只能收到「@ 到 bot / 回复 bot / 斜杠命令」"
+        "（BotFather → /setprivacy → Disable 才能读全群上下文）"
+    )
+    log(name, "tg", "info",
+        f"Telegram 长轮询已启动 (@{bot.feishu.bot_username or '?'}){hint}")
+
+
 def start_profile_ws(bot: BotInstance) -> None:
     """为一个 profile 启动独立 WS 客户端（跑在单独线程，监督式自愈）。
 
@@ -501,6 +543,10 @@ def start_profile_ws(bot: BotInstance) -> None:
             .register_p2_im_message_receive_v1(_on_message)
             .register_p2_card_action_trigger(_on_card)
             .register_p2_im_message_message_read_v1(lambda _e: None)
+            # 表情回应事件没人消费，但应用订阅了它 → SDK 每条都刷一行 ERROR "processor not found"
+            # （36 小时 342 条，占日志 ERROR 七成，真错误被淹没）。注册 no-op 吞掉。
+            .register_p2_im_message_reaction_created_v1(lambda _e: None)
+            .register_p2_im_message_reaction_deleted_v1(lambda _e: None)
             .build()
         )
         return lark.ws.Client(

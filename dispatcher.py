@@ -24,7 +24,13 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger, P2CardActionTriggerResponse, CallBackToast,
 )
 
-from bot_config import Profile, normalize_effort, normalize_model
+from bot_config import (
+    Profile,
+    is_model_compatible_with_runner,
+    normalize_effort,
+    normalize_model,
+    normalize_model_for_runner,
+)
 from bot_instance import BotInstance
 from card_security import (
     card_action_allowed,
@@ -43,6 +49,9 @@ from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_
 from lark_prompts import render_lark_prompt
 from passthrough import is_builtin_passthrough
 from log_util import log
+import handover_store
+import resume_store
+import task_routes
 from run_control import RUN_GATE, ActiveRun, stop_run
 from thread_context import build_thread_context
 from trinity_dispatch import maybe_handle_trinity, TrinityContext
@@ -189,15 +198,58 @@ async def _handle_stop_command(bot: BotInstance, sender_open_id: str, chat_id: s
     return "已发送停止请求"
 
 
+_RESTART_MSG = "♻️ cc-lark 服务正在重启 — 本次任务被中断，~5s 后再发一遍。"
+_RESTART_RESUME_MSG = (
+    "♻️ cc-lark 服务正在重启 — 本次任务被中断，"
+    "服务起来后我会自动接着跑，不用再发一遍。"
+)
+
+
+def _restart_tail(run) -> str:
+    """重启中断卡末尾那句话：开了自动续跑就别再叫用户手动重发。"""
+    if resume_store.enabled() and getattr(run, "resume_key", ""):
+        return "♻️ 服务起来后我会自动接着跑（约 20-30s），不用再发一遍。"
+    return "~5s 后再发一遍。"
+
+
+def _restart_card_content(run) -> str:
+    """重启中断卡：保留中断前流式渲染出的进度，只在末尾追加重启说明。
+
+    与 /stop（_announce_stopped_run）和报错路径的"保留旧内容 + 追加"一致——
+    整卡覆盖成一句"正在重启"会把用户已经看到的工具轨迹和半截回答全部抹掉。
+    """
+    body = (getattr(run, "last_body", "") or "").strip()
+    if body and body != "⏳ 思考中...":
+        return (
+            f"{body}\n\n---\n\n"
+            "♻️ **cc-lark 服务正在重启，本次任务被中断**（以上为中断前的进度）\n\n"
+            f"{_restart_tail(run)}"
+        )
+    return (
+        _RESTART_RESUME_MSG
+        if resume_store.enabled() and getattr(run, "resume_key", "")
+        else _RESTART_MSG
+    )
+
+
 async def _handle_restart_command(originating_bot: BotInstance) -> int:
     """
     /restart：跨所有 bot 对每个 active run 调 stop_run（terminate PTY → 等子
     进程退出 → on_stopped 改卡片），保证我们的"♻️ 重启"中断消息不被并发的
     push() 流回覆盖。返回受影响数量。调用方负责回 ack + 触发 detach。
     """
-    RESTART_MSG = "♻️ cc-lark 服务正在重启 — 本次任务被中断，~5s 后再发一遍。"
 
     async def _stop_one(b: BotInstance, prof_name: str, run):
+        # 必须在 stop_run 之前打标：stop_run 会杀掉 runner，run 的 finally 随即
+        # 跑到 _drop_resume——keep_resume 晚一步置位，记录就已经被删了。
+        # 还没进 _execute_run（= 没有 resume_key）的是排队中被掐掉的，一行都没跑过，
+        # 续跑时该"从头执行"而不是"接着上一步"。
+        _record_resume(
+            b, run,
+            reason="restart" if getattr(run, "resume_key", "") else "queued",
+            interrupted=True,
+        )
+
         async def _announce(r):
             if not r.card_msg_id:
                 return
@@ -209,7 +261,7 @@ async def _handle_restart_command(originating_bot: BotInstance) -> int:
             try:
                 try:
                     await asyncio.wait_for(
-                        b.feishu.update_card(r.card_msg_id, RESTART_MSG),
+                        b.feishu.update_card(r.card_msg_id, _restart_card_content(r)),
                         timeout=1.5,
                     )
                 except Exception as e:
@@ -339,10 +391,13 @@ async def _handle_restart_request(
             raise
 
     affected = _active_run_count()
-    task_note = (
-        f"正在中断 {affected} 个未完成任务"
-        if affected else "当前没有未完成任务"
-    )
+    if affected:
+        task_note = f"正在中断 {affected} 个未完成任务"
+        if resume_store.enabled():
+            # 用户最烦的就是重启完还得回来把指令再发一遍 —— 明确告诉他不用。
+            task_note += "（服务起来后会自动接着跑，不用重发）"
+    else:
+        task_note = "当前没有未完成任务"
     await _restart_step(
         _send_restart_notice(
             bot, user_id, is_group, message_id,
@@ -653,15 +708,36 @@ _SAFEGUARDS_RESUME_NUDGE_WRITE = (
 # ── 每轮用户消息开头的【本轮】行 ─────────────────────────────
 # 本轮消息 id / 提问者不再写进 system prompt（会打断 prompt cache，见
 # lark_prompts._build_lark_commands），改为放在用户消息最前面一行 + CC_LARK_* env。
-def _turn_header(message_id: str, asker_open_id: str) -> str:
+def _turn_header(message_id: str, asker_open_id: str, thread_id: str = "") -> str:
     parts = []
     if message_id:
         parts.append(f"消息 id: {message_id}")
     if asker_open_id:
         parts.append(f"提问者 open_id: {asker_open_id}")
-    if not parts:
-        return ""
-    return "【本轮 · " + " · ".join(parts) + "】\n\n"
+    header = ""
+    if parts:
+        header = "【本轮 · " + " · ".join(parts) + "】\n\n"
+
+    if thread_id:
+        try:
+            import scheduler
+            wakes = scheduler.get_pending_wakes_for_thread(thread_id)
+            if wakes:
+                wake_descs = []
+                for w in wakes:
+                    fire_at = w.get("fire_at", "")
+                    time_str = fire_at[11:16] if len(fire_at) >= 16 else fire_at
+                    note = (w.get("note") or "").strip()
+                    wake_descs.append(f"原定 {time_str} 唤醒（note: {note!r}）")
+                header += (
+                    "【⏰ 待办唤醒提醒】当前话题存在未触发的排定唤醒："
+                    + "；".join(wake_descs)
+                    + "。如果本次用户交互已覆盖该待办或不再需要唤醒，请主动调用 `cancel_wake` 取消它，避免后续重复唤醒。\n\n"
+                )
+        except Exception:
+            pass
+
+    return header
 
 
 # ── Claude Max 用量墙：一次性紧急切账户 + resume 续跑 + 配额恢复自动唤醒 ──
@@ -675,6 +751,21 @@ _RATE_LIMIT_MARKERS = (
     "用量已达上限", "hit your session limit", "hit your weekly limit",
     "hit your limit", "usage limit reached",
 )
+# ── 凭证失效（token 被另一台机器刷新顶掉 / 被吊销）→ 复用同一套紧急切账户 ──
+# 本机 Mac 与财务机 spx-pay 共用同一批订阅号，OAuth 是 rolling refresh token：
+# 谁刷新，对方手上那份当场作废，之后 refresh 报 400 "Refresh token not found or
+# invalid"、请求报 401。这类 auth 死法**不带任何用量墙文案**，所以原来完全不触发
+# 切换、一轮直接 ❌（2026-09-09 财务机真炸过一次）。开关 ACCOUNT_SWITCH_ON_AUTH_FAIL。
+_AUTH_FAIL_MARKERS = (
+    "refresh token not found or invalid", "oauth token revoked",
+    "invalid bearer token", "authentication_error", "authentication failed",
+    "invalid api key", "invalid_api_key", "please run /login",
+)
+# 凭证被 env 钉死时（setup-token CLAUDE_CODE_OAUTH_TOKEN / 三方中转 ANTHROPIC_*），
+# 它优先级高于 ~/.claude 的凭证 —— 账户池被架空，切了也白切，直接别切。
+_ACCOUNT_POOL_PINNING_ENVS = (
+    "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+)
 _LIMIT_RESUME_NUDGE = (
     "继续。上一轮因 Claude Max 用量墙中断，已自动切换账户接管本会话；"
     "请基于已经完成的工作继续任务并给出最终回复，"
@@ -682,6 +773,17 @@ _LIMIT_RESUME_NUDGE = (
 )
 _LIMIT_RESUME_NUDGE_WRITE = (
     "继续。上一轮因 Claude Max 用量墙中断，已自动切换账户接管本会话。"
+    "本轮涉及写操作 / 外部接口调用：请先核实上一轮最后一步是否已经生效"
+    "（查库 / 查接口返回 / 看已有记录），已经生效的绝对不要重复执行，"
+    "只补做剩下的步骤，然后给出最终回复。"
+)
+_AUTH_RESUME_NUDGE = (
+    "继续。上一轮因当前账户凭证失效中断，已自动切换到另一个账户接管本会话；"
+    "请基于已经完成的工作继续任务并给出最终回复，"
+    "不要重复执行上一轮已经做过的写操作 / 命令 / 文件改动。"
+)
+_AUTH_RESUME_NUDGE_WRITE = (
+    "继续。上一轮因当前账户凭证失效中断，已自动切换到另一个账户接管本会话。"
     "本轮涉及写操作 / 外部接口调用：请先核实上一轮最后一步是否已经生效"
     "（查库 / 查接口返回 / 看已有记录），已经生效的绝对不要重复执行，"
     "只补做剩下的步骤，然后给出最终回复。"
@@ -701,6 +803,21 @@ def _is_rate_limit_error(exc: Optional[BaseException]) -> bool:
         return False
     low = str(exc).lower()
     return any(m.lower() in low for m in _RATE_LIMIT_MARKERS)
+
+
+def _is_auth_failure_error(exc: Optional[BaseException]) -> bool:
+    """错误是否为「当前账户凭证已失效」（换个账户就能继续，跟额度无关）。"""
+    if exc is None:
+        return False
+    low = str(exc).lower()
+    return any(m in low for m in _AUTH_FAIL_MARKERS)
+
+
+def _account_pool_pinned(bot=None) -> bool:
+    """凭证是否被 env / profile 的 claude_env_file 钉死（钉死则账户池不生效）。"""
+    if any((os.environ.get(k) or "").strip() for k in _ACCOUNT_POOL_PINNING_ENVS):
+        return True
+    return bool((getattr(getattr(bot, "profile", None), "claude_env_file", "") or "").strip())
 
 
 def _limit_detail(exc: BaseException) -> str:
@@ -1101,6 +1218,57 @@ async def _abandon_queued_run(
             active_run.card_update_lock.release()
 
 
+def _record_resume(
+    bot: BotInstance, active_run: ActiveRun, *,
+    reason: str = "", interrupted: bool = False,
+) -> str:
+    """给一个 run 落 / 更新一条续跑记录（见 resume_store）。
+
+    interrupted=True 时同时打断点标记 + 把中断前卡片上的进度存下来，并置
+    keep_resume 让 run 的 finally 别把记录删掉（留给下一个进程续跑）。
+    整个函数 best-effort：续跑是增强能力，绝不能反过来把正常 run 弄挂。
+    """
+    try:
+        key = resume_store.record(
+            profile=bot.profile.name,
+            user_id=getattr(active_run, "user_id", ""),
+            chat_id=getattr(active_run, "chat_id", ""),
+            is_group=bool(getattr(active_run, "is_group", False)),
+            thread_id=getattr(active_run, "thread_id", ""),
+            anchor=getattr(active_run, "anchor_msg_id", ""),
+            card_msg_id=getattr(active_run, "card_msg_id", ""),
+            prompt=getattr(active_run, "prompt", ""),
+            reason=reason,
+        )
+        active_run.resume_key = key
+        if key and interrupted:
+            active_run.keep_resume = True
+            resume_store.mark_interrupted(
+                key, reason=reason or "crash",
+                progress=getattr(active_run, "last_body", ""),
+            )
+        return key
+    except Exception as e:  # noqa: BLE001
+        log(bot.profile.name, "resume", "warn",
+            f"落盘续跑记录失败: {type(e).__name__}: {e}")
+        return ""
+
+
+def _drop_resume(bot: BotInstance, active_run: ActiveRun) -> None:
+    """run 收尾（跑完 / 报错 / 被 /stop）→ 删掉续跑记录。
+
+    keep_resume=True（重启中断）时保留：磁盘上残留的记录就是"上个进程没跑完"的
+    唯一凭据，删了就等于放弃续跑。
+    """
+    if not getattr(active_run, "resume_key", "") or getattr(active_run, "keep_resume", False):
+        return
+    try:
+        resume_store.drop(active_run.resume_key)
+    except Exception as e:  # noqa: BLE001
+        log(bot.profile.name, "resume", "warn",
+            f"清理续跑记录失败: {type(e).__name__}: {e}")
+
+
 async def _run_and_display(
     bot: BotInstance,
     user_id: str, chat_id: str, is_group: bool,
@@ -1130,6 +1298,11 @@ async def _run_and_display(
         return
 
     active_run = bot.active_runs.start_run(user_id, chat_id, card_msg_id)
+    # 重启续跑要的原始上下文挂在 run 上：/restart 广播时只拿得到 ActiveRun。
+    active_run.prompt = text
+    active_run.anchor_msg_id = notify_msg_id or ""
+    active_run.is_group = is_group
+    active_run.thread_id = chat_id.partition(":")[2] if is_group else ""
 
     def _gate_aborted() -> bool:
         return bool(active_run.stop_requested) or _restart_committed
@@ -1143,6 +1316,10 @@ async def _run_and_display(
     if gate_state != "ok":
         log(bot.profile.name, "gate", "info",
             f"排队结束但未执行（{gate_state}） chat={chat_id[:24]}")
+        # 排队中被重启掐掉的任务一行都没跑过，但用户的指令同样丢了 —— 也落一条
+        # 续跑记录（reason=queued，续跑 prompt 是"从头执行"而不是"接着做"）。
+        if gate_state == "aborted" and _restart_committed and not active_run.stop_requested:
+            _record_resume(bot, active_run, reason="queued", interrupted=True)
         await _abandon_queued_run(bot, active_run, card_msg_id, gate_state)
         bot.active_runs.clear_run(user_id, chat_id, active_run)
         return None
@@ -1177,6 +1354,10 @@ async def _execute_run(
         # runs are drained. Re-check it after every potentially slow Lark request
         # so an old run cannot append a success/error notification after restart.
         return active_run.stop_requested or _restart_committed
+
+    # 开跑即落一条续跑记录：跑完在 finally 删掉，所以磁盘上残留的记录 == 上个
+    # 进程没跑完就没了（/restart、崩溃、机器重启），下次启动照着它自动续跑。
+    _record_resume(bot, active_run)
 
     # cc-lark MCP 的会话上下文。透传给 run_agent → claude 的 extra_env，MCP
     # server 用这些默认值把 send_text / schedule_wakeup 定向到当前 Lark 话题。
@@ -1223,6 +1404,8 @@ async def _execute_run(
 
     accumulated = ""
     tool_history: list[str] = []
+    # 与 tool_history 一一对应的 (工具名, 入参标识)，用于判断覆盖还是新起一行
+    tool_idents: list[tuple[str, str]] = []
     ask_options: list[tuple[str, str]] = []
     plan_exited = False
     final_usage: dict = {}
@@ -1238,7 +1421,8 @@ async def _execute_run(
     # 一路刷到 12 分钟且始终停在流式帧（无终态、无 ✅），/stop 才解开。cancel 路径看不
     # 出问题，所以这里加一道与取消无关的闸门：收尾一开始就置位，心跳自己退出。
     run_finished = False
-    current_tool: tuple[str, float] | None = None
+    # (工具名, 主参数短文本, 起始时间)——footer 显示「正在跑什么」
+    current_tool: tuple[str, str, float] | None = None
     pty_warning: tuple[str, float] | None = None  # (label, since_ts) — PTY 抓到的 API 限流/过载提示
 
     def _fmt_duration(seconds: float) -> str:
@@ -1292,7 +1476,7 @@ async def _execute_run(
     def _build_display() -> str:
         parts = []
         if tool_history:
-            parts.append("\n".join(tool_history[-5:]))
+            parts.append("\n".join(tool_history[-_TOOL_HISTORY_SHOWN:]))
         if accumulated:
             if parts:
                 parts.append("")
@@ -1309,8 +1493,9 @@ async def _execute_run(
         now = time.time()
         footer = [f"⏱ {_fmt_duration(now - start_ts)}"]
         if current_tool:
-            tname, t_started = current_tool
-            footer.append(f"🔧 {tname} {_fmt_duration(now - t_started)}")
+            tname, targ, t_started = current_tool
+            label = f"{tname} {targ}" if targ else tname
+            footer.append(f"🔧 {label} {_fmt_duration(now - t_started)}")
         idle = now - last_output_ts
         if idle >= 30:
             if (session.runner or "").strip().lower() in _NON_STREAMING_RUNNERS:
@@ -1354,11 +1539,18 @@ async def _execute_run(
                 await push(_build_display())
                 return
         tool_line = _format_tool(name, inp)
-        if inp and tool_history:
+        # 同一个工具的后续状态（先报名字后补入参 / 开始→完成）覆盖上一行；
+        # 换了工具或换了入参就新起一行——否则卡片上永远只剩一条记录。
+        ident = _tool_identity(name, inp)
+        if tool_idents and tool_idents[-1][0] == (name or "").lower() and (
+            not tool_idents[-1][1] or tool_idents[-1][1] == ident
+        ):
             tool_history[-1] = tool_line
+            tool_idents[-1] = ((name or "").lower(), ident)
         else:
             tool_history.append(tool_line)
-        current_tool = (name, time.time())
+            tool_idents.append(((name or "").lower(), ident))
+        current_tool = (name, _short_arg(_tool_primary_arg(inp), 36), time.time())
         last_output_ts = time.time()
         await push(_build_display())
         last_push_time = time.time()
@@ -1411,7 +1603,7 @@ async def _execute_run(
     heartbeat_task = asyncio.create_task(_heartbeat())
 
     # 本轮消息 id / 提问者写在用户消息最前面（system prompt 里不放每轮都变的字段）
-    claude_msg = _turn_header(notify_msg_id, user_id) + text
+    claude_msg = _turn_header(notify_msg_id, user_id, thread_id=thread_id) + text
     # 外层 try/finally 让 active_run 的生命周期对齐 lock —— 后处理（卡片 patch、发✅、
     # 写 session）期间 lock 仍然 held，active_run 也必须仍可被 /stop 找到，否则会出现
     # "队列说在跑、/stop 说没在跑" 的死区。
@@ -1430,6 +1622,7 @@ async def _execute_run(
         stall_count = 0
         safeguards_switched = False
         limit_switched = False          # 用量墙紧急切账户，一轮只切一次
+        auth_switched = False           # 凭证失效紧急切账户，一轮只切一次
         limit_info: dict = {}           # 切换探测结果（含当前账户 5h 重置时刻）
         codex_model_switched = False    # codex 模型被拒 → fallback，一轮只换一次
         last_exc: Optional[Exception] = None
@@ -1441,13 +1634,14 @@ async def _execute_run(
         try:
             while True:
                 try:
+                    # 一轮只写一行（以前"开始调用..."和"开始调用 runner=..."各写一行，纯重复）
                     if retry_count == 0:
-                        log(bot.profile.name, "agent", "info", "开始调用...")
+                        log(bot.profile.name, "agent", "info",
+                            f"开始调用 runner={session.runner} model={session.model}")
                     else:
                         log(bot.profile.name, "agent", "info",
-                            f"重试调用 ({retry_count}/{_AUTO_RETRY_MAX})...")
-                    log(bot.profile.name, "agent", "info",
-                        f"开始调用 runner={session.runner} model={session.model}")
+                            f"重试调用 ({retry_count}/{_AUTO_RETRY_MAX}) "
+                            f"runner={session.runner} model={session.model}")
                     full_text, new_session_id, used_fresh_session_fallback = await run_agent(
                         profile=bot.profile,
                         runner=session.runner,
@@ -1568,14 +1762,28 @@ async def _execute_run(
 
                     # ── Claude Max 用量墙 → 紧急切账户 + resume 续跑 ──
                     is_rate_limit = _is_rate_limit_error(e)
+                    is_auth_fail = (
+                        not is_rate_limit
+                        and _is_auth_failure_error(e)
+                        and not _account_pool_pinned(bot)
+                    )
                     if (
-                        is_rate_limit
-                        and not limit_switched
+                        (
+                            (is_rate_limit and not limit_switched
+                             and _env_flag("ACCOUNT_SWITCH_ON_LIMIT"))
+                            or (is_auth_fail and not auth_switched
+                                and _env_flag("ACCOUNT_SWITCH_ON_AUTH_FAIL"))
+                        )
                         and (session.runner or "claude").lower() == "claude"
-                        and _env_flag("ACCOUNT_SWITCH_ON_LIMIT")
                     ):
-                        limit_switched = True
-                        await push("🔁 撞到 Claude Max 用量墙，正在探测其他账户额度…")
+                        if is_rate_limit:
+                            limit_switched = True
+                        else:
+                            auth_switched = True
+                        await push(
+                            "🔁 撞到 Claude Max 用量墙，正在探测其他账户额度…" if is_rate_limit
+                            else "🔁 当前账户凭证已失效（token 被顶掉 / 吊销），正在探测其他账户…"
+                        )
                         try:
                             limit_info = await asyncio.to_thread(_emergency_account_switch)
                         except Exception as sw_err:  # noqa: BLE001
@@ -1585,20 +1793,32 @@ async def _execute_run(
                         if target:
                             if resumable:
                                 session.session_id = resumable
-                                claude_msg = (
-                                    _LIMIT_RESUME_NUDGE_WRITE if blacklisted
-                                    else _LIMIT_RESUME_NUDGE
-                                )
+                                if is_rate_limit:
+                                    claude_msg = (
+                                        _LIMIT_RESUME_NUDGE_WRITE if blacklisted
+                                        else _LIMIT_RESUME_NUDGE
+                                    )
+                                else:
+                                    claude_msg = (
+                                        _AUTH_RESUME_NUDGE_WRITE if blacklisted
+                                        else _AUTH_RESUME_NUDGE
+                                    )
                             else:
-                                claude_msg = _turn_header(notify_msg_id, user_id) + text
-                            log(bot.profile.name, "limit", "warn",
-                                f"用量墙：账户 {limit_info.get('from') or '?'} → {target}"
+                                claude_msg = _turn_header(notify_msg_id, user_id, thread_id=thread_id) + text
+                            log(bot.profile.name, "limit" if is_rate_limit else "auth", "warn",
+                                f"{'用量墙' if is_rate_limit else '凭证失效'}："
+                                f"账户 {limit_info.get('from') or '?'} → {target}"
                                 f"（{limit_info.get('reason')}），续跑 "
                                 f"session={(resumable or 'fresh')[:8]} write_op={blacklisted}")
                             notice = (
                                 f"🔁 账户 `{limit_info.get('from') or '?'}` 撞到 Claude Max 用量墙"
                                 f"（{_limit_detail(e)}），已自动切到 `{target}`"
                                 f"（{limit_info.get('reason')}）并续跑本任务。"
+                                if is_rate_limit else
+                                f"🔁 账户 `{limit_info.get('from') or '?'}` 凭证已失效"
+                                f"（{_format_run_error(e)[:120]}），已自动切到 `{target}`"
+                                f"（{limit_info.get('reason')}）并续跑本任务。"
+                                "\n凭证是两台机器共用同一批订阅号被顶掉的，跑 `~/bin/cc-acct-sync` 可把死掉那份补回来。"
                             )
                             accumulated = ""
                             await push(f"🔄 {notice}")
@@ -1618,8 +1838,9 @@ async def _execute_run(
                             pty_warning = None
                             heartbeat_task = asyncio.create_task(_heartbeat())
                             continue
-                        log(bot.profile.name, "limit", "warn",
-                            f"用量墙但无法切换账户：{limit_info.get('reason') or '未知'}")
+                        log(bot.profile.name, "limit" if is_rate_limit else "auth", "warn",
+                            f"{'用量墙' if is_rate_limit else '凭证失效'}但无法切换账户："
+                            f"{limit_info.get('reason') or '未知'}")
 
                     # ── codex：模型被当前账户拒绝 → 换 fallback 模型原样重发 ──
                     if (
@@ -1633,7 +1854,7 @@ async def _execute_run(
                             old_model = session.model
                             session.model = fallback
                             # 请求在第一步就被拒、什么都没做：原样重发（沿用 session）
-                            claude_msg = _turn_header(notify_msg_id, user_id) + text
+                            claude_msg = _turn_header(notify_msg_id, user_id, thread_id=thread_id) + text
                             log(bot.profile.name, "codex", "warn",
                                 f"模型 {old_model} 被拒（{str(e)[:120]}），本轮改用 {fallback} 重发")
                             notice = (
@@ -1785,6 +2006,12 @@ async def _execute_run(
             )
             if resumable_sid:
                 err_brief += "\n\n💾 上下文已保留，配额恢复后发『继续』即可接着上次进度跑。"
+            if _is_auth_failure_error(last_exc) and not _account_pool_pinned(bot):
+                err_brief += (
+                    "\n\n🔑 这是**凭证失效**（不是额度）：两台机器共用同一批订阅号，"
+                    "谁刷新对方那份就作废。跑 `~/bin/cc-acct-sync`（skill `claude-account-sync`）"
+                    "把活的那份同步回来，或换一个账户再重试。"
+                )
             if _is_rate_limit_error(last_exc):
                 wake_line = await _schedule_limit_wake(
                     bot, raw_chat_id, thread_id, notify_msg_id, user_id,
@@ -1796,7 +2023,7 @@ async def _execute_run(
             # 不能整卡覆盖成错误信息——保留旧内容，把错误追加在末尾。
             partial_parts = []
             if tool_history:
-                partial_parts.append("\n".join(tool_history[-5:]))
+                partial_parts.append("\n".join(tool_history[-_TOOL_HISTORY_SHOWN:]))
             if accumulated:
                 d = accumulated
                 if len(d) > _MAX_STREAM_DISPLAY:
@@ -1960,6 +2187,7 @@ async def _execute_run(
         # interactive 卡"初始快照"限制，本来也拿不到子的最终答案文本）。错误路径上面已 return（→None）。
         return full_text
     finally:
+        _drop_resume(bot, active_run)
         bot.active_runs.clear_run(user_id, chat_id, active_run)
 
 
@@ -2054,6 +2282,11 @@ async def _process_message(
                 f"[用户发送了文件：{file_name}，本地路径：{fpath}。"
                 f"请根据需要读取该文件并分析，用中文回复。]"
             )
+            # Telegram 的文件/视频可以带一句说明（caption），Lark 的 file 消息没有
+            # 这个字段，所以这里读到就带上、读不到就照旧。
+            caption = (content_obj.get("caption") or "").strip()
+            if caption:
+                text += f"\n用户对这个文件的说明：{caption}"
             preview_text = f"[文件 {file_name}]"
         except Exception as e:
             log(tag, "file", "error", f"下载文件失败: {e}")
@@ -2266,6 +2499,7 @@ async def _process_message(
     lark_sys = build_lark_system_prompt(
         bot.profile, raw_chat_id, thread_id, msg.message_id, is_group,
         asker_open_id=user_id, trinity_ctx=trinity_ctx, runner=session.runner,
+        bot_username=getattr(bot.feishu, "bot_username", ""),
     )
 
     await _run_and_display(
@@ -2296,9 +2530,11 @@ def build_lark_system_prompt(
     asker_open_id: str = "",
     trinity_ctx: Optional[TrinityContext] = None,
     runner: str = "",
+    bot_username: str = "",
 ) -> str:
-    """构造注入到 Claude 的 Lark 语境系统提示。模板见 prompts/。
-    runner 决定运行时 MCP 段落的注入版本（非 claude 后端没有那些工具）。"""
+    """构造注入到 Claude 的 Lark / Telegram 语境系统提示。模板见 prompts/。
+    runner 决定运行时 MCP 段落的注入版本（非 claude 后端没有那些工具）。
+    bot_username 只有 Telegram 渠道用（"怎样算 @ 到我"要写进提示里）。"""
     ticket_state = trinity_ctx.new_state.value if trinity_ctx else None
     ticket_id = trinity_ctx.ticket.ticket_id if trinity_ctx else ""
     ticket_history = trinity_ctx.history_text if trinity_ctx else ""
@@ -2313,6 +2549,7 @@ def build_lark_system_prompt(
         ticket_id=ticket_id,
         ticket_history=ticket_history,
         runner=runner,
+        bot_username=bot_username,
     )
 
 
@@ -2338,7 +2575,13 @@ def _format_usage_footer(usage: dict, model: str) -> str:
             return f"{s}k"
         return str(n)
 
-    return f"— 📊 上下文 {fmt(total_context)} / {fmt(window)} ({pct:.1f}%)"
+    line = f"— 📊 上下文 {fmt(total_context)} / {fmt(window)} ({pct:.1f}%)"
+    # 有些后端（agy）一轮里会为每次工具调用重新发一次完整请求，累计消耗远大于
+    # 上下文占用。两个数分开显示：百分比只反映上下文，本轮总消耗单独挂后面。
+    turn_tokens = int(usage.get("_turn_tokens") or 0)
+    if turn_tokens > total_context:
+        line += f" · 本轮消耗 {fmt(turn_tokens)}"
+    return line
 
 
 def _split_process_and_result(accumulated: str, result: str) -> tuple[str, str]:
@@ -2431,37 +2674,144 @@ def _extract_options(text: str) -> list[tuple[str, str]]:
     return []
 
 
+# 卡片上工具轨迹保留几条。5 条太少——一轮里 agent 常连着跑十来个命令，
+# 用户回看时只剩最后几个就等于看不见过程。
+_TOOL_HISTORY_SHOWN = 10
+
+# 各后端"主参数"的字段名（Claude / agy / 常见变体混在一起按优先级取第一个命中）。
+# 通用兜底靠它把 `⚙️ some_tool` 变成 `⚙️ some_tool `真实入参``。
+_TOOL_PRIMARY_KEYS = (
+    "command", "CommandLine",                    # shell
+    "file_path", "path", "AbsolutePath", "TargetFile", "target_file", "notebook_path",
+    "pattern", "Pattern", "query", "Query",      # 搜索
+    "DirectoryPath", "SearchDirectory", "SearchPath",
+    "url", "Url", "description", "prompt", "tool_name", "name",
+)
+
+
+def _short_arg(value: object, limit: int = 96) -> str:
+    """把入参压成一行短文本：家目录换 ~、去掉换行、超长中间省略。"""
+    text = str(value or "").replace("\n", " ").strip()
+    if not text:
+        return ""
+    home = os.path.expanduser("~")
+    if text.startswith(home):
+        text = "~" + text[len(home):]
+    if len(text) > limit:
+        head = text[: limit - 24]
+        text = f"{head}…{text[-20:]}"
+    return text
+
+
+def _tool_primary_arg(inp: dict) -> str:
+    """按 _TOOL_PRIMARY_KEYS 优先级取一个能说明"在干什么"的入参。"""
+    if not isinstance(inp, dict):
+        return ""
+    for key in _TOOL_PRIMARY_KEYS:
+        if key in inp and isinstance(inp[key], (str, int, float)) and str(inp[key]).strip():
+            return _short_arg(inp[key])
+    # 没命中已知字段名时，退而取第一个非空短字符串（未知后端的新工具也能有内容）。
+    # 跳过 _ 开头的键——那是 runner 塞进来的内部标记（如 _agy_state），
+    # 不能进 identity，否则 ACTIVE→DONE 会被当成两个不同的工具各占一行。
+    for key, val in inp.items():
+        if key.startswith("_"):
+            continue
+        if isinstance(val, str) and val.strip():
+            return _short_arg(val)
+    return ""
+
+
+def _pick(inp: dict, *keys: str) -> str:
+    """按 keys 优先级取入参；都没命中就回落到通用主参数。
+
+    各后端字段名不统一（Claude=file_path、agy=AbsolutePath/TargetFile、
+    grok=target_file、opencode/mimo 把入参压成一个 command 字符串），
+    这里统一兜住，卡片上就不会出现「读取：``」这种空壳。
+    """
+    for key in keys:
+        val = inp.get(key)
+        if isinstance(val, (str, int, float)) and str(val).strip():
+            return _short_arg(val)
+    return _tool_primary_arg(inp)
+
+
+def _tool_identity(name: str, inp: dict) -> str:
+    """同一工具名下"这次调用"的标识（= 主参数），空串表示"还没拿到入参"。
+
+    调用方拿它判断新事件是"同一个工具的后续状态"（覆盖上一行）还是
+    "下一个工具/下一条命令"（新起一行）：名字相同 且（上一条没入参 或
+    入参一致）→ 覆盖。
+
+    ⚠️ 这是 2026-09-03 修掉的一个真 bug：老逻辑是 `if inp and tool_history:
+    tool_history[-1] = tool_line`，只对"先报名字(inp 空)再补入参"的 Claude 有效；
+    agy / 任何一次就带全参数上报的后端，每个新工具都会覆盖掉上一行，
+    卡片上永远只剩一条工具记录。name 只为可读性保留，不参与标识。
+    """
+    del name
+    return _tool_primary_arg(inp)
+
+
 def _format_tool(name: str, inp: dict) -> str:
-    n = name.lower()
-    if n == "bash":
-        cmd = inp.get("command", "")
-        if len(cmd) > 80:
-            cmd = cmd[:77] + "..."
+    n = (name or "").lower()
+    inp = inp if isinstance(inp, dict) else {}
+    # 完成态两个来源：agy_runner 塞的 _agy_state（DONE/ERROR），
+    # 以及 codex/opencode/mimo 自带的 status（in_progress/completed/error）。
+    agy_state = str(inp.get("_agy_state") or "").upper()
+    status = str(inp.get("status") or "").lower()
+
+    def mark(running: str) -> str:
+        if agy_state == "DONE" or status == "completed":
+            return "✅"
+        if agy_state == "ERROR" or status in ("error", "failed"):
+            return "❌"
+        return running
+
+    if n in ("bash", "run_command", "shell"):
+        cmd = _short_arg(inp.get("command") or inp.get("CommandLine") or "")
         status = str(inp.get("status") or "").lower()
         exit_code = inp.get("exit_code")
         if status == "completed":
             prefix = "✅" if exit_code in (0, "0", None) else "⚠️"
             suffix = "" if exit_code in (0, "0", None) else f"（exit {exit_code}）"
             return f"{prefix} **执行命令：** `{cmd}`{suffix}" if cmd else f"{prefix} **执行命令完成**{suffix}"
-        return f"🔧 **执行命令：** `{cmd}`" if cmd else f"🔧 **执行命令...**"
-    elif n in ("read_file", "read"):
-        return f"📄 **读取：** `{inp.get('file_path', inp.get('path', ''))}`"
-    elif n in ("write_file", "write"):
-        return f"✏️ **写入：** `{inp.get('file_path', inp.get('path', ''))}`"
-    elif n in ("edit_file", "edit"):
-        return f"✂️ **编辑：** `{inp.get('file_path', inp.get('path', ''))}`"
-    elif n in ("glob",):
-        return f"🔍 **搜索文件：** `{inp.get('pattern', '')}`"
-    elif n in ("grep",):
-        return f"🔎 **搜索内容：** `{inp.get('pattern', '')}`"
-    elif n == "task":
-        return f"🤖 **子任务：** {inp.get('description', inp.get('prompt', '')[:40])}"
-    elif n == "webfetch":
-        return f"🌐 **抓取网页...**"
-    elif n == "websearch":
-        return f"🔍 **搜索：** {inp.get('query', '')}"
+        cwd_hint = _short_arg(inp.get("Cwd") or "", 40)
+        tail = f"  ·  `{cwd_hint}`" if cwd_hint else ""
+        return f"{mark('🔧')} **执行命令：** `{cmd}`{tail}" if cmd else f"{mark('🔧')} **执行命令...**"
+    elif n in ("read_file", "read", "view_file", "view_code_item", "notebook_read"):
+        target = _pick(inp, "file_path", "path", "AbsolutePath", "target_file")
+        return f"{mark('📄')} **读取：** `{target}`"
+    elif n in ("write_file", "write", "write_to_file"):
+        target = _pick(inp, "file_path", "path", "TargetFile", "target_file")
+        return f"{mark('✏️')} **写入：** `{target}`"
+    elif n in ("edit_file", "edit", "replace_file_content", "multi_replace_file_content",
+               "sed_file", "notebook_edit"):
+        target = _pick(inp, "file_path", "path", "TargetFile", "target_file")
+        return f"{mark('✂️')} **编辑：** `{target}`"
+    elif n in ("glob", "find_by_name"):
+        pat = _pick(inp, "pattern", "Pattern", "SearchDirectory")
+        return f"{mark('🔍')} **搜索文件：** `{pat}`"
+    elif n in ("grep", "grep_search"):
+        pat = _pick(inp, "pattern", "Query", "query")
+        where = _short_arg(inp.get("path") or inp.get("SearchPath") or "", 40)
+        tail = f"  ·  `{where}`" if where else ""
+        return f"{mark('🔎')} **搜索内容：** `{pat}`{tail}"
+    elif n in ("list_dir",):
+        return f"{mark('📁')} **列目录：** `{_pick(inp, 'DirectoryPath', 'path')}`"
+    elif n in ("task", "invoke_subagent", "define_subagent", "manage_subagents"):
+        detail = _pick(inp, "description", "prompt", "name")[:60]
+        return f"{mark('🤖')} **子任务：** {detail}"
+    elif n in ("webfetch", "read_url_content", "open_browser_url"):
+        return f"{mark('🌐')} **抓取网页：** `{_pick(inp, 'url', 'Url')}`"
+    elif n in ("websearch", "search_web"):
+        return f"{mark('🔍')} **搜索：** {_pick(inp, 'query', 'Query')}"
+    elif n == "call_mcp_tool":
+        server = _short_arg(inp.get("ServerName") or inp.get("server") or "", 30)
+        tool = _short_arg(inp.get("ToolName") or inp.get("tool_name") or inp.get("tool") or "", 40)
+        label = " / ".join(x for x in (server, tool) if x)
+        return f"{mark('🔌')} **MCP：** `{label}`" if label else f"{mark('🔌')} **MCP 调用**"
     else:
-        return f"⚙️ **{name}**"
+        arg = _tool_primary_arg(inp)
+        return f"{mark('⚙️')} **{name}** `{arg}`" if arg else f"{mark('⚙️')} **{name}**"
 
 
 # ── 卡片按钮点击处理 ─────────────────────────────────────────
@@ -2884,7 +3234,16 @@ async def handle_spawn(
         try:
             await bot.store.new_session(user_id, chat_id)
             if model:
-                await bot.store.set_model(user_id, chat_id, model)
+                child_runner = bot.profile.runner
+                if not is_model_compatible_with_runner(model, child_runner):
+                    corrected = normalize_model_for_runner(
+                        "", child_runner, fallback=bot.profile.dispatch_model or bot.profile.default_model or ""
+                    )
+                    log(tag, "spawn", "warn",
+                        f"spawn model={model!r} 不兼容 runner={child_runner}，已自动修正为 {corrected!r}")
+                    model = corrected
+                if model:
+                    await bot.store.set_model(user_id, chat_id, model)
             # 新话题的 effort_override 一律是 None，定时任务/派单要指定强度只能在这里落
             if effort:
                 await bot.store.set_effort(user_id, chat_id, effort)
@@ -3022,6 +3381,12 @@ async def wake_thread_as_user(bot: BotInstance, anchor_msg_id: str, prompt: str)
     if not anchor_msg_id:
         log(bot.profile.name, "wake", "warn", "缺 anchor，无法 send-as-user 唤醒")
         return False
+    if getattr(bot.profile, "is_telegram", False):
+        # Telegram 没有"user 身份发消息"这回事（Bot API 只能以 bot 身份发），而
+        # _resolve_bot_open_id 会照着 profile.domain 去 POST Lark 的 tenant_access_token
+        # ——那是 https://api.telegram.org 上一个不存在的路径，白等 10s 还把 bot token
+        # 塞进请求体。直接让调用方走进程内直投兜底（wake_thread_internal）。
+        return False
     bot_oid = await _resolve_bot_open_id(bot)
     if not bot_oid:
         log(bot.profile.name, "wake", "warn", "拿不到 bot open_id，无法 @ 自己唤醒")
@@ -3045,6 +3410,100 @@ async def wake_thread_as_user(bot: BotInstance, anchor_msg_id: str, prompt: str)
             f"send-as-user 唤醒 lark-cli rc={proc.returncode} err={err.decode('utf-8','replace')[:200]}")
         return False
     return True
+
+
+class _SyntheticMsg:
+    """进程内直投用的最小消息对象：只带 _process_message 真正会读的字段
+    （message_id / message_type / content / mentions），其余字段给个合理值防 getattr 踩空。"""
+
+    def __init__(self, message_id: str, text: str, chat_id: str, thread_id: str):
+        self.message_id = message_id
+        self.message_type = "text"
+        self.content = json.dumps({"text": text}, ensure_ascii=False)
+        self.mentions = None
+        self.chat_id = chat_id
+        self.chat_type = "group"
+        self.thread_id = thread_id
+        self.root_id = message_id
+        self.parent_id = message_id
+        self.create_time = str(int(time.time() * 1000))
+
+
+async def wake_thread_internal(
+    bot: BotInstance, *, user_id: str, chat_id_raw: str, thread_id: str,
+    anchor_msg_id: str, prompt: str,
+) -> bool:
+    """不经 Lark、在进程内把 prompt 当作「owner 在该 thread 里 @bot 说的一句话」直投给
+    _process_message：resume 该 thread 现有 session、忙时等 per-chat 锁（排队不丢）。
+
+    是 wake_thread_as_user 的兜底——后者靠 `lark-cli --as user` 发消息，要求对应 profile
+    的 lark-cli 有 user 身份，线上只有 spx 有。与 handle_spawn 的区别：不开新 session
+    （父上下文保留）、不 reject-if-busy。返回是否成功投递并跑完；异常只 log 不冒泡。"""
+    tag = bot.profile.name
+    if not (user_id and chat_id_raw and thread_id):
+        log(tag, "wake", "warn",
+            f"进程内唤醒缺参数 user={bool(user_id)} chat={bool(chat_id_raw)} thread={bool(thread_id)}")
+        return False
+    chat_id = f"{chat_id_raw}:{thread_id}"
+    try:
+        msg = _SyntheticMsg(anchor_msg_id or "", prompt, chat_id_raw, thread_id)
+        lock = bot._ensure_chat_lock(chat_id)
+        if lock.locked():
+            log(tag, "wake", "info", f"进程内唤醒：父 thread 忙，排队等待 thread={thread_id[:12]}...")
+        async with lock:
+            await _process_message(bot, user_id, chat_id, True, thread_id, msg)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(tag, "wake", "warn", f"进程内唤醒异常: {type(e).__name__}: {e}")
+        return False
+
+
+async def resume_run_internal(
+    bot: BotInstance, *, user_id: str, chat_id: str, is_group: bool,
+    thread_id: str, anchor_msg_id: str, prompt: str,
+) -> bool:
+    """把一条续跑指令在进程内直投给 _process_message（群 / 私聊都支持）。
+
+    与 wake_thread_internal 的区别：那个只服务话题群（写死 is_group=True），而被
+    重启打断的 run 也可能来自私聊。同样是"不经 Lark、resume 本会话、忙时等 per-chat
+    锁排队"，所以续跑不需要 WS 已经连上，开机即可投。异常只 log 不冒泡。
+    """
+    tag = bot.profile.name
+    if not (user_id and chat_id and prompt):
+        log(tag, "resume", "warn",
+            f"续跑缺参数 user={bool(user_id)} chat={bool(chat_id)} prompt={bool(prompt)}")
+        return False
+    raw_chat_id = chat_id.partition(":")[0] if is_group else chat_id
+    try:
+        msg = _SyntheticMsg(anchor_msg_id or "", prompt, raw_chat_id, thread_id or "")
+        if not is_group:
+            msg.chat_type = "p2p"
+        lock = bot._ensure_chat_lock(chat_id)
+        if lock.locked():
+            log(tag, "resume", "info", f"续跑：该会话忙，排队等待 chat={chat_id[:24]}")
+        async with lock:
+            await _process_message(bot, user_id, chat_id, is_group, thread_id or "", msg)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(tag, "resume", "warn", f"续跑直投异常: {type(e).__name__}: {e}")
+        return False
+
+
+async def notify_resume_skipped(bot: BotInstance, rec: dict, why: str) -> None:
+    """不自动续跑时也要让用户看见（否则任务就这么无声无息地没了）。"""
+    text = (
+        f"♻️ 上次被中断的任务**没有自动续跑**：{why}\n"
+        f"原指令：{(rec.get('prompt') or '')[:120]}…\n"
+        f"要继续的话回我一句「继续」即可。"
+    )
+    anchor = rec.get("anchor") or ""
+    try:
+        if rec.get("is_group") and anchor:
+            await bot.feishu.reply_text(anchor, text)
+        elif rec.get("user_id"):
+            await bot.feishu.send_text_to_user(rec["user_id"], text)
+    except Exception as e:  # noqa: BLE001
+        log(bot.profile.name, "resume", "warn", f"跳过续跑的提示发送失败: {type(e).__name__}: {e}")
 
 
 async def _dispatch_safe_reply(bot: BotInstance, anchor: str, text: str) -> None:
@@ -3078,8 +3537,20 @@ async def _dispatch_wake_parent(grp: dict) -> None:
         f"请核对 / 汇总后回复用户。如还需继续，可再 dispatch_task 派下一波。"
     )
     ok = await wake_thread_as_user(bot, grp.get("anchor", ""), prompt)
+    if ok:
+        return
+    # send-as-user 要求该 profile 的 lark-cli 有 user 身份；线上只有 spx 有，agy / grok /
+    # regtank / seesaw 走到这里必失败（2026-09-03 16:07 实锤：agy 批次跑完，父 agent 永远没醒）。
+    # 兜底走进程内直投：同样 resume 父 thread 的 session、忙时等锁不丢，只是不经 Lark。
+    log(bot.profile.name, "dispatch", "warn",
+        "批次完成唤醒父 agent：send-as-user 未成功，改走进程内直投")
+    ok = await wake_thread_internal(
+        bot, user_id=grp.get("user", ""), chat_id_raw=grp.get("chat", ""),
+        thread_id=grp.get("thread", ""), anchor_msg_id=grp.get("anchor", ""), prompt=prompt,
+    )
     if not ok:
-        log(bot.profile.name, "dispatch", "warn", "批次完成唤醒父 agent 失败（send-as-user 未成功）")
+        log(bot.profile.name, "dispatch", "error",
+            "批次完成唤醒父 agent 失败（send-as-user 与进程内直投都未成功）")
 
 
 async def _dispatch_wake_parent_debounced(ptid: str) -> None:
@@ -3158,8 +3629,33 @@ async def dispatch_task(
     child_bot = target_bot or bot
     cross = child_bot is not bot
     # open_id 是按 app 维度的——父的 open_id 在异 app 子 bot 里无效。跨 agent 时
-    # 用子 bot 自己的 primary user 作 @/session 归属；拿不到就不 @（post 仍可发）。
+    # 用子 bot 自己的 primary user 作 @/session 归属；拿不到就拒绝，不能借父 open_id。
     child_user = user if not cross else (child_bot.store.find_primary_user() or "")
+    if not child_user:
+        return {"ok": False, "error": "无法确定目标 bot 侧的 user_id，不能复用调用方 open_id"}
+
+    child_runner = child_bot.profile.runner
+    if model:
+        if not is_model_compatible_with_runner(model, child_runner):
+            fallback_target = (
+                child_bot.profile.dispatch_model
+                or child_bot.profile.default_model
+                or ""
+            )
+            corrected_model = normalize_model_for_runner(
+                "", child_runner, fallback=fallback_target
+            )
+            log(
+                bot.profile.name,
+                "dispatch",
+                "warn",
+                f"派发指定模型 {model!r} 与目标 runner={child_runner} 不兼容，"
+                f"已自动修正为 {corrected_model!r}",
+            )
+            model = corrected_model
+        else:
+            model = normalize_model_for_runner(model, child_runner)
+
     # 没显式指定就用**子 bot** profile 的 dispatch 默认模型（DISPATCH_MODEL）——
     # 让"主对话用便宜模型聊天、派出去的活用最强模型"成为配置保证，而不是靠派发方
     # 每次记得传 model。取 child_bot 的：model 属于跑它的那个后端。
@@ -3191,6 +3687,14 @@ async def dispatch_task(
             thread_id = resolved
     except Exception:
         pass
+
+    # Persist before scheduling the worker: even a queued/failed startup belongs to it.
+    try:
+        task_routes.bind(chat_id=group_chat_id, thread_id=thread_id,
+                         profile=child_bot.profile.name, user_id=child_user, anchor=anchor)
+    except Exception as e:
+        return {"ok": False, "error": f"任务归属保存失败，未启动子任务: {e}",
+                "thread_id": thread_id, "anchor_message_id": anchor}
 
     # 父批次登记（带父上下文才启用回报闭环）
     if parent_thread and parent_anchor:
@@ -3291,6 +3795,139 @@ async def dispatch_task(
             "model": model, "effort": effort}
 
 
+# ── 会话移交（handover）───────────────────────────────────────────────────
+# 与 dispatch_task 的区别只有一句话：**移交不要求回报**。
+#   dispatch_task = 派子任务，子会话跑完回报父 thread、整波跑完唤醒父 agent 收口；
+#   handover_task = 交所有权，上一个 agent 把手工压缩的简报交出去就收工，接手方
+#                   直接对用户负责，既不回报也不唤醒移交方（不登记 _DISPATCH_PARENTS）。
+# 所以实现上它复用 dispatch_task 建话题/并发 cap/跨 agent/model 的全套机械，只是
+# **不传 parent_thread / parent_anchor**，另外补三件移交独有的收尾：
+#   ① 简报落盘（接手方自己上下文再爆时能重读）
+#   ② 取消原话题挂着的定时唤醒（否则老 agent 会带着爆掉的上下文醒回来抢同一件活）
+#   ③ 在原话题贴一条移交标记（告诉用户"后续去新话题"，且移交方崩了也留痕）
+
+_HANDOVER_PROMPT = """【会话移交 · HANDOVER —— 从现在起这项任务由你负责】
+上一个 agent（{from_agent}）把这项活**整段移交**给你了（通常是它的上下文太大／不适合再往下接）。
+移交规则，务必照做：
+· 这项任务的**所有权已经在你手上**：直接在**本话题**向用户汇报进展和结果。
+· **不要**回报给移交方、不要试图唤醒原话题——它已经收工，不会再跟进这件事，等它是死等。
+· 原话题是 `{from_thread}`；需要更多细节时可以 read_thread 回看，但**别在那边继续干活**。{doc_line}
+· 简报里的"已完成"是移交方的自述：**挑关键几条实际核实一遍**（跑测试／看文件／查库），别盲信、也别重做已经好了的部分。
+· 你和移交方**不共享上下文**，本简报 + 仓库现状就是你的全部依据；缺信息就自己查，真缺关键决策再问用户。
+
+────────── 移交简报 ──────────
+{brief}
+──────────────────────────────
+
+请先按简报核实状态，然后接着把「未完成 / 下一步」做完，做完直接向用户交付。"""
+
+
+async def handover_task(
+    bot: BotInstance, *, user_id: str, group_chat_id: str,
+    brief: dict, title: str = "", cap: int = DISPATCH_CONCURRENCY_CAP,
+    target_bot: "BotInstance | None" = None,
+    model: str = "", effort: str = "",
+    from_thread: str = "", from_anchor: str = "",
+    cwd: str = "", workspace: str = "",
+) -> dict:
+    """把整项任务的所有权移交给一个全新会话（可跨 agent），移交方随后即可收工。
+
+    brief：移交方手工压缩的交接件（goal / completed / remaining 必填，notes / files 选填，
+    详见 handover_store）。渲染成 markdown 后**既落盘又内联进接手方的 prompt**——落盘是
+    给接手方自己上下文再爆时重读用的，所以写盘失败只降级、不阻断移交。
+
+    from_thread / from_anchor：移交方所在话题及其锚点消息。给了就顺带做两件收尾——
+    取消原话题挂着的定时唤醒（否则移交方会醒回来和接手方抢同一件活）、在原话题贴一条
+    带新话题 id 的移交标记（用户知道去哪儿继续，移交方当场崩了也留痕）。
+
+    返回 dict 与 dispatch_task 同构，另带 brief_path / cancelled_wakes / from_thread。
+    """
+    try:
+        normalized = handover_store.normalize(brief)
+    except ValueError as e:
+        log(bot.profile.name, "handover", "warn", f"移交被拒：{e}")
+        return {"ok": False, "error": str(e)}
+    lacking = handover_store.missing_required(normalized)
+    if lacking:
+        labels = dict(handover_store.SECTIONS)
+        detail = "、".join(f"{k}（{labels[k]}）" for k in lacking)
+        log(bot.profile.name, "handover", "warn", f"移交被拒：简报缺 {', '.join(lacking)}")
+        return {"ok": False, "error": f"移交简报缺必填项：{detail}。把这几项写全再交，接手方没有你的上下文。"}
+
+    child_bot = target_bot or bot
+    topic_title = (title.strip() or normalized["goal"].splitlines()[0].strip())[:48]
+    meta = {
+        "title": topic_title,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+        "from": f"{bot.profile.name}[{bot.profile.runner}]",
+        "from_thread": from_thread,
+        "to": f"{child_bot.profile.name}[{child_bot.profile.runner}]",
+        "chat_id": group_chat_id,
+    }
+    rendered = handover_store.render(normalized, meta)
+    if len(rendered) > handover_store.MAX_BRIEF_CHARS:
+        log(bot.profile.name, "handover", "warn", f"移交被拒：简报 {len(rendered)} 字符过长")
+        return {"ok": False, "error": (
+            f"移交简报太长（{len(rendered)} 字符 > {handover_store.MAX_BRIEF_CHARS}）。"
+            "移交要的是压缩后的交接件，不是上下文转储——再压一轮，细节留给接手方自己查。")}
+
+    # 落盘失败不阻断移交：简报本身还会内联进 prompt，只是接手方少一份可重读的副本。
+    brief_path = ""
+    try:
+        brief_path = await asyncio.to_thread(handover_store.save, rendered, title=topic_title)
+    except OSError as e:
+        log(bot.profile.name, "handover", "warn", f"简报落盘失败（继续移交）: {type(e).__name__}: {e}")
+
+    prompt = _HANDOVER_PROMPT.format(
+        from_agent=meta["from"],
+        from_thread=from_thread or "（未知）",
+        doc_line=(f"\n· 这份简报也落盘在 `{brief_path}`，你自己上下文变大时可以重读它找回状态。"
+                  if brief_path else ""),
+        brief=rendered.strip(),
+    )
+
+    # 关键差异：**不传 parent_thread / parent_anchor** —— 移交不要回报、不要批次唤醒。
+    result = await dispatch_task(
+        bot, user_id=user_id, group_chat_id=group_chat_id,
+        title=f"[移交] {topic_title}", prompt=prompt, cap=cap,
+        target_bot=target_bot, model=model, effort=effort,
+        cwd=cwd, workspace=workspace,
+        body_header=(f"（🔀 会话移交：本话题由 {meta['to']} 独立负责到底，"
+                     f"移交自 {meta['from']} 的话题 {from_thread or '（未知）'}）"),
+    )
+    if not result.get("ok"):
+        return result
+
+    new_thread = result.get("thread_id", "")
+    handover_store.append_target(brief_path, new_thread)
+
+    # 原话题挂着的定时唤醒必须清掉：移交后老 agent 一旦被唤醒，就会带着已经爆掉的
+    # 上下文回来干同一件活，和接手方打对台。
+    cancelled = 0
+    if from_thread:
+        try:
+            import scheduler  # 懒 import：scheduler 侧也懒 import dispatcher，避免顶层循环
+            res = await asyncio.to_thread(
+                scheduler.cancel_wake, thread_id=from_thread, chat_id=group_chat_id)
+            cancelled = int(res.get("count") or 0) if isinstance(res, dict) else 0
+        except Exception as e:  # noqa: BLE001 — 清理失败不该让已完成的移交显示为失败
+            log(bot.profile.name, "handover", "warn",
+                f"取消原话题定时唤醒失败: {type(e).__name__}: {e}")
+
+    if from_anchor:
+        note = (f"🔀 这项任务已移交给 {meta['to']}，新话题 thread={new_thread}。"
+                f"本话题不再跟进，后续请到新话题继续。")
+        if cancelled:
+            note += f"（顺带取消了本话题 {cancelled} 个待触发的定时唤醒）"
+        await _dispatch_safe_reply(bot, from_anchor, note)
+
+    log(bot.profile.name, "handover", "info",
+        f"移交 chat={group_chat_id[:12]}... from={from_thread[:14] or '-'} → thread={new_thread[:14]}... "
+        f"agent={meta['to']} wakes_cancelled={cancelled} brief={os.path.basename(brief_path) or '-'}")
+    return {**result, "brief_path": brief_path, "cancelled_wakes": cancelled,
+            "from_thread": from_thread}
+
+
 async def read_thread(bot: BotInstance, *, thread_id: str, limit: int = 50) -> dict:
     """读一条 thread 的全部消息，渲染成 `[seq] sender time: text` 紧凑 transcript。
 
@@ -3337,10 +3974,79 @@ async def read_thread(bot: BotInstance, *, thread_id: str, limit: int = 50) -> d
 # 这组原语只供 MCP 的 append_to_task / steer_task 使用（编排 agent 监工子会话
 # 时实时调整方向）。人工 `/stop` 始终是纯取消。lock 天然给 append 提供"排队在后"语义。
 
+async def _resolve_followup_target(
+    caller: BotInstance, *, user_id: str, group_chat_id: str, thread_id: str,
+) -> tuple[BotInstance, str, str, str]:
+    """Resolve execution ownership before inspecting a run, taking a lock or writing.
+
+    Old dispatches are recovered from the root message's app ID (not its display name
+    or whichever profile happens to have a session). This also repairs threads in which
+    the old bug already created a second session under the caller's profile.
+    """
+    bots = dict(_bots)
+    bots.setdefault(caller.profile.name, caller)
+    route = task_routes.get(group_chat_id, thread_id)
+    if route:
+        target = bots.get(route["profile"])
+        if target is None:
+            raise ValueError(f"目标 bot {route['profile']} 未加载，未转交其他执行者")
+        thread_id = route["thread_id"]
+        if thread_id.startswith("om_"):
+            actual = await target.feishu.get_message_thread_id(thread_id)
+            if not actual or not actual.startswith("omt_"):
+                raise ValueError("无法解析目标任务的 thread_id")
+            route = task_routes.bind(**{**route, "thread_id": actual})
+        return target, route["user_id"], route["thread_id"], route["anchor"]
+
+    if thread_id.startswith("om_"):
+        actual = await caller.feishu.get_message_thread_id(thread_id)
+        if not actual or not actual.startswith("omt_"):
+            raise ValueError("无法把消息 ID 转为目标 thread_id")
+        # Consult the canonical key before attempting legacy recovery.
+        return await _resolve_followup_target(
+            caller, user_id=user_id, group_chat_id=group_chat_id, thread_id=actual)
+    if not thread_id.startswith("omt_"):
+        raise ValueError("目标必须是 dispatch_task 返回的话题或消息 ID")
+
+    messages = await caller.feishu.list_thread_messages(thread_id, limit=1)
+    if not messages:
+        raise ValueError("目标话题为空，无法确定执行者")
+    root = messages[0]
+    if getattr(root, "chat_id", None) != group_chat_id:
+        raise ValueError("目标话题不属于当前群，未投递指令")
+    anchor = getattr(root, "message_id", "") or ""
+    if not anchor or getattr(root, "parent_id", None):
+        raise ValueError("无法确认话题根消息，未猜测执行者")
+    sender = getattr(root, "sender", None)
+    chat_id = f"{group_chat_id}:{thread_id}"
+    if getattr(sender, "sender_type", "") == "app":
+        candidates = [b for b in bots.values()
+                      if b.profile.app_id == getattr(sender, "id", None)]
+    else:
+        # For a human-created thread there is no dispatching app to identify the owner.
+        # Only a unique existing owner is safe; a new caller session is never a fallback.
+        candidates = [b for b in bots.values() if b.store.thread_owner(chat_id)]
+    if len(candidates) != 1:
+        raise ValueError("目标执行者未加载或归属不唯一，未创建调用方会话")
+    target = candidates[0]
+    owner = target.store.thread_owner(chat_id)
+    if not owner:
+        # A bot-created task can fail before its session is written. Its own primary
+        # user is valid; the caller's app-scoped open_id is not.
+        if getattr(sender, "sender_type", "") == "app":
+            owner = (user_id if target is caller else "") or target.store.find_primary_user()
+    if not owner:
+        raise ValueError("无法确定目标 bot 侧的会话归属人")
+    route = task_routes.bind(chat_id=group_chat_id, thread_id=thread_id,
+                             profile=target.profile.name, user_id=owner, anchor=anchor)
+    return target, owner, thread_id, anchor
+
+
 async def _deliver_followup(
     bot: BotInstance, *, user_id: str, chat_id: str, thread_id: str,
     anchor_message_id: str, instruction: str, stop_first: bool,
     is_group: bool = True,
+    expected_run: Optional[ActiveRun] = None,
 ):
     """(可选)停当前 run → 抢 per-chat lock → resume 现有 session 跑 instruction。
 
@@ -3348,14 +4054,20 @@ async def _deliver_followup(
     等旧 run 释放 lock 再续跑；stop_first=False：直接抢 lock，天然排在当前 run 之后。
     始终 resume 现有 session（option B），不新开会话。"""
     tag = bot.profile.name
-    if stop_first:
+    interrupted = False
+    if stop_first and bot.active_runs.get_run(user_id, chat_id) is expected_run and expected_run is not None:
         try:
-            await stop_run(
+            interrupted = await stop_run(
                 bot.active_runs, user_id, chat_id,
                 on_stopped=lambda run: _announce_stopped_run(bot, run),
             )
         except Exception as e:
-            log(tag, "steer", "warn", f"停当前 run 失败（仍继续续跑）: {e}")
+            log(tag, "steer", "error", f"停止目标 run 失败，未投递后续指令: {e}")
+            try:
+                await bot.feishu.reply_text(anchor_message_id, f"❌ 停止目标任务失败，未续跑：{e}")
+            except Exception:
+                pass
+            return
 
     lock = bot._ensure_chat_lock(chat_id)
     async with lock:
@@ -3376,7 +4088,7 @@ async def _deliver_followup(
             asker_open_id=user_id, runner=session.runner,
         )
         run_text = instruction
-        if stop_first:
+        if interrupted:
             run_text = (
                 "⚠️ 我刚打断了你上一步正在做的事（上一轮任务被显式中止）。"
                 "请改按下面的新指令继续，不要重复已经做过的写操作 / 命令 / 文件改动：\n\n"
@@ -3406,43 +4118,28 @@ async def steer_or_append_thread(
         return {"ok": False, "error": "缺少 group_chat_id / thread_id"}
     if not (instruction and instruction.strip()):
         return {"ok": False, "error": "instruction 不能为空"}
-    # 兜底：dispatch_task 偶尔把 anchor 的 om_ 当 thread_id 传回 → 转成真 omt_
-    if thread_id.startswith("om_") and not thread_id.startswith("omt_"):
-        try:
-            actual = await bot.feishu.get_message_thread_id(thread_id)
-            if actual and actual.startswith("omt_"):
-                thread_id = actual
-        except Exception:
-            pass
-    user = user_id or bot.store.find_primary_user() or ""
-    if not user:
-        return {"ok": False, "error": "无法确定归属人 user_id"}
+    caller = bot
+    try:
+        bot, user, thread_id, anchor = await _resolve_followup_target(
+            caller, user_id=user_id, group_chat_id=group_chat_id, thread_id=thread_id)
+    except Exception as e:
+        return {"ok": False, "error": f"任务归属解析失败: {e}"}
     chat_id = f"{group_chat_id}:{thread_id}"
     run = bot.active_runs.get_run(user, chat_id)
     running = run is not None and not run.stop_requested
-
-    # 回复锚点：优先当前 run 的流式卡（一定在该 thread 内），否则拉 thread 里一条消息
-    anchor = run.card_msg_id if run else ""
-    if not anchor:
-        try:
-            msgs = await bot.feishu.list_thread_messages(thread_id, limit=1)
-            if msgs:
-                anchor = getattr(msgs[0], "message_id", "") or ""
-        except Exception as e:
-            return {"ok": False, "error": f"无法定位 thread 锚点: {type(e).__name__}: {e}"}
-    if not anchor:
-        return {"ok": False, "error": "thread 内没有可回复的消息作为锚点"}
+    busy = running or bot._ensure_chat_lock(chat_id).locked()
+    anchor = (run.card_msg_id if run else "") or anchor
 
     do_stop = stop_first and running
     if do_stop:
-        head, title = "⏹ 已停止当前任务，正在按新指令续跑（保留已完成的上下文）", "🛠 停止并改指令"
-    elif running:
+        head, title = "⏹ 正在停止当前任务，随后按新指令续跑（保留已完成的上下文）", "🛠 停止并改指令"
+    elif busy:
         head, title = "📬 已把新指令追加到当前任务后面，跑完就接着上下文执行", "➕ 追加指令"
     else:
         head, title = "▶️ 该话题当前空闲，直接按新指令续跑", "➕ 追加指令"
     # 把「完整指令」发进 thread —— MCP 路径的指令来自编排 agent，人在群里看不到，
     # 必须像 dispatch_task 展示 worker prompt 那样把全文贴出来，否则只剩一句状态。
-    body_text = f"{head}\n\n【完整指令】\n{instruction.strip()}"
+    body_text = f"{head}\n执行者：{bot.profile.name}\n\n【完整指令】\n{instruction.strip()}"
     try:
         await bot.feishu.reply_post(anchor, title=title, body_text=body_text)
     except Exception:
@@ -3455,11 +4152,13 @@ async def steer_or_append_thread(
         bot, user_id=user, chat_id=chat_id, thread_id=thread_id,
         anchor_message_id=anchor, instruction=instruction.strip(),
         stop_first=do_stop, is_group=True,
+        expected_run=run,
     ))
     _DISPATCH_TASKS.add(t)
     t.add_done_callback(_DISPATCH_TASKS.discard)
     return {
         "ok": True, "thread_id": thread_id,
+        "agent": bot.profile.name,
         "mode": "steer" if stop_first else "append",
-        "stopped": do_stop, "queued": bool(running and not stop_first),
+        "stopped": do_stop, "queued": bool(busy and not stop_first),
     }

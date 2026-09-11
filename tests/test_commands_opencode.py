@@ -42,7 +42,9 @@ async def test_model_picker_uses_gemini_buttons_for_opencode(opencode_store):
     assert reply["text"].startswith("当前 runner：**opencode**")
     labels = [button["text"] for button in reply["buttons"]]
     assert "💎 Gemini 3.1 Pro" in labels
-    assert "Gemini 2.5 Pro" in labels
+    # 2026-09-03 picker 换成 3.8 / 3.7 Flash 为主推（2.5 Pro 按钮已下线）
+    assert "🚀 Gemini 3.8 Flash" in labels
+    assert "Gemini 3.7 Flash" in labels
     assert all("Claude" not in label and "Sonnet" not in label for label in labels)
 
 

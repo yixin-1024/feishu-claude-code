@@ -34,6 +34,7 @@ from lark_oapi.api.contact.v3 import BatchUserRequest
 
 import outbox
 from card_security import sign_action_value
+from lark_md import normalize_lark_md
 
 
 class FeishuApiError(RuntimeError):
@@ -188,6 +189,7 @@ def _card_dict(content: str, loading: bool = False) -> dict:
     if loading:
         elements.append({"tag": "markdown", "content": "⏳ 思考中..."})
     else:
+        content = normalize_lark_md(content)
         # 飞书 markdown 元素长度限制约 3000 字符，保守使用 2800
         MAX_CHUNK_SIZE = 2800
 
@@ -643,6 +645,7 @@ class FeishuClient:
         if not nxt:
             return
         card_id, element_id, seq = nxt
+        content = normalize_lark_md(content)
 
         async def _update():
             req = (
@@ -1084,6 +1087,9 @@ class FeishuClient:
     async def update_card_elements(self, message_id: str, elements: list[dict]):
         """用自定义 elements 列表更新卡片（支持 markdown + button 混排）"""
         elements = self._protect_card_elements(elements, message_id)
+        for el in elements:
+            if isinstance(el, dict) and el.get("tag") == "markdown":
+                el["content"] = normalize_lark_md(el.get("content") or "")
         card_content = _serialize_card({
             "schema": "2.0",
             "body": {"elements": elements},

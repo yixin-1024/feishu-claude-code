@@ -53,7 +53,12 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _DOMAIN_MAP = {
     "feishu": "https://open.feishu.cn",
     "lark": "https://open.larksuite.com",
+    # 第三个渠道：Telegram。走 Bot API 长轮询而不是 Lark 长连接，鉴权只有一个
+    # bot token（没有 app_id/app_secret 的概念），见 _load_profile 的分支。
+    "telegram": "https://api.telegram.org",
 }
+
+_PLATFORMS = ", ".join(_DOMAIN_MAP)
 
 # /effort 对外展示的稳定档位。Codex 底层还接受 none/minimal，但并非当前
 # gpt-5.6-sol 的可选档位，因此不暴露在聊天按钮中。
@@ -82,6 +87,110 @@ def normalize_model(raw: str) -> str:
     return MODEL_ALIASES.get(value.lower(), value)
 
 
+# agy(Antigravity CLI) 内置的第三方模型（`agy models` 实测）。它们走
+# "Claude and GPT models" 配额池，与 Gemini 池**独立计量**。
+# ⚠️ 必须精确匹配，不能用 `claude-*` / `gpt-*` 前缀放行：
+#   · Claude Code 自己的 opus/sonnet（claude-opus-5、opus[1m] 等）agy 根本没有，
+#     前缀放行会让它们被误注入 agy；
+#   · 反过来这几个 id 也不是 Claude Code / codex 能跑的，所以那两个 runner 的
+#     分支要把它们排除掉，否则在 claude 会话里发 /model agy-opus 会被放行。
+# ⚠️ 另见 agy_runner._MODELS_WITHOUT_EFFORT：它们都不接受 --effort。
+AGY_THIRD_PARTY_MODELS = frozenset({
+    "claude-opus-4-6-thinking",
+    "claude-sonnet-4-6",
+    "gpt-oss-120b-medium",
+})
+
+# 上面那批里**只有 agy 能跑**的。用于把它们挡在 claude / codex 之外。
+# ⚠️ `claude-sonnet-4-6` 故意不在此列：它同时是 Claude Code 自己的真实模型名，
+# 两个后端各有一个同名模型，都合法。早先把它一起排除，导致 Claude 会话里
+# `/model claude-sonnet-4-6` 被判不兼容、静默回退成默认模型
+# （tests/test_session_store.py 三个用例当场抓到）。
+AGY_ONLY_MODELS = frozenset({
+    "claude-opus-4-6-thinking",
+    "gpt-oss-120b-medium",
+})
+
+
+def is_model_compatible_with_runner(model: str, runner: str) -> bool:
+    """判定 model 是否属于该 runner，防止把 Claude 模型（如 opus）误注入 agy/codex 等异构后端。"""
+    raw = (model or "").strip()
+    if not raw:
+        return True
+    runner = (runner or "").strip().lower()
+    from commands import MODEL_ALIASES
+    resolved = MODEL_ALIASES.get(raw.lower(), raw)
+    low = resolved.lower()
+
+    if runner == "claude":
+        # agy 专属的模型（claude-opus-4-6-thinking）Claude CLI 跑不了，必须先
+        # 排除，否则会被下面的 claude-* 前缀误放行。注意用 AGY_ONLY_MODELS 而不是
+        # AGY_THIRD_PARTY_MODELS —— claude-sonnet-4-6 两边都合法。
+        if low in AGY_ONLY_MODELS:
+            return False
+        # claude: opus, sonnet, haiku, fable, opusplan, best, 或 claude-* 开头，或 [1m] 结尾（非 google/quotio）
+        if low.startswith("claude") or low in {"opus", "sonnet", "haiku", "fable", "opusplan", "best"}:
+            return True
+        if low.endswith("[1m]") and not low.startswith(("google/", "quotio/")):
+            return True
+        return False
+
+    if runner == "agy":
+        # agy: Gemini 3.x（gemini-* 或 agy 别名）+ 内置的第三方模型
+        if low.startswith("google/"):
+            low = low[len("google/"):]
+        if low in AGY_THIRD_PARTY_MODELS:
+            return True
+        return low.startswith("gemini-") or low.startswith("agy")
+
+    if runner == "codex":
+        # gpt-oss-120b-medium 是 agy 内置的，codex 跑不了 —— 别被 gpt-* 前缀放行
+        if low in AGY_ONLY_MODELS:
+            return False
+        # codex: gpt-* 或 codex*
+        return low.startswith("gpt-") or "codex" in low
+
+    if runner == "opencode":
+        # opencode: google/gemini-* 或 gemini-*
+        return low.startswith("google/") or low.startswith("gemini")
+
+    if runner == "mimo":
+        # mimo: quotio/* 或 mimo
+        return low.startswith("quotio/") or low.startswith("mimo")
+
+    if runner == "grok":
+        # grok: wow-* 或 grok
+        return low.startswith("wow-") or low.startswith("grok")
+
+    if runner == "maka":
+        # maka: deepseek-*, nemotron-*, maka
+        return low.startswith("deepseek-") or low.startswith("nemotron-") or low.startswith("maka")
+
+    return True
+
+
+def normalize_model_for_runner(model: str, runner: str, fallback: str = "") -> str:
+    """把 model 字段归一化为适合该 runner 的串；若不兼容则回落至 fallback。"""
+    runner = (runner or "").strip().lower()
+    from commands import MODEL_ALIASES
+
+    target = (model or "").strip()
+    if target:
+        resolved = MODEL_ALIASES.get(target.lower(), target)
+        if runner == "agy" and resolved.lower().startswith("google/"):
+            resolved = resolved[len("google/"):]
+        if is_model_compatible_with_runner(resolved, runner):
+            return resolved
+
+    fb = (fallback or "").strip()
+    if not fb:
+        return ""
+    resolved_fb = MODEL_ALIASES.get(fb.lower(), fb)
+    if runner == "agy" and resolved_fb.lower().startswith("google/"):
+        resolved_fb = resolved_fb[len("google/"):]
+    return resolved_fb
+
+
 def normalize_effort(raw: str, ctx: str) -> str:
     """校验并归一 effort；空 / "default" = 不覆盖（跟随 profile 或 CLI 默认）。"""
     value = (raw or "").strip().lower()
@@ -96,6 +205,25 @@ def normalize_effort(raw: str, ctx: str) -> str:
 
 def _split_csv(value: str) -> set[str]:
     return {s.strip() for s in (value or "").split(",") if s.strip()}
+
+
+def _load_tg_allowlist(profile: str) -> set[str]:
+    """读 Telegram 自助授权落盘的 id（模块缺失/文件坏了都当空，绝不影响启动）。"""
+    try:
+        import tg_allowlist
+
+        return tg_allowlist.load(profile)
+    except Exception as e:  # noqa: BLE001 — 白名单读失败不能让 bot 起不来
+        print(f"⚠️ 读取 {profile} 的 Telegram 自助授权白名单失败（当作空）: {e}")
+        return set()
+
+
+def _env_flag(value: str, default: bool) -> bool:
+    """"1/true/yes/on" → True，"0/false/no/off" → False，空 → default。"""
+    text = (value or "").strip().lower()
+    if not text:
+        return default
+    return text in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -126,6 +254,18 @@ class Profile:
     # authenticated by the SDK; HTTP callbacks should also set this per profile.
     verification_token: str = ""
     lark_cli_profile: str = ""  # 告诉 Claude 用 `lark-cli --profile <name>` 发消息
+    # ── Telegram 渠道（platform=telegram 时生效）──────────────────
+    # BotFather 给的 token（`<id>:<secret>`）。app_id 取它的数字前缀，app_secret
+    # 就是整串 token（只在本机内部当 HMAC key / 调 API，不外发）。
+    bot_token: str = ""
+    # 群里裸 `/cmd` 是否算"@ 到我"。Telegram 客户端从命令菜单点出来的就是裸 `/cmd`，
+    # 不认它等于斜杠命令在群里全部失效；群里有第二个 bot 时可关掉。
+    tg_commands_imply_mention: int = 1
+    # 未授权的人私聊时，是否回一句"你的 user id 是 X"方便机主加白名单。
+    tg_reveal_unauthorized: int = 1
+    # 自助授权口令：机主**私聊** bot 原样发这串口令 → 当场把他的 user id 记进白名单
+    # 并落盘，不用改 .env 也不用再重启。空 = 关闭这条通道。见 tg_allowlist.py。
+    claim_code: str = ""
     # 可选：该 profile spawn claude 时额外注入的 env 覆盖文件（相对 cc-lark 目录或绝对路径）。
     # 用于把某个 bot 路由到不同的模型供应商（如 .env.deepseek 走 DeepSeek 的 Anthropic 兼容端点）。
     # 文件格式见 load_claude_extra_env：支持 JSON {"env":{...}} 或 dotenv KEY=VALUE。
@@ -188,6 +328,21 @@ class Profile:
     maka_max_steps: int = 0  # 0 = 不限；>0 给工具步数加护栏
     maka_dangerous_skip: int = 1
     maka_idle_timeout_sec: int = 1800
+    # agy runner 配置（Google Antigravity CLI，Gemini CLI 的官方继任者）。
+    # 鉴权走 1.1.13+ 的 API key 通道：agy_model_provider="gemini" 会把
+    # modelProvider 写进 ~/.gemini/antigravity-cli/settings.json，agy_api_key
+    # 注入 agy_api_key_env（默认 GEMINI_API_KEY）。
+    # ⚠️ Gemini API 不服务香港/大陆出口，agy_proxy 指向本机 launchd 起的日本
+    # 出口（com.yixinlu.gemini-jp-proxy，127.0.0.1:7899）；只注入给 agy 子进程，
+    # 不影响 bot 本身和其它后端。
+    agy_bin: str = ""
+    agy_model_provider: str = "gemini"
+    agy_api_key: str = ""
+    agy_api_key_env: str = "GEMINI_API_KEY"
+    agy_proxy: str = "http://127.0.0.1:7899"
+    agy_print_timeout: str = "24h"
+    agy_dangerous_skip: int = 1
+    agy_idle_timeout_sec: int = 600
     # "会话群" chat_id：bot 在其它群被 @ 时（=调度 session），会被指引把任务派单到
     # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
     dispatch_chat_id: str = ""
@@ -214,7 +369,13 @@ class Profile:
 
     @property
     def brand_label(self) -> str:
+        if self.platform == "telegram":
+            return "Telegram"
         return "飞书" if self.platform == "feishu" else "Lark"
+
+    @property
+    def is_telegram(self) -> bool:
+        return self.platform == "telegram"
 
     @property
     def is_trinity(self) -> bool:
@@ -243,18 +404,32 @@ def _load_profile(name: str) -> Profile:
     def env(suffix: str, default: str = "") -> str:
         return os.getenv(f"{prefix}_{suffix}", default)
 
-    app_id = env("APP_ID")
-    app_secret = env("APP_SECRET")
-    if not app_id or not app_secret:
-        raise ValueError(
-            f"profile {name!r} 缺少 {prefix}_APP_ID 或 {prefix}_APP_SECRET"
-        )
-
     platform = env("PLATFORM", "feishu").lower()
     if platform not in _DOMAIN_MAP:
         raise ValueError(
-            f"profile {name!r} 的 {prefix}_PLATFORM 必须是 feishu 或 lark，当前: {platform}"
+            f"profile {name!r} 的 {prefix}_PLATFORM 必须是 {_PLATFORMS} 之一，当前: {platform}"
         )
+
+    # Telegram 没有 app_id/app_secret，只有一个 bot token。为了让下游（thread_context
+    # 的"这条是不是我发的"、card_security 的 HMAC key）不必分渠道，这里把 token 拆成
+    # app_id=数字 bot id、app_secret=整串 token 填进同名字段。
+    bot_token = ""
+    if platform == "telegram":
+        bot_token = env("BOT_TOKEN").strip()
+        if not bot_token or ":" not in bot_token:
+            raise ValueError(
+                f"profile {name!r} 是 telegram 渠道，需要 {prefix}_BOT_TOKEN"
+                f"（BotFather 给的 `<id>:<secret>` 形式）"
+            )
+        app_id = bot_token.split(":", 1)[0]
+        app_secret = bot_token
+    else:
+        app_id = env("APP_ID")
+        app_secret = env("APP_SECRET")
+        if not app_id or not app_secret:
+            raise ValueError(
+                f"profile {name!r} 缺少 {prefix}_APP_ID 或 {prefix}_APP_SECRET"
+            )
 
     default_cwd = os.path.expanduser(env("DEFAULT_CWD", os.path.expanduser("~")))
 
@@ -269,9 +444,9 @@ def _load_profile(name: str) -> Profile:
 
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
-    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka"}:
+    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy"}:
         raise ValueError(
-            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka，"
+            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka / agy，"
             f"当前: {runner}"
         )
     claude_runner = env("CLAUDE_RUNNER").strip().lower()
@@ -328,6 +503,14 @@ def _load_profile(name: str) -> Profile:
         maka_steps = int(env("MAKA_MAX_STEPS", os.getenv("MAKA_MAX_STEPS", "0")) or "0")
     except ValueError:
         maka_steps = 0
+    try:
+        agy_skip = int(env("AGY_DANGEROUS_SKIP", os.getenv("AGY_DANGEROUS_SKIP", "1")) or "1")
+    except ValueError:
+        agy_skip = 1
+    try:
+        agy_idle = int(env("AGY_IDLE_TIMEOUT_SEC", os.getenv("AGY_IDLE_TIMEOUT_SEC", "600")) or "600")
+    except ValueError:
+        agy_idle = 600
     return Profile(
         name=name,
         app_id=app_id,
@@ -339,10 +522,20 @@ def _load_profile(name: str) -> Profile:
         default_model=env("DEFAULT_MODEL", os.getenv("DEFAULT_MODEL", "")),
         dispatch_model=env("DISPATCH_MODEL", os.getenv("DISPATCH_MODEL", "")).strip(),
         chat_default_cwd=chat_default_cwd,
-        allowed_open_ids=_split_csv(env("ALLOWED_OPEN_IDS")),
+        # 白名单 = .env 里配的 ∪ 自助授权落盘的（见 tg_allowlist）
+        allowed_open_ids=(
+            _split_csv(env("ALLOWED_OPEN_IDS"))
+            | (_load_tg_allowlist(name) if platform == "telegram" else set())
+        ),
         allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
         verification_token=env("VERIFICATION_TOKEN").strip(),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),
+        bot_token=bot_token,
+        claim_code=env("CLAIM_CODE").strip(),
+        tg_commands_imply_mention=1 if _env_flag(
+            env("COMMANDS_IMPLY_MENTION"), True) else 0,
+        tg_reveal_unauthorized=1 if _env_flag(
+            env("REVEAL_UNAUTHORIZED"), True) else 0,
         claude_env_file=env("CLAUDE_ENV_FILE").strip(),
         claude_runner=claude_runner,
         codex_bin=env("CODEX_BIN", os.getenv("CODEX_BIN", "")).strip(),
@@ -380,6 +573,14 @@ def _load_profile(name: str) -> Profile:
         maka_max_steps=max(0, maka_steps),
         maka_dangerous_skip=max(0, min(1, maka_skip)),
         maka_idle_timeout_sec=max(0, maka_idle),
+        agy_bin=env("AGY_BIN", os.getenv("AGY_BIN", "")).strip(),
+        agy_model_provider=env("AGY_MODEL_PROVIDER", os.getenv("AGY_MODEL_PROVIDER", "gemini")).strip(),
+        agy_api_key=env("AGY_API_KEY", os.getenv("AGY_API_KEY", os.getenv("GEMINI_API_KEY", ""))).strip(),
+        agy_api_key_env=env("AGY_API_KEY_ENV", os.getenv("AGY_API_KEY_ENV", "GEMINI_API_KEY")).strip() or "GEMINI_API_KEY",
+        agy_proxy=env("AGY_PROXY", os.getenv("AGY_PROXY", "http://127.0.0.1:7899")).strip(),
+        agy_print_timeout=env("AGY_PRINT_TIMEOUT", os.getenv("AGY_PRINT_TIMEOUT", "24h")).strip() or "24h",
+        agy_dangerous_skip=max(0, min(1, agy_skip)),
+        agy_idle_timeout_sec=max(0, agy_idle),
         dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
         role=role,
         court_chat_id=env("COURT_CHAT_ID").strip(),
@@ -453,6 +654,14 @@ def _load_legacy_profile() -> Optional[Profile]:
         maka_steps = int(os.getenv("MAKA_MAX_STEPS", "0") or "0")
     except ValueError:
         maka_steps = 0
+    try:
+        agy_skip = int(os.getenv("AGY_DANGEROUS_SKIP", "1") or "1")
+    except ValueError:
+        agy_skip = 1
+    try:
+        agy_idle = int(os.getenv("AGY_IDLE_TIMEOUT_SEC", "600") or "600")
+    except ValueError:
+        agy_idle = 600
     return Profile(
         name=legacy_name,
         app_id=app_id,
@@ -504,6 +713,14 @@ def _load_legacy_profile() -> Optional[Profile]:
         maka_max_steps=max(0, maka_steps),
         maka_dangerous_skip=max(0, min(1, maka_skip)),
         maka_idle_timeout_sec=max(0, maka_idle),
+        agy_bin=os.getenv("AGY_BIN", "").strip(),
+        agy_model_provider=os.getenv("AGY_MODEL_PROVIDER", "gemini").strip(),
+        agy_api_key=os.getenv("AGY_API_KEY", os.getenv("GEMINI_API_KEY", "")).strip(),
+        agy_api_key_env=os.getenv("AGY_API_KEY_ENV", "GEMINI_API_KEY").strip() or "GEMINI_API_KEY",
+        agy_proxy=os.getenv("AGY_PROXY", "http://127.0.0.1:7899").strip(),
+        agy_print_timeout=os.getenv("AGY_PRINT_TIMEOUT", "24h").strip() or "24h",
+        agy_dangerous_skip=max(0, min(1, agy_skip)),
+        agy_idle_timeout_sec=max(0, agy_idle),
     )
 
 
@@ -654,7 +871,7 @@ def load_claude_extra_env(profile: "Profile") -> dict[str, str]:
 # ── cc-lark 运行时 MCP 能力闸门（支持 per-profile 覆盖）──────────
 #
 # 三个闸门决定 spawn 出的 claude 里注册哪几个 cc-lark 运行时工具：
-#   CC_LARK_ALLOW_DISPATCH（dispatch_task + read_thread）
+#   CC_LARK_ALLOW_DISPATCH（dispatch_task + handover + read_thread + append/steer）
 #   CC_LARK_ALLOW_WAKE    （wake_me_in）
 #   CC_LARK_ALLOW_CRON    （schedule_cron + list_crons）
 # 优先级：<PROFILE>_<FLAG>（该 profile 专属）> <FLAG>（全局）> 未设（=开，由
