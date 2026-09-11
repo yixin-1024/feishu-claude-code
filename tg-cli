@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""tg-cli —— 给 agent 用的 Telegram 侧"手脚"，对标 Lark 那边的 lark-cli。
+
+agent 在 Telegram 会话里跑的时候，正文由 bot 负责渲染回去；但"主动发一张图 /
+发个文件 / 读一下这个群最近说了什么"这些事需要一个命令行入口，这就是本脚本。
+
+    tg-cli --profile tg send --text "跑完了"
+    tg-cli --profile tg send --image out.png --caption "对比图"
+    tg-cli --profile tg send --file report.pdf
+    tg-cli --profile tg context --limit 30
+
+设计取舍：
+  · 纯标准库（urllib + json），不依赖 cc-lark 的 venv —— agent 手上是哪个 python3
+    都能跑。
+  · token 不走环境变量，而是**现场从 cc-lark 的 .env 里读 `<PROFILE>_BOT_TOKEN`**。
+    别把 bot token 灌进 agent 的进程环境（子进程/日志到处漏）。
+  · chat / 回复锚点默认取 bot 注入的 `CC_LARK_CHAT_ID` / `CC_LARK_MESSAGE_ID`
+    （Telegram 侧的 message id 是 `<chat_id>:<message_id>` 复合 key，这里会自动拆）。
+  · `context` 直接读 bot 落盘的会话缓冲 jsonl，不调 Telegram（Bot API 没有读历史
+    的接口，能读到全靠 bot 自己记）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 同 telegram_client：留 env 覆盖给本机联调用（CC_TG_API_ROOT），生产不设。
+API_ROOT = (os.environ.get("CC_TG_API_ROOT", "").strip().rstrip("/")
+            or "https://api.telegram.org")
+
+
+def die(msg: str, code: int = 1):
+    print(f"tg-cli: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_env(path: str) -> dict:
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+def resolve_token(profile: str) -> str:
+    env = load_env(os.path.join(BASE_DIR, ".env"))
+    for key in (f"{profile.upper()}_BOT_TOKEN", "TG_BOT_TOKEN"):
+        token = (env.get(key) or os.environ.get(key) or "").strip()
+        if token:
+            return token
+    die(f"在 {BASE_DIR}/.env 里找不到 {profile.upper()}_BOT_TOKEN")
+
+
+def split_key(value: str) -> tuple[str, str]:
+    text = str(value or "")
+    if ":" not in text:
+        return text, ""
+    chat, _, mid = text.rpartition(":")
+    return chat, mid
+
+
+def resolve_target(args) -> tuple[str, str]:
+    """→ (chat_id, reply_to_message_id)。显式参数 > bot 注入的 env。"""
+    anchor = (args.reply_to or os.environ.get("CC_LARK_MESSAGE_ID", "")).lstrip("=")
+    a_chat, a_mid = split_key(anchor)
+    chat = (args.chat or os.environ.get("CC_LARK_CHAT_ID", "") or a_chat).lstrip("=")
+    if not chat:
+        die("拿不到 chat id（给 --chat=<id>，或在 bot 注入的环境里跑）")
+    if a_mid and not a_mid.lstrip("-").isdigit():
+        die(f"回复锚点不是 `<chat_id>:<message_id>` 形式: {anchor!r}")
+    return str(chat), str(a_mid or "")
+
+
+def api(token: str, method: str, payload: dict, timeout: float = 30) -> dict:
+    body = json.dumps({k: v for k, v in payload.items() if v is not None}).encode()
+    req = urllib.request.Request(
+        f"{API_ROOT}/bot{token}/{method}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            data = json.loads(e.read())
+        except Exception:
+            die(f"{method} HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        die(f"{method} 网络错误: {e}")
+    if not data.get("ok"):
+        die(f"{method} 失败: [{data.get('error_code')}] {data.get('description')}")
+    return data["result"]
+
+
+def api_upload(token: str, method: str, fields: dict, file_field: str,
+               file_path: str, timeout: float = 300) -> dict:
+    """multipart/form-data 上传（图片 / 文件）。"""
+    boundary = f"----tgcli{uuid.uuid4().hex}"
+    # 文件名里的引号/换行会撑破 Content-Disposition 头（服务端解析出错或截断）
+    name = (os.path.basename(file_path)
+            .replace('"', "_").replace("\r", " ").replace("\n", " "))
+    ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    parts: list[bytes] = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n"
+            f"{value}\r\n".encode()
+        )
+    with open(file_path, "rb") as f:
+        blob = f.read()
+    parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; "
+        f"filename=\"{name}\"\r\nContent-Type: {ctype}\r\n\r\n".encode()
+    )
+    parts.append(blob)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    data = b"".join(parts)
+    req = urllib.request.Request(
+        f"{API_ROOT}/bot{token}/{method}",
+        data=data,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            result = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        try:
+            result = json.loads(e.read())
+        except Exception:
+            die(f"{method} HTTP {e.code}")
+    except (urllib.error.URLError, OSError) as e:
+        die(f"{method} 网络错误: {e}")
+    if not result.get("ok"):
+        die(f"{method} 失败: [{result.get('error_code')}] {result.get('description')}")
+    return result["result"]
+
+
+# Telegram 的 caption 上限是 1024 字符（text 是 4096）。超了直接 400，
+# 图/文件整条发不出去 —— 截断比发不出去好。
+CAPTION_LIMIT = 1024
+
+
+def cmd_send(args) -> None:
+    token = resolve_token(args.profile)
+    chat, reply_to = resolve_target(args)
+    if args.caption and len(args.caption) > CAPTION_LIMIT:
+        args.caption = args.caption[: CAPTION_LIMIT - 1] + "…"
+    reply_params = (
+        {"message_id": int(reply_to), "allow_sending_without_reply": True}
+        if reply_to else None
+    )
+    if args.image:
+        if not os.path.exists(args.image):
+            die(f"文件不存在: {args.image}")
+        result = api_upload(token, "sendPhoto", {
+            "chat_id": chat,
+            "caption": args.caption or None,
+            "reply_parameters": json.dumps(reply_params) if reply_params else None,
+        }, "photo", args.image)
+    elif args.file:
+        if not os.path.exists(args.file):
+            die(f"文件不存在: {args.file}")
+        result = api_upload(token, "sendDocument", {
+            "chat_id": chat,
+            "caption": args.caption or None,
+            "reply_parameters": json.dumps(reply_params) if reply_params else None,
+        }, "document", args.file)
+    elif args.text is not None:
+        text = args.text
+        if text == "-":
+            text = sys.stdin.read()
+        if not text.strip():
+            die("--text 为空")
+        result = api(token, "sendMessage", {
+            "chat_id": chat,
+            "text": text[:4096],
+            "reply_parameters": reply_params,
+            "link_preview_options": {"is_disabled": True},
+        })
+    else:
+        die("send 需要 --text / --image / --file 之一")
+    print(json.dumps({
+        "ok": True,
+        "chat_id": result["chat"]["id"],
+        "message_id": result["message_id"],
+    }, ensure_ascii=False))
+
+
+def buffer_path(profile: str) -> str:
+    base = os.environ.get("CC_TG_BUFFER_DIR", "").strip() or os.path.expanduser(
+        "~/.feishu-claude/tg")
+    return os.path.join(base, f"{profile}.jsonl")
+
+
+def cmd_context(args) -> None:
+    """打印当前 chat（可指定 --thread）最近的消息，用于"读一下上下文"。"""
+    path = buffer_path(args.profile)
+    if not os.path.exists(path):
+        die(f"还没有会话缓冲文件: {path}")
+    chat = args.chat or os.environ.get("CC_LARK_CHAT_ID", "") or split_key(
+        os.environ.get("CC_LARK_MESSAGE_ID", ""))[0]
+    thread = args.thread or os.environ.get("CC_LARK_THREAD_ID", "")
+    records: dict[str, dict] = {}
+    order: list[str] = []
+    # errors="replace"：进程被 kill -9 时尾行可能撕成半个多字节字符
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            mid = obj.get("mid", "")
+            if not mid:
+                continue
+            if obj.get("op") == "text":
+                if mid in records:
+                    records[mid]["content"] = json.dumps(
+                        {"text": obj.get("content", "")}, ensure_ascii=False)
+                continue
+            if chat and str(obj.get("chat")) != str(chat):
+                continue
+            if thread and obj.get("thread") != thread:
+                continue
+            if mid not in records:
+                order.append(mid)
+            records[mid] = obj
+
+    rows = [records[m] for m in order][-max(1, args.limit):]
+    if not rows:
+        print("(缓冲里还没有这个会话的消息)")
+        return
+    for i, rec in enumerate(rows, 1):
+        try:
+            body = json.loads(rec.get("content") or "{}")
+        except ValueError:
+            body = {}
+        text = body.get("text") or f"[{rec.get('type')}]"
+        who = rec.get("name") or rec.get("uid", "")
+        if rec.get("bot"):
+            who += "(bot)"
+        when = time.strftime("%m-%d %H:%M", time.localtime((rec.get("ts") or 0) / 1000))
+        print(f"[{i}] {who} ({when}): {text}")
+
+
+_NEG_VALUE_OPTS = ("--chat", "--reply-to")
+
+
+def _glue_negative_values(argv: list[str]) -> list[str]:
+    """把 `--chat -100123` 改写成 `--chat=-100123`。
+
+    群 chat id 是负数，argparse 会把 `-100123` 当成选项名直接报 usage 错误。
+    要求调用方记得写 `=` 是个纯粹的坑（agent 尤其容易踩），这里帮它接上。
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if (tok in _NEG_VALUE_OPTS and i + 1 < len(argv)
+                and re.match(r"^-\d", argv[i + 1])):
+            out.append(f"{tok}={argv[i + 1]}")
+            i += 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="tg-cli", description="Telegram 侧的 agent 工具")
+    ap.add_argument("--profile", default=os.environ.get("CC_LARK_PROFILE_NAME", "tg"),
+                    help="cc-lark 的 profile 名（决定读哪个 <P>_BOT_TOKEN）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("send", help="发文本 / 图片 / 文件到当前会话")
+    s.add_argument("--text", nargs="?", const="-", help="文本正文（'-' = 读 stdin）")
+    s.add_argument("--image", help="图片路径（走 sendPhoto）")
+    s.add_argument("--file", help="任意文件路径（走 sendDocument）")
+    s.add_argument("--caption", help="图片/文件的说明文字")
+    # ⚠️ 群 chat id 是负数，`--chat -100123` 会被 argparse 当成选项名 →
+    # 必须写成 `--chat=-100123`（帮助里明说，别让人踩）
+    s.add_argument("--chat", help="目标 chat id；负数要写成 --chat=-100123"
+                                  "（默认取 CC_LARK_CHAT_ID）")
+    s.add_argument("--reply-to", dest="reply_to",
+                   help="回复锚点 <chat_id>:<message_id>；负数要写成 "
+                        "--reply-to=-100:55（默认取 CC_LARK_MESSAGE_ID）")
+    s.set_defaults(func=cmd_send)
+
+    c = sub.add_parser("context", help="读当前会话最近的消息（bot 落盘的缓冲）")
+    c.add_argument("--limit", type=int, default=30)
+    c.add_argument("--chat", help="目标 chat id；负数要写成 --chat=-100123"
+                                  "（默认取 CC_LARK_CHAT_ID）")
+    c.add_argument("--thread", help="合成 thread id（默认取 CC_LARK_THREAD_ID）")
+    c.set_defaults(func=cmd_context)
+
+    args = ap.parse_args(_glue_negative_values(sys.argv[1:]))
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
