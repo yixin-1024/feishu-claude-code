@@ -75,11 +75,17 @@ async def test_usage_for_opencode_uses_last_usage_not_claude_quota(opencode_stor
         "usage", "", "user_1", "oc_hermes", opencode_store, bot=_bot()
     )
 
-    assert "opencode 用量" in reply
-    assert "Claude Max" not in reply
-    assert "Runner: `opencode`" in reply
-    assert f"模型: `{GEMINI_31}`" in reply
-    assert "1.8k / 1M" in reply
+    text = reply["text"] if isinstance(reply, dict) else reply
+    assert "opencode 用量" in text
+    assert "Claude Max" not in text
+    assert "Runner: `opencode`" in text
+    assert f"模型: `{GEMINI_31}`" in text
+    assert "1.8k / 1M" in text
+    if isinstance(reply, dict):
+        assert reply["buttons"] == [{
+            "text": "🔄 刷新",
+            "value": {"action": "run_cmd", "cmd": "/usage", "cid": "oc_hermes"},
+        }]
 
 
 @pytest.mark.asyncio

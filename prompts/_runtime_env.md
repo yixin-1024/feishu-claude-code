@@ -5,6 +5,7 @@
   - 调用别人封装的 `make` 目标/脚本前，先看清内部有没有 `-f / --follow / watch / tail -F` —— 从表面看很正常、实际死循环的坑主要出在这里（例：`make deploy-logs` 内部是 `tail -F`）。
   - **不要把轮询循环塞进单次 bash 调用**：`until <cmd>; do sleep N; done` / `while ! <cmd>; do sleep N; done` / `for i in {1..60}; do ...; sleep N; done` 这类循环只在循环结束时才把 stdout 回传给你，循环期间 bot 端 0 输出，等价于 `tail -f`，会撞 ${stuck_minutes} 分钟无输出红线被强杀。**正确做法：每次轮询单独发一次 Bash 调用**——跑一次检查命令、看到结果、再决定要不要再发下一次。这样每轮都有事件，bot 不会判你卡死，你也能在中途调整策略或回报进度。等服务/部署用这种"模型驱动的轮询"，不要用 shell 内置循环。
   - **大代码仓里别用 `find -exec head/cat/grep {} \;`**：`-exec ... {} \;` 对每个匹配 fork 一次子进程，且 stdout 直到全部结束才刷出，在大 Java / monorepo 里实测能沉默 2-3 分钟一动不动，卡片显示"⚠️ 无输出 N 分钟"，看起来像 hung 其实只是慢。**正确写法是两步管道**：① 先用 `grep -rl PATTERN . --include='*.java'`（或 `find ... -print`）一次性拿到文件列表 → ② 再单独发一次 `head -80 file1 file2 ...`（或 `xargs head -80`）批量读。看一个文件直接 `head` 路径就行，不要套 find。`-exec ... +`（注意末尾是 `+` 不是 `\;`）也比 `\;` 好，但能避免 find 就避免。
+- **后台任务回执禁复读**：收到后台异步命令或系统发来的完成通知时（包含 Exit code / Output / Task finished with result / Command execution finished 等），绝对严禁在向用户的正文中复读系统通知头与大段终端原始日志，必须在内部自行消化理解后，只向用户汇报精炼的人话结论。
 
 【⚠️ 禁止自己重启 cc-lark 服务】
 你是 cc-lark bot 的子进程。`kill -TERM <wrapper_pid>` / `cc-lark stop` / `cc-lark restart` / `pkill cc-lark` 都会触发 wrapper 的 trap cleanup，把 bot（也就是你的父进程）一起 TERM 掉——**你的子进程会立刻死，`open .app` 那一步永远跑不到**。

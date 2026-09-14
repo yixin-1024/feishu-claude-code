@@ -61,6 +61,8 @@ MODEL_ALIASES = {
     "opus5": "claude-opus-5[1m]",
     "opus-4-8": "claude-opus-4-8[1m]",
     "opus4.8": "claude-opus-4-8[1m]",
+    "sonnet5": "claude-sonnet-5[1m]",
+    "sonnet-5": "claude-sonnet-5[1m]",
     "sonnet-4-6": "claude-sonnet-4-6",
     "sonnet4.6": "claude-sonnet-4-6",
     "codex-max": "gpt-5.1-codex-max",
@@ -223,8 +225,8 @@ HELP_TEXT = """\
 `/skills` — 列出已安装的 Claude Skills
 `/mcp` — 列出已配置的 MCP Servers
 `/usage` — 查看当前 runner 的上下文/用量信息
-`/accounts` — 查看所有 Claude Max 账户全景 + 智能切换状态
-`/switch <账户>` — 在 Claude runner 下切换本机全局 Claude Code 账户
+`/accounts` — 账户全景（Claude runner：Max 用量 + 智能切换状态；agy runner：Antigravity 账号）
+`/switch <账户>` — 切换本机全局账户（Claude Code；agy runner 下切 Antigravity 账号，`/switch save [名字]` 存当前号）
 
 **审计：**
 `/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
@@ -659,8 +661,26 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
     if not accounts:
         data = fetch_quota_headers()
         if not data.get("ok"):
-            return f"❌ {data.get('error', '获取用量失败')}"
-        return "\n".join(_usage_single_account_lines(data))
+            err_text = f"❌ {data.get('error', '获取用量失败')}"
+            if chat_id:
+                return {
+                    "text": err_text,
+                    "buttons": [{
+                        "text": "🔄 刷新",
+                        "value": {"action": "run_cmd", "cmd": "/usage", "cid": chat_id},
+                    }],
+                }
+            return err_text
+        lines = _usage_single_account_lines(data)
+        if chat_id:
+            return {
+                "text": "\n".join(lines),
+                "buttons": [{
+                    "text": "🔄 刷新",
+                    "value": {"action": "run_cmd", "cmd": "/usage", "cid": chat_id},
+                }],
+            }
+        return "\n".join(lines)
 
     # 顶部：当前 active 账户的详尽 bar
     cur = accounts.get(current) if current else None
@@ -732,8 +752,9 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
     # 底部账户切换按钮（点击即切换本机全局 Claude Code 账户，并原地重渲染 /usage）
     buttons = _account_switch_buttons(chat_id, for_usage=True) if chat_id else []
     if buttons:
-        lines.append("")
-        lines.append("👇 点账户按钮切换 Claude Code 账户 · 🔄 刷新用量：")
+        if any(b.get("value", {}).get("action") == "switch_usage" for b in buttons):
+            lines.append("")
+            lines.append("👇 点账户按钮切换 Claude Code 账户 · 🔄 刷新用量：")
         return {"text": "\n".join(lines), "buttons": buttons}
     return "\n".join(lines)
 
@@ -1185,28 +1206,34 @@ def _account_switch_buttons(chat_id: str, *, for_usage: bool = False) -> list[di
 
     for_usage=False（`/switch` 选择卡）：点击发 `/switch <名称>`，把当前卡片刷成
     切换结果文本。
-    for_usage=True（`/usage` 底部）：点击走 `switch_usage` 动作——切换后把当前卡片
-    原地重渲染成最新 `/usage`（切换后的账户置顶 ● + 按钮保留），而不是替换成裸切换提示。
+    for_usage=True（`/usage` 底部）：
+    - 仅当保存了 >1 个账户时，才展示各账户的切换按钮（点击走 `switch_usage` 动作原地重渲染）；
+    - 若只有 1 个账户或没有保存账户，不展示无意义的切换按钮；
+    - 只要 for_usage=True 且有 chat_id，末尾必带「🔄 刷新」按钮，点击原地重跑 `/usage`。
     """
     try:
         from account_switcher import list_accounts_summary
         rows = list_accounts_summary()
     except Exception:
-        return []
+        rows = []
     buttons: list[dict] = []
+    if for_usage:
+        if len(rows) > 1:
+            for row in rows:
+                text = ("● " if row.get("active") else "") + row["name"]
+                value = {"action": "switch_usage", "name": row["name"], "cid": chat_id}
+                buttons.append({"text": text, "value": value})
+        if chat_id:
+            buttons.append({
+                "text": "🔄 刷新",
+                "value": {"action": "run_cmd", "cmd": "/usage", "cid": chat_id},
+            })
+        return buttons
+
     for row in rows:
         text = ("● " if row.get("active") else "") + row["name"]
-        if for_usage:
-            value = {"action": "switch_usage", "name": row["name"], "cid": chat_id}
-        else:
-            value = {"action": "run_cmd", "cmd": f"/switch {row['name']}", "cid": chat_id}
+        value = {"action": "run_cmd", "cmd": f"/switch {row['name']}", "cid": chat_id}
         buttons.append({"text": text, "value": value})
-    # /usage 底部：账户按钮之后追加一个「刷新」按钮，点击原地重跑 /usage
-    if for_usage and buttons:
-        buttons.append({
-            "text": "🔄 刷新",
-            "value": {"action": "run_cmd", "cmd": "/usage", "cid": chat_id},
-        })
     return buttons
 
 
@@ -1271,6 +1298,189 @@ def _switch_claude_account(name: str) -> str:
     if "identity missing" in detail:
         lines.append("⚠️ 该账户缺少 identity 快照，Claude Code 可能要求重新登录。")
     return "\n".join(lines)
+
+
+# ── agy（Antigravity）账号切换：与 Claude 那套同形，但底层只有 keychain 一份态 ──
+
+# `/switch` 在 agy runner 下的保留子命令（不能当账号名用）
+_AGY_SWITCH_SUBCMDS = {"save", "remove", "rm", "list", "ls", "logout"}
+
+
+def _agy_switch_buttons(chat_id: str, *, for_usage: bool = False) -> list[dict]:
+    """agy 账号切换按钮——`/accounts`、`/switch` 选择卡、`/usage` 底部共用。
+
+    active 账号前缀 `●`。与 Claude 版 `_account_switch_buttons` 同语义：
+
+    for_usage=False：点击发 `/switch <名称>`，整张卡换成切换结果文本。
+    for_usage=True（`/usage` 底部）：
+    - 仅当保存了 >1 个账号时才给切换按钮（点击走 `switch_usage` 动作原地重渲染）；
+    - 只要有 chat_id，末尾必带「🔄 刷新」按钮。
+    """
+    try:
+        from agy_account_switcher import list_accounts_summary
+        rows = list_accounts_summary()
+    except Exception:
+        rows = []
+    buttons: list[dict] = []
+    if for_usage:
+        if len(rows) > 1:
+            for row in rows:
+                text = ("● " if row.get("active") else "") + row["name"]
+                buttons.append({
+                    "text": text,
+                    "value": {"action": "switch_usage", "name": row["name"], "cid": chat_id},
+                })
+        if chat_id:
+            buttons.append({
+                "text": "🔄 刷新",
+                "value": {"action": "run_cmd", "cmd": "/usage", "cid": chat_id},
+            })
+        return buttons
+
+    for row in rows:
+        text = ("● " if row.get("active") else "") + row["name"]
+        buttons.append({
+            "text": text,
+            "value": {"action": "run_cmd", "cmd": f"/switch {row['name']}", "cid": chat_id},
+        })
+    return buttons
+
+
+def _agy_current_account() -> tuple[str, str]:
+    """当前 agy 账号 (快照名, email)。读不到就回 ("", "")——调用方按需降级。"""
+    try:
+        from agy_account_switcher import current_account_name, current_email
+        return (current_account_name() or "", current_email() or "")
+    except Exception:
+        return ("", "")
+
+
+def _get_agy_accounts(chat_id: str) -> dict | str:
+    """渲染 agy 版 `/accounts`：当前账号 + token 到期 + 已存账号列表 + 切换按钮。"""
+    try:
+        from agy_account_switcher import render_accounts_text
+        text = render_accounts_text()
+    except Exception as e:
+        return f"❌ agy_account_switcher 加载失败：{e}"
+    buttons = _agy_switch_buttons(chat_id) if chat_id else []
+    return {"text": text, "buttons": buttons} if buttons else text
+
+
+def _get_agy_switch_picker(chat_id: str) -> dict | str:
+    """`/switch` 无参数（agy runner）时的账号选择卡。"""
+    try:
+        from agy_account_switcher import (
+            current_email,
+            list_accounts_summary,
+        )
+        rows = list_accounts_summary()
+        cur_email = current_email()
+    except Exception as e:
+        return f"❌ 读取 agy 账号失败：{e}"
+    if not rows:
+        return (
+            "❌ 还没有保存任何 agy 账号。\n"
+            f"当前 keychain 里的是：`{cur_email or '（无）'}`\n"
+            "发 `/switch save <名字>` 先把它存下来，再去 `agy` 里登另一个号并同样保存。"
+        )
+    current = next((row["name"] for row in rows if row.get("active")), None)
+    current_line = (
+        f"当前账号：`{current}`（{cur_email}）" if current
+        else f"当前账号：`未保存`（{cur_email or '无凭证'}）"
+    )
+    return {
+        "text": (
+            "👤 **切换 agy（Antigravity）账号**\n"
+            f"{current_line}\n"
+            "切换只改本机全局 agy 凭证（终端里的 `agy` 和 bot 共用同一份），"
+            "不改当前 chat 的 runner / model。"
+        ),
+        "buttons": _agy_switch_buttons(chat_id),
+    }
+
+
+def _switch_agy_account(name: str) -> str:
+    """执行一次 agy 账号切换。"""
+    try:
+        from agy_account_switcher import list_account_files, use_account
+        ok, detail = use_account(name)
+    except Exception as e:
+        return f"❌ agy 账号切换失败：{e}"
+    if not ok:
+        available = "、".join(f"`{n}`" for n in list_account_files()) or "（无）"
+        return f"❌ agy 账号切换失败：{detail}\n可用账号：{available}"
+    if detail.startswith("already using"):
+        return f"✅ 当前已经是 agy 账号 `{name}`。"
+    return (
+        f"✅ agy 账号已切换：{detail}\n"
+        "新启动的 agy 任务会用该账号；正在运行的任务不受影响。\n"
+        "发 `/usage` 可以看这个号的额度。"
+    )
+
+
+def _save_agy_account(args: str) -> str:
+    """`/switch save [名字] [--force]`——把当前 keychain 里的 agy 号存成快照。"""
+    parts = args.split()
+    force = "--force" in parts
+    names = [p for p in parts if not p.startswith("--")]
+    try:
+        from agy_account_switcher import save_current_account
+        ok, detail = save_current_account(names[0] if names else None,
+                                          guard_email=not force)
+    except Exception as e:
+        return f"❌ 保存 agy 账号失败：{e}"
+    if not ok:
+        return f"❌ 保存 agy 账号失败：{detail}"
+    return (
+        f"✅ 已保存 agy 账号：{detail}\n"
+        "之后 `/switch <名字>` 即可切回来。"
+    )
+
+
+def _remove_agy_account(name: str) -> str:
+    try:
+        from agy_account_switcher import remove_account
+        ok, detail = remove_account(name)
+    except Exception as e:
+        return f"❌ 删除 agy 账号失败：{e}"
+    return ("✅ " if ok else "❌ ") + detail
+
+
+def _logout_agy_account(args: str) -> str:
+    """`/switch logout [--force]`——清空 keychain，好让 agy 下次启动重新登号。"""
+    force = "--force" in args.split()
+    try:
+        from agy_account_switcher import logout
+        ok, detail = logout(require_saved=not force)
+    except Exception as e:
+        return f"❌ agy 登出失败：{e}"
+    if not ok:
+        return f"❌ agy 登出失败：{detail}"
+    return (
+        f"✅ {detail}\n"
+        "⚠️ 登录要在本机终端里跑 `agy` 完成（要开浏览器授权），bot 代不了。"
+    )
+
+
+def _handle_agy_switch(args: str, chat_id: str) -> dict | str:
+    """agy runner 下的 `/switch`：无参出选择卡，`save`/`logout`/`remove` 走管理分支。"""
+    args = (args or "").strip()
+    if not args:
+        return _get_agy_switch_picker(chat_id)
+    head, _, rest = args.partition(" ")
+    head_l = head.lower()
+    if head_l == "save":
+        return _save_agy_account(rest.strip())
+    if head_l == "logout":
+        return _logout_agy_account(rest.strip())
+    if head_l in ("remove", "rm"):
+        target = rest.strip()
+        if not target:
+            return "⚠️ 用法：`/switch remove <名字>`"
+        return _remove_agy_account(target)
+    if head_l in ("list", "ls"):
+        return _get_agy_accounts(chat_id)
+    return _switch_agy_account(head)
 
 
 _EXEC_TIMEOUT_SEC = 30
@@ -2171,6 +2381,21 @@ async def handle_command(
     elif cmd == "usage":
         cur = await store.get_current_raw(user_id, chat_id)
         runner = str(cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
+
+        def _wrap_usage_output(text_lines: list[str],
+                              buttons: list[dict] | None = None) -> "str | dict":
+            if buttons:
+                return {"text": "\n".join(text_lines), "buttons": buttons}
+            if chat_id:
+                return {
+                    "text": "\n".join(text_lines),
+                    "buttons": [{
+                        "text": "🔄 刷新",
+                        "value": {"action": "run_cmd", "cmd": "/usage", "cid": chat_id},
+                    }],
+                }
+            return "\n".join(text_lines)
+
         if runner == "codex":
             model = cur.get("model_override") or store.default_model
             lines = ["📊 **Codex 用量**", ""]
@@ -2192,7 +2417,7 @@ async def handle_command(
             lines.append("")
             lines.append(f"Runner: `codex`")
             lines.append(f"模型: `{model}`")
-            return "\n".join(lines)
+            return _wrap_usage_output(lines)
         if runner == "opencode":
             model = cur.get("model_override") or store.default_model
             lines = ["📈 **opencode 用量**"]
@@ -2206,7 +2431,7 @@ async def handle_command(
                 lines.append(ctx_line)
             lines.append(f"Runner: `opencode`")
             lines.append(f"模型: `{model}`")
-            return "\n".join(lines)
+            return _wrap_usage_output(lines)
         if runner == "grok":
             model = cur.get("model_override") or store.default_model
             lines = ["📈 **Grok CLI 用量**"]
@@ -2220,10 +2445,16 @@ async def handle_command(
                 lines.append(ctx_line)
             lines.append(f"Runner: `grok`")
             lines.append(f"模型: `{model}`")
-            return "\n".join(lines)
+            return _wrap_usage_output(lines)
         if runner == "agy":
             model = cur.get("model_override") or store.default_model
-            lines = ["📈 **Antigravity CLI 用量**"]
+            acct_name, acct_email = await asyncio.to_thread(_agy_current_account)
+            title = "📈 **Antigravity CLI 用量**"
+            if acct_name:
+                title += f" — 当前 `{acct_name}`"
+            elif acct_email:
+                title += f" — 当前 `{acct_email}`"
+            lines = [title]
             ctx_line = _format_context_line(
                 cur.get("session_id"),
                 model,
@@ -2245,7 +2476,12 @@ async def handle_command(
             lines.append("")
             lines.append(f"Runner: `agy`")
             lines.append(f"模型: `{model}`")
-            return "\n".join(lines)
+            # 底部账号切换按钮：点击即切本机全局 agy 凭证并原地重渲染 /usage
+            buttons = _agy_switch_buttons(chat_id, for_usage=True) if chat_id else []
+            if any(b.get("value", {}).get("action") == "switch_usage" for b in buttons):
+                lines.append("")
+                lines.append("👇 点账号按钮切换 Antigravity 账号 · 🔄 刷新用量：")
+            return _wrap_usage_output(lines, buttons)
         if runner == "mimo":
             model = cur.get("model_override") or store.default_model
             lines = ["📈 **MiMo Code 用量**"]
@@ -2259,10 +2495,31 @@ async def handle_command(
                 lines.append(ctx_line)
             lines.append(f"Runner: `mimo`")
             lines.append(f"模型: `{model}`")
-            return "\n".join(lines)
+            return _wrap_usage_output(lines)
+        if runner == "maka":
+            model = cur.get("model_override") or store.default_model
+            lines = ["📈 **Apache Maka 用量**"]
+            ctx_line = _format_context_line(
+                cur.get("session_id"),
+                model,
+                runner="maka",
+                current_usage=cur.get("last_usage") or None,
+            )
+            if ctx_line:
+                lines.append(ctx_line)
+            lines.append(f"Runner: `maka`")
+            lines.append(f"模型: `{model}`")
+            return _wrap_usage_output(lines)
         return _get_usage(chat_id)
 
     elif cmd == "accounts":
+        cur = await store.get_current(user_id, chat_id)
+        runner = str(
+            getattr(cur, "runner", "")
+            or getattr(getattr(bot, "profile", None), "runner", "claude")
+        ).lower()
+        if runner == "agy":
+            return await asyncio.to_thread(_get_agy_accounts, chat_id)
         return await asyncio.to_thread(_get_accounts)
 
     elif cmd == "switch":
@@ -2271,10 +2528,13 @@ async def handle_command(
             getattr(cur, "runner", "")
             or getattr(getattr(bot, "profile", None), "runner", "claude")
         ).lower()
+        # agy 也有多号切换（凭证在 keychain 的 gemini/antigravity 条目里）
+        if runner == "agy":
+            return await asyncio.to_thread(_handle_agy_switch, args, chat_id)
         if runner != "claude":
             return (
-                "⚠️ `/switch` 只用于 Claude Code 账户切换。\n"
-                f"当前 chat runner 是 `{runner}`；可先发送 `/runner claude`。"
+                "⚠️ `/switch` 只用于 Claude Code / agy 账号切换。\n"
+                f"当前 chat runner 是 `{runner}`；可先发送 `/runner claude` 或 `/runner agy`。"
             )
         name = args.strip()
         if not name:

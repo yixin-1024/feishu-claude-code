@@ -174,6 +174,17 @@ _AGY_MCP_ADAPTER = (
     "就当成不存在。\n\n"
 )
 
+_AGY_SYSTEM_NOTIFICATION_GUARD = (
+    "【后台任务与系统通知处理规范】\n"
+    "- 当收到后台异步任务（run_command 等 background task）或系统消息完成的回执通知时（如包含 `Command execution finished`、"
+    "`Task id ... finished with result`、`Exit code:`、`Output:`、`收到来自系统的新消息` 等）：\n"
+    "- **绝对严禁在向用户的回复中直接复读、引用或 dump 原始系统通知头与大段终端日志**"
+    "（绝不要输出形如「收到来自系统的新消息：Command execution finished:...」的内容）；\n"
+    "- 你必须在内部自行消化理解这些输出，向用户回复时**只能输出精炼的人话结论与后续操作**，"
+    "严禁把原始终端调试日志直接暴露给用户。\n\n"
+)
+
+
 
 def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
     """按实际配置渲染超时阈值文案，别在模板里写死数字。
@@ -307,9 +318,8 @@ def render_lark_prompt(
         runtime_mcp_section = render("_runtime_mcp_claude", shared_ctx)
         if backend == "agy":
             # agy 不把 MCP 工具铺平成 mcp__<server>__<tool>，而是统一走 call_mcp_tool，
-            # 所以照抄 claude 版介绍前先给一句调用方式的转译，免得它照着
-            # `mcp__cc-lark__wake_me_in` 这个名字去找工具然后放弃。
-            runtime_mcp_section = _AGY_MCP_ADAPTER + runtime_mcp_section
+            # 并前置后台任务回执防复读规范
+            runtime_mcp_section = _AGY_MCP_ADAPTER + _AGY_SYSTEM_NOTIFICATION_GUARD + runtime_mcp_section
     else:
         runtime_mcp_section = render("_runtime_mcp_other", shared_ctx)
 

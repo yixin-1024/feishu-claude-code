@@ -36,5 +36,16 @@ def _isolate_sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("CC_LARK_TASK_ROUTES", str(tmp_path / "task_routes.json"))
     # 会话移交简报同理：测试里的假移交不该在仓库 data/handovers/ 里堆文件。
     monkeypatch.setenv("CC_LARK_HANDOVER_DIR", str(tmp_path / "handovers"))
+    # agy 账号快照 / keychain 同理，而且更凶：~/.gemini/accounts 里是**真凭证**，
+    # keychain 那条 gemini/antigravity 就是本机 agy 的登录态。测试一律读不到真号、
+    # 也写不动 keychain（要验证写入路径的用例自己 monkeypatch 回去）。
+    import agy_account_switcher as _aas
+    monkeypatch.setattr(_aas, "ACCOUNTS_DIR", str(tmp_path / "agy_accounts"))
+    monkeypatch.setattr(_aas, "_read_keychain_raw", lambda: None)
+    monkeypatch.setattr(_aas, "_write_keychain_raw",
+                        lambda raw: (False, "test: keychain 写入已被隔离挡住"))
+    monkeypatch.setattr(_aas, "_delete_keychain",
+                        lambda: (False, "test: keychain 删除已被隔离挡住"))
+
     import resume_store as _rs
     _rs._ATTEMPTS.clear()

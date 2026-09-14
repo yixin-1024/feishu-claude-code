@@ -976,3 +976,208 @@ def test_claude_sonnet_4_6_stays_valid_for_claude_runner():
 
     assert is_model_compatible_with_runner("claude-sonnet-4-6", "claude")
     assert is_model_compatible_with_runner("claude-sonnet-4-6", "agy")
+
+
+# ── 系统通知/后台任务日志复读清洗与流式抑制测试 ──────────────────────────────
+
+def test_clean_leaked_system_output_with_human_conclusion():
+    raw = (
+        "收到来自系统的新消息：\n"
+        "Command execution finished:\n"
+        "Exit code: 0\n"
+        "Output:\n"
+        "============================= test session starts ==============================\n"
+        "platform darwin -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0\n"
+        "rootdir: /Users/yixinlu/Desktop/workspace/tools/feishu-claude-code\n"
+        "collected 552 items\n\n"
+        "tests/test_workspace_commands.py .........                               [100%]\n\n"
+        "============================= 552 passed in 10.36s =============================\n\n"
+        "已完成优化并全面通过自动化测试：\n\n"
+        "### 🛠 改动内容\n"
+        "1. **多 Runner `/usage` 增加刷新按钮**：\n"
+        "   - 点击后直接复用当前卡片原地更新最新用量"
+    )
+    cleaned = agy_runner.clean_leaked_system_output(raw)
+    assert "收到来自系统的新消息" not in cleaned
+    assert "Command execution finished" not in cleaned
+    assert "552 passed in" not in cleaned
+    assert cleaned.startswith("已完成优化并全面通过自动化测试：")
+    assert "多 Runner `/usage` 增加刷新按钮" in cleaned
+
+
+def test_clean_leaked_system_output_leak_only():
+    raw = (
+        "Command execution finished:\n"
+        "Exit code: 0\n"
+        "Output:\n"
+        "552 passed in 10.36s"
+    )
+    cleaned = agy_runner.clean_leaked_system_output(raw)
+    assert "Command execution finished" not in cleaned
+    assert "552 passed" not in cleaned
+    assert cleaned == "后台任务已执行完成：成功。"
+
+
+def test_clean_leaked_system_output_english_format():
+    raw = (
+        '[Message] timestamp=2026-09-12T13:52:10Z sender=task-82 priority=MESSAGE_PRIORITY_HIGH content=Task id "task-82" finished with result:\n\n'
+        "The command exited with code 0.\n"
+        "Output:\n"
+        "total 100\n"
+        "-rw-r--r-- 1 root root 1234 test.txt\n\n"
+        "The file has been created successfully."
+    )
+    cleaned = agy_runner.clean_leaked_system_output(raw)
+    assert "Task id" not in cleaned
+    assert "The command exited" not in cleaned
+    assert cleaned == "The file has been created successfully."
+
+
+def test_clean_leaked_system_output_preserves_normal_text():
+    normal = (
+        "用户要求运行 pytest，命令结果如下：\n\n"
+        "```text\n"
+        "552 passed in 10.36s\n"
+        "```"
+    )
+    assert agy_runner.clean_leaked_system_output(normal) == normal
+
+
+def test_run_agy_suppresses_leaked_system_notification_streaming(monkeypatch):
+    """当 step 0/1 是系统回执复读时，不调用 on_text_chunk，但后续真实回答正常流式，最终结果也被净化。"""
+    captured_chunks = []
+
+    async def _on_chunk(chunk):
+        captured_chunks.append(chunk)
+
+    stream = [
+        json.dumps({
+            "event": "init",
+            "conversation_id": CID,
+            "init": {"model": "gemini-3.8-flash", "cwd": "/tmp", "tools": ["run_command"],
+                     "permission_mode": "always-proceed"},
+        }).encode() + b"\n",
+        # Step 1: 泄漏的系统通知（应被抑制）
+        json.dumps({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": CID,
+                "step_index": 1,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "text_delta": "收到来自系统的新消息：\nCommand execution finished:\nExit code: 0\nOutput:\n552 passed\n",
+            },
+        }).encode() + b"\n",
+        # Step 2: 真实的业务结论（应正常流式）
+        json.dumps({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": CID,
+                "step_index": 2,
+                "state": "ACTIVE",
+                "step_type": "agent_response",
+                "text_delta": "已完成全部优化并通过测试。",
+            },
+        }).encode() + b"\n",
+        # Result
+        json.dumps({
+            "event": "result",
+            "result": {
+                "conversation_id": CID,
+                "status": "SUCCESS",
+                "response": (
+                    "收到来自系统的新消息：\nCommand execution finished:\nExit code: 0\nOutput:\n552 passed\n\n"
+                    "已完成全部优化并通过测试。"
+                ),
+            },
+        }).encode() + b"\n",
+    ]
+
+    captured = {}
+    _patch_exec(monkeypatch, FakeProc(stream), captured)
+
+    full_text, _, _ = asyncio.run(
+        run_agy(message="check tests", cwd="/tmp", on_text_chunk=_on_chunk)
+    )
+
+    # 验证流式推送被拦截，只有真正的结论推了出去
+    assert len(captured_chunks) == 1
+    assert captured_chunks[0] == "已完成全部优化并通过测试。"
+    assert not any("收到来自系统的新消息" in c for c in captured_chunks)
+
+    # 验证最终返回结果也被净化
+    assert full_text == "已完成全部优化并通过测试。"
+
+
+def test_dispatcher_split_process_and_result_cleans_leaked_output():
+    from dispatcher import _split_process_and_result
+
+    leaked = (
+        "收到来自系统的新消息：\n"
+        "Command execution finished:\n"
+        "Exit code: 0\n"
+        "Output:\n"
+        "552 passed\n\n"
+        "已完成优化。"
+    )
+    clean = "已完成优化。"
+
+    # 当 accumulated 含有泄漏内容时，应被自动净化且不产生虚假的「过程」区
+    proc, res = _split_process_and_result(leaked, clean)
+    assert proc == ""
+    assert res == clean
+
+
+
+# ── 清洗函数的「别把答案吞了」回归测试 ──────────────────────────────────────
+# 初版靠「结论是否以某些中文词开头」的白名单定边界，白名单没命中就把整段正文
+# 换成一句"后台任务已执行完成"，实测会直接吞掉用户要的答案。以下场景锁死。
+
+def test_clean_leaked_output_keeps_conclusion_outside_old_whitelist():
+    raw = (
+        "收到来自系统的新消息：Command execution finished: Exit code: 0\n"
+        "Output: ===== test session starts =====\n"
+        "collected 12 items\n\n"
+        "全部测试通过，改动已完成。"
+    )
+    assert agy_runner.clean_leaked_system_output(raw) == "全部测试通过，改动已完成。"
+
+
+def test_clean_leaked_output_keeps_first_person_conclusion():
+    raw = (
+        "Command execution finished: Exit code: 0\n"
+        "Output: log line\n\n"
+        "我已经把三处改完了，请重启生效。"
+    )
+    assert agy_runner.clean_leaked_system_output(raw) == "我已经把三处改完了，请重启生效。"
+
+
+def test_clean_leaked_output_does_not_truncate_normal_explanation():
+    """正文中间提到 Exit code / Output 属于正常讲解，不能当泄漏截断。"""
+    normal = (
+        "这个脚本跑完会打印 Exit code: 0\n"
+        "Output: hello\n\n"
+        "所以你可以据此判断成功与否。"
+    )
+    assert agy_runner.clean_leaked_system_output(normal) == normal
+
+
+def test_clean_leaked_output_drops_capitalized_log_lines():
+    """日志里以大写单词开头的行不能被当成"人话开始"而放行。"""
+    raw = (
+        "Command execution finished: Exit code: 0\n"
+        "Output: ===== starts =====\n\n"
+        "Collecting packages...\n\n"
+        "好的，已完成。"
+    )
+    assert agy_runner.clean_leaked_system_output(raw) == "好的，已完成。"
+
+
+def test_clean_leaked_output_reports_failure_exit_code():
+    raw = "Command execution finished:\nExit code: 1\nOutput:\n552 failed in 10s"
+    assert agy_runner.clean_leaked_system_output(raw) == "后台任务已执行完成：失败（退出码 1）。"
+
+
+def test_extract_agy_log_error_returns_empty_string_when_nothing_found():
+    """兜底分支必须返回 ""，不能因为后续顶层代码把 return 顶掉而变成 None。"""
+    assert _extract_agy_log_error(None, after_ts=0, stderr_text="warning: noise") == ""

@@ -2594,8 +2594,9 @@ def _split_process_and_result(accumulated: str, result: str) -> tuple[str, str]:
 
     返回 (process, result)：process 为空表示这是一条自包含的单段回复，收尾时
     照旧只显示干净结论、不加过程区。"""
-    proc = (accumulated or "").strip()
-    res = (result or "").strip()
+    from agy_runner import clean_leaked_system_output
+    proc = clean_leaked_system_output((accumulated or "").strip())
+    res = clean_leaked_system_output((result or "").strip())
     if not proc:
         return "", res
     if not res or proc == res:
@@ -2907,7 +2908,7 @@ def on_card_action(bot: BotInstance, data: P2CardActionTrigger) -> P2CardActionT
         resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "info"
-        toast.content = cmd_text
+        toast.content = "正在刷新用量…" if cmd_text == "/usage" else cmd_text
         resp.toast = toast
         return resp
 
@@ -3001,13 +3002,25 @@ async def handle_switch_usage(bot: BotInstance, user_id: str, chat_id: str, name
 
     与直接跑 `/switch` 的区别——不把整张卡换成裸切换提示，而是切完立刻重出一份
     /usage（切换后的账户置顶 ● + 按钮保留），顶部只加一行切换结果 headline。
-    """
-    from commands import _get_usage, _switch_claude_account
 
-    switch_result = await asyncio.to_thread(_switch_claude_account, name)
+    切哪套账户由**当前 chat 的 runner** 决定（按钮就是按它渲染出来的）：
+    agy runner 切 Antigravity 的 Google 号，其余走 Claude Code 账户。
+    """
+    from commands import _get_usage, _switch_agy_account, _switch_claude_account, handle_command
+
+    cur = await bot.store.get_current_raw(user_id, chat_id)
+    runner = str(
+        cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")
+    ).lower()
+
+    if runner == "agy":
+        switch_result = await asyncio.to_thread(_switch_agy_account, name)
+        usage = await handle_command("usage", "", user_id, chat_id, bot.store, bot)
+    else:
+        switch_result = await asyncio.to_thread(_switch_claude_account, name)
+        usage = await asyncio.to_thread(_get_usage, chat_id)
     headline = (switch_result or "").split("\n", 1)[0].strip()
 
-    usage = await asyncio.to_thread(_get_usage, chat_id)
     if isinstance(usage, dict):
         usage_text, buttons = usage["text"], usage.get("buttons", [])
     else:

@@ -733,6 +733,42 @@ def test_get_usage_no_buttons_without_chat_id(monkeypatch):
     assert isinstance(out, str)
 
 
+def test_get_usage_single_account_only_refresh_button(monkeypatch):
+    """保存单个账户时：不用切换，底部只出现刷新按钮，且不出现切换提示。"""
+    import commands
+    fake_probes = {
+        "via": mk("via", u5=0.29, u7=0.10),
+    }
+    monkeypatch.setattr(accs, "probe_all", lambda: fake_probes)
+    monkeypatch.setattr(accs, "current_account_name", lambda: "via")
+    monkeypatch.setattr(
+        accs, "list_accounts_summary",
+        lambda: [{"name": "via", "active": True}],
+    )
+    out = commands._get_usage("oc_test_chat")
+    assert isinstance(out, dict)
+    assert "点账户按钮切换" not in out["text"]
+    btns = out["buttons"]
+    assert len(btns) == 1
+    assert btns[0] == {"text": "🔄 刷新", "value": {"action": "run_cmd", "cmd": "/usage", "cid": "oc_test_chat"}}
+
+
+def test_get_usage_no_accounts_appends_refresh_button_when_chat_id(monkeypatch):
+    """没保存账户（退回老路径）且传了 chat_id 时：返回 dict 并附带刷新按钮。"""
+    import commands
+    monkeypatch.setattr(accs, "probe_all", lambda: {})
+    monkeypatch.setattr(
+        commands, "fetch_quota_headers",
+        lambda: {"ok": True, "u5h": 0.4, "u7d": 0.2,
+                 "r5h": int(time.time() + 3600), "r7d": int(time.time() + 86400),
+                 "s5h": "allowed", "s7d": "allowed"},
+    )
+    out = commands._get_usage("oc_test_chat")
+    assert isinstance(out, dict)
+    assert "Claude Max 用量" in out["text"]
+    assert out["buttons"] == [{"text": "🔄 刷新", "value": {"action": "run_cmd", "cmd": "/usage", "cid": "oc_test_chat"}}]
+
+
 # ────────────────── decode_security_stdout (hex 兜底) ──────────────────
 
 def test_decode_security_stdout_passthrough_json():

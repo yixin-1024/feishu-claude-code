@@ -498,6 +498,118 @@ def _extract_agy_log_error(
     return ""
 
 
+LEAK_START_RE = re.compile(
+    r"(?:(?:收到来自系统的新消息|系统通知)[：:]?\s*)?"
+    r"(?:\[Message\]\s+timestamp=[^\n]+\s+sender=[^\n]+\s+(?:priority=[^\n]+\s+)?content=)?"
+    r"(?:Task id \"[^\"]+\" finished with result:\s*)?"
+    r"(?:Command execution finished:\s*)?"
+    r"(?:(?:Exit code|The command exited with code)[\s:]*(\d+)\.?\s*)?"
+    r"Output:\s*",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+# 只有这些才算"系统注入的回执头"的强信号。裸的 `Exit code: / Output:` 不算——
+# 正常回答里讲解某条命令的输出时完全可能出现，据此截断会把用户要的正文砍掉。
+_LEAK_STRONG_SIGNS = (
+    "Command execution finished",
+    "finished with result",
+    "收到来自系统的新消息",
+    "系统通知",
+    "[Message] timestamp=",
+    "The command exited with code",
+)
+
+# 终端日志段落的硬特征（命中任意一条即判定为 raw log）
+_TERMINAL_LOG_MARKERS = (
+    "[100%]",
+    "passed in",
+    "failed in",
+    "Traceback (most recent call last)",
+    "rootdir:",
+    "platform ",
+    "collected ",
+    "warnings summary",
+    "-- Docs:",
+    "npm ERR!",
+    "node_modules",
+    "drwx",
+    "-rw-",
+)
+_LOG_RULE_RE = re.compile(r"^[=~_]{4,}|^-{4,}", re.MULTILINE)
+_MD_PREFIXES = ("- ", "* ", "+ ", "#", "> ", "1. ", "2. ", "3. ", "4. ", "5. ")
+
+
+def _looks_like_terminal_log(para: str) -> bool:
+    """判断一个段落是不是原始终端输出而非人话。
+
+    宁可漏判（多留一点日志）也不能误判——误判的代价是把模型真正的结论
+    整段吞掉，那比刷屏严重得多。"""
+    s = para.strip()
+    if not s:
+        return True
+    if any(mark in para for mark in _TERMINAL_LOG_MARKERS):
+        return True
+    if _LOG_RULE_RE.search(para):
+        return True
+
+    lines = [l.strip() for l in s.splitlines() if l.strip()]
+    natural = 0
+    for line in lines:
+        if re.search(r"[\u4e00-\u9fff]", line):  # 含中文 → 当人话
+            natural += 1
+        elif line.startswith(_MD_PREFIXES):  # markdown 结构
+            natural += 1
+        elif re.search(r"[.!?:;]$", line) and len(line.split()) >= 3:  # 英文整句
+            natural += 1
+    return natural < max(1, len(lines) * 0.5)
+
+
+def clean_leaked_system_output(text: str) -> str:
+    """清理模型误复读的底层异步任务/系统通知回执与原始终端日志。
+
+    常见于 agy/Gemini 等后端在收到 background task 完成通知（如
+    `Command execution finished: Exit code: 0 Output: ...`）时，
+    把系统注入的回调头及大段终端 log 原样复读输出的情况。
+
+    策略是**从尾部往回保留**：模型的复读形态固定为「回执头 + raw log 在前、
+    真结论在后」，所以从最后一段倒着收，遇到第一个确认是日志的段落才停手。
+    早期版本靠「结论是否以某些中文词开头」的白名单定边界，白名单没命中就
+    把整段正文替换成一句"后台任务已执行完成"，实测会直接吞掉用户要的答案
+    （如「全部测试通过…」「我已经把三处改完了…」）。"""
+    if not text:
+        return ""
+    m = LEAK_START_RE.search(text)
+    if not m:
+        return text
+
+    header_matched = m.group(0)
+    prefix = text[: m.start()].strip()
+    if not any(sig in header_matched for sig in _LEAK_STRONG_SIGNS):
+        # 弱信号（只有 Exit code / Output）时，仅当它就是整段开头才敢认定是泄漏；
+        # 出现在正文中间的一律放过，避免误伤正常讲解。
+        if prefix:
+            return text
+
+    rest = text[m.end() :]
+    kept: list[str] = []
+    for para in reversed(re.split(r"\n{2,}", rest)):
+        if not para.strip():
+            continue
+        if _looks_like_terminal_log(para):
+            break
+        kept.append(para.strip())
+
+    human_text = "\n\n".join(reversed(kept)).strip()
+    if human_text:
+        return f"{prefix}\n\n{human_text}".strip() if prefix else human_text
+
+    exit_code = m.group(1) or "0"
+    status_str = "成功" if exit_code == "0" else f"失败（退出码 {exit_code}）"
+    fallback = f"后台任务已执行完成：{status_str}。"
+    return f"{prefix}\n\n{fallback}".strip() if prefix else fallback
+
+
 def _usage_from_result(
     data: dict, last_step: Optional[dict] = None, model: Optional[str] = None
 ) -> dict:
@@ -680,6 +792,9 @@ async def _run_agy_once(
     current_turn_has_error_step = False
     last_agent_response_done = False
     is_stale_history_error = False
+    current_step_index: Optional[int] = None
+    current_step_text: str = ""
+    current_step_is_leaked: bool = False
 
     idle_seconds = 0
     loop = asyncio.get_event_loop()
@@ -739,6 +854,23 @@ async def _run_agy_once(
                 new_session_id = sid
             step_type = step.get("step_type")
             state = str(step.get("state") or "").upper()
+            idx = step.get("step_index")
+
+            # step 边界重置抑制状态。除了 step_index 变化，DONE/ERROR 收尾也重置：
+            # 万一某次事件流没带 step_index（idx 恒为 None），仅靠前者会让抑制
+            # 标记一旦置位就再也不复位，后续真回答的流式推送会被永久吞掉。
+            if idx != current_step_index:
+                current_step_index = idx
+                current_step_text = ""
+                current_step_is_leaked = False
+            elif (
+                step_type == "agent_response"
+                and state in ("DONE", "ERROR")
+                and not step.get("text_delta")
+            ):
+                # 仅在收尾事件不再携带正文时复位，免得把 DONE 帧自带的泄漏尾巴放出去
+                current_step_text = ""
+                current_step_is_leaked = False
 
             if state == "ERROR" and step_type != "tool":
                 current_turn_has_error_step = True
@@ -755,7 +887,21 @@ async def _run_agy_once(
                 chunk = step.get("text_delta") or ""
                 if chunk:
                     full_text += chunk
-                    await _fire_callback(on_text_chunk, chunk)
+                    current_step_text += chunk
+                    if not current_step_is_leaked:
+                        stripped_step = current_step_text.strip()
+                        if any(
+                            stripped_step.startswith(prefix)
+                            for prefix in (
+                                "收到来自系统的新消息",
+                                "Command execution finished:",
+                                "Task id \"",
+                                "[Message] timestamp=",
+                            )
+                        ):
+                            current_step_is_leaked = True
+                    if not current_step_is_leaked:
+                        await _fire_callback(on_text_chunk, chunk)
 
             elif step_type == "tool":
                 info = step.get("tool_info") or {}
@@ -821,6 +967,7 @@ async def _run_agy_once(
             final_text = result.get("response") or ""
             if final_text:
                 full_text = final_text
+            full_text = clean_leaked_system_output(full_text)
             usage = _usage_from_result(result, last_step_usage, resolved_model)
             if usage:
                 await _fire_callback(on_usage, usage)
@@ -849,7 +996,7 @@ async def _run_agy_once(
             )
             error_detail = ""
             if not full_text:
-                full_text = resp_str
+                full_text = clean_leaked_system_output(resp_str)
 
     if error_detail or (proc.returncode != 0 and not full_text):
         if not error_detail and proc.returncode != 0:
@@ -873,7 +1020,7 @@ async def _run_agy_once(
                 os.unlink(run_log_file)
             except OSError:
                 pass
-        return full_text.strip(), new_session_id, False
+        return clean_leaked_system_output(full_text).strip(), new_session_id, False
 
     # 成功执行且无错误，清理当前轮的独立临时日志
     if run_log_file and os.path.exists(run_log_file):
@@ -882,7 +1029,7 @@ async def _run_agy_once(
         except OSError:
             pass
 
-    return full_text.strip(), new_session_id, False
+    return clean_leaked_system_output(full_text).strip(), new_session_id, False
 
 
 # ── Antigravity 后端的间歇性抽风 ────────────────────────────────────────

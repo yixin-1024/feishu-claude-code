@@ -506,7 +506,7 @@ def handle_callback(bot: BotInstance, cq: dict, submit: Callable) -> None:
         cmd_text = value.get("cmd", "")
         if cmd_text:
             submit(dispatcher.handle_menu_command(bot, user_id, chat_id, cmd_text, card_key))
-        ack(cmd_text)
+        ack("正在刷新用量…" if cmd_text == "/usage" else cmd_text)
         return
     if action == "switch_usage":
         name = value.get("name", "")

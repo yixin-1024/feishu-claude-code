@@ -4,6 +4,8 @@ agy 报的是**剩余**百分比（不是已用），窗口有 Weekly + Five Hou
 且模型分成 Gemini / Claude+GPT 两个独立池子。
 """
 
+import base64
+import json
 import os
 import subprocess
 import sys
@@ -109,3 +111,126 @@ def test_agy_usage_bar_lines_groups_and_shows_remaining(monkeypatch):
 
 def test_agy_usage_bar_lines_empty_when_no_rows():
     assert _agy_usage_bar_lines([]) == []
+
+
+class _DummyStore:
+    def __init__(self, runner="agy", model="gemini-3.8-flash"):
+        self.runner = runner
+        self.default_model = model
+
+    async def get_current_raw(self, user_id, chat_id):
+        return {"runner": self.runner, "model_override": self.default_model, "session_id": "sid_1"}
+
+
+def _seed_agy_accounts(monkeypatch, tmp_path, accounts, current=None):
+    """把 agy 账号快照目录隔离到 tmp 并塞几个号，返回内存 keychain state。
+
+    accounts: [(name, email)]；current: 其中哪个是 keychain 里当前登录的号。
+    不隔离的话这些用例会读到本机真实的 ~/.gemini/accounts。
+    """
+    import agy_account_switcher as aas
+
+    monkeypatch.setattr(aas, "ACCOUNTS_DIR", str(tmp_path))
+    state = {"raw": None}
+    for name, email in accounts:
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"email": email}).encode()
+        ).decode().rstrip("=")
+        blob = {
+            "token": {"access_token": f"ya29.{name}", "refresh_token": f"1//{name}",
+                      "expiry": "2026-09-13T01:34:56.123456789+08:00"},
+            "auth_method": "consumer",
+            "id_token": f"h.{payload}.s",
+        }
+        (tmp_path / f"{name}.json").write_text(json.dumps(blob))
+        if name == current:
+            state["raw"] = aas.encode_raw(blob)
+    monkeypatch.setattr(aas, "_read_keychain_raw", lambda: state["raw"])
+    return state
+
+
+@pytest.mark.asyncio
+async def test_agy_usage_command_with_chat_id_appends_refresh_button(monkeypatch, tmp_path):
+    """agy runner 执行 /usage 时，带 chat_id 应返回带刷新按钮的卡片 dict。"""
+    _seed_agy_accounts(monkeypatch, tmp_path, [])
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda: [])
+    monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：1k/1M")
+    store = _DummyStore(runner="agy")
+    reply = await commands.handle_command("usage", "", "ou_user", "oc_test_chat", store)
+    assert isinstance(reply, dict)
+    assert "Antigravity CLI 用量" in reply["text"]
+    assert reply["buttons"] == [{
+        "text": "🔄 刷新",
+        "value": {"action": "run_cmd", "cmd": "/usage", "cid": "oc_test_chat"},
+    }]
+    # 没号可切时不要出那行没用的引导
+    assert "点账号按钮" not in reply["text"]
+
+
+@pytest.mark.asyncio
+async def test_agy_usage_shows_account_switch_buttons(monkeypatch, tmp_path):
+    """存了多个 agy 号时，/usage 底部要像 Claude 版一样给切号按钮 + 刷新。"""
+    _seed_agy_accounts(
+        monkeypatch, tmp_path,
+        [("cactrinh383", "cactrinh383@gmail.com"), ("luyixin75", "luyixin75@gmail.com")],
+        current="luyixin75",
+    )
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda: [])
+    monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：1k/1M")
+    store = _DummyStore(runner="agy")
+
+    reply = await commands.handle_command("usage", "", "ou_user", "oc_test_chat", store)
+
+    assert reply["text"].startswith("📈 **Antigravity CLI 用量** — 当前 `luyixin75`")
+    assert "👇 点账号按钮切换 Antigravity 账号" in reply["text"]
+    assert reply["buttons"] == [
+        {"text": "cactrinh383",
+         "value": {"action": "switch_usage", "name": "cactrinh383", "cid": "oc_test_chat"}},
+        {"text": "● luyixin75",
+         "value": {"action": "switch_usage", "name": "luyixin75", "cid": "oc_test_chat"}},
+        {"text": "🔄 刷新",
+         "value": {"action": "run_cmd", "cmd": "/usage", "cid": "oc_test_chat"}},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agy_usage_single_account_has_no_switch_button(monkeypatch, tmp_path):
+    """只有一个号时不给无意义的切换按钮，但标题仍标出当前号。"""
+    _seed_agy_accounts(monkeypatch, tmp_path,
+                       [("solo", "solo@gmail.com")], current="solo")
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda: [])
+    monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：1k/1M")
+    store = _DummyStore(runner="agy")
+
+    reply = await commands.handle_command("usage", "", "ou_user", "oc_test_chat", store)
+
+    assert "— 当前 `solo`" in reply["text"]
+    assert [b["value"]["action"] for b in reply["buttons"]] == ["run_cmd"]
+    assert "点账号按钮" not in reply["text"]
+
+
+@pytest.mark.asyncio
+async def test_agy_usage_command_without_chat_id_returns_string(monkeypatch, tmp_path):
+    """不传 chat_id 时保持纯文本返回。"""
+    _seed_agy_accounts(monkeypatch, tmp_path, [("solo", "solo@gmail.com")], current="solo")
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda: [])
+    monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：1k/1M")
+    store = _DummyStore(runner="agy")
+    reply = await commands.handle_command("usage", "", "ou_user", "", store)
+    assert isinstance(reply, str)
+    assert "Antigravity CLI 用量" in reply
+
+
+@pytest.mark.asyncio
+async def test_codex_usage_command_with_chat_id_appends_refresh_button(monkeypatch):
+    """codex runner 执行 /usage 时，带 chat_id 应返回带刷新按钮的卡片 dict。"""
+    monkeypatch.setattr(commands, "_get_codex_rate_limits", lambda: {})
+    monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：5k/1M")
+    store = _DummyStore(runner="codex", model="gpt-5.5")
+    reply = await commands.handle_command("usage", "", "ou_user", "oc_test_chat", store)
+    assert isinstance(reply, dict)
+    assert "Codex 用量" in reply["text"]
+    assert reply["buttons"] == [{
+        "text": "🔄 刷新",
+        "value": {"action": "run_cmd", "cmd": "/usage", "cid": "oc_test_chat"},
+    }]
