@@ -74,13 +74,15 @@ def test_schedule_wake_persists_record_and_fire_removes_it(monkeypatch):
     _state(monkeypatch, sched, {"spx": bot}, loop)
 
     fired = threading.Event()
+    seen: dict = {}
 
-    async def fake_wake(bot_, anchor, prompt):
+    async def fake_wake(bot_, **kw):
+        seen.update(kw)
         fired.set()
         return True
 
     import dispatcher
-    monkeypatch.setattr(dispatcher, "wake_thread_as_user", fake_wake)
+    monkeypatch.setattr(dispatcher, "wake_thread_announced", fake_wake)
     try:
         res = scheduler.schedule_wake(
             profile="spx", chat_id="oc_x", thread_id="omt_abcd1234",
@@ -98,6 +100,12 @@ def test_schedule_wake_persists_record_and_fire_removes_it(monkeypatch):
         fn()  # 模拟 APScheduler 到点触发
         assert fired.wait(timeout=3)
         assert res["job_id"] not in _store(), "触发后要从落盘里清掉"
+        # 群里那行公告是 bot 自己的人话摘要；完整 prompt 只进 session
+        assert seen["announce"].startswith("⏰ 自动唤醒")
+        assert "check CI" in seen["announce"]
+        assert "[⏰ 自动唤醒]" in seen["prompt"] and "check CI" in seen["prompt"]
+        assert seen["user_id"] == "ou_user" and seen["chat_id_raw"] == "oc_x"
+        assert seen["thread_id"] == "omt_abcd1234" and seen["anchor_msg_id"] == "om_anchor"
     finally:
         loop.call_soon_threadsafe(loop.stop)
         t.join(timeout=3)
@@ -215,12 +223,12 @@ def test_cancel_wake_prevents_firing_if_job_executed(monkeypatch):
 
     fired = threading.Event()
 
-    async def fake_wake(bot_, anchor, prompt):
+    async def fake_wake(bot_, **kw):
         fired.set()
         return True
 
     import dispatcher
-    monkeypatch.setattr(dispatcher, "wake_thread_as_user", fake_wake)
+    monkeypatch.setattr(dispatcher, "wake_thread_announced", fake_wake)
     try:
         res = scheduler.schedule_wake(
             profile="spx", chat_id="oc_x", thread_id="omt_cancel_test",

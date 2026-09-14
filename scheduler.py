@@ -429,12 +429,23 @@ def _build_wake_prompt(rec: dict) -> str:
     )
 
 
+def _build_wake_announce(rec: dict) -> str:
+    """群里可见的那一行人话公告——只说"我自己醒了、要干啥"，长 prompt 不铺屏（只进 session）。"""
+    note = " ".join((rec.get("note") or "").strip().split())
+    if len(note) > 180:
+        note = note[:180] + "…"
+    late = "（bot 重启后的补跑）" if rec.get("late_from") else ""
+    return f"⏰ 自动唤醒{late}：{rec.get('minutes')} 分钟前排的这次唤醒到点了，我接着干 —— {note}"
+
+
 def _arm_wake(bot, rec: dict, run_date: datetime, *, persist: bool = True) -> None:
     """把一条 wake 记录挂到 scheduler（DateTrigger）。persist=True 时同时落盘。
 
-    fire 时走 send-as-user @bot（dispatcher.wake_thread_as_user）唤醒：经 WS 入站路径、
-    忙时排队不丢、且 resume 本话题 session。比 handle_spawn(reject-if-busy) 稳。
-    懒 import 避免 scheduler↔dispatcher 顶层循环依赖；失败兜底回退 spawn_fn(handle_spawn)。
+    fire 时走 dispatcher.wake_thread_announced：bot 先以**自己的身份**在话题里贴一行
+    「这次唤醒要干啥」的公告，再把完整 prompt 进程内直投给自己（等 per-chat 锁排队不丢、
+    resume 本话题 session）。不再借 owner 身份 @bot——那条看着像用户自己说的话，还把整段
+    prompt 铺在群里刷屏。懒 import 避免 scheduler↔dispatcher 顶层循环依赖；
+    直投失败退 send-as-user（仅 spx 有 user 身份），再失败退 spawn_fn(handle_spawn)。
     """
     sched = _STATE["scheduler"]
     bot_loop = _STATE["bot_loop"]
@@ -442,6 +453,7 @@ def _arm_wake(bot, rec: dict, run_date: datetime, *, persist: bool = True) -> No
     job_id = rec["job_id"]
     chat_id, thread_id, anchor, user = rec["chat_id"], rec["thread_id"], rec["anchor"], rec["user_id"]
     wake_prompt = _build_wake_prompt(rec)
+    wake_announce = _build_wake_announce(rec)
     _JOB_CHAT_SCOPE[job_id] = chat_id  # list_crons 按 chat 过滤用
 
     def _fire():
@@ -454,18 +466,17 @@ def _arm_wake(bot, rec: dict, run_date: datetime, *, persist: bool = True) -> No
 
         async def _do():
             try:
-                from dispatcher import wake_thread_as_user, wake_thread_internal
-                ok = await wake_thread_as_user(bot, anchor, wake_prompt)
-                if ok:
+                from dispatcher import wake_thread_announced, wake_thread_as_user
+                # 公告（bot 身份、一行人话）+ 进程内直投（完整 prompt 只进 session）。
+                if await wake_thread_announced(bot, user_id=user, chat_id_raw=chat_id,
+                                               thread_id=thread_id, anchor_msg_id=anchor,
+                                               prompt=wake_prompt, announce=wake_announce):
                     return
-                # 非 spx profile 的 lark-cli 没有 user 身份，send-as-user 必败。先试进程内直投：
-                # 同样 resume 本话题 session（上下文保留），比 handle_spawn 开新 session 好。
-                print(f"[scheduler/wake] ⚠️ {job_id} send-as-user 未成功，改走进程内直投", flush=True)
-                if await wake_thread_internal(bot, user_id=user, chat_id_raw=chat_id,
-                                              thread_id=thread_id, anchor_msg_id=anchor,
-                                              prompt=wake_prompt):
+                # 直投没成才退回老的 send-as-user @bot（只有 spx profile 的 lark-cli 有 user 身份）。
+                print(f"[scheduler/wake] ⚠️ {job_id} 进程内直投未成功，回退 send-as-user", flush=True)
+                if await wake_thread_as_user(bot, anchor, wake_prompt):
                     return
-                print(f"[scheduler/wake] ⚠️ {job_id} 进程内直投未成功，回退 handle_spawn", flush=True)
+                print(f"[scheduler/wake] ⚠️ {job_id} send-as-user 未成功，回退 handle_spawn", flush=True)
             except Exception as e:
                 print(f"[scheduler/wake] ⚠️ {job_id} 唤醒异常 {type(e).__name__}: {e}，回退 handle_spawn", flush=True)
             try:

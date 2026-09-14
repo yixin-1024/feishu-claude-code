@@ -3481,6 +3481,36 @@ async def wake_thread_internal(
         return False
 
 
+async def wake_thread_announced(
+    bot: BotInstance, *, user_id: str, chat_id_raw: str, thread_id: str,
+    anchor_msg_id: str, prompt: str, announce: str,
+) -> bool:
+    """**默认的自动唤醒姿势**：bot 先以自己身份在本话题贴一行「这次唤醒要干啥」的人话公告，
+    再走进程内直投（wake_thread_internal）把完整 prompt 喂给自己。
+
+    取代老的 send-as-user @bot：那条是借 owner 身份发的，在群里看着像用户自己说的话，
+    而且整段唤醒 prompt 会原样铺在群里刷屏（dispatch 批次那条还内联了全部子任务结果，
+    动辄上万字）。现在群里只留一行公告，长 prompt 只进 session。顺带甩掉对 lark-cli
+    user 身份的依赖——线上只有 spx profile 有。
+
+    公告消息的 message_id 当作新 anchor → 本轮回答卡片挂在公告底下，阅读顺序自然。
+    公告发失败不拦唤醒（退回用原 anchor 直投）。返回是否唤醒成功。
+    """
+    tag = bot.profile.name
+    anchor = anchor_msg_id
+    if announce and anchor_msg_id:
+        try:
+            mid = await bot.feishu.reply_text(anchor_msg_id, announce)
+            if mid:
+                anchor = mid
+        except Exception as e:  # noqa: BLE001 — 公告 best-effort，绝不因它拦住唤醒
+            log(tag, "wake", "warn", f"唤醒公告发送失败（不影响唤醒）: {type(e).__name__}: {e}")
+    return await wake_thread_internal(
+        bot, user_id=user_id, chat_id_raw=chat_id_raw, thread_id=thread_id,
+        anchor_msg_id=anchor, prompt=prompt,
+    )
+
+
 async def resume_run_internal(
     bot: BotInstance, *, user_id: str, chat_id: str, is_group: bool,
     thread_id: str, anchor_msg_id: str, prompt: str,
@@ -3540,9 +3570,9 @@ async def _dispatch_safe_reply(bot: BotInstance, anchor: str, text: str) -> None
 async def _dispatch_wake_parent(grp: dict) -> None:
     """父的子任务批次全部完成 → 唤醒父 agent 一次去收口（监工闭环）。
 
-    走 send-as-user @bot（wake_thread_as_user）而不是 handle_spawn——后者 reject-if-busy
-    会被 "话题已有任务在跑，已忽略" 丢掉（实测闭环就栽在这）；前者经 WS 排队、且 resume
-    父 session。**唤醒消息内联每个子任务的实际结果**（grp["results"] 里存的子会话最终响应
+    走「bot 贴一行公告 + 进程内直投」（wake_thread_announced）而不是 handle_spawn——后者
+    reject-if-busy 会被 "话题已有任务在跑，已忽略" 丢掉（实测闭环就栽在这）；前者等 per-chat
+    锁排队不丢、且 resume 父 session。**唤醒消息内联每个子任务的实际结果**（grp["results"] 里存的子会话最终响应
     文本），主 agent 醒来即拿到全部内容，无需再 read_thread。"""
     bot = grp["bot"]
     results = grp.get("results", [])
@@ -3559,21 +3589,24 @@ async def _dispatch_wake_parent(grp: dict) -> None:
         f"（无需再 read_thread，除非要看完整细节）：\n\n{joined}\n\n"
         f"请核对 / 汇总后回复用户。如还需继续，可再 dispatch_task 派下一波。"
     )
-    ok = await wake_thread_as_user(bot, grp.get("anchor", ""), prompt)
+    # 群里只贴一行人话公告；上面那坨内联结果只进 session，不铺屏。
+    announce = f"🔔 派出的 {len(results)} 个子任务已全部跑完，我来汇总结果。"
+    ok = await wake_thread_announced(
+        bot, user_id=grp.get("user", ""), chat_id_raw=grp.get("chat", ""),
+        thread_id=grp.get("thread", ""), anchor_msg_id=grp.get("anchor", ""),
+        prompt=prompt, announce=announce,
+    )
     if ok:
         return
-    # send-as-user 要求该 profile 的 lark-cli 有 user 身份；线上只有 spx 有，agy / grok /
-    # regtank / seesaw 走到这里必失败（2026-09-03 16:07 实锤：agy 批次跑完，父 agent 永远没醒）。
-    # 兜底走进程内直投：同样 resume 父 thread 的 session、忙时等锁不丢，只是不经 Lark。
+    # 直投没成（grp 缺 user/chat/thread，或 _process_message 抛了）→ 退回老路径
+    # send-as-user @bot。它要求该 profile 的 lark-cli 有 user 身份（线上只有 spx 有），
+    # 所以多半也救不回来，但比让父 agent 永远不醒强（2026-09-03 16:07 有过实锤断链）。
     log(bot.profile.name, "dispatch", "warn",
-        "批次完成唤醒父 agent：send-as-user 未成功，改走进程内直投")
-    ok = await wake_thread_internal(
-        bot, user_id=grp.get("user", ""), chat_id_raw=grp.get("chat", ""),
-        thread_id=grp.get("thread", ""), anchor_msg_id=grp.get("anchor", ""), prompt=prompt,
-    )
+        "批次完成唤醒父 agent：进程内直投未成功，回退 send-as-user")
+    ok = await wake_thread_as_user(bot, grp.get("anchor", ""), prompt)
     if not ok:
         log(bot.profile.name, "dispatch", "error",
-            "批次完成唤醒父 agent 失败（send-as-user 与进程内直投都未成功）")
+            "批次完成唤醒父 agent 失败（进程内直投与 send-as-user 都未成功）")
 
 
 async def _dispatch_wake_parent_debounced(ptid: str) -> None:
