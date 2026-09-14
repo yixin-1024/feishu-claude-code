@@ -1566,7 +1566,17 @@ async def _execute_run(
         now = time.time()
         if now - last_push_time >= _PUSH_INTERVAL:
             await push(_build_display())
-            last_push_time = now
+            # 水位线必须取 push **返回后**的时间。取发起前的 now 会让节流在
+            # 「单帧耗时 > _PUSH_INTERVAL」时彻底失效：push 一返回就已经超阈值，
+            # 于是每个 text_delta 都推一整卡。而 on_text_chunk 是在 runner 读
+            # stdout 的循环里被 await 的，一帧就把读流堵住，循环退化成
+            # 「读 1 个 delta → 堵一帧 → 读 1 个 delta」——一个 delta 才 2~3 个字。
+            # 2026-09-14 实测：Lark 整卡 PATCH 稳定 850ms（与正文体积无关）> 0.4s
+            # 阈值，正好踩在这条线上：模型 38 字/秒，卡片只画出 2.3 字/秒，且 reader
+            # 越落越远（90 字的回答滞后 35s），stream-json 在管道里堆积到写阻塞后
+            # 会反过来把模型真拖慢。取返回后的时间 → 帧间隔 = 阈值 + 单帧耗时，
+            # 期间积压的 delta 在下一帧一次性画出。同 on_tool_use / on_status 写法。
+            last_push_time = time.time()
 
     def on_usage(usage: dict):
         final_usage.update(usage)
