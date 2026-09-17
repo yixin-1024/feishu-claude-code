@@ -8,7 +8,7 @@
 <p>
   <img src="https://img.shields.io/badge/Python_3.11+-0D1117?style=flat-square&logo=python&logoColor=7DF9FF" alt="Python" />
   <img src="https://img.shields.io/badge/6_agent_backends-0D1117?style=flat-square&label=runtime&labelColor=0D1117&color=0D1117" alt="backends" />
-  <img src="https://img.shields.io/badge/7--way_parallel_fleet-0D1117?style=flat-square&label=fan--out&labelColor=0D1117&color=0D1117" alt="fleet" />
+  <img src="https://img.shields.io/badge/7--way_parallel_fleet-0D1117?style=flat-square&label=fan-out&labelColor=0D1117&color=0D1117" alt="fleet" />
   <img src="https://img.shields.io/badge/Lark_·_Feishu_·_Telegram-0D1117?style=flat-square&label=channels&labelColor=0D1117&color=0D1117" alt="channels" />
   <img src="https://img.shields.io/badge/MIT-0D1117?style=flat-square&label=license&labelColor=0D1117&color=0D1117" alt="MIT" />
 </p>
