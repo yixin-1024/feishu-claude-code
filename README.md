@@ -7,7 +7,7 @@
 
 <p>
   <img src="https://img.shields.io/badge/Python_3.11+-0D1117?style=flat-square&logo=python&logoColor=7DF9FF" alt="Python" />
-  <img src="https://img.shields.io/badge/6_agent_backends-0D1117?style=flat-square&label=runtime&labelColor=0D1117&color=0D1117" alt="backends" />
+  <img src="https://img.shields.io/badge/heterogeneous_agent_backends-0D1117?style=flat-square&label=runtime&labelColor=0D1117&color=0D1117" alt="backends" />
   <img src="https://img.shields.io/badge/7--way_parallel_fleet-0D1117?style=flat-square&label=fan-out&labelColor=0D1117&color=0D1117" alt="fleet" />
   <img src="https://img.shields.io/badge/Lark_·_Feishu_·_Telegram-0D1117?style=flat-square&label=channels&labelColor=0D1117&color=0D1117" alt="channels" />
   <img src="https://img.shields.io/badge/MIT-0D1117?style=flat-square&label=license&labelColor=0D1117&color=0D1117" alt="MIT" />
@@ -15,7 +15,7 @@
 
 </div>
 
-在飞书 / Lark / Telegram 里直接和你本机的 Claude Code（以及 Codex / Gemini / MiMo / Grok / Antigravity）对话。
+在飞书 / Lark / Telegram 里直接和你本机的 Claude Code、Codex、Gemini 等异构 Agent 后端对话（完整 runner 清单见下文）。
 WebSocket 长连接，流式卡片输出，话题群上下文，运行心跳，自主发文件 / 截图 / 建文档。手机上随时 code review、debug、派活。
 
 > 复用 Claude Max/Pro 订阅，不需要 API Key，不需要公网 IP。
