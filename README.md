@@ -1,17 +1,79 @@
-# feishu-claude-code
+<div align="center">
 
-在飞书/Lark 里直接和你本机的 Claude Code 对话。
+# cc-lark · feishu-claude-code
 
-WebSocket 长连接，流式卡片输出，支持话题群上下文、运行心跳、自主发文件/截图。手机上随时 code review、debug、问问题。
+### 把一整支 AI Agent 舰队，装进你的聊天群
+**A multi-agent fleet platform that uses your IM group as the bus.**
+
+<p>
+  <img src="https://img.shields.io/badge/Python_3.11+-0D1117?style=flat-square&logo=python&logoColor=7DF9FF" alt="Python" />
+  <img src="https://img.shields.io/badge/6_agent_backends-0D1117?style=flat-square&label=runtime&labelColor=0D1117&color=0D1117" alt="backends" />
+  <img src="https://img.shields.io/badge/7--way_parallel_fleet-0D1117?style=flat-square&label=fan--out&labelColor=0D1117&color=0D1117" alt="fleet" />
+  <img src="https://img.shields.io/badge/Lark_·_Feishu_·_Telegram-0D1117?style=flat-square&label=channels&labelColor=0D1117&color=0D1117" alt="channels" />
+  <img src="https://img.shields.io/badge/MIT-0D1117?style=flat-square&label=license&labelColor=0D1117&color=0D1117" alt="MIT" />
+</p>
+
+</div>
+
+在飞书 / Lark / Telegram 里直接和你本机的 Claude Code（以及 Codex / Gemini / MiMo / Grok / Antigravity）对话。
+WebSocket 长连接，流式卡片输出，话题群上下文，运行心跳，自主发文件 / 截图 / 建文档。手机上随时 code review、debug、派活。
 
 > 复用 Claude Max/Pro 订阅，不需要 API Key，不需要公网 IP。
-> 同时支持 **飞书** (`open.feishu.cn`) 和 **Lark 国际版** (`open.larksuite.com`)。
+> 同时支持 **飞书** (`open.feishu.cn`)、**Lark 国际版** (`open.larksuite.com`) 和 **Telegram**。
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.11+-blue" alt="Python" />
-  <img src="https://img.shields.io/badge/Claude_Code-CLI-blueviolet" alt="Claude Code" />
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT" />
-</p>
+---
+
+## Why this is different · 它和别的「IM 接 Claude」不一样在哪
+
+市面上的 CLI Agent 有三个共同的天花板：**一次只干一件事**、**没人复核它说的对不对**、**进程一死全丢**。
+cc-lark 这三件都不认。
+
+### ① Fleet — 一条需求，7 路并行出勤
+
+不是"开几个线程"，是 **fan-out 出最多 7 个相互独立、跨轮存活的子会话**。
+每个子会话托管在常驻 bot 名下、跑在自己的话题里、有自己的工作目录甚至自己的模型；
+跑完自动把结果回贴到主话题，**整批收工后主动唤醒主 Agent** 做聚合决策。
+主 Agent 派完活可以直接收工——它不需要在那儿干等，这正是单进程 agent 做不到的事。
+
+```
+        一句话需求
+             │
+   ┌────┬────┼────┬────┬────┬────┐        ≤ 7 个独立子会话
+   ▼    ▼    ▼    ▼    ▼    ▼    ▼        各自的 thread / cwd / 模型
+  ...  ...  ...  ...  ...  ...  ...       跨轮存活，父进程死了也在跑
+   └────┴────┼────┴────┴────┴────┘
+             ▼
+     全部完工 → 自动唤醒主 Agent，结果已内联在手
+```
+
+还能**跨工作域路由**：一条 `workspace="kyt"` 就把活派到另一个项目的群、另一个工作目录里开工。
+
+### ② Cosign — 跨模型异构会签，双签才算交付
+
+把 **Claude / GPT / Gemini / opencode / MiMo / Grok / Antigravity** 各接成一个**独立的机器人**，
+拉进同一个群，让它们互相 @。一方负责实现，另一方必须**回到 ground truth** 独立复核——
+链上解码、查库对账、无头浏览器真跑一遍 UI、curl 探针打真实接口——而不是听对方"自报家门"。
+
+单模型自查就是让它给自己批卷子；换一个**厂商、训练数据、失败模式都不同**的模型来挑刺，
+才真的能逮住幻觉出的表名、想当然的字段和没跑过的分支。两边都签字，才算交付。
+
+### ③ Runtime MCP — 打破「单轮生命周期」这道物理天花板
+
+Agent 每轮被 spawn、轮末即被 killpg 杀掉，所以它**没有定时器、没有后台、承诺"等会儿回来看"就是空头支票**。
+cc-lark 自研的 `cc_mcp_server.py` 把 13 个运行时工具注入进去，兑现方是**常驻的 bot 进程**：
+
+| 工具 | 它真正解决的问题 |
+|---|---|
+| `wake_me_in(minutes, note)` | 等 CI / 等部署 / 等限流恢复：排一个持久化定时唤醒，**然后立刻收工**。到点 bot 在原话题开新轮把 note 当 prompt 续上，**落盘、重启不丢**。 |
+| `dispatch_task(...)` | 派出**能活过本轮**的子 Agent（可跨后端、跨模型、跨工作域），自动回报 + 批次唤醒。 |
+| `handover(...)` | 上下文爆了但活没完：把**所有权**连同一份压缩简报交给一个干净的新会话，接手方直接对用户负责。 |
+| `schedule_cron(...)` + 增删改停 | 群内持久定时任务，改配置立即生效、不用重启。 |
+| `read_thread` / `steer_task` / `append_to_task` | 看子会话进展、中途给它改方向、追加输入。 |
+
+**加上任务状态落盘：`/restart` 或崩溃打断的任务，进程起来之后自己接着干。**
+结果就是——这个 Agent 具备了**以天为单位**的自驱动能力，而不是以一次对话为单位。
+
+---
 
 ## 特性
 
