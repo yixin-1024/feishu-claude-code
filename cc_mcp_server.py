@@ -469,9 +469,13 @@ SCHEDULE_CRON_TOOL = {
         "scheduled time the cc-lark bot opens a fresh turn in a NEW thread in the current "
         "group and runs `prompt`. This is the persistent 'cron' kind — it survives bot "
         "restarts (written to the bot's task config). For a ONE-OFF 'come back in N minutes' "
-        "use wake_me_in instead. `cron` is a standard 5-field expression: minute hour "
+        "use wake_me_in instead. `cron` is a 5-field expression: minute hour "
         "day-of-month month day-of-week (timezone Asia/Shanghai), e.g. '0 9 * * *' = daily "
-        "09:00, '*/30 * * * *' = every 30 min, '0 9 * * 1' = Mondays 09:00. Write `prompt` "
+        "09:00, '*/30 * * * *' = every 30 min, '0 9 * * mon' = Mondays 09:00, "
+        "'0 9 * * mon-fri' = weekdays 09:00. ⚠️ Day-of-week NUMBERS are NOT standard "
+        "crontab here: 0=Monday, 1=Tuesday … 6=Sunday (7 is rejected), so '1' means "
+        "Tuesday. Prefer the names mon/tue/wed/thu/fri/sat/sun, and check next_run in the "
+        "reply. Write `prompt` "
         "SELF-CONTAINED (each run is a fresh session). Group/recipient are supplied "
         "automatically. Because each run is a fresh session it does NOT inherit any /model "
         "or /effort set in this thread — pass `model` / `effort` if the task needs a "
@@ -481,7 +485,7 @@ SCHEDULE_CRON_TOOL = {
     "inputSchema": {
         "type": "object",
         "properties": {
-            "cron": {"type": "string", "description": "5-field cron: 'minute hour dom month dow' (Asia/Shanghai)."},
+            "cron": {"type": "string", "description": "5-field cron: 'minute hour dom month dow' (Asia/Shanghai). dow: prefer names (mon, mon-fri); numbers are 0=Mon … 6=Sun, NOT standard crontab."},
             "prompt": {"type": "string", "description": "Self-contained instruction run at each scheduled time."},
             "title": {"type": "string", "description": "Optional short title for the recurring topic."},
             "model": {
@@ -574,7 +578,7 @@ UPDATE_CRON_TOOL = {
         "type": "object",
         "properties": {
             "name": _NAME_PROP,
-            "cron": {"type": "string", "description": "New 5-field cron: 'minute hour dom month dow' (Asia/Shanghai)."},
+            "cron": {"type": "string", "description": "New 5-field cron: 'minute hour dom month dow' (Asia/Shanghai). dow: prefer names (mon, mon-fri); numbers are 0=Mon … 6=Sun, NOT standard crontab."},
             "prompt": {"type": "string", "description": "New self-contained instruction to run at each scheduled time (replaces the old one)."},
             "title": {"type": "string", "description": "New topic title for each run."},
             "model": {
