@@ -227,6 +227,7 @@ HELP_TEXT = """\
 `/usage` — 查看当前 runner 的上下文/用量信息
 `/accounts` — 账户全景（Claude runner：Max 用量 + 智能切换状态；agy runner：Antigravity 账号）
 `/switch <账户>` — 切换本机全局账户（Claude Code；agy runner 下切 Antigravity 账号，`/switch save [名字]` 存当前号）
+`/server` 或 `/sys` — 本机 CPU / 负载 / 内存 / 磁盘 / 进程一屏看
 
 **审计：**
 `/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
@@ -275,7 +276,7 @@ MODEL_SHORTCUTS: Tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "runner", "model", "effort", "mode", "status", "cd", "ls",
     "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "switch", "stop",
-    "restart", "group", "defaults",
+    "restart", "group", "defaults", "server", "sys",
     *MODEL_SHORTCUTS,
 }
 
@@ -2578,6 +2579,19 @@ async def handle_command(
         # （单次就有 10s 超时）。留在事件循环里跑 = 这段时间全 profile 的卡片推送、
         # 流式刷新、WS 回调集体冻住，正是「/usage 一点整个 bot 就卡住」的根因。
         return await asyncio.to_thread(_get_usage, chat_id)
+
+    elif cmd in ("server", "sys"):
+        import server_stats
+        text = await asyncio.to_thread(server_stats.get_report)
+        if not chat_id:
+            return text
+        return {
+            "text": text,
+            "buttons": [{
+                "text": "🔄 刷新",
+                "value": {"action": "run_cmd", "cmd": "/server", "cid": chat_id},
+            }],
+        }
 
     elif cmd == "accounts":
         cur = await store.get_current(user_id, chat_id)

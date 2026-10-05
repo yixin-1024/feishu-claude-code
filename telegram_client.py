@@ -988,6 +988,7 @@ class TelegramClient:
         ("ws", "查看 / 设置本会话的工作目录"),
         ("status", "当前会话状态"),
         ("usage", "Claude 用量"),
+        ("server", "服务器 CPU / 内存 / 磁盘"),
         ("skills", "可用 skills"),
         ("mcp", "MCP 服务器"),
         ("ls", "列出工作目录"),

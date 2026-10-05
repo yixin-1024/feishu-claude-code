@@ -981,6 +981,7 @@ _COMMAND_MENU_GROUPS = [
     ("**查看**", [
         {"text": "📊 状态",        "value": {"action": "run_cmd", "cmd": "/status"}},
         {"text": "📈 用量",        "value": {"action": "run_cmd", "cmd": "/usage"}},
+        {"text": "🖥 服务器",      "value": {"action": "run_cmd", "cmd": "/server"}},
         {"text": "🛠 Skills",      "value": {"action": "run_cmd", "cmd": "/skills"}},
         {"text": "🔌 MCP",         "value": {"action": "run_cmd", "cmd": "/mcp"}},
         {"text": "📄 目录",        "value": {"action": "run_cmd", "cmd": "/ls"}},
