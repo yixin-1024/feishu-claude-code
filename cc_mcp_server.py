@@ -455,9 +455,8 @@ HANDOVER_TOOL = {
                 "type": "string",
                 "description": (
                     "Optional target agent/backend to hand the task to (CROSS-AGENT handover). "
-                    "Family alias — \"gpt\"/\"codex\", \"claude\", \"gemini\"/\"opencode\", "
-                    "\"mimo\", \"grok\"/\"xai\" — or an exact loaded profile name. Omit to hand "
-                    "it to a fresh session of your own backend."
+                    "Family alias — " + _ALIAS_DOC + " — or an exact loaded profile name. "
+                    "Omit to hand it to a fresh session of your own backend."
                 ),
             },
             "model": {
