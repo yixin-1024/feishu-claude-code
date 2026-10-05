@@ -240,6 +240,20 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
     }
 
 
+def _build_global_run_gate() -> str:
+    """全局并发闸门的实际额度（CC_LARK_MAX_CONCURRENT_RUNS）。
+
+    以前模板里写死「默认同时只跑 4 个 run」，那只是代码缺省值；本机 .env 配成别的数后，
+    agent 会照着假数字跟用户说"最多 4 个同时跑"。改成按运行中的配置渲染。
+    """
+    from run_control import MAX_CONCURRENT_RUNS
+
+    if MAX_CONCURRENT_RUNS <= 0:
+        return "本机当前未设上限（`CC_LARK_MAX_CONCURRENT_RUNS`≤0）"
+    return (f"本机当前同时最多跑 {MAX_CONCURRENT_RUNS} 个 run，含你自己这一轮，"
+            "由 `CC_LARK_MAX_CONCURRENT_RUNS` 配置")
+
+
 def _build_workspace_routing(profile: Profile) -> str:
     """dispatch_task 的「派到哪个群」子说明（从工作域路由表生成）。没配表就空串。
 
@@ -339,6 +353,7 @@ def render_lark_prompt(
     shared_ctx = {
         **timeout_ctx,
         "workspace_routing": _build_workspace_routing(profile),
+        "global_run_gate": _build_global_run_gate(),
         "ask_cmd": (
             f"{os.path.join(os.path.dirname(PROMPTS_DIR), 'tg-cli')} send "
             '--text "<问题>"'
