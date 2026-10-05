@@ -145,7 +145,9 @@ def test_run_qoder_streams_text_tools_and_usage(monkeypatch):
     # 入参攒齐才报，一个工具只报一次
     assert tools == [("Bash", {"command": "cat a.txt"})]
     # qoder 的 token 数全是 0：只留上下文占比和 credits
-    assert usages[-1] == {"_context_ratio": 0.11064, "_turn_credits": 0.0672}
+    # 窗口按模型（Efficient 200K），已用 = 占比 × 窗口
+    assert usages[-1] == {"_context_ratio": 0.11064, "_context_window": 200_000,
+                          "_context_tokens": 22128, "_turn_credits": 0.0672}
     # prompt 走 stdin，写完就关
     proc = captured["procs"][0]
     assert proc.stdin.data.decode() == "读 a.txt"
@@ -324,9 +326,19 @@ def test_usage_keeps_real_token_counts_when_present():
     usage = qoder_runner._usage_from_result({
         "usage": {"input_tokens": 1200, "output_tokens": 30, "context_usage_ratio": 0.2},
         "total_credits": 0.5,
-    })
+    }, "Performance")
     assert usage == {"input_tokens": 1200, "output_tokens": 30,
-                     "_context_ratio": 0.2, "_turn_credits": 0.5}
+                     "_context_ratio": 0.2, "_context_window": 272_000,
+                     "_context_tokens": 54400, "_turn_credits": 0.5}
+
+
+def test_context_window_per_model_and_override(monkeypatch):
+    monkeypatch.delenv("QODER_CONTEXT_WINDOW", raising=False)
+    assert qoder_runner.context_window_for("Qwen3.8-Flash") == 200_000
+    assert qoder_runner.context_window_for("performance") == 272_000
+    assert qoder_runner.context_window_for(None) == 200_000
+    monkeypatch.setenv("QODER_CONTEXT_WINDOW", "1000000")
+    assert qoder_runner.context_window_for("Auto") == 1_000_000
 
 
 def test_resolve_qoder_bin_prefers_configured(monkeypatch):

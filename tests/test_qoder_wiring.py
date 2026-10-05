@@ -166,13 +166,14 @@ async def test_runner_command_switches_to_qoder(tmp_path, monkeypatch):
     assert "Qoder" in [b["text"] for b in picker["buttons"]]
 
     reply = await handle_command("runner", "qoder", "u", "oc_1", s, bot=bot)
-    assert reply.startswith("✅ 已切换 runner 为 `qoder`，模型 `Auto`")
+    assert reply.startswith("✅ 已切换 runner 为 `qoder`，模型 `Qwen3.8-Flash`")
 
 
 @pytest.mark.asyncio
 async def test_model_picker_and_alias_for_qoder(store):
     picker = await handle_command("model", "", "u", "oc_1", store, bot=_bot())
     labels = [b["text"] for b in picker["buttons"]]
+    assert labels[0] == "🆓 Qwen3.8 Flash"
     assert "🧭 Auto" in labels and "🇨🇳 Qwen3.8 Max" in labels
     assert all("Opus" not in label and "Sonnet" not in label for label in labels)
 
@@ -196,7 +197,17 @@ async def test_effort_levels_for_qoder(store):
     assert raw["effort_override"] == "max"
 
 
-def test_footer_and_status_show_context_ratio_when_tokens_hidden():
+def test_footer_and_status_show_estimated_tokens_and_window():
+    # 用户截图里那一轮：69.4%、69.78 credits，Auto 窗口 200K
+    usage = {"_context_ratio": 0.694, "_context_window": 200_000,
+             "_context_tokens": 138800, "_turn_credits": 69.78}
+    assert _format_usage_footer(usage, "Auto") == "— 📊 上下文 138.8k / 200k (69.4%) · 本轮 69.78 credits"
+    assert _format_context_line(None, "Auto", runner="qoder", current_usage=usage) == \
+        "上下文: `138.8k / 200k (69.4%)`"
+
+
+def test_footer_falls_back_to_ratio_only_for_old_usage():
+    # 升级前落盘的 last_usage 只有占比
     usage = {"_context_ratio": 0.11064, "_turn_credits": 0.0672}
     assert _format_usage_footer(usage, "Auto") == "— 📊 上下文 11.1% · 本轮 0.07 credits"
     assert _format_context_line(None, "Auto", runner="qoder", current_usage=usage) == "上下文: `11.1%`"

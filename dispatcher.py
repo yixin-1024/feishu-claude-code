@@ -2774,9 +2774,11 @@ def _format_usage_footer(usage: dict, model: str) -> str:
     cache_create = int(usage.get("cache_creation_input_tokens", 0) or 0)
     output_tok = int(usage.get("output_tokens", 0) or 0)
     total_context = input_tok + cache_read + cache_create + output_tok
+    # qoder 不回 token 数，只给上下文占比：runner 按「占比 × 模型窗口」估出 _context_tokens
+    ratio = usage.get("_context_ratio")
     if total_context <= 0:
-        # qoder 不回 token 数，只给上下文占比和本轮 credits
-        ratio = usage.get("_context_ratio")
+        total_context = int(usage.get("_context_tokens") or 0)
+    if total_context <= 0:
         if not isinstance(ratio, (int, float)) or ratio <= 0:
             return ""
         line = f"— 📊 上下文 {ratio * 100:.1f}%"
@@ -2785,7 +2787,7 @@ def _format_usage_footer(usage: dict, model: str) -> str:
             line += f" · 本轮 {credits:.2f} credits"
         return line
     window = int(usage.get("_context_window") or 0) or _context_window_for(model)
-    pct = total_context / window * 100
+    pct = ratio * 100 if isinstance(ratio, (int, float)) and ratio > 0 else total_context / window * 100
 
     def fmt(n: int) -> str:
         if n >= 1_000_000:
@@ -2802,6 +2804,9 @@ def _format_usage_footer(usage: dict, model: str) -> str:
     turn_tokens = int(usage.get("_turn_tokens") or 0)
     if turn_tokens > total_context:
         line += f" · 本轮消耗 {fmt(turn_tokens)}"
+    credits = usage.get("_turn_credits")
+    if isinstance(credits, (int, float)) and credits > 0:
+        line += f" · 本轮 {credits:.2f} credits"
     return line
 
 

@@ -960,14 +960,16 @@ def _format_context_line(session_id: Optional[str], model: str, runner: str = "c
         + int(usage.get("cache_creation_input_tokens", 0) or 0)
         + int(usage.get("output_tokens", 0) or 0)
     )
+    # qoder 不回 token 数，只给上下文占比：runner 按「占比 × 模型窗口」估出 _context_tokens
+    ratio = usage.get("_context_ratio")
     if total <= 0:
-        # qoder 不回 token 数，只给上下文占比
-        ratio = usage.get("_context_ratio")
+        total = int(usage.get("_context_tokens") or 0)
+    if total <= 0:
         if isinstance(ratio, (int, float)) and ratio > 0:
             return f"上下文: `{ratio * 100:.1f}%`"
         return "上下文: （无）"
     window = int(usage.get("_context_window") or 0) or _context_window_for(model)
-    pct = total / window * 100
+    pct = ratio * 100 if isinstance(ratio, (int, float)) and ratio > 0 else total / window * 100
     return f"上下文: `{_fmt_tokens(total)} / {_fmt_tokens(window)} ({pct:.1f}%)`"
 
 
@@ -1284,7 +1286,8 @@ def _runner_default_model(bot, runner: str) -> str:
     if runner == "agy":
         return "gemini-3.8-flash"
     if runner == "qoder":
-        return "Auto"
+        # Qwen3.8-Flash 限时免费（/model 面板 0.10x、实测 0 credits），Auto 一轮能吃掉几十 credits
+        return "Qwen3.8-Flash"
     if runner == "dots":
         return "dots"
     return "sonnet[1m]"
@@ -2308,6 +2311,7 @@ async def handle_command(
                 ]
             elif runner == "qoder":
                 buttons = [
+                    {"text": "🆓 Qwen3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model qoder-qwen-flash", "cid": chat_id}},
                     {"text": "🧭 Auto", "value": {"action": "run_cmd", "cmd": "/model qoder-auto", "cid": chat_id}},
                     {"text": "💎 Ultimate", "value": {"action": "run_cmd", "cmd": "/model qoder-ultimate", "cid": chat_id}},
                     {"text": "🚀 Performance", "value": {"action": "run_cmd", "cmd": "/model qoder-performance", "cid": chat_id}},

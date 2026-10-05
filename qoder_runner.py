@@ -297,7 +297,21 @@ def fetch_qoder_plan_usage(
     return result
 
 
-def _usage_from_result(data: dict) -> dict:
+# 各模型的上下文窗口（交互界面 /model 面板里的 ▦ 那一列，1.1.65）。qoder 只回占比、
+# 不回 token 数，footer 的「已用 / 窗口」靠「占比 × 窗口」换算。没列的都是 200K；
+# 用 /context-window 改过窗口的，用 QODER_CONTEXT_WINDOW 覆盖。
+_DEFAULT_CONTEXT_WINDOW = 200_000
+_MODEL_CONTEXT_WINDOWS = {"performance": 272_000}
+
+
+def context_window_for(model: Optional[str]) -> int:
+    override = (os.getenv("QODER_CONTEXT_WINDOW") or "").strip()
+    if override.isdigit() and int(override) > 0:
+        return int(override)
+    return _MODEL_CONTEXT_WINDOWS.get((model or "").strip().lower(), _DEFAULT_CONTEXT_WINDOW)
+
+
+def _usage_from_result(data: dict, model: Optional[str] = None) -> dict:
     """qoder 的 token 数全是 0，真正有用的是上下文占比和 credits。"""
     usage = data.get("usage") or {}
     out = {
@@ -308,7 +322,10 @@ def _usage_from_result(data: dict) -> dict:
     }
     ratio = usage.get("context_usage_ratio")
     if isinstance(ratio, (int, float)) and ratio > 0:
+        window = context_window_for(model)
         out["_context_ratio"] = float(ratio)
+        out["_context_window"] = window
+        out["_context_tokens"] = int(round(float(ratio) * window))
     credits = data.get("total_credits")
     if isinstance(credits, (int, float)) and credits > 0:
         out["_turn_credits"] = float(credits)
@@ -546,7 +563,7 @@ async def run_qoder(
                         raise exc
                     if final_text:
                         full_text = final_text
-                    usage = _usage_from_result(data)
+                    usage = _usage_from_result(data, model)
                     if usage:
                         await _fire_callback(on_usage, usage)
         except BaseException:
