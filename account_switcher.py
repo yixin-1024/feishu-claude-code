@@ -63,6 +63,7 @@ state 持久化到 ~/.feishu-claude/account_switcher_state.json（仅冷却时�
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import socket
@@ -106,9 +107,20 @@ _API_URL = "https://api.anthropic.com/v1/messages"
 _PROBE_MODEL = "claude-haiku-4-5-20251001"
 _PROBE_TIMEOUT_SEC = 10
 
-# OAuth usage 端点：分模型的周额度（如 Fable 7d）只在这里，
-# /v1/messages 的 rate-limit headers 只有 unified 5h/7d
+# OAuth usage 端点：分模型的周额度（如 Fable 7d）。要 user:profile scope ——
+# setup-token（CLAUDE_CODE_OAUTH_TOKEN，只有 user:inference）调它是 403，
+# 而且这个端点限流很凶（429 Retry-After 动辄 20~60 分钟）
 _USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# 退路：Fable 周额度也会出现在 /v1/messages 的 unified-7d_oi-* headers 里（CLI 源码
+# 里 seven_day_overage_included 的标签就是 "Fable limit"），但只在请求的模型是 Fable
+# 时才回。订阅 OAuth 调非 haiku 模型必须带 Claude Code 身份，否则一律 429 "Error"。
+_SCOPED_PROBE_MODEL = "claude-fable-5-1"
+_SCOPED_PROBE_CLAIM = "7d_oi"
+_SCOPED_PROBE_NAME = "Fable"
+_CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+# usage 端点 403/429 后按 token 退避，别每次 /usage 都去撞（撞多了 Retry-After 只会更长）
+_USAGE_BACKOFF_403_SEC = 6 * 3600
+_usage_skip_until: dict[str, float] = {}
 
 # OAuth refresh endpoint（从 claude.exe 二进制扒出来，client_id 通用）
 _OAUTH_REFRESH_URL = "https://platform.claude.com/v1/oauth/token"
@@ -876,12 +888,22 @@ def _probe_one(acc: Account, is_current: bool = False) -> Account:
 
 
 def fetch_scoped_weekly_limits(token: str) -> list[dict]:
-    """拉分模型的周额度（limits[] 里 kind=weekly_scoped，如 Fable 7d）。
+    """拉分模型的周额度（如 Fable 7d）。
 
-    best-effort：任何失败返回 []，不影响主探测（这个额度只做展示，
-    不参与 evaluate 打分/硬筛）。percent 归一成 0~1 的 u，resets_at
-    ISO 串转 epoch，severity 原样带回。
+    先走 OAuth usage 端点；拿不到（setup-token 没 user:profile → 403、端点限流
+    429、返回里没有）再退到 Fable 探测请求的 headers。best-effort：任何失败返回
+    []，不影响主探测（这个额度只做展示，不参与 evaluate 打分/硬筛）。
+    每项 {"name", "u"(0~1), "r"(epoch), "sev"}。
     """
+    return _scoped_limits_from_usage_endpoint(token) or _scoped_limits_from_probe_headers(token)
+
+
+def _scoped_limits_from_usage_endpoint(token: str) -> list[dict]:
+    """usage 端点 limits[] 里 kind=weekly_scoped 的项。percent 归一成 0~1 的 u，
+    resets_at ISO 串转 epoch，severity 原样带回。"""
+    key = hashlib.sha256(token.encode()).hexdigest()[:16]
+    if time.time() < _usage_skip_until.get(key, 0):
+        return []
     req = urllib.request.Request(
         _USAGE_URL,
         headers={
@@ -894,6 +916,16 @@ def fetch_scoped_weekly_limits(token: str) -> list[dict]:
         ctx = ssl.create_default_context()
         with urlopen_with_retry(req, context=ctx, timeout=_PROBE_TIMEOUT_SEC) as resp:
             payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            _usage_skip_until[key] = time.time() + _USAGE_BACKOFF_403_SEC
+        elif e.code == 429:
+            try:
+                retry_after = int((e.headers or {}).get("Retry-After") or 0)
+            except Exception:
+                retry_after = 0
+            _usage_skip_until[key] = time.time() + max(retry_after, 60)
+        return []
     except Exception:
         return []
     out: list[dict] = []
@@ -921,6 +953,53 @@ def fetch_scoped_weekly_limits(token: str) -> list[dict]:
             "sev": lim.get("severity") or "unknown",
         })
     return out
+
+
+def _scoped_limits_from_probe_headers(token: str) -> list[dict]:
+    """发一个 max_tokens=1 的 Fable 请求，读 unified-7d_oi-* headers。
+    只要 user:inference，setup-token 也能用。"""
+    body = json.dumps({
+        "model": _SCOPED_PROBE_MODEL,
+        "max_tokens": 1,
+        "system": [{"type": "text", "text": _CLAUDE_CODE_SYSTEM}],
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    # 别带 _OAUTH_UA：服务端按 UA 里的 CLI 版本卡新模型（"Claude Code 2.1.150 does not
+    # support this model; version 2.1.251 or newer is required"），不带 UA 反而放行
+    req = urllib.request.Request(
+        _API_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": f"{_OAUTH_BETA},claude-code-20250219",
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        ctx = ssl.create_default_context()
+        with urlopen_with_retry(req, context=ctx, timeout=_PROBE_TIMEOUT_SEC) as resp:
+            headers = resp.headers
+    except urllib.error.HTTPError as e:
+        headers = e.headers or {}  # Fable 周额度打满时本身就是 429，headers 照样带
+    except Exception:
+        return []
+
+    def h(suffix):
+        return headers.get(f"anthropic-ratelimit-unified-{_SCOPED_PROBE_CLAIM}-{suffix}")
+
+    try:
+        u = float(h("utilization")) if h("utilization") is not None else None
+    except Exception:
+        u = None
+    try:
+        r = int(float(h("reset"))) if h("reset") is not None else None
+    except Exception:
+        r = None
+    if u is None and r is None:
+        return []
+    return [{"name": _SCOPED_PROBE_NAME, "u": u, "r": r, "sev": h("status") or "unknown"}]
 
 
 def probe_all(parallel: int = 4) -> dict[str, Account]:
