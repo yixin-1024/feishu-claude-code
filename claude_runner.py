@@ -217,17 +217,29 @@ def _cc_lark_cli_args(extra_env: Optional[dict]) -> list[str]:
     if deny:
         args += ["--disallowedTools", deny]
 
-    if not (extra_env or {}).get("CC_LARK_THREAD_ID"):
-        return args
-    if os.getenv("CC_LARK_WAKE_MCP", "1") == "0":
-        return args
+    cc_cfg = cc_lark_mcp_config(extra_env, log_tag="claude_runner")
+    if cc_cfg:
+        args += ["--mcp-config", json.dumps(cc_cfg)]
+    return args
 
+
+def cc_lark_mcp_config(extra_env: Optional[dict], log_tag: str = "cc-mcp") -> Optional[dict]:
+    """本轮的 cc-lark 运行时 MCP 配置（Claude `--mcp-config` 的 JSON 形状）。
+
+    没有话题上下文（私聊直跑 / 非 bot 调用）或 CC_LARK_WAKE_MCP=0 时返回 None。
+    CC_LARK_* 显式写进 server 的 env，不靠继承——并发话题各拿各的。
+    qoder 的 `--mcp-config` 也吃这个形状，两边共用。
+    """
+    if not (extra_env or {}).get("CC_LARK_THREAD_ID"):
+        return None
+    if os.getenv("CC_LARK_WAKE_MCP", "1") == "0":
+        return None
     try:
         cc_server = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "cc_mcp_server.py"
         )
         if not os.path.isfile(cc_server):
-            return args
+            return None
         cc_env = {
             k: str(v) for k, v in (extra_env or {}).items()
             if k.startswith("CC_LARK_")
@@ -237,7 +249,7 @@ def _cc_lark_cli_args(extra_env: Optional[dict]) -> list[str]:
         # 能力闸门支持 per-profile 覆盖（<PROFILE>_<FLAG> 优先于全局 <FLAG>）。
         from bot_config import resolve_cc_lark_gates
         cc_env.update(resolve_cc_lark_gates((extra_env or {}).get("CC_LARK_PROFILE") or ""))
-        cc_cfg = {
+        return {
             "mcpServers": {
                 "cc-lark": {
                     "command": sys.executable,
@@ -246,13 +258,12 @@ def _cc_lark_cli_args(extra_env: Optional[dict]) -> list[str]:
                 }
             }
         }
-        args += ["--mcp-config", json.dumps(cc_cfg)]
     except Exception as exc:
         print(
-            f"[claude_runner] cc-mcp 注入跳过: {type(exc).__name__}: {exc}",
+            f"[{log_tag}] cc-mcp 注入跳过: {type(exc).__name__}: {exc}",
             flush=True,
         )
-    return args
+        return None
 
 
 async def _fire_callback(cb, *args):

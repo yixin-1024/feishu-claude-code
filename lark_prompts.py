@@ -200,7 +200,7 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
     except Exception:  # noqa: BLE001 — 常量拿不到就退回历史默认
         _idle, _stuck = 300, 3600
 
-    if backend in {"claude", "codex"} or backend not in {"opencode", "mimo", "grok", "maka", "agy"}:
+    if backend in {"claude", "codex", "qoder"} or backend not in {"opencode", "mimo", "grok", "maka", "agy"}:
         if backend == "codex":
             idle = int(getattr(profile, "codex_idle_timeout_sec", 3600) or 3600)
             rules = [f"连续 {_fmt_minutes(idle)}没有任何新输出 → 强杀"]
@@ -210,6 +210,10 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
             from bot_config import resolve_claude_wall_clock_limit
             wall = resolve_claude_wall_clock_limit(profile_name=profile.name)
             stuck_minutes = int(round(_stuck / 60))
+            if backend == "qoder":
+                # qoder_runner 的判活和 claude print 同构（无输出且无子进程 / 有子进程但卡住 /
+                # wall-clock），只是「无输出」的阈值取 profile 的 qoder_idle_timeout_sec
+                _idle = int(getattr(profile, "qoder_idle_timeout_sec", 600) or 600)
             rules = [
                 f"{_fmt_minutes(_idle)}内完全无输出且无子进程 → 强杀",
                 f"有子进程但你 {_fmt_minutes(_stuck)}没新输出 → 强杀",
@@ -361,7 +365,8 @@ def render_lark_prompt(
             else 'lark-cli ... im +messages-reply ... --text "<问题>"'
         ),
     }
-    if backend in {"claude", "codex", "agy"}:
+    # qoder 的 MCP 工具名与 Claude 完全一致（mcp__cc-lark__*），直接用 Claude 那份
+    if backend in {"claude", "codex", "agy", "qoder"}:
         runtime_mcp_section = render("_runtime_mcp_claude", shared_ctx)
         if backend == "agy":
             # agy 不把 MCP 工具铺平成 mcp__<server>__<tool>，而是统一走 call_mcp_tool，

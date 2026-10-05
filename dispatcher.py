@@ -2775,7 +2775,15 @@ def _format_usage_footer(usage: dict, model: str) -> str:
     output_tok = int(usage.get("output_tokens", 0) or 0)
     total_context = input_tok + cache_read + cache_create + output_tok
     if total_context <= 0:
-        return ""
+        # qoder 不回 token 数，只给上下文占比和本轮 credits
+        ratio = usage.get("_context_ratio")
+        if not isinstance(ratio, (int, float)) or ratio <= 0:
+            return ""
+        line = f"— 📊 上下文 {ratio * 100:.1f}%"
+        credits = usage.get("_turn_credits")
+        if isinstance(credits, (int, float)) and credits > 0:
+            line += f" · 本轮 {credits:.2f} credits"
+        return line
     window = int(usage.get("_context_window") or 0) or _context_window_for(model)
     pct = total_context / window * 100
 

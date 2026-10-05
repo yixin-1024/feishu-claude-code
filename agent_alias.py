@@ -16,6 +16,7 @@ AGENT_RUNNER_ALIASES: dict[str, str] = {
     "grok": "grok", "xai": "grok",
     "maka": "maka", "apache-maka": "maka",
     "agy": "agy", "antigravity": "agy",
+    "qoder": "qoder", "qodercli": "qoder",
     "dots": "dots", "dot": "dots",
 }
 
@@ -26,6 +27,7 @@ RUNNER_HINTS: list[tuple[str, str, str]] = [
     ("agy",      '"agy"/"antigravity"',     "AGY（Google Antigravity CLI，跑 Gemini）"),
     ("opencode", '"gemini"/"opencode"',     "opencode"),
     ("grok",     '"grok"/"xai"',            "Grok"),
+    ("qoder",    '"qoder"',                 "Qoder CLI（Qwen / Kimi / GLM / DeepSeek 等，按 Qoder 账号 credits 计费）"),
     ("mimo",     '"mimo"',                  "MiMo Code"),
     ("maka",     '"maka"',                  "Apache Maka"),
     ("dots",     '"dots"/"dot"',            "OpenAI Dots（网页里的 Dot，只收发消息，不执行本机命令）"),

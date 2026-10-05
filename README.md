@@ -184,7 +184,7 @@ macOS 和 Linux 都是一等公民，全部斜杠命令 / runner / 定时任务 
 
 | 能力 | macOS | Linux | 说明 |
 |------|-------|-------|------|
-| 全部 runner（claude / codex / opencode / mimo / grok / maka / agy） | ✅ | ✅ | PTY 后端是纯 POSIX |
+| 全部 runner（claude / codex / opencode / mimo / grok / maka / agy / qoder） | ✅ | ✅ | PTY 后端是纯 POSIX |
 | `/usage` `/accounts` `/switch` + 账户智能切换 | ✅ | ✅ | 凭证存储自动分流：macOS 读 login keychain，Linux 读 `~/.claude/.credentials.json`（见下） |
 | 群里 `/restart` | ✅ launchd | ✅ systemd | Linux 需 `Restart=always` + bot 是 `MainPID` |
 | 服务控制脚本 | `deploy/cc-lark` | `deploy/cc-lark-linux` | 同一套 install/start/stop/restart/status/logs |

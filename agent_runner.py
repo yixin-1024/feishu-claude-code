@@ -1,4 +1,4 @@
-"""Claude / Codex / OpenCode / MiMo / Grok / Maka / agy / Dots 后端分发入口。"""
+"""Claude / Codex / OpenCode / MiMo / Grok / Maka / agy / Qoder / Dots 后端分发入口。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from mimo_runner import run_mimo
 from grok_runner import run_grok
 from maka_runner import run_maka
 from agy_runner import run_agy
+from qoder_runner import run_qoder
 from dots_runner import run_dots
 
 
@@ -189,6 +190,32 @@ async def run_agent(
             dangerously_skip_permissions=bool(profile.agy_dangerous_skip),
             idle_timeout_sec=profile.agy_idle_timeout_sec,
             extra_env=agy_env,
+        )
+
+    if backend == "qoder":
+        # qoder 的 --mcp-config 吃 Claude 同款 JSON，CC_LARK_* 由 qoder_runner 显式写进
+        # cc-lark server 的 env（不靠继承），wake/dispatch/cron 就能定向到本话题。
+        qoder_env = dict(wake_context or {})
+        qoder_env["CC_LARK_PROFILE"] = profile.name
+        return await run_qoder(
+            message=message,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            on_usage=on_usage,
+            on_status=on_status,
+            append_system_prompt=append_system_prompt,
+            qoder_bin=profile.qoder_bin,
+            config_dir=profile.qoder_config_dir,
+            api_key=profile.qoder_api_key,
+            dangerously_skip_permissions=bool(profile.qoder_dangerous_skip),
+            idle_timeout_sec=profile.qoder_idle_timeout_sec,
+            extra_env=qoder_env,
         )
 
     if backend == "codex":

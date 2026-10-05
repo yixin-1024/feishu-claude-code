@@ -27,6 +27,7 @@ from bot_config import (
 )
 from grok_runner import GROK_EFFORT_LEVELS
 from agy_runner import AGY_EFFORT_LEVELS, resolve_agy_bin
+from qoder_runner import QODER_EFFORT_LEVELS
 from run_control import RUN_GATE
 from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title, _find_session_file
 
@@ -131,6 +132,18 @@ MODEL_ALIASES = {
     "agy-opus": "claude-opus-4-6-thinking",
     "agy-sonnet": "claude-sonnet-4-6",
     "agy-gpt": "gpt-oss-120b-medium",
+    # Qoder CLI（qodercli）：四个档位 + 它托管的具体模型，名字照 `qodercli --list-models`
+    "qoder": "Auto",
+    "qoder-auto": "Auto",
+    "qoder-ultimate": "Ultimate",
+    "qoder-performance": "Performance",
+    "qoder-efficient": "Efficient",
+    "qoder-qwen": "Qwen3.8-Max",
+    "qoder-qwen-flash": "Qwen3.8-Flash",
+    "qoder-kimi": "Kimi-K3",
+    "qoder-glm": "GLM-5.3",
+    "qoder-deepseek": "DeepSeek-V4-Pro",
+    "qoder-minimax": "MiniMax-M3",
     # OpenAI Dots（网页里的 Dot）：模型由 Dot 自己决定，只有一个占位名
     "dots": "dots",
     "dot": "dots",
@@ -174,6 +187,13 @@ def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[s
         value = (raw or "").strip().lower()
         return value if value in AGY_EFFORT_LEVELS else None
 
+    if runner == "qoder":
+        raw = os.getenv(f"{profile_name.upper()}_QODER_EFFORT") if profile_name else None
+        if raw is None:
+            raw = os.getenv("QODER_EFFORT")
+        value = (raw or "").strip().lower()
+        return value if value in QODER_EFFORT_LEVELS else None
+
     return None
 
 
@@ -213,7 +233,7 @@ HELP_TEXT = """\
 `/new` 或 `/clear` — 开始新 session
 `/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
-`/runner [codex|claude|opencode|mimo|grok|maka]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka
+`/runner [codex|claude|opencode|mimo|grok|maka|agy|qoder]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka / Antigravity / Qoder CLI
 `/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID；会重开 session）
 `/fable` `/opus` `/sonnet` `/haiku` `[指令]` — 快捷切模型并**直接执行后面的指令**，沿用当前 session 不丢上下文（例：`/opus 帮我查一下数据库`；仅 claude runner 可用）
 `/effort [级别]` — 设置当前对话推理强度（default / low / medium / high / xhigh / max / ultra）
@@ -941,6 +961,10 @@ def _format_context_line(session_id: Optional[str], model: str, runner: str = "c
         + int(usage.get("output_tokens", 0) or 0)
     )
     if total <= 0:
+        # qoder 不回 token 数，只给上下文占比
+        ratio = usage.get("_context_ratio")
+        if isinstance(ratio, (int, float)) and ratio > 0:
+            return f"上下文: `{ratio * 100:.1f}%`"
         return "上下文: （无）"
     window = int(usage.get("_context_window") or 0) or _context_window_for(model)
     pct = total / window * 100
@@ -1224,6 +1248,8 @@ def _runner_default_model(bot, runner: str) -> str:
         return "deepseek-v4-flash"
     if runner == "agy":
         return "gemini-3.8-flash"
+    if runner == "qoder":
+        return "Auto"
     if runner == "dots":
         return "dots"
     return "sonnet[1m]"
@@ -2178,6 +2204,7 @@ async def handle_command(
                     {"text": "Grok CLI", "value": {"action": "run_cmd", "cmd": "/runner grok", "cid": chat_id}},
                     {"text": "Maka", "value": {"action": "run_cmd", "cmd": "/runner maka", "cid": chat_id}},
                     {"text": "Antigravity", "value": {"action": "run_cmd", "cmd": "/runner agy", "cid": chat_id}},
+                    {"text": "Qoder", "value": {"action": "run_cmd", "cmd": "/runner qoder", "cid": chat_id}},
                     {"text": "OpenAI Dots", "value": {"action": "run_cmd", "cmd": "/runner dots", "cid": chat_id}},
                 ],
             }
@@ -2194,8 +2221,10 @@ async def handle_command(
             requested = "agy"
         if requested in {"dot", "openai-dots", "openai-dot"}:
             requested = "dots"
-        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka", "agy", "dots"}:
-            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）、`agy`（Antigravity CLI）、`dots`（网页版 OpenAI Dots）".format(args)
+        if requested in {"qodercli", "qoder-cli"}:
+            requested = "qoder"
+        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka", "agy", "qoder", "dots"}:
+            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）、`agy`（Antigravity CLI）、`qoder`（Qoder CLI）、`dots`（网页版 OpenAI Dots）".format(args)
         model = _runner_default_model(bot, requested)
         await store.set_runner(user_id, chat_id, requested, model=model)
         return f"✅ 已切换 runner 为 `{requested}`，模型 `{model}`。已开始新 session。"
@@ -2241,6 +2270,17 @@ async def handle_command(
                     {"text": "💎 Gemini 3.1 Pro", "value": {"action": "run_cmd", "cmd": "/model agy-pro", "cid": chat_id}},
                     {"text": "🧠 Claude Opus 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-opus", "cid": chat_id}},
                     {"text": "⚡ Claude Sonnet 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-sonnet", "cid": chat_id}},
+                ]
+            elif runner == "qoder":
+                buttons = [
+                    {"text": "🧭 Auto", "value": {"action": "run_cmd", "cmd": "/model qoder-auto", "cid": chat_id}},
+                    {"text": "💎 Ultimate", "value": {"action": "run_cmd", "cmd": "/model qoder-ultimate", "cid": chat_id}},
+                    {"text": "🚀 Performance", "value": {"action": "run_cmd", "cmd": "/model qoder-performance", "cid": chat_id}},
+                    {"text": "⚡ Efficient", "value": {"action": "run_cmd", "cmd": "/model qoder-efficient", "cid": chat_id}},
+                    {"text": "🇨🇳 Qwen3.8 Max", "value": {"action": "run_cmd", "cmd": "/model qoder-qwen", "cid": chat_id}},
+                    {"text": "🌙 Kimi K3", "value": {"action": "run_cmd", "cmd": "/model qoder-kimi", "cid": chat_id}},
+                    {"text": "GLM-5.3", "value": {"action": "run_cmd", "cmd": "/model qoder-glm", "cid": chat_id}},
+                    {"text": "🐋 DeepSeek V4 Pro", "value": {"action": "run_cmd", "cmd": "/model qoder-deepseek", "cid": chat_id}},
                 ]
             elif runner == "grok":
                 buttons = [
@@ -2292,6 +2332,8 @@ async def handle_command(
             levels = _codex_effort_levels(cur.model)
         elif runner == "grok":
             levels = GROK_EFFORT_LEVELS
+        elif runner == "qoder":
+            levels = QODER_EFFORT_LEVELS
         elif runner == "maka":
             # maka 的 --thinking 档位（off 对应 cc-lark 的 none，由 maka_runner 归一）
             levels = ("minimal", "low", "medium", "high", "xhigh", "max")
@@ -2307,7 +2349,7 @@ async def handle_command(
                 )
             levels = AGY_EFFORT_LEVELS
         else:
-            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok`、`maka` 或 `agy`。"
+            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok`、`maka`、`agy` 或 `qoder`。"
 
         raw = await store.get_current_raw(user_id, chat_id)
         overridden = bool(raw.get("effort_override"))
@@ -2377,7 +2419,7 @@ async def handle_command(
         quota_line = (
             await asyncio.to_thread(_format_codex_rate_line, cur.get("session_id"))
             if runner == "codex"
-            else "" if runner in {"opencode", "mimo", "grok", "maka", "agy", "dots"}
+            else "" if runner in {"opencode", "mimo", "grok", "maka", "agy", "qoder", "dots"}
             else await asyncio.to_thread(_get_quota_compact)
         )
 
@@ -2387,7 +2429,7 @@ async def handle_command(
             f"Runner: `{runner}`",
             f"模型: `{model}`",
         ]
-        if runner in {"claude", "codex", "grok", "maka", "agy"}:
+        if runner in {"claude", "codex", "grok", "maka", "agy", "qoder"}:
             effort_override = cur.get("effort_override")
             effort = _effective_effort_label(store, bot, runner, effort_override)
             effort_status = "当前对话覆盖" if effort_override else "跟随默认"
@@ -2521,6 +2563,25 @@ async def handle_command(
                 lines.append(ctx_line)
             lines.append(f"Runner: `opencode`")
             lines.append(f"模型: `{model}`")
+            return _wrap_usage_output(lines)
+        if runner == "qoder":
+            model = cur.get("model_override") or store.default_model
+            lines = ["📈 **Qoder CLI 用量**"]
+            last_usage = cur.get("last_usage") or None
+            ctx_line = _format_context_line(
+                cur.get("session_id"),
+                model,
+                runner="qoder",
+                current_usage=last_usage,
+            )
+            if ctx_line:
+                lines.append(ctx_line)
+            credits = (last_usage or {}).get("_turn_credits")
+            if credits:
+                lines.append(f"上一轮消耗: `{credits:.2f} credits`")
+            lines.append(f"Runner: `qoder`")
+            lines.append(f"模型: `{model}`")
+            lines.append("额度按 credits 计在 Qoder 账号上，余量去 qoder.com 账户页看；cc-lark 这边只记每轮消耗。")
             return _wrap_usage_output(lines)
         if runner == "grok":
             model = cur.get("model_override") or store.default_model

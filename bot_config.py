@@ -112,6 +112,12 @@ AGY_ONLY_MODELS = frozenset({
 })
 
 
+# qoder 的模型名（qodercli --list-models，1.1.65）：四个档位 + 托管的具体模型。
+# 具体模型按家族前缀放行（新版本出 Qwen3.9 之类不用跟着改）。
+QODER_TIER_MODELS = frozenset({"auto", "ultimate", "performance", "efficient", "sonus", "cantus"})
+QODER_MODEL_PREFIXES = ("qwen", "kimi-", "glm-", "deepseek-v", "deepseek-flash", "minimax-", "qoder")
+
+
 def is_model_compatible_with_runner(model: str, runner: str) -> bool:
     """判定 model 是否属于该 runner，防止把 Claude 模型（如 opus）误注入 agy/codex 等异构后端。"""
     raw = (model or "").strip()
@@ -161,6 +167,14 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
     if runner == "grok":
         # grok: wow-* 或 grok
         return low.startswith("wow-") or low.startswith("grok")
+
+    if runner == "qoder":
+        # qoder: Auto/Ultimate/Performance/Efficient 档位 + 它托管的具体模型（大小写不敏感），
+        # 或 qoder-* 别名。全表随账号变（qodercli --list-models），这里只放已知的家族前缀。
+        return (
+            low in QODER_TIER_MODELS
+            or low.startswith(QODER_MODEL_PREFIXES)
+        )
 
     if runner == "dots":
         # dots: 模型是 Dot 自己的（服务端决定），这里只认占位名
@@ -347,6 +361,15 @@ class Profile:
     agy_print_timeout: str = "24h"
     agy_dangerous_skip: int = 1
     agy_idle_timeout_sec: int = 600
+    # qoder runner 配置（Qoder CLI，qodercli）。默认沿用本机 `qodercli login` /
+    # Qoder 桌面 App 的登录态（~/.qoder）；qoder_api_key 注入 QODER_PERSONAL_ACCESS_TOKEN
+    # （CLI 优先用它，适合没开浏览器登录的服务器）。qoder_config_dir 对应 --config-dir，
+    # 可把 bot 的会话/配置隔离到独立目录（默认沿用 ~/.qoder）。
+    qoder_bin: str = ""
+    qoder_config_dir: str = ""
+    qoder_api_key: str = ""
+    qoder_dangerous_skip: int = 1
+    qoder_idle_timeout_sec: int = 600
     # "会话群" chat_id：bot 在其它群被 @ 时（=调度 session），会被指引把任务派单到
     # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
     dispatch_chat_id: str = ""
@@ -448,9 +471,9 @@ def _load_profile(name: str) -> Profile:
 
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
-    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "dots"}:
+    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "dots"}:
         raise ValueError(
-            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka / agy / dots，"
+            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka / agy / qoder / dots，"
             f"当前: {runner}"
         )
     claude_runner = env("CLAUDE_RUNNER").strip().lower()
@@ -515,6 +538,14 @@ def _load_profile(name: str) -> Profile:
         agy_idle = int(env("AGY_IDLE_TIMEOUT_SEC", os.getenv("AGY_IDLE_TIMEOUT_SEC", "600")) or "600")
     except ValueError:
         agy_idle = 600
+    try:
+        qoder_skip = int(env("QODER_DANGEROUS_SKIP", os.getenv("QODER_DANGEROUS_SKIP", "1")) or "1")
+    except ValueError:
+        qoder_skip = 1
+    try:
+        qoder_idle = int(env("QODER_IDLE_TIMEOUT_SEC", os.getenv("QODER_IDLE_TIMEOUT_SEC", "600")) or "600")
+    except ValueError:
+        qoder_idle = 600
     return Profile(
         name=name,
         app_id=app_id,
@@ -585,6 +616,11 @@ def _load_profile(name: str) -> Profile:
         agy_print_timeout=env("AGY_PRINT_TIMEOUT", os.getenv("AGY_PRINT_TIMEOUT", "24h")).strip() or "24h",
         agy_dangerous_skip=max(0, min(1, agy_skip)),
         agy_idle_timeout_sec=max(0, agy_idle),
+        qoder_bin=env("QODER_BIN", os.getenv("QODER_BIN", "")).strip(),
+        qoder_config_dir=env("QODER_CONFIG_DIR", os.getenv("QODER_CONFIG_DIR", "")).strip(),
+        qoder_api_key=env("QODER_API_KEY", os.getenv("QODER_API_KEY", "")).strip(),
+        qoder_dangerous_skip=max(0, min(1, qoder_skip)),
+        qoder_idle_timeout_sec=max(0, qoder_idle),
         dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
         role=role,
         court_chat_id=env("COURT_CHAT_ID").strip(),
@@ -666,6 +702,14 @@ def _load_legacy_profile() -> Optional[Profile]:
         agy_idle = int(os.getenv("AGY_IDLE_TIMEOUT_SEC", "600") or "600")
     except ValueError:
         agy_idle = 600
+    try:
+        qoder_skip = int(os.getenv("QODER_DANGEROUS_SKIP", "1") or "1")
+    except ValueError:
+        qoder_skip = 1
+    try:
+        qoder_idle = int(os.getenv("QODER_IDLE_TIMEOUT_SEC", "600") or "600")
+    except ValueError:
+        qoder_idle = 600
     return Profile(
         name=legacy_name,
         app_id=app_id,
@@ -725,6 +769,11 @@ def _load_legacy_profile() -> Optional[Profile]:
         agy_print_timeout=os.getenv("AGY_PRINT_TIMEOUT", "24h").strip() or "24h",
         agy_dangerous_skip=max(0, min(1, agy_skip)),
         agy_idle_timeout_sec=max(0, agy_idle),
+        qoder_bin=os.getenv("QODER_BIN", "").strip(),
+        qoder_config_dir=os.getenv("QODER_CONFIG_DIR", "").strip(),
+        qoder_api_key=os.getenv("QODER_API_KEY", "").strip(),
+        qoder_dangerous_skip=max(0, min(1, qoder_skip)),
+        qoder_idle_timeout_sec=max(0, qoder_idle),
     )
 
 
