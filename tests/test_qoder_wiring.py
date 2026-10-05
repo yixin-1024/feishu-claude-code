@@ -199,9 +199,12 @@ async def test_effort_levels_for_qoder(store):
 
 def test_footer_and_status_show_estimated_tokens_and_window():
     # 用户截图里那一轮：69.4%、69.78 credits，Auto 窗口 200K
-    usage = {"_context_ratio": 0.694, "_context_window": 200_000,
-             "_context_tokens": 138800, "_turn_credits": 69.78}
-    assert _format_usage_footer(usage, "Auto") == "— 📊 上下文 138.8k / 200k (69.4%) · 本轮 69.78 credits"
+    usage = {"_context_ratio": 0.694, "_context_window": 200_000, "_context_tokens": 138800,
+             "_turn_credits": 2.67, "_session_credits": 69.78}
+    assert _format_usage_footer(usage, "Auto") == \
+        "— 📊 上下文 138.8k / 200k (69.4%) · 本轮 2.67 credits · 会话累计 69.78 credits"
+    free = {**usage, "_turn_credits": 0.0, "_turn_free_credits": 1.25}
+    assert _format_usage_footer(free, "Qwen3.8-Flash").endswith("· 本轮免费 · 会话累计 69.78 credits")
     assert _format_context_line(None, "Auto", runner="qoder", current_usage=usage) == \
         "上下文: `138.8k / 200k (69.4%)`"
 

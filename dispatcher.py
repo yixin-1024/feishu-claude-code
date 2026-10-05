@@ -2782,10 +2782,8 @@ def _format_usage_footer(usage: dict, model: str) -> str:
         if not isinstance(ratio, (int, float)) or ratio <= 0:
             return ""
         line = f"— 📊 上下文 {ratio * 100:.1f}%"
-        credits = usage.get("_turn_credits")
-        if isinstance(credits, (int, float)) and credits > 0:
-            line += f" · 本轮 {credits:.2f} credits"
-        return line
+        credits = _credits_suffix(usage)
+        return f"{line} · {credits}" if credits else line
     window = int(usage.get("_context_window") or 0) or _context_window_for(model)
     pct = ratio * 100 if isinstance(ratio, (int, float)) and ratio > 0 else total_context / window * 100
 
@@ -2804,10 +2802,19 @@ def _format_usage_footer(usage: dict, model: str) -> str:
     turn_tokens = int(usage.get("_turn_tokens") or 0)
     if turn_tokens > total_context:
         line += f" · 本轮消耗 {fmt(turn_tokens)}"
-    credits = usage.get("_turn_credits")
-    if isinstance(credits, (int, float)) and credits > 0:
-        line += f" · 本轮 {credits:.2f} credits"
+    credits = _credits_suffix(usage)
+    if credits:
+        line += f" · {credits}"
     return line
+
+
+def _credits_suffix(usage: dict) -> str:
+    """按 credits 计费的后端（qoder）：本轮扣了多少 / 会话累计。"""
+    if not any(k in usage for k in ("_turn_credits", "_session_credits")):
+        return ""
+    from qoder_runner import format_credits_suffix
+    # 升级前落盘的 last_usage 把会话累计记在 _turn_credits 里，没有 _session_credits
+    return format_credits_suffix(usage)
 
 
 def _split_process_and_result(accumulated: str, result: str) -> tuple[str, str]:

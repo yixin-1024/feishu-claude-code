@@ -147,7 +147,7 @@ def test_run_qoder_streams_text_tools_and_usage(monkeypatch):
     # qoder 的 token 数全是 0：只留上下文占比和 credits
     # 窗口按模型（Efficient 200K），已用 = 占比 × 窗口
     assert usages[-1] == {"_context_ratio": 0.11064, "_context_window": 200_000,
-                          "_context_tokens": 22128, "_turn_credits": 0.0672}
+                          "_context_tokens": 22128, "_session_credits": 0.0672}
     # prompt 走 stdin，写完就关
     proc = captured["procs"][0]
     assert proc.stdin.data.decode() == "读 a.txt"
@@ -329,7 +329,45 @@ def test_usage_keeps_real_token_counts_when_present():
     }, "Performance")
     assert usage == {"input_tokens": 1200, "output_tokens": 30,
                      "_context_ratio": 0.2, "_context_window": 272_000,
-                     "_context_tokens": 54400, "_turn_credits": 0.5}
+                     "_context_tokens": 54400, "_session_credits": 0.5}
+
+
+def test_turn_credits_sum_billable_messages_only(monkeypatch):
+    # result.total_credits 是会话累计（实测 6.87 → 28.09 → 67.11 → 69.78 一路涨）；
+    # 本轮要按消息加，限时免费模型的消息 billable=false 不算。
+    def asst(mid, credits, billable=True, **extra):
+        return (json.dumps({"type": "assistant", "session_id": SID, **extra, "message": {
+            "id": mid, "content": [], "usage": {"credits": credits, "billable": billable}}}) + "\n").encode()
+
+    lines = [
+        b'{"type":"system","subtype":"init","session_id":"' + SID.encode() + b'"}\n',
+        asst("m1", 0.0),          # 同一条消息先到 thinking 块（还没记 credits）
+        asst("m1", 1.25),         # 再到带 credits 的那次——按 id 取最大，只算一次
+        asst("m2", 0.75),
+        asst("m3", 2.0, billable=False),
+        asst("m4", 0.5, parent_tool_use_id="call_sub"),  # 子 agent 也是真扣钱
+        b'{"type":"result","subtype":"success","is_error":false,"result":"ok","total_credits":69.78,'
+        b'"session_id":"' + SID.encode() + b'","usage":{"context_usage_ratio":0.694}}\n',
+    ]
+    _patch_exec(monkeypatch, [FakeProc(lines)], {})
+    usages = []
+    asyncio.run(run_qoder(message="x", cwd="/tmp", on_usage=usages.append))
+
+    u = usages[-1]
+    assert u["_turn_credits"] == 2.5
+    assert u["_turn_free_credits"] == 2.0
+    assert u["_session_credits"] == 69.78
+    assert qoder_runner.format_credits_suffix(u) == "本轮 2.50 credits · 会话累计 69.78 credits"
+
+
+def test_credits_suffix_variants():
+    f = qoder_runner.format_credits_suffix
+    assert f({"_turn_credits": 0.0, "_turn_free_credits": 1.25, "_session_credits": 69.78}) == \
+        "本轮免费 · 会话累计 69.78 credits"
+    assert f({"_turn_credits": 0.39, "_session_credits": 0.39}) == "本轮 0.39 credits"
+    assert f({"_session_credits": 12.0}) == "会话累计 12.00 credits"
+    assert f({"_turn_credits": 0.0672}) == "本轮 0.07 credits"   # 升级前落盘的老数据
+    assert f({}) == ""
 
 
 def test_context_window_per_model_and_override(monkeypatch):

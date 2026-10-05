@@ -311,8 +311,16 @@ def context_window_for(model: Optional[str]) -> int:
     return _MODEL_CONTEXT_WINDOWS.get((model or "").strip().lower(), _DEFAULT_CONTEXT_WINDOW)
 
 
-def _usage_from_result(data: dict, model: Optional[str] = None) -> dict:
-    """qoder 的 token 数全是 0，真正有用的是上下文占比和 credits。"""
+def _usage_from_result(
+    data: dict, model: Optional[str] = None,
+    message_credits: Optional[dict[str, tuple[float, bool]]] = None,
+) -> dict:
+    """qoder 的 token 数全是 0，真正有用的是上下文占比和 credits。
+
+    credits 有两层：result.total_credits 是这个会话**累计**扣的；本轮扣了多少要把本轮
+    每条 assistant 消息的 usage.credits 加起来，且只算 billable 的——限时免费的模型
+    （Qwen3.8-Flash）消息上照样记 credits，但 billable=false，不扣。
+    """
     usage = data.get("usage") or {}
     out = {
         k: v for k, v in usage.items()
@@ -328,8 +336,29 @@ def _usage_from_result(data: dict, model: Optional[str] = None) -> dict:
         out["_context_tokens"] = int(round(float(ratio) * window))
     credits = data.get("total_credits")
     if isinstance(credits, (int, float)) and credits > 0:
-        out["_turn_credits"] = float(credits)
+        out["_session_credits"] = float(credits)
+    if message_credits:
+        out["_turn_credits"] = round(sum(c for c, billable in message_credits.values() if billable), 4)
+        out["_turn_free_credits"] = round(sum(c for c, billable in message_credits.values() if not billable), 4)
     return out
+
+
+def format_credits_suffix(usage: dict) -> str:
+    """footer / 状态行用的 credits 片段，如「本轮 6.87 credits · 会话累计 28.09」。"""
+    turn = usage.get("_turn_credits")
+    session = usage.get("_session_credits")
+    free = usage.get("_turn_free_credits") or 0
+    parts = []
+    if isinstance(turn, (int, float)):
+        if turn <= 0 and free > 0:
+            parts.append("本轮免费")
+        elif turn > 0 or not session:
+            parts.append(f"本轮 {turn:.2f} credits")
+    if isinstance(session, (int, float)) and session > 0 and (
+        not isinstance(turn, (int, float)) or session - (turn or 0) > 0.005
+    ):
+        parts.append(f"会话累计 {session:.2f} credits")
+    return " · ".join(parts)
 
 
 async def run_qoder(
@@ -433,6 +462,9 @@ async def run_qoder(
         # tool_use 块的流是交错到的（实测 Write 的入参被随后的 list_crons 冲掉过）
         pending_tools: dict[tuple, dict] = {}
         reported_tool_ids: set[str] = set()
+        # 本轮各条 assistant 消息的 credits（同一条消息会分几次事件到，按 id 取最大）。
+        # result 里的 total_credits 是**整个会话累计**，本轮花了多少只能自己加。
+        message_credits: dict[str, tuple[float, bool]] = {}
 
         idle_seconds = 0
         loop = asyncio.get_event_loop()
@@ -534,6 +566,15 @@ async def run_qoder(
                             await _fire_callback(on_tool_use, pending["name"], inp)
 
                 elif event_type == "assistant":
+                    msg = data.get("message") or {}
+                    msg_usage = msg.get("usage") or {}
+                    msg_credits = msg_usage.get("credits")
+                    if msg.get("id") and isinstance(msg_credits, (int, float)):
+                        prev = message_credits.get(msg["id"], (0.0, True))[0]
+                        message_credits[msg["id"]] = (
+                            max(prev, float(msg_credits)),
+                            msg_usage.get("billable", True) is not False,
+                        )
                     # 整条 assistant 消息里带着完整的 tool_use；流里漏掉的（没有 partial
                     # 事件 / 没收到 stop）在这里补报
                     if not data.get("parent_tool_use_id"):
@@ -563,7 +604,7 @@ async def run_qoder(
                         raise exc
                     if final_text:
                         full_text = final_text
-                    usage = _usage_from_result(data, model)
+                    usage = _usage_from_result(data, model, message_credits)
                     if usage:
                         await _fire_callback(on_usage, usage)
         except BaseException:

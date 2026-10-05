@@ -2615,9 +2615,10 @@ async def handle_command(
             )
             if ctx_line:
                 lines.append(ctx_line)
-            credits = (last_usage or {}).get("_turn_credits")
+            from qoder_runner import format_credits_suffix
+            credits = format_credits_suffix(last_usage or {})
             if credits:
-                lines.append(f"上一轮消耗: `{credits:.2f} credits`")
+                lines.append(f"上一轮 credits: {credits}")
             lines.append(f"Runner: `qoder`")
             lines.append(f"模型: `{model}`")
             lines.append("")
