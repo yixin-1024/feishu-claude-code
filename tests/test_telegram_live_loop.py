@@ -215,7 +215,13 @@ async def test_long_answer_is_split_into_continuation_messages(live):
     long_reply = "\n".join(f"### 第 {i} 节\n正文 **{i}** 与 `code{i}`" for i in range(300))
     with mock.patch.object(dispatcher, "run_agent", stub_runner([], long_reply)):
         live.api.user_message(text="@SPX_STG_bot 出个长报告")
-        texts = await live.texts(GROUP, 2, timeout=25)
+        # 续段是一条条发出去的，会切成几段取决于分页预算。只等「≥2 条」会在末段落地前
+        # 就断言（实测切 3 段时第 3 段还在路上）；只等末节也不行——流式预览阶段占位
+        # 消息显示的是正文**尾巴**，末节早就在里面了。首节 + 末节都在 = 分页已按序发全。
+        await live.wait_for(
+            lambda: "第 0 节" in texts_now(live, GROUP) and "第 299 节" in texts_now(live, GROUP),
+            timeout=25, what="首节和末节都落地")
+        texts = live.api.texts_of(GROUP)
     assert len(texts) >= 2, "超长正文应该续段而不是被截断"
     joined = "".join(texts)
     assert "第 0 节" in joined and "第 299 节" in joined

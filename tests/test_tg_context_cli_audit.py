@@ -477,8 +477,10 @@ def test_thread_context_reads_tg_buffer_end_to_end():
     assert ctx.startswith("【话题新增 · 4 条（距上次处理后）】")
     assert "早就看过的" not in ctx and "上次处理到这" not in ctx   # last_seen 之前
     assert "当前这条" not in ctx                                  # 当前那条被排除
-    assert "[1] Yixin (11-15" in ctx                              # 姓名来自缓冲姓名表
-    assert "[2] bot(自己) (11-15" in ctx                          # 自己的消息标 bot(自己)
+    # _rec 默认 ts=1700000000000 按本机时区显示：CST 是 11-15，UTC 机器上是 11-14
+    day = time.strftime("%m-%d", time.localtime(1700000000))
+    assert f"[1] Yixin ({day}" in ctx                             # 姓名来自缓冲姓名表
+    assert f"[2] bot(自己) ({day}" in ctx                         # 自己的消息标 bot(自己)
     assert "[文件: 报告 v2.pdf]" in ctx
     # 附件真的走了 download_file（打桩，不下载）
     assert client.downloads == [
