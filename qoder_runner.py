@@ -30,6 +30,11 @@ MCP：`--mcp-config` 吃 Claude 同款 JSON，cc-lark 运行时工具注入后�
 
 鉴权：默认沿用本机 `qodercli login` / Qoder 桌面 App 的登录态（~/.qoder）；
 服务器上可以配 QODER_PERSONAL_ACCESS_TOKEN（CLI 优先用它）。
+
+Claude Code 的规则 / 记忆 / skill：qoder 不读 CLAUDE.md、看不到 ~/.claude/skills 和
+Claude 的记忆目录。每轮把缺的 skill 软链进 ~/.qoder/skills，再把全局 CLAUDE.md、
+项目 CLAUDE.md 路径、记忆索引拼进系统提示（见 claude_context.py）。
+CC_LARK_QODER_CLAUDE_CONTEXT=0 关掉。
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ import uuid
 from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, resolve_claude_wall_clock_limit
+from claude_context import build_claude_context_brief, link_claude_skills
 from claude_runner import (
     _extract_text_content,
     _fire_callback,
@@ -70,6 +76,8 @@ _CAMEL_TO_QODER_MODE = {
 # qoder 自带的「自我唤醒 / 定时 / 盯事件」工具：cc-lark 每轮结束就 killpg，没人兑现。
 # 跨轮的等待和定时走 cc-lark 的 wake_me_in / schedule_cron。
 DEFAULT_DISALLOWED_TOOLS = "Workflow,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList"
+
+QODER_HOME = os.path.expanduser("~/.qoder")
 
 # `-r` 指向的会话不存在 / 不在本 cwd 下
 _RESUME_FAILED_RC = 42
@@ -112,6 +120,35 @@ def _normalize_effort(effort: Optional[str]) -> Optional[str]:
             f"invalid Qoder effort {e!r}; expected one of {list(QODER_EFFORT_LEVELS)}"
         )
     return e
+
+
+def _with_claude_context(
+    append_system_prompt: Optional[str], cwd: Optional[str], config_dir: Optional[str],
+) -> str:
+    """把 Claude Code 的 skill 同步进 qoder，并把规则 / 记忆拼到系统提示后面。"""
+    base = append_system_prompt or ""
+    if os.getenv("CC_LARK_QODER_CLAUDE_CONTEXT", "1") == "0":
+        return base
+    skills_root = os.path.join(
+        os.path.expanduser(config_dir) if config_dir else QODER_HOME, "skills"
+    )
+    try:
+        linked = link_claude_skills(skills_root)
+        if linked:
+            print(f"[run_qoder] 同步 Claude skill → {skills_root}: {', '.join(linked)}", flush=True)
+        brief = build_claude_context_brief(
+            cwd,
+            skills_note=(
+                f"~/.claude/skills 里的 skill 已经软链进 {skills_root}，lark-* 那批在 "
+                "~/.agents/skills，都在你的 skill 列表里，按名字正常用。"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — 接不上 Claude 的上下文不该拖垮这一轮
+        print(f"[run_qoder] Claude 上下文跳过: {type(exc).__name__}: {exc}", flush=True)
+        return base
+    if not brief:
+        return base
+    return f"{base}\n\n{brief}" if base else brief
 
 
 def _usage_from_result(data: dict) -> dict:
@@ -161,6 +198,7 @@ async def run_qoder(
     )
     idle_limit = idle_timeout_sec if idle_timeout_sec > 0 else IDLE_TIMEOUT
     mcp_cfg = cc_lark_mcp_config(extra_env, log_tag="run_qoder")
+    system_prompt = _with_claude_context(append_system_prompt, cwd, config_dir)
 
     async def _run_once(
         active_session_id: Optional[str],
@@ -185,8 +223,8 @@ async def run_qoder(
             cmd += ["-m", model]
         if resolved_effort:
             cmd += ["--reasoning-effort", resolved_effort]
-        if append_system_prompt:
-            cmd += ["--append-system-prompt", append_system_prompt]
+        if system_prompt:
+            cmd += ["--append-system-prompt", system_prompt]
         if mcp_cfg:
             cmd += ["--mcp-config", json.dumps(mcp_cfg)]
         if config_dir:
