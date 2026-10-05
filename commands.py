@@ -1232,6 +1232,41 @@ def _agy_usage_bar_lines(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _qoder_plan_lines(profile) -> list[str]:
+    """Qoder 套餐额度（交互式 /usage 面板里那几行）；读不到就给一句原因。"""
+    from qoder_runner import fetch_qoder_plan_usage
+
+    try:
+        u = fetch_qoder_plan_usage(
+            getattr(profile, "qoder_bin", "") or None,
+            getattr(profile, "qoder_config_dir", "") or None,
+            getattr(profile, "qoder_api_key", "") or None,
+        )
+    except Exception as e:  # noqa: BLE001
+        return [f"**订阅额度**：读取失败（{type(e).__name__}: {str(e)[:120]}）"]
+    head = "**订阅额度**"
+    if u.get("plan"):
+        head += f" — {u['plan']}"
+        if u.get("expires"):
+            head += f"（{u['expires']} 到期）"
+    lines = [head]
+    for key, label in (("plan_credits", "套餐 credits"), ("addon_credits", "加购 credits")):
+        used_total = u.get(key)
+        if not used_total:
+            continue
+        used, total = used_total
+        if total <= 0:
+            lines.append(f"{label}：已用 {used:g}（无额度）")
+            continue
+        left = max(total - used, 0)
+        lines.append(f"{label} 剩余 {_fmt_pct_bar(left / total)}")
+        lines.append(f"已用 {used:g} / {total:g}，剩 {left:g}")
+    org = u.get("org_package")
+    if org and org.upper() != "N/A":
+        lines.append(f"组织资源包：{org}")
+    return lines
+
+
 def _runner_default_model(bot, runner: str) -> str:
     profile = getattr(bot, "profile", None)
     if profile and getattr(profile, "runner", "") == runner and getattr(profile, "default_model", ""):
@@ -2581,7 +2616,8 @@ async def handle_command(
                 lines.append(f"上一轮消耗: `{credits:.2f} credits`")
             lines.append(f"Runner: `qoder`")
             lines.append(f"模型: `{model}`")
-            lines.append("额度按 credits 计在 Qoder 账号上，余量去 qoder.com 账户页看；cc-lark 这边只记每轮消耗。")
+            lines.append("")
+            lines.extend(await asyncio.to_thread(_qoder_plan_lines, getattr(bot, "profile", None)))
             return _wrap_usage_output(lines)
         if runner == "grok":
             model = cur.get("model_override") or store.default_model

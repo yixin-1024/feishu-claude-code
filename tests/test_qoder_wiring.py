@@ -217,3 +217,17 @@ def test_qoder_prompt_uses_claude_runtime_mcp_section():
     assert "cc-lark 运行时 MCP 工具" in out
     assert "mcp__cc-lark__wake_me_in" in out
     assert "本后端无运行时 MCP 工具" not in out
+
+
+@pytest.mark.asyncio
+async def test_usage_command_shows_qoder_plan_credits(store, monkeypatch):
+    import qoder_runner
+    monkeypatch.setattr(qoder_runner, "fetch_qoder_plan_usage", lambda *a, **k: {
+        "plan": "Pro Trial", "expires": "2026-10-19 10:36",
+        "plan_credits": (37.0, 300.0), "addon_credits": (0.0, 100.0),
+    })
+    reply = await handle_command("usage", "", "u", "oc_1", store, bot=_bot())
+    text = reply["text"] if isinstance(reply, dict) else reply
+    assert "Qoder CLI 用量" in text
+    assert "Pro Trial（2026-10-19 10:36 到期）" in text
+    assert "已用 37 / 300，剩 263" in text

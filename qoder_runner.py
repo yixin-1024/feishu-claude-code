@@ -42,8 +42,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import select
 import shutil
+import signal
+import subprocess
+import time
 import uuid
+from datetime import datetime
 from typing import Callable, Optional
 
 from bot_config import PERMISSION_MODE, resolve_claude_wall_clock_limit
@@ -149,6 +155,146 @@ def _with_claude_context(
     if not brief:
         return base
     return f"{base}\n\n{brief}" if base else brief
+
+
+# ── 套餐额度（/usage）────────────────────────────────────────────
+# credits 余量只在交互界面的 /usage 里有：`-p "/usage"` 会被当成本地命令吃掉但什么都
+# 不输出，`qodercli status -o json` 只有账号信息。所以开一个伪终端跑交互式 qodercli，
+# 敲 /usage 读屏幕再退出——不调模型、不花 credits，一次 6~8 秒。
+QODER_USAGE_CWD = os.path.expanduser("~/.feishu-claude/qoder-usage")
+_USAGE_CACHE_TTL = 30
+_usage_cache: dict[tuple, tuple[float, dict]] = {}
+
+
+def _screen_text(raw: bytes) -> str:
+    """TUI 输出转纯文本：光标右移换成空格（不然词会粘在一起），其余控制序列去掉。"""
+    t = raw.decode("utf-8", "replace")
+    t = re.sub(r"\x1b\[(\d*)C", lambda m: " " * int(m.group(1) or 1), t)
+    t = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", t)
+    t = re.sub(r"\x1b\[[0-9;?<>=]*[ -/]*[@-~]", "", t)
+    t = re.sub(r"\x1b[()][A-Za-z0-9]", "", t)
+    return t.replace("\r", "\n")
+
+
+def _last(pattern: str, text: str):
+    found = re.findall(pattern, text, re.IGNORECASE)
+    return found[-1] if found else None
+
+
+def _num(v: str) -> float:
+    return float(v.replace(",", ""))
+
+
+def parse_qoder_usage_screen(text: str) -> dict:
+    """从 /usage 面板的文字里抠套餐额度；TUI 会重绘，同一项取最后一次出现的。"""
+    out: dict = {}
+    plan = _last(r"Qoder\s*Plan\s*:\s*([^\n]+?)\s*(?:\n|$)", text)
+    if plan:
+        out["plan"] = re.sub(r"\s+", " ", plan).strip()
+        # 被吃掉空格的「ProTrial」补回空格
+        out["plan"] = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", out["plan"])
+    exp = _last(r"Plan\s*Expires\s*At\s*:\s*([^\n]+?)\s*(?:\n|$)", text)
+    if exp:
+        out["expires"] = exp.strip()
+        m = re.search(r"([A-Za-z]{3})\s*(\d{1,2}),\s*(\d{4})\s*at\s*(\d{1,2}):(\d{2})", exp)
+        if m:
+            try:
+                dt = datetime.strptime(" ".join(m.groups()[:3]) + f" {m.group(4)}:{m.group(5)}", "%b %d %Y %H:%M")
+                out["expires"] = dt.strftime("%Y-%m-%d %H:%M")
+            except ValueError:
+                pass
+    for key, label in (("plan_credits", r"Plan\s*Credits\s*Used"), ("addon_credits", r"Add-?\s*on\s*Credits\s*Used")):
+        pair = _last(label + r"\s*:\s*([\d.,]+)\s*/\s*([\d.,]+)", text)
+        if pair:
+            out[key] = (_num(pair[0]), _num(pair[1]))
+    org = _last(r"Org\s*Resource\s*Package\s*:\s*([^\n]+?)\s*(?:\n|$)", text)
+    if org:
+        out["org_package"] = org.strip()
+    return out
+
+
+def fetch_qoder_plan_usage(
+    qoder_bin: Optional[str] = None,
+    config_dir: Optional[str] = None,
+    api_key: Optional[str] = None,
+    timeout: float = 25.0,
+) -> dict:
+    """跑一次交互式 /usage，返回 parse_qoder_usage_screen 的结果；失败抛 RuntimeError。"""
+    import fcntl
+    import pty
+    import struct
+    import termios
+
+    key = (qoder_bin or "", config_dir or "", bool(api_key))
+    hit = _usage_cache.get(key)
+    if hit and time.time() - hit[0] < _USAGE_CACHE_TTL:
+        return hit[1]
+
+    os.makedirs(QODER_USAGE_CWD, exist_ok=True)
+    cmd = [resolve_qoder_bin(qoder_bin)]
+    if config_dir:
+        cmd += ["--config-dir", os.path.expanduser(config_dir)]
+    env = dict(os.environ, TERM="xterm-256color", COLUMNS="140", LINES="50", CC_LARK_MIRROR_OFF="1")
+    if api_key:
+        env["QODER_PERSONAL_ACCESS_TOKEN"] = api_key
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 140, 0, 0))
+    proc = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, cwd=QODER_USAGE_CWD,
+                            env=env, start_new_session=True, close_fds=True)
+    os.close(slave)
+    buf = bytearray()
+    deadline = time.time() + timeout
+
+    def pump(sec: float, until: Optional[str] = None) -> bool:
+        end = min(time.time() + sec, deadline)
+        while time.time() < end:
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if ready:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    return False
+                if not chunk:
+                    return False
+                buf.extend(chunk)
+                if until and re.search(until, _screen_text(bytes(buf)), re.IGNORECASE):
+                    return True
+        return False
+
+    try:
+        # 首次在这个目录启动会问「信任这个文件夹吗」，默认项就是信任
+        if pump(15, r"Type\s*your\s*message|Trust\s*folder"):
+            if re.search(r"Trust\s*folder", _screen_text(bytes(buf)), re.IGNORECASE) and \
+                    not re.search(r"Type\s*your\s*message", _screen_text(bytes(buf)), re.IGNORECASE):
+                os.write(master, b"\r")
+                pump(10, r"Type\s*your\s*message")
+        mark = len(buf)
+        os.write(master, b"/usage")
+        pump(0.8)
+        os.write(master, b"\r")
+        pump(15, r"Plan\s*Credits\s*Used\s*:\s*[\d.,]+\s*/\s*[\d.,]+")
+        pump(0.8)  # 让加购那一行也画出来
+        result = parse_qoder_usage_screen(_screen_text(bytes(buf[mark:])))
+    finally:
+        try:
+            os.write(master, b"\x1b")
+            os.write(master, b"/quit\r")
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait(timeout=2)
+        os.close(master)
+    if "plan_credits" not in result:
+        tail = _screen_text(bytes(buf))[-300:].strip()
+        raise RuntimeError(f"没读到 /usage 面板：{tail[-160:]!r}")
+    _usage_cache[key] = (time.time(), result)
+    return result
 
 
 def _usage_from_result(data: dict) -> dict:

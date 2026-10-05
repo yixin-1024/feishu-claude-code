@@ -153,17 +153,23 @@ def _parse_session_file(fpath: str, session_id: str, mtime: float) -> dict:
         "source": "terminal",
     }
 
+# qoder 的会话也是 <projects>/<cwd-slug>/<sid>.jsonl，行格式与 Claude 相同（type=user/
+# assistant + message.content）。不一起找的话，后台摘要会把 qoder 会话全标成「已被清理」。
+QODER_PROJECTS_DIR = os.path.expanduser("~/.qoder/projects")
+
+
 def _find_session_file(session_id: str) -> Optional[str]:
-    """在 ~/.claude/projects/ 下找到 session 对应的 .jsonl 文件"""
-    if not os.path.isdir(CLAUDE_PROJECTS_DIR):
-        return None
-    for project_dir in os.listdir(CLAUDE_PROJECTS_DIR):
-        project_path = os.path.join(CLAUDE_PROJECTS_DIR, project_dir)
-        if not os.path.isdir(project_path):
+    """在 ~/.claude/projects/（以及 qoder 的 ~/.qoder/projects/）下找到 session 对应的 .jsonl 文件"""
+    for root in (CLAUDE_PROJECTS_DIR, QODER_PROJECTS_DIR):
+        if not os.path.isdir(root):
             continue
-        fpath = os.path.join(project_path, f"{session_id}.jsonl")
-        if os.path.isfile(fpath):
-            return fpath
+        for project_dir in os.listdir(root):
+            project_path = os.path.join(root, project_dir)
+            if not os.path.isdir(project_path):
+                continue
+            fpath = os.path.join(project_path, f"{session_id}.jsonl")
+            if os.path.isfile(fpath):
+                return fpath
     return None
 
 

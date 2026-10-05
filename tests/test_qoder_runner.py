@@ -333,3 +333,75 @@ def test_resolve_qoder_bin_prefers_configured(monkeypatch):
     assert qoder_runner.resolve_qoder_bin("~/bin/qodercli") == os.path.expanduser("~/bin/qodercli")
     monkeypatch.setattr(qoder_runner.shutil, "which", lambda name: "/usr/local/bin/qodercli")
     assert qoder_runner.resolve_qoder_bin("") == "/usr/local/bin/qodercli"
+
+
+# ── /usage 套餐额度 ─────────────────────────────────────────────
+
+# 交互式 qodercli 敲 /usage 后实测的面板（光标右移被当成空格前的样子，词粘在一起）
+USAGE_SCREEN_SQUASHED = """
+Qoder CLI · Usage  Status
+APIquotaandsessiontokenusageforthecurrentconversation.
+
+QoderPlan:ProTrial
+PlanExpiresAt:Oct19,2026at10:36:35GMT+8
+PlanCreditsUsed:30/300
+Add-onCreditsUsed:0/100
+OrgResourcePackage:N/A
+TotalDuration(API):0.0s
+"""
+
+
+def test_parse_usage_screen_with_squashed_spaces():
+    u = qoder_runner.parse_qoder_usage_screen(USAGE_SCREEN_SQUASHED)
+    assert u == {
+        "plan": "Pro Trial",
+        "expires": "2026-10-19 10:36",
+        "plan_credits": (30.0, 300.0),
+        "addon_credits": (0.0, 100.0),
+        "org_package": "N/A",
+    }
+
+
+def test_screen_text_turns_cursor_moves_into_spaces_and_keeps_last_redraw():
+    raw = (b"\x1b[2J\x1b[1;1HPlan\x1b[1CCredits\x1b[1CUsed:\x1b[1C10/300\r\n"
+           b"\x1b[38;5;245mPlan Credits Used: 12.5/300\x1b[0m\r\n")
+    text = qoder_runner._screen_text(raw)
+    assert "Plan Credits Used: 10/300" in text
+    assert qoder_runner.parse_qoder_usage_screen(text)["plan_credits"] == (12.5, 300.0)
+
+
+def test_usage_lines_render_remaining_credits(monkeypatch):
+    import commands
+    monkeypatch.setattr(qoder_runner, "fetch_qoder_plan_usage", lambda *a, **k: {
+        "plan": "Pro Trial", "expires": "2026-10-19 10:36",
+        "plan_credits": (30.0, 300.0), "addon_credits": (0.0, 100.0), "org_package": "N/A",
+    })
+    lines = commands._qoder_plan_lines(None)
+    assert lines[0] == "**订阅额度** — Pro Trial（2026-10-19 10:36 到期）"
+    assert any(l.startswith("套餐 credits 剩余") and "90.0%" in l for l in lines)
+    assert "已用 30 / 300，剩 270" in lines
+    assert "已用 0 / 100，剩 100" in lines
+    assert not any("组织资源包" in l for l in lines)
+
+
+def test_usage_lines_report_failure(monkeypatch):
+    import commands
+
+    def boom(*a, **k):
+        raise RuntimeError("没读到 /usage 面板")
+
+    monkeypatch.setattr(qoder_runner, "fetch_qoder_plan_usage", boom)
+    assert "读取失败" in commands._qoder_plan_lines(None)[0]
+
+
+def test_session_file_lookup_includes_qoder_projects(tmp_path, monkeypatch):
+    import session_store
+    claude = tmp_path / "claude_projects"
+    qoder = tmp_path / "qoder_projects" / "-Users-me-spx"
+    claude.mkdir()
+    qoder.mkdir(parents=True)
+    (qoder / f"{SID}.jsonl").write_text('{"type":"user","message":{"content":"hi"}}\n')
+    monkeypatch.setattr(session_store, "CLAUDE_PROJECTS_DIR", str(claude))
+    monkeypatch.setattr(session_store, "QODER_PROJECTS_DIR", str(tmp_path / "qoder_projects"))
+    assert session_store._find_session_file(SID) == str(qoder / f"{SID}.jsonl")
+    assert session_store._find_session_file("nope") is None
