@@ -515,17 +515,26 @@ def fetch_quota_headers() -> dict:
     try:
         from account_switcher import (
             _read_keychain_blob, credentials_store_label, ensure_keychain_intact,
+            pinned_env_credential,
         )
-        ensure_keychain_intact()  # /restart 周期里凭证被写丢时自愈
-        # 统一走 account_switcher 的读取（macOS 上优先 -a <用户名>）：keychain 可能
-        # 残留同 service 名的历史死条目，无 -a 读取会长期命中过期 token → 永远 401
-        blob = _read_keychain_blob()
-        if not blob:
-            return {"ok": False,
-                    "error": f"读取凭证失败：{credentials_store_label()} 里没有 Claude 凭证，"
-                             f"先在本机 `claude` 登录一次"}
-        creds = json.loads(blob)
-        token = creds["claudeAiOauth"]["accessToken"]
+        # 凭证被 env 钉死时 claude CLI 只认 env 那份 token，额度也必须按它探——
+        # 否则 /usage、quota 预检都在探 credentials.json 里名义上的号（2026-09-28
+        # 财务机实测：账户池清空后 /usage 报 credentials.json 403，实际 env token 正常）
+        pin_key, token = pinned_env_credential()
+        if pin_key:
+            token_src = f"env `{pin_key}`"
+        else:
+            ensure_keychain_intact()  # /restart 周期里凭证被写丢时自愈
+            # 统一走 account_switcher 的读取（macOS 上优先 -a <用户名>）：keychain 可能
+            # 残留同 service 名的历史死条目，无 -a 读取会长期命中过期 token → 永远 401
+            blob = _read_keychain_blob()
+            if not blob:
+                return {"ok": False,
+                        "error": f"读取凭证失败：{credentials_store_label()} 里没有 Claude 凭证，"
+                                 f"先在本机 `claude` 登录一次"}
+            creds = json.loads(blob)
+            token = creds["claudeAiOauth"]["accessToken"]
+            token_src = credentials_store_label()
     except Exception as e:
         return {"ok": False, "error": f"读取凭证失败：{e}"}
 
@@ -557,7 +566,7 @@ def fetch_quota_headers() -> dict:
         # 401/403 = token 失效，明说要重登，别报成"无用量 headers"误导排障
         if e.code in (401, 403):
             return {"ok": False,
-                    "error": f"认证失败（HTTP {e.code}）：{credentials_store_label()} 里的 token "
+                    "error": f"认证失败（HTTP {e.code}）：{token_src} 里的 token "
                              f"已失效，请重新 `claude /login`"}
         http_status = e.code
         headers = dict(e.headers)
@@ -697,7 +706,13 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
                     }],
                 }
             return err_text
-        lines = _usage_single_account_lines(data)
+        try:
+            from account_switcher import pinned_env_credential
+            pinned = bool(pinned_env_credential()[0])
+        except Exception:
+            pinned = False
+        lines = _usage_single_account_lines(
+            data, account_label=("env-token（钉死）" if pinned else None))
         if chat_id:
             return {
                 "text": "\n".join(lines),
