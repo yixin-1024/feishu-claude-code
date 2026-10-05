@@ -63,7 +63,7 @@ def test_timeout_rules_are_rendered_from_config(monkeypatch):
     out = _render("om_1", "ou_1")
     assert "未设单轮 wall-clock 上限" in out
     assert "60 分钟 wall-clock" not in out and "15/60min" not in out
-    assert "15 分钟" in out  # STUCK_CHILD_TIMEOUT=900 渲染出来的
+    assert "1 小时" in out  # STUCK_CHILD_TIMEOUT=3600 渲染出来的
 
     monkeypatch.setenv("CLAUDE_WALL_CLOCK_LIMIT_SEC", "7200")
     out2 = _render("om_1", "ou_1")

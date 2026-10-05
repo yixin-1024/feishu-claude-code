@@ -43,7 +43,7 @@ from claude_runner import (
 )
 
 IDLE_TIMEOUT = 300  # 无输出且无子进程 → 视为挂死
-STUCK_CHILD_TIMEOUT = 900  # 有子进程但 grok 端持续无输出（tail -f / npm run dev 类）
+STUCK_CHILD_TIMEOUT = int(os.getenv("STUCK_CHILD_TIMEOUT_SEC", "3600"))  # 有子进程但 grok 端持续无输出（tail -f / npm run dev 类）
 _CHECK_INTERVAL = 30
 
 # grok 的 --reasoning-effort 档位（比 Claude 多 none / minimal 两档）

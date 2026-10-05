@@ -47,7 +47,7 @@ CLAUDE_CONFIG_PATH = os.path.expanduser("~/.claude.json")
 
 # 与 claude_runner.py 保持语义一致的超时参数
 IDLE_TIMEOUT = 300        # 第一条 assistant 之后又卡住的"空闲"阈值
-STUCK_CHILD_TIMEOUT = 900  # 有子进程但 Claude 端持续无新输出
+STUCK_CHILD_TIMEOUT = int(os.getenv("STUCK_CHILD_TIMEOUT_SEC", "3600"))  # 有子进程但 Claude 端持续无新输出
 # 单轮 wall-clock 兜底。默认 60 分钟，可用 CLAUDE_WALL_CLOCK_LIMIT_SEC（或
 # <PROFILE>_ 前缀）覆盖；设 0 = 永不因 wall-clock 强杀。见
 # bot_config.resolve_claude_wall_clock_limit。

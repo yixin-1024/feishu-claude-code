@@ -198,7 +198,7 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
     try:
         from claude_pty import IDLE_TIMEOUT as _idle, STUCK_CHILD_TIMEOUT as _stuck
     except Exception:  # noqa: BLE001 — 常量拿不到就退回历史默认
-        _idle, _stuck = 300, 900
+        _idle, _stuck = 300, 3600
 
     if backend in {"claude", "codex"} or backend not in {"opencode", "mimo", "grok", "maka", "agy"}:
         if backend == "codex":

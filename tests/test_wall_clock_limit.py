@@ -217,3 +217,15 @@ def test_pty_loop_guards_on_resolved_limit():
     src = inspect.getsource(claude_pty.run_claude)
     assert "wall_clock_limit = resolve_claude_wall_clock_limit(extra_env)" in src
     assert "if wall_clock_limit > 0 and now - start_time >= wall_clock_limit:" in src
+
+
+def test_runners_stuck_child_timeout_defaults_to_one_hour():
+    import agy_runner
+    import claude_pty
+    import claude_runner
+    import grok_runner
+
+    assert agy_runner.STUCK_CHILD_TIMEOUT == 3600
+    assert claude_pty.STUCK_CHILD_TIMEOUT == 3600
+    assert claude_runner.STUCK_CHILD_TIMEOUT == 3600
+    assert grok_runner.STUCK_CHILD_TIMEOUT == 3600

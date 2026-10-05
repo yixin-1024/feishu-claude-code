@@ -42,7 +42,7 @@ _CHECK_INTERVAL = 30  # 静默时每 30 秒检查一次子进程
 # 有子进程但 Claude 端持续无新输出的"卡死"上限。
 # 专治 tail -f / watch / npm run dev：子进程一直在但 Claude 端再也不产出。
 # 留得比 IDLE_TIMEOUT 宽，避免误杀正常长编译/长安装。
-STUCK_CHILD_TIMEOUT = 900  # 15 分钟
+STUCK_CHILD_TIMEOUT = int(os.getenv("STUCK_CHILD_TIMEOUT_SEC", "3600"))  # 1 小时
 # 单轮 wall-clock 最终保险：无论是否还在产出，都会强杀，防 runaway loop。
 # 默认 60 分钟，可用 CLAUDE_WALL_CLOCK_LIMIT_SEC（或 <PROFILE>_ 前缀）改；设 0 = 永不。
 # 具体解析见 bot_config.resolve_claude_wall_clock_limit。
