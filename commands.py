@@ -131,6 +131,9 @@ MODEL_ALIASES = {
     "agy-opus": "claude-opus-4-6-thinking",
     "agy-sonnet": "claude-sonnet-4-6",
     "agy-gpt": "gpt-oss-120b-medium",
+    # OpenAI Dots（网页里的 Dot）：模型由 Dot 自己决定，只有一个占位名
+    "dots": "dots",
+    "dot": "dots",
 }
 
 
@@ -1221,6 +1224,8 @@ def _runner_default_model(bot, runner: str) -> str:
         return "deepseek-v4-flash"
     if runner == "agy":
         return "gemini-3.8-flash"
+    if runner == "dots":
+        return "dots"
     return "sonnet[1m]"
 
 
@@ -2173,6 +2178,7 @@ async def handle_command(
                     {"text": "Grok CLI", "value": {"action": "run_cmd", "cmd": "/runner grok", "cid": chat_id}},
                     {"text": "Maka", "value": {"action": "run_cmd", "cmd": "/runner maka", "cid": chat_id}},
                     {"text": "Antigravity", "value": {"action": "run_cmd", "cmd": "/runner agy", "cid": chat_id}},
+                    {"text": "OpenAI Dots", "value": {"action": "run_cmd", "cmd": "/runner dots", "cid": chat_id}},
                 ],
             }
         requested = args.strip().lower().replace("_", "-")
@@ -2186,8 +2192,10 @@ async def handle_command(
             requested = "maka"
         if requested in {"antigravity", "antigravity-cli"}:
             requested = "agy"
-        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka", "agy"}:
-            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）、`agy`（Antigravity CLI）".format(args)
+        if requested in {"dot", "openai-dots", "openai-dot"}:
+            requested = "dots"
+        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka", "agy", "dots"}:
+            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）、`agy`（Antigravity CLI）、`dots`（网页版 OpenAI Dots）".format(args)
         model = _runner_default_model(bot, requested)
         await store.set_runner(user_id, chat_id, requested, model=model)
         return f"✅ 已切换 runner 为 `{requested}`，模型 `{model}`。已开始新 session。"
@@ -2198,6 +2206,8 @@ async def handle_command(
             raw = await store.get_current_raw(user_id, chat_id)
             overridden = bool(raw.get("model_override"))
             runner = (getattr(cur, "runner", "") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
+            if runner == "dots":
+                return "当前 runner：**dots**（网页版 OpenAI Dots）\n模型由 Dot 自己决定，这里没有可切换的模型。"
             if runner == "codex":
                 buttons = [
                     {"text": "Codex Max", "value": {"action": "run_cmd", "cmd": "/model codex-max", "cid": chat_id}},
@@ -2367,7 +2377,7 @@ async def handle_command(
         quota_line = (
             await asyncio.to_thread(_format_codex_rate_line, cur.get("session_id"))
             if runner == "codex"
-            else "" if runner in {"opencode", "mimo", "grok", "maka", "agy"}
+            else "" if runner in {"opencode", "mimo", "grok", "maka", "agy", "dots"}
             else await asyncio.to_thread(_get_quota_compact)
         )
 
@@ -2461,6 +2471,21 @@ async def handle_command(
                 }
             return "\n".join(text_lines)
 
+        if runner == "dots":
+            # Dot 的额度算在 ChatGPT 账号上，这里查不到；顺手做一次连通性体检更有用
+            import dots_runner
+            profile_name = getattr(getattr(bot, "profile", None), "name", "") or ""
+            lines = ["🫧 **OpenAI Dots 连接状态**", ""]
+            try:
+                st = await dots_runner.run_driver_oneshot(profile_name, "status")
+                lines.append(f"Dot：`{st.get('name') or '?'}`（房间 `{(st.get('room') or '?')[:12]}…`）")
+                lines.append("状态：" + (f"忙（{st.get('label')}）" if st.get("busy") else "空闲"))
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"❌ 连不上 Dots 页面：{e}")
+            relay = "运行中" if dots_runner.relay_running(profile_name) else "没在跑"
+            lines.append(f"回复转发器：{relay}（豆包说的每一条都转到私聊）")
+            lines.append("额度：算在 ChatGPT 账号上，cc-lark 这边查不到。")
+            return "\n".join(lines)
         if runner == "codex":
             model = cur.get("model_override") or store.default_model
             lines = ["📊 **Codex 用量**", ""]

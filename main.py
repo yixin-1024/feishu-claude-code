@@ -245,6 +245,17 @@ def main():
     for bot in _bots.values():
         runtime.start_profile_channel(bot)
 
+    # 7.1) OpenAI Dots：常驻转发器，豆包说的每一条都转回和用户的 Lark 私聊
+    for bot in _bots.values():
+        if bot.profile.runner == "dots" and not bot.profile.is_telegram:
+            import dots_runner
+
+            async def _start_dots_follower(b=bot):
+                dots_runner.start_relay(b)
+
+            asyncio.run_coroutine_threadsafe(_start_dots_follower(), bot_loop)
+            print(f"🫧 Dots 转发器已挂到 profile {bot.profile.name}")
+
     # 8) 定时任务调度器（独立后台线程，绕开 asyncio monotonic timer 的 macOS 睡眠坑）
     sched_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scheduled_tasks.yaml")
     runtime.start_scheduler_bg(sched_path)

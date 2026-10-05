@@ -16,6 +16,7 @@ AGENT_RUNNER_ALIASES: dict[str, str] = {
     "grok": "grok", "xai": "grok",
     "maka": "maka", "apache-maka": "maka",
     "agy": "agy", "antigravity": "agy",
+    "dots": "dots", "dot": "dots",
 }
 
 # runner → 给模型看的说明。顺序即工具说明里的呈现顺序。
@@ -27,6 +28,7 @@ RUNNER_HINTS: list[tuple[str, str, str]] = [
     ("grok",     '"grok"/"xai"',            "Grok"),
     ("mimo",     '"mimo"',                  "MiMo Code"),
     ("maka",     '"maka"',                  "Apache Maka"),
+    ("dots",     '"dots"/"dot"',            "OpenAI Dots（网页里的 Dot，只收发消息，不执行本机命令）"),
 ]
 
 

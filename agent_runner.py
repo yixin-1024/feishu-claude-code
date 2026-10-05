@@ -1,4 +1,4 @@
-"""Claude / Codex / OpenCode / MiMo / Grok / Maka / agy 后端分发入口。"""
+"""Claude / Codex / OpenCode / MiMo / Grok / Maka / agy / Dots 后端分发入口。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from mimo_runner import run_mimo
 from grok_runner import run_grok
 from maka_runner import run_maka
 from agy_runner import run_agy
+from dots_runner import run_dots
 
 
 async def run_agent(
@@ -38,6 +39,20 @@ async def run_agent(
     Claude/Codex 后端会把它透传给 cc_mcp_server，让 wake/dispatch/cron 能定向到本话题。
     """
     backend = (runner or profile.runner or "claude").strip().lower()
+    if backend == "dots":
+        # Dots 是网页里的 OpenAI Dot，不是本地 CLI：模型/工具/系统提示词都是它自己的，
+        # 只递用户说的话；wake_context 用来把晚到的回复绑回本话题（见 dots_runner 跟随器）。
+        return await run_dots(
+            message=message,
+            session_id=session_id,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            should_stop=should_stop,
+            profile_name=profile.name,
+            wake_context=wake_context,
+        )
+
     if backend == "opencode":
         return await run_opencode(
             message=message,

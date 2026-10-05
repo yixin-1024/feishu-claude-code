@@ -651,7 +651,12 @@ _STALL_COOLDOWNS = (10, 30, 60)
 # maka run 把整轮事件写进自己的 Runtime Event Log，只在收尾时一次性 print
 # finalOutput——正常干活期间 stdout 就是空的。对这些后端「无输出 N 分钟」是常态，
 # 显示成 ⚠️ 会让每个超过 30s 的正常任务看起来像卡死。
-_NON_STREAMING_RUNNERS = {"maka"}
+_NON_STREAMING_RUNNERS = {"maka", "dots"}
+# 卡片 footer 上给这些后端的说明（dots：Dot 的回复是整条到的，一轮里可能隔几分钟才来下一条）
+_NON_STREAMING_LABELS = {
+    "maka": "🌀 无流式输出，整轮跑完才出正文",
+    "dots": "🫧 等豆包回复（整条到达，不逐字）",
+}
 
 # ── 卡片推送的看门狗 ───────────────────────────────────────
 # 单帧（含 SDK 内部重试）的硬上限；超时就放弃这一帧并把锁还回去。必须大于
@@ -1087,6 +1092,101 @@ async def _run_lock_free_command(
         log(tag, "cmd", "error", f"/{cmd} 回复失败: {_err_desc(e)}")
 
 
+# ── Dots：Lark 私聊 ⇄ 豆包 ─────────────────────────────────
+
+async def _dots_ack(bot: BotInstance, message_id: str) -> None:
+    """已送达豆包：给用户那条点个 👌（不另发消息，免得私聊里一堆回执）。"""
+    try:
+        from lark_oapi.api.im.v1 import (
+            CreateMessageReactionRequest, CreateMessageReactionRequestBody, Emoji,
+        )
+        req = (
+            CreateMessageReactionRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                CreateMessageReactionRequestBody.builder()
+                .reaction_type(Emoji.builder().emoji_type("OK").build())
+                .build()
+            )
+            .build()
+        )
+        # Telegram 那边没有 .client（调用方已经挡掉 Telegram，这里再兜一层）
+        lark_client = getattr(bot.feishu, "client", None)
+        if lark_client is None:
+            return
+        resp = await lark_client.im.v1.message_reaction.acreate(req)
+        if not resp.success():
+            log(bot.profile.name, "dots", "warn", f"加表情失败 code={resp.code} {resp.msg}")
+    except Exception as e:  # noqa: BLE001
+        log(bot.profile.name, "dots", "warn", f"加表情失败: {type(e).__name__}: {e}")
+
+
+async def _dots_handle_message(bot: BotInstance, user_id: str, is_group: bool, msg) -> bool:
+    """RUNNER=dots 的 bot 只是用户和豆包私聊的传话筒。返回 True = 这条已处理完。
+
+    - 群里的消息一律不管（用户原话：「群里 at 他就不需要管了」）；
+    - 私聊里除了 / 命令，每条都立刻送进 Dots 网页：不排队、不开卡片、不等回复；
+      豆包的回复由 dots_runner 的常驻转发器逐条发回私聊。
+    """
+    if (getattr(bot.profile, "runner", "") or "").strip().lower() != "dots":
+        return False
+    if getattr(bot.profile, "is_telegram", False):
+        return False
+    tag = bot.profile.name
+    if is_group:
+        log(tag, "dots", "info", "群消息，Dots bot 只在私聊里传话，忽略")
+        return True
+
+    mtype = msg.message_type
+    try:
+        c = json.loads(msg.content or "{}")
+    except Exception:
+        c = {}
+    if mtype == "text" and (c.get("text") or "").strip().startswith("/"):
+        return False  # 命令照旧走 cc-lark 自己的处理
+    if mtype not in ("text", "post", "image", "file", "audio"):
+        return False
+
+    import dots_runner
+
+    async def prepare():
+        files: list[str] = []
+        if mtype == "text":
+            return c.get("text") or "", files
+        if mtype == "post":
+            for ik in extract_post_image_keys(msg.content):
+                files.append(await bot.feishu.download_image(msg.message_id, ik))
+            return parse_post_content(msg.content), files
+        if mtype == "image":
+            files.append(await bot.feishu.download_image(msg.message_id, c.get("image_key", "")))
+            return "", files
+        if mtype == "file":
+            files.append(await bot.feishu.download_file(
+                msg.message_id, c.get("file_key", ""), msg_type="file",
+                file_name=c.get("file_name") or "file",
+            ))
+            return "", files
+        # 语音：豆包收不了 Lark 的 opus，转成文字再递
+        audio_path = await bot.feishu.download_file(
+            msg.message_id, c.get("file_key", ""), msg_type="audio", file_name="voice.opus",
+        )
+        return await bot.feishu.speech_to_text(audio_path, file_id=msg.message_id), files
+
+    try:
+        sent = await dots_runner.forward(bot, prepare, user_id=user_id)
+    except Exception as e:  # noqa: BLE001
+        log(tag, "dots", "error", f"发给豆包失败: {type(e).__name__}: {e}")
+        try:
+            await bot.feishu.reply_text(msg.message_id, f"❌ 没能发给豆包：{e}")
+        except Exception:
+            pass
+        return True
+    if sent:
+        log(tag, "dots", "info", f"已发给豆包 type={mtype}")
+        await _dots_ack(bot, msg.message_id)
+    return True
+
+
 # ── 核心消息处理 ─────────────────────────────────────────────
 
 async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
@@ -1200,6 +1300,11 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
                 return
             await _show_command_menu(bot, user_id, chat_id, is_group, msg.message_id)
             return
+
+    # Dots：Lark 只是用户和豆包私聊的传话筒——私聊消息直接送进 Dots（不排队、不开卡片），
+    # 豆包的回复由常驻转发器逐条发回私聊；群里的消息一律不管。
+    if await _dots_handle_message(bot, user_id, is_group, msg):
+        return
 
     # 群聊只响应 @机器人 的消息。
     # 例外：语音消息没法 @ 人，在已有会话记录的话题 thread 里直接放行
@@ -1584,9 +1689,10 @@ async def _execute_run(
             footer.append(f"🔧 {label} {_fmt_duration(now - t_started)}")
         idle = now - last_output_ts
         if idle >= 30:
-            if (session.runner or "").strip().lower() in _NON_STREAMING_RUNNERS:
+            _r = (session.runner or "").strip().lower()
+            if _r in _NON_STREAMING_RUNNERS:
                 # 这个后端天生不流式，别把常态渲染成"疑似卡死"
-                footer.append("🌀 无流式输出，整轮跑完才出正文")
+                footer.append(_NON_STREAMING_LABELS.get(_r, "🌀 无流式输出，整轮跑完才出正文"))
             else:
                 footer.append(f"⚠️ 无输出 {_fmt_duration(idle)}")
         if pty_warning:

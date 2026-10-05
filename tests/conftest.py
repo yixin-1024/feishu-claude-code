@@ -37,6 +37,8 @@ def _isolate_sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("CC_LARK_TASK_RESULTS_DIR", str(tmp_path / "task_results"))
     # 会话移交简报同理：测试里的假移交不该在仓库 data/handovers/ 里堆文件。
     monkeypatch.setenv("CC_LARK_HANDOVER_DIR", str(tmp_path / "handovers"))
+    # Dots 跟随器的已转发水位线同理：测试别往仓库 data/dots_state.json 写假记录
+    monkeypatch.setenv("CC_LARK_DOTS_STATE", str(tmp_path / "dots_state.json"))
     # agy 账号快照 / keychain 同理，而且更凶：~/.gemini/accounts 里是**真凭证**，
     # keychain 那条 gemini/antigravity 就是本机 agy 的登录态。测试一律读不到真号、
     # 也写不动 keychain（要验证写入路径的用例自己 monkeypatch 回去）。

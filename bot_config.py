@@ -162,6 +162,10 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
         # grok: wow-* 或 grok
         return low.startswith("wow-") or low.startswith("grok")
 
+    if runner == "dots":
+        # dots: 模型是 Dot 自己的（服务端决定），这里只认占位名
+        return low in {"dots", "dot"}
+
     if runner == "maka":
         # maka: deepseek-*, nemotron-*, maka
         return low.startswith("deepseek-") or low.startswith("nemotron-") or low.startswith("maka")
@@ -444,9 +448,9 @@ def _load_profile(name: str) -> Profile:
 
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
-    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy"}:
+    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "dots"}:
         raise ValueError(
-            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka / agy，"
+            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka / agy / dots，"
             f"当前: {runner}"
         )
     claude_runner = env("CLAUDE_RUNNER").strip().lower()
