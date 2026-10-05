@@ -132,6 +132,10 @@ cc-lark 自研的 `cc_mcp_server.py` 把 13 个运行时工具注入进去，**�
 - 新消息不再打断当前任务，而是排队等待（同 chat 串行，跨 chat 并发）
 - 当前任务繁忙时新消息收到 `📬 排队中` 回执
 - 想真正打断时用 `/stop` 显式终止
+- **只读命令免排队**：`/usage` `/status` `/help` `/skills` `/mcp` `/accounts` `/ls`，
+  以及不带参数的 `/model` `/mode` `/effort` `/runner` `/resume` `/ws` —— 这些只看状态、
+  不动 session，任务跑着也能随时发、立刻出结果。带参数（`/model opus`）或会开新会话的
+  （`/new` `/cd` `/exec` …）仍然排队，避免和运行中的任务并发改写 session
 
 **图片 / 文件 / 富文本**
 
@@ -550,6 +554,30 @@ stdio 前端只把鉴权请求发到本机 control listener，真正的派工与
 `/model` `/effort`，默认跑目标 bot 的 profile 默认模型。要按活儿分配算力就显式传
 `model` / `effort`（别名同 `/model`：`fable` / `opus` / `sonnet` / `haiku` …），
 配合 `agent` 还能混编：一路 Opus 实现、一路 Fable 复核、一路 `agent="gpt"` 交叉验证。
+
+### 工作域路由：把活派到**对的群**（`workspaces.json`）
+
+一个群就是一摊活——群在 `.env` 里钉着工作目录（`<PROFILE>_CHAT_CWD_<chat_id>`）。所以
+「派到哪个群」等于「在哪个项目里干活」。把仓库根的 `workspaces.json.example` 拷成
+`workspaces.json`（本地配置，已 gitignore），一条 = 一个项目：
+
+```json
+{"workspaces": [
+  {"name": "kyt", "aliases": ["链上"], "chat_id": "oc_…",
+   "cwd": "/Users/me/work/kyt", "desc": "链上风控", "agent": ""}
+]}
+```
+
+配好后 `dispatch_task` / `schedule_cron` 多出一个 `workspace` 参数：传了就把子会话开在那个
+项目的群、并把工作目录钉死成它的 `cwd`；**省略则维持原行为**（派在调用方所在的当前群）。
+名字匹配对大小写与 `-_ .` 空格都不敏感，别名可以写中文——用户是**用嘴说**这些名字的
+（语音端 `cclark-voice` 也读同一张表生成系统提示）。工作域清单会渲染进工具说明，模型据此
+知道「用户提到某个项目 = 该路由过去」。
+
+同一目录对应多个群时只挑一个当**派活入口**，其余写进 `other_chats` 备查。跨群派发会校验
+目标 bot 是否在那个群（不在就当场清晰报错，而不是等 Lark 回 230002）；并发闸门按**目标群**
+计数；父 agent 的批次回报仍回到调用方自己的话题。工作域是 Lark 群的概念，Telegram 会话
+不提供该参数。
 
 `handover` 是**会话移交**：把整项任务连所有权一起交给一条新话题里的新会话，移交方随后收工。
 它和 `dispatch_task` 只差一件事——**移交不要回报**：`dispatch_task` 派的是子任务，子会话

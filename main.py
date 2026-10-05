@@ -66,7 +66,8 @@ def _external_api_deps(bot_loop: asyncio.AbstractEventLoop) -> external_api.Exte
         target_bot = None
         if agent:
             target_bot, err = http_server.resolve_target_agent(
-                _bots, agent, exclude=bot.profile.name)
+                _bots, agent, exclude=bot.profile.name,
+                chat_id=(kwargs.get("group_chat_id") or "").strip())
             if target_bot is None:
                 return {"ok": False, "error": err}
         return await dispatcher.dispatch_task(bot, target_bot=target_bot, **kwargs)

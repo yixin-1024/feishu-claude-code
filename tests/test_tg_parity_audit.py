@@ -1019,6 +1019,15 @@ def test_telegram_and_lark_share_the_runtime_mcp_section_except_ask_cmd():
     # 唯一允许的差异就是 ${ask_cmd}（Lark 用 lark-cli，Telegram 用 tg-cli）
     tg_norm = tg_sec.replace(os.path.join(PROJECT_ROOT, "tg-cli") + ' send --text "<问题>"', "<ASK>")
     lk_norm = lk_sec.replace('lark-cli ... im +messages-reply ... --text "<问题>"', "<ASK>")
+    # 第二处**有意**的差异：工作域路由（dispatch_task 的 workspace 参数）只给 Lark。
+    # 工作域指向的是 Lark 群 oc_…，Telegram bot 往那儿建话题根本发不出去，所以那一段
+    # 对 Telegram 整个不注入。比较前按同一把尺子抹掉。
+    import lark_prompts
+    _ws_block = lark_prompts._build_workspace_routing(_LARK_PROFILE)
+    assert lark_prompts._build_workspace_routing(_profile()) == "", "Telegram 不该拿到工作域清单"
+    if _ws_block:
+        assert _ws_block in lk_norm
+        lk_norm = lk_norm.replace(_ws_block, "")
     # 后半段（运行环境约束）已在上一个测试比过，这里只比 MCP 段
     tg_mcp = tg_norm[:tg_norm.index("【⚠️ 运行环境约束（通用）】")]
     lk_mcp = lk_norm[:lk_norm.index("【⚠️ 运行环境约束（通用）】")]

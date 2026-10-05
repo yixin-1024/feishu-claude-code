@@ -99,6 +99,31 @@ async def test_stall_auto_resumes_same_session_and_recovers():
     assert "❌" not in body
 
 
+async def test_incomplete_task_never_reports_success_or_restarts_budget():
+    bot = _bot()
+    session = _session()
+    session.runner = "agy"
+    calls = []
+
+    async def fake_run_agent(**kwargs):
+        calls.append(kwargs)
+        await kwargs["on_text_chunk"]("正在扫描海外信源与官方更新…")
+        raise dispatcher.IncompleteTaskError("自动续跑已达到次数上限", "sid-partial")
+
+    result = await _run(bot, session, fake_run_agent)
+    assert result is None
+    assert len(calls) == 1
+    body = bot.feishu.update_card_final.await_args.args[1]
+    assert "任务未完成" in body
+    assert "正在扫描" in body
+    assert "配额恢复" not in body
+    bot.store.on_agent_response.assert_awaited_once_with(
+        "u1", "c1", "sid-partial", "帮我查一下余额",
+    )
+    assert all(call.args[1] != "✅" for call in bot.feishu.reply_text.await_args_list)
+    assert "任务未完成" in bot.feishu.reply_text.await_args.args[1]
+
+
 async def test_stall_retries_up_to_budget_then_reports():
     """一直中断也不能无限续跑：跑满预算后报错，并保留『继续』提示。"""
     bot = _bot()

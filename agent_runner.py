@@ -162,6 +162,8 @@ async def run_agent(
             on_process_start=on_process_start,
             on_usage=on_usage,
             on_status=on_status,
+            # 自动续跑循环要在两个 pass 之间读 /stop，不然叫停后还会再 spawn 一轮
+            should_stop=should_stop,
             append_system_prompt=append_system_prompt,
             agy_bin=profile.agy_bin,
             model_provider=profile.agy_model_provider,

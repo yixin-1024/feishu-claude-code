@@ -29,9 +29,16 @@ spawn claude 时通过 --mcp-config 的 env 块注入到本进程环境里（CC_
 from __future__ import annotations
 
 import json
+
+from agent_alias import alias_doc as _alias_doc
+
+_ALIAS_DOC = _alias_doc()
 import os
 import sys
+import urllib.error
 import urllib.request
+# 置 1 = 派出去的子任务不回报、批次跑完也不唤醒发起方（语音对讲用）。
+_NO_REPORT_BACK = (os.environ.get("CC_LARK_NO_REPORT_BACK") or "").strip() in ("1", "true", "yes")
 
 try:
     # 定时任务的删/停/改：纯 stdlib、跟本文件同目录。缺失时只是少 4 个工具，
@@ -39,6 +46,51 @@ try:
     import cron_store
 except Exception:  # noqa: BLE001
     cron_store = None
+
+try:
+    # 工作域路由表（「派到哪个群」）：同样纯 stdlib、同目录。没有它就只是少了
+    # workspace 参数（派发退回"当前群"的原行为），不能拖垮整个 server。
+    import workspaces as _workspaces
+except Exception:  # noqa: BLE001
+    _workspaces = None
+
+
+def _workspace_catalog() -> str:
+    """本机配置了哪些工作域（渲染进工具说明）。没配就返回空串 → 不暴露该参数。"""
+    if _workspaces is None:
+        return ""
+    try:
+        return _workspaces.catalog_doc()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_WS_CATALOG = _workspace_catalog()
+
+# 有工作域表才把 workspace 参数 + 路由说明挂出去；没配置时工具说明与从前逐字一致。
+_WS_DOC = (
+    "WORKSPACE ROUTING (choose the RIGHT Lark group): each configured workspace is one "
+    "project = one Lark group = one working directory. Pass `workspace` to run the "
+    "sub-task in THAT project's group/dir; omit it to keep the task in the CURRENT group. "
+    "**When the user names a project or system, you MUST route to its workspace instead of "
+    "defaulting to the current group** —— 用户说「去 KYT 查一下」「SPX 那边改个接口」就传对应的 "
+    "workspace，别把活留在当前群（当前群往往是另一摊活、另一个目录）。Configured workspaces:\n"
+    + _WS_CATALOG + "\n"
+) if _WS_CATALOG else ""
+
+# 参数说明里只列名字（各自是干什么的已经在工具 description 的清单里写过一遍了，
+# 再抄一遍纯粹是把同样的几百 token 收两次费）。
+_WS_NAMES = " | ".join(_workspaces.names()) if (_workspaces and _WS_CATALOG) else ""
+
+_WS_PARAM = {
+    "type": "string",
+    "description": (
+        "Optional target WORKSPACE (project) — routes this task to that project's Lark "
+        "group and working directory. Case/spacing-insensitive, aliases accepted (see the "
+        "workspace list in this tool's description). Omit to use the CURRENT group "
+        "(previous behaviour). Configured: " + _WS_NAMES
+    ),
+} if _WS_CATALOG else None
 
 SERVER_NAME = "cc-lark"
 SERVER_VERSION = "0.1.0"
@@ -116,25 +168,67 @@ _ALLOW_WAKE = _allow("CC_LARK_ALLOW_WAKE")
 _ALLOW_CRON = _allow("CC_LARK_ALLOW_CRON")
 
 
+def _read_body(resp_or_err) -> str:
+    """把响应体读成文本；读挂了也不抛（拿不到就当空 body）。"""
+    try:
+        return (resp_or_err.read() or b"").decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _decode_body(where: str, raw: str, status: int = 0) -> dict:
+    """把一次 control API 响应压成 dict，**永不抛异常**。
+
+    status=0 表示 2xx；非 0 = 4xx/5xx。bot 侧 `_mcp_respond` 对 ok=false 一律回
+    HTTP 400 **并在 body 里带真实原因**，而 urllib 把 4xx 抛成 HTTPError 丢掉 body
+    —— 模型只看得到 "HTTP Error 400: Bad Request"，只能反复瞎试（实测连吃 3 个 400）。
+    所以这里把 body 解出来：能解析成对象就原样返回（`ok` 强制置 false），让调用方
+    照常走既有的 `body.get("ok")` 分支把真实原因透出去；解析不了就退化成一条带
+    状态码 + body 片段的可读 error。"""
+    try:
+        data = json.loads(raw or "{}")
+    except Exception:  # noqa: BLE001
+        data = None
+    snippet = (raw or "").strip()[:400] or "(empty body)"
+    if not isinstance(data, dict):
+        head = f"HTTP {status} " if status else ""
+        return {"ok": False, "error": f"{head}bad response from {where}: {snippet}"}
+    if not status:
+        return data
+    reason = str(data.get("error") or "").strip() or snippet
+    return {**data, "ok": False, "error": f"{reason} [HTTP {status} {where}]"}
+
+
 def _post_json(path: str, payload: dict, timeout: int = 35) -> dict:
-    """POST 一个 JSON 给常驻 bot 的本机端点，返回解析后的 dict。任何异常向上抛。"""
+    """POST 一个 JSON 给常驻 bot 的本机端点，返回解析后的 dict。
+
+    4xx/5xx **不抛异常**：bot 在 body 里回的 {"ok": false, "error": ...} 被原样带回，
+    调用方的 `if not body.get("ok")` 分支就能拿到真实原因（所有调用方同等受益）。
+    body 不是 JSON / 读不出来也只退化成可读的 ok=false，绝不抛解析异常。
+    连不上 / 超时这类真·传输失败仍向上抛，由调用方的 except 兜底。"""
     req = urllib.request.Request(
         f"{_control_base()}{path}",
         data=json.dumps(payload).encode("utf-8"),
         headers=_control_headers(),
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8") or "{}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _decode_body(path, _read_body(resp))
+    except urllib.error.HTTPError as e:
+        return _decode_body(path, _read_body(e), e.code)
 
 
 def _get_json(path: str, timeout: int = 35) -> dict:
-    """GET 一个本机 control 端点（/reload 是 GET）。任何异常向上抛。"""
+    """GET 一个本机 control 端点（/reload 是 GET）。错误处理同 _post_json。"""
     req = urllib.request.Request(
         f"{_control_base()}{path}", headers=_control_headers(), method="GET"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8") or "{}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _decode_body(path, _read_body(resp))
+    except urllib.error.HTTPError as e:
+        return _decode_body(path, _read_body(e), e.code)
 
 
 def _reload_tasks() -> dict:
@@ -214,7 +308,8 @@ DISPATCH_TASK_TOOL = {
     "name": "dispatch_task",
     "description": (
         "Fan out an INDEPENDENT sub-task to a fresh cc-lark Claude session running in a "
-        "NEW thread in the current Lark group, then return immediately (fire-and-forget) "
+        "NEW thread in a Lark group (the current one by default — see WORKSPACE ROUTING "
+        "below to send it to another project's group), then return immediately (fire-and-forget) "
         "with its thread_id. This is the generic multi-agent dispatch primitive: use it to "
         "parallelize a goal across several worker agents, each with its own clean context. "
         "The sub-agent runs fully autonomously; you do NOT block waiting for it — poll its "
@@ -222,7 +317,8 @@ DISPATCH_TASK_TOOL = {
         "(working dir, scope, acceptance criteria, any 'do not touch prod' guards) — the "
         "worker has none of your context. HARD LIMIT: the bot enforces a PER-GROUP concurrency "
         "cap (default 7; excess dispatches in the same group are rejected) — dispatch in waves "
-        "and wait for the prior wave before launching the next. Target group/recipient are supplied automatically. "
+        "and wait for the prior wave before launching the next. The recipient is supplied automatically. "
+        + _WS_DOC +
         "AUTO-REPORT: each sub-agent posts a completion line back to YOUR thread when it "
         "finishes (even if it crashes), and once the WHOLE wave is done you are automatically "
         "woken with each sub-agent's ACTUAL RESULT inlined in the wake message — so you may "
@@ -254,9 +350,11 @@ DISPATCH_TASK_TOOL = {
                 "type": "string",
                 "description": (
                     "Optional target agent/backend for the worker (CROSS-AGENT dispatch). "
-                    "Accepts a family alias — \"gpt\"/\"codex\" (GPT), \"claude\", "
-                    "\"gemini\"/\"opencode\", \"mimo\", \"grok\"/\"xai\" — or an exact loaded profile name. "
-                    "Omit to run the worker on your own backend (default)."
+                    "Accepts a family alias — " + _ALIAS_DOC + " — or an exact loaded "
+                    "profile name. Omit to run the worker on your own backend (default). "
+                    "When the user names an agent out loud (\"派给 agy\", \"让 GPT 做\", "
+                    "\"用 antigravity\"), pass it here instead of silently falling back to "
+                    "the default."
                 ),
             },
             "model": {
@@ -279,6 +377,9 @@ DISPATCH_TASK_TOOL = {
         "required": ["prompt"],
     },
 }
+
+if _WS_PARAM:
+    DISPATCH_TASK_TOOL["inputSchema"]["properties"]["workspace"] = dict(_WS_PARAM)
 
 HANDOVER_TOOL = {
     "name": "handover",
@@ -476,8 +577,16 @@ SCHEDULE_CRON_TOOL = {
         "crontab here: 0=Monday, 1=Tuesday … 6=Sunday (7 is rejected), so '1' means "
         "Tuesday. Prefer the names mon/tue/wed/thu/fri/sat/sun, and check next_run in the "
         "reply. Write `prompt` "
-        "SELF-CONTAINED (each run is a fresh session). Group/recipient are supplied "
-        "automatically. Because each run is a fresh session it does NOT inherit any /model "
+        "SELF-CONTAINED (each run is a fresh session). The recipient is supplied "
+        "automatically. "
+        + (
+            "`workspace` picks WHICH GROUP the task recurs in (same routing table as "
+            "dispatch_task; omit = current group). NOTE: a cron created into another "
+            "workspace belongs to THAT group — list_crons / pause / cancel only see the "
+            "群 they are called from, so manage it from there. "
+            if _WS_CATALOG else ""
+        )
+        + "Because each run is a fresh session it does NOT inherit any /model "
         "or /effort set in this thread — pass `model` / `effort` if the task needs a "
         "specific model or reasoning depth. Returns the task name + next run time; use "
         "list_crons to review."
@@ -506,6 +615,9 @@ SCHEDULE_CRON_TOOL = {
         "required": ["cron", "prompt"],
     },
 }
+
+if _WS_PARAM:
+    SCHEDULE_CRON_TOOL["inputSchema"]["properties"]["workspace"] = dict(_WS_PARAM)
 
 LIST_CRONS_TOOL = {
     "name": "list_crons",
@@ -601,6 +713,13 @@ UPDATE_CRON_TOOL = {
     },
 }
 
+TASK_RESULT_TOOL = {
+    "name": "get_task_result",
+    "description": "Read authoritative running/completed/failed/cancelled status and result of a task dispatched by this caller. Use thread_id from dispatch_task. Does not start or resume any task.",
+    "inputSchema": {"type": "object", "properties": {
+        "thread_id": {"type": "string"}}, "required": ["thread_id"]},
+}
+
 # 按闸门装配 tools/list —— 关掉的能力这里就不出现，agent 看都看不到。
 TOOLS = []
 if _ALLOW_WAKE:
@@ -608,7 +727,7 @@ if _ALLOW_WAKE:
     TOOLS.append(CANCEL_WAKE_TOOL)
 if _ALLOW_DISPATCH:
     TOOLS += [DISPATCH_TASK_TOOL, HANDOVER_TOOL, READ_THREAD_TOOL,
-              APPEND_TASK_TOOL, STEER_TASK_TOOL]
+              APPEND_TASK_TOOL, STEER_TASK_TOOL, TASK_RESULT_TOOL]
 if _ALLOW_CRON:
     TOOLS += [SCHEDULE_CRON_TOOL, LIST_CRONS_TOOL]
     # 删/停/改靠本地改 yaml + /reload 实现，没有 cron_store 就整组不暴露
@@ -727,22 +846,68 @@ def _err(text: str) -> dict:
     return {"content": [{"type": "text", "text": f"⚠️ {text}"}], "isError": True}
 
 
+def _resolve_workspace(args: dict) -> tuple[str, dict | None]:
+    """把 `workspace` 参数预检一遍。返回 (名字, 错误 result)。
+
+    真正的解析在 bot 侧（http_server 才是权威：chat_id / cwd 都以路由表为准，
+    不信客户端传来的值）。这里只是**提前失败**——名字打错时当场把可选清单回给模型，
+    而不是让它吃一个 HTTP 400 再猜。
+    """
+    spec = (args.get("workspace") or args.get("target") or "").strip()
+    if not spec:
+        return "", None
+    if _workspaces is None:
+        return "", _err("本机没有工作域路由表，无法按项目分流；去掉 workspace 参数即派在当前群。")
+    try:
+        ws, err = _workspaces.resolve(spec)
+    except Exception as e:  # noqa: BLE001
+        return "", _err(f"工作域解析失败: {type(e).__name__}: {e}")
+    if ws is None:
+        return "", _err(err)
+    return ws.name, None
+
+
+def _stale_routing_warning(workspace: str, body: dict) -> str:
+    """bot 还在跑旧代码时，workspace 会被它整个忽略——活其实落在了当前群。
+
+    识破方式：新版 bot 一定会在响应里**回显** workspace；旧版没有这个字段。
+    这里不报 isError（活真的已经派出去了，报错只会引诱模型再派一遍），而是在回执
+    最前面顶一行醒目警告，让模型如实转告用户去 /restart。
+    """
+    if not workspace or body.get("workspace") == workspace:
+        return ""
+    return (
+        f"⚠️ 路由未生效：目标工作域 «{workspace}» 被 bot 忽略了，任务实际落在了**当前群/当前目录**。"
+        f"原因几乎一定是常驻 bot 还在跑旧代码 —— 让用户发 /restart 后再重试一次，"
+        f"并且**别假装派对了群**。\n"
+    )
+
+
 def _tool_dispatch_task(args: dict) -> dict:
-    """派一个独立子会话到当前群的新 thread（fan-out）。上下文取自 env。"""
+    """派一个独立子会话到目标群的新 thread（fan-out）。
+
+    目标群默认是**当前群**（env 里的 CC_LARK_CHAT_ID，原行为）；传了 workspace 就
+    改派到那个工作域的群、并把子会话钉在该工作域的目录里（bot 侧按路由表落）。
+    """
     prompt = args.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         return _err("`prompt` must be a non-empty string.")
+    workspace, ws_err = _resolve_workspace(args)
+    if ws_err:
+        return ws_err
     chat_id = (os.environ.get("CC_LARK_CHAT_ID") or "").strip()
     profile = (os.environ.get("CC_LARK_PROFILE") or "").strip()
     user_id = (os.environ.get("CC_LARK_USER_ID") or "").strip()
-    if not chat_id:
+    if not chat_id and not workspace:
         return _err(
             "No Lark group context — dispatch_task only works inside a cc-lark group "
             "session. (CC_LARK_CHAT_ID unset.)"
         )
     payload = {
         "profile": profile,
+        # 调用方自己所在的群。目标群由 bot 侧按 workspace 定；不传 workspace 时就是这个。
         "chat_id": chat_id,
+        "workspace": workspace,
         "user_id": user_id,
         "title": (args.get("title") or "").strip(),
         "prompt": prompt.strip(),
@@ -752,8 +917,12 @@ def _tool_dispatch_task(args: dict) -> dict:
         "model": (args.get("model") or "").strip(),
         "effort": (args.get("effort") or "").strip(),
         # 父上下文：让 bot 在子会话结束后回报本 thread + 批次全完时唤醒我（主 agent）
-        "parent_thread": (os.environ.get("CC_LARK_THREAD_ID") or "").strip(),
-        "parent_anchor": (os.environ.get("CC_LARK_ANCHOR") or os.environ.get("CC_LARK_MESSAGE_ID") or "").strip(),
+        # 父上下文 = 回报闭环的开关（bot 侧 `if parent_thread and parent_anchor` 才登记）。
+        # 语音对讲这类「派完就挂电话」的场景要把它关掉：否则活明明派去了别的工作域，
+        # 子任务回报和批次汇总却全灌回发起方的话题里。同 handover 的取舍。
+        "parent_thread": "" if _NO_REPORT_BACK else (os.environ.get("CC_LARK_THREAD_ID") or "").strip(),
+        "parent_anchor": "" if _NO_REPORT_BACK else (
+            os.environ.get("CC_LARK_ANCHOR") or os.environ.get("CC_LARK_MESSAGE_ID") or "").strip(),
     }
     try:
         body = _post_json("/dispatch", payload)
@@ -768,12 +937,46 @@ def _tool_dispatch_task(args: dict) -> dict:
     agent_note += "".join(
         f" ({k}={body.get(k)})" for k in ("model", "effort") if body.get(k)
     )
-    return _ok(
-        f"✅ Dispatched a sub-agent{agent_note} in a new thread. thread_id={body.get('thread_id')} "
-        f"(active {body.get('active_after')}/{body.get('cap')}). "
+    stale = _stale_routing_warning(workspace, body)
+    where = ""
+    if body.get("workspace"):
+        where = f" in workspace «{body['workspace']}»"
+        if body.get("cwd"):
+            where += f" ({body['cwd']})"
+    result = _ok(
+        stale +
+        f"✅ Dispatched a sub-agent{agent_note}{where} in a new thread. thread_id={body.get('thread_id')} "
+        f"(active {body.get('active_after')}/{body.get('cap')} in that group). "
         f"It runs autonomously — poll its progress/result later with "
         f"read_thread(thread_id=\"{body.get('thread_id')}\")."
     )
+    result["structuredContent"] = {k: body.get(k) for k in (
+        "thread_id", "chat_id", "agent", "workspace", "anchor_message_id")}
+    try:
+        import task_results
+        available = task_results.get(body.get("thread_id"), profile=profile,
+                                     user_id=user_id).get("status") != "unavailable"
+    except Exception:
+        available = False
+    result["structuredContent"]["callback_available"] = available
+    if not available:
+        result["content"][0]["text"] += (
+            "\nCompletion callback is not available for this task. "
+            "Do not promise an automatic voice notification; the cc-lark bot may need /restart.")
+    return result
+
+
+def _tool_get_task_result(args: dict) -> dict:
+    import task_results
+    try:
+        record = task_results.get(args.get("thread_id"),
+                                  profile=os.environ.get("CC_LARK_PROFILE", ""),
+                                  user_id=os.environ.get("CC_LARK_USER_ID", ""))
+    except (ValueError, PermissionError) as e:
+        return _err(str(e))
+    except Exception:
+        return _err("Task result store is unavailable; do not infer task completion.")
+    return {**_ok(json.dumps(record, ensure_ascii=False)), "structuredContent": record}
 
 
 def _tool_handover(args: dict) -> dict:
@@ -917,13 +1120,18 @@ def _tool_schedule_cron(args: dict) -> dict:
         return _err("`cron` is required (5-field: minute hour dom month dow).")
     if not isinstance(prompt, str) or not prompt.strip():
         return _err("`prompt` must be a non-empty string.")
+    workspace, ws_err = _resolve_workspace(args)
+    if ws_err:
+        return ws_err
     chat_id = (os.environ.get("CC_LARK_CHAT_ID") or "").strip()
     profile = (os.environ.get("CC_LARK_PROFILE") or "").strip()
     user_id = (os.environ.get("CC_LARK_USER_ID") or "").strip()
-    if not chat_id:
+    if not chat_id and not workspace:
         return _err("No Lark group context — schedule_cron only works inside a cc-lark group session.")
     payload = {
         "profile": profile, "chat_id": chat_id, "user_id": user_id,
+        # 空 = 在当前群循环；给了就按路由表改到那个工作域的群（bot 侧权威解析）
+        "workspace": workspace,
         "cron": cron, "prompt": prompt.strip(), "title": (args.get("title") or "").strip(),
         "model": (args.get("model") or "").strip(),
         "effort": (args.get("effort") or "").strip(),
@@ -938,9 +1146,14 @@ def _tool_schedule_cron(args: dict) -> dict:
     over = "".join(
         f", {k}={body.get(k)}" for k in ("model", "effort") if body.get(k)
     )
+    stale = _stale_routing_warning(workspace, body)
+    where = f" in workspace «{workspace}»" if workspace else ""
+    hint = (" It belongs to THAT group — list/pause/cancel it from there."
+            if workspace else " Use list_crons to review.")
     return _ok(
-        f"✅ Recurring task created: {body.get('name')} — cron '{body.get('cron')}'{over}, "
-        f"next run {body.get('next_run')}. It survives restarts. Use list_crons to review."
+        stale +
+        f"✅ Recurring task created{where}: {body.get('name')} — cron '{body.get('cron')}'{over}, "
+        f"next run {body.get('next_run')}. It survives restarts.{hint}"
     )
 
 
@@ -1055,6 +1268,7 @@ if _ALLOW_WAKE:
     _HANDLERS["cancel_wake"] = _tool_cancel_wake
 if _ALLOW_DISPATCH:
     _HANDLERS["dispatch_task"] = _tool_dispatch_task
+    _HANDLERS["get_task_result"] = _tool_get_task_result
     _HANDLERS["handover"] = _tool_handover
     _HANDLERS["read_thread"] = _tool_read_thread
     _HANDLERS["append_to_task"] = _tool_append_to_task

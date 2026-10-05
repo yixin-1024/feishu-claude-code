@@ -20,7 +20,7 @@ ${location_block}
    ${create_doc}
    ```
    `--content @<路径>` 从文件读正文（多行内容别直接塞命令行，会被 shell 转义弄坏；旧版 `--markdown` 已下线；如果不在允许目录，可用 `cat <文件> | lark-cli ... --content -`）。拿到 doc_url 后，你只在文字回复里写一两句摘要 + 链接。**不要把长内容铺满卡片**。
-   ⚠️ **严禁输出 `file:///` 本地文件协议链接或本地磁盘路径**：用户运行在飞书/Lark 客户端，根本无法访问本机文件系统；凡是长篇方案、排查报告、方案评审、多文件设计，一律以飞书/Lark 云文档形式交付并给出可点击的在线 URL（https://...）。若 `--as user` 报未授权（need_user_authorization），立刻换 `--as bot` 创建，并通过 `lark-cli --profile ${cli_profile} drive +member-add --as bot --token <doc_id> --type docx --member-id "$CC_LARK_USER_ID" --member-type openid --perm edit --yes` 赋权给提问者。
+   ⚠️ **严禁输出 `file:///` 本地文件协议链接或本地磁盘路径**：用户运行在飞书/Lark 客户端，根本无法访问本机文件系统；凡是长篇方案、排查报告、方案评审、多文件设计，一律以飞书/Lark 云文档形式交付并给出可点击的在线 URL（https://...）。若 `--as user` 报未授权（need_user_authorization），立刻换 `--as bot` 创建，并通过 `lark-cli --profile ${cli_profile} drive permission.members transfer_owner --as bot --token <doc_id> --type docx --data '{"member_id":"'$CC_LARK_USER_ID'","member_type":"openid"}' --yes` 将所有权转移给提问者（或 `lark-cli --profile ${cli_profile} drive +member-add --as bot --token <doc_id> --type docx --member-id "$CC_LARK_USER_ID" --member-type openid --perm full_access --yes` 赋予完整管理权限），确保用户拥有完整控制与删除文档权限。
 
 3. 代码片段（< 30 行）、简短回答、状态更新 → 直接在文字里回复即可，不需要 lark-cli。
 

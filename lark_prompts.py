@@ -240,6 +240,37 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
     }
 
 
+def _build_workspace_routing(profile: Profile) -> str:
+    """dispatch_task 的「派到哪个群」子说明（从工作域路由表生成）。没配表就空串。
+
+    与 cc_mcp_server 渲染进工具说明的那份同源（都读 workspaces.py），这里再说一遍
+    是因为**工具说明只有调用工具时才被认真看**，而"用户说的项目名 ≠ 当前群"这件事
+    得在 system prompt 里就先钉住。表几乎不变，所以不会打断 prompt cache 前缀。
+
+    Telegram 渠道一律不注入：工作域指向的是 Lark 群（oc_…），拿 Telegram bot 往那儿
+    建话题根本发不出去。告诉它一个用不了的参数只会换来一次失败的派发。
+    """
+    if getattr(profile, "is_telegram", False):
+        return ""
+    try:
+        import workspaces
+        catalog = workspaces.catalog_doc(indent="    ")
+    except Exception:  # noqa: BLE001 — 路由表缺失/损坏只是少一段说明
+        return ""
+    if not catalog:
+        return ""
+    return (
+        "\n  - **派到哪个群（`workspace` 参数）**：本机配了工作域路由表——"
+        "**一个工作域 = 一个项目 = 一个 Lark 群 = 一个工作目录**。"
+        "用户提到哪个项目（「去 KYT 查」「SPX 那边改」），就把 `workspace` 传成它，"
+        "**别把活留在当前群**——当前群往往是另一摊活、另一个目录，那就是派错了。"
+        "他没点名项目时才省略（= 当前群，老行为）。传了 workspace 就别再在 prompt 里"
+        "写死路径，子会话会直接在那个目录里开工。`schedule_cron` 同样支持（但那条 cron "
+        "从此归目标群管，只能在那边 list/pause/cancel）。可选工作域：\n"
+        + catalog
+    )
+
+
 def _build_dispatch_section(
     profile: Profile,
     raw_chat_id: str,
@@ -307,6 +338,7 @@ def render_lark_prompt(
     # Lark 用 lark-cli，Telegram 用 tg-cli。其余文案两个渠道通用。
     shared_ctx = {
         **timeout_ctx,
+        "workspace_routing": _build_workspace_routing(profile),
         "ask_cmd": (
             f"{os.path.join(os.path.dirname(PROMPTS_DIR), 'tg-cli')} send "
             '--text "<问题>"'

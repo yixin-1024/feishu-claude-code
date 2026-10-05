@@ -106,9 +106,18 @@ class _FakeFeishu:
         return "om_fake_anchor"
 
 
+class _FakeProfile:
+    def __init__(self, runner: str):
+        self.name = "spx"
+        self.runner = runner
+
+
 class _FakeBot:
-    def __init__(self):
+    def __init__(self, runner: str | None = None):
         self.feishu = _FakeFeishu()
+        # runner=None 模拟拿不到 profile 的老对象（应按 claude 兜底）
+        if runner is not None:
+            self.profile = _FakeProfile(runner)
 
 
 def _make_task():
@@ -195,6 +204,61 @@ def test_fire_proceeds_when_quota_fetch_fails(monkeypatch):
     asyncio.run(fire())
 
     assert len(spawn_called) == 1, "fetch 失败时仍应派单"
+
+
+def test_fire_ignores_claude_quota_for_non_claude_runner(monkeypatch):
+    """agy / codex 等后端不吃 Claude Max 额度：Claude 用量爆表也照派，且压根不查。
+
+    历史 bug：ai-router 群的 cc-version-watch 跑在 agy profile 上，却被
+    「Claude Max 5h 99% ≥ 刹车线」整轮跳过。
+    """
+    bot = _FakeBot(runner="agy")
+    task = _make_task()
+    spawn_called: list[dict] = []
+    fetched: list[int] = []
+
+    async def spawn_fn(bot_, **kw):
+        spawn_called.append(kw)
+
+    import commands
+
+    def _fetch():
+        fetched.append(1)
+        return {"ok": True, "u5h": 0.99, "u7d": 0.99,
+                "r5h": 9999999999, "r7d": 9999999999,
+                "s5h": "exceeded", "s7d": "exceeded"}
+
+    monkeypatch.setattr(commands, "fetch_quota_headers", _fetch)
+
+    fire = scheduler._make_async_fire(task, bot, spawn_fn)
+    asyncio.run(fire())
+
+    assert len(spawn_called) == 1, "非 claude runner 不该被 Claude 用量挡掉"
+    assert fetched == [], "非 claude runner 不该白白去拉 Claude 用量"
+    assert len(bot.feishu.posts) == 1
+    assert bot.feishu.posts[0]["title"] == "日报", "不该发跳过通报"
+
+
+def test_fire_still_brakes_for_explicit_claude_runner(monkeypatch):
+    """claude runner 的刹车线行为不变（profile 显式声明时也认）。"""
+    bot = _FakeBot(runner="claude")
+    task = _make_task()
+    spawn_called: list[dict] = []
+
+    async def spawn_fn(bot_, **kw):
+        spawn_called.append(kw)
+
+    import commands
+    monkeypatch.setattr(commands, "fetch_quota_headers",
+                        lambda: {"ok": True, "u5h": 0.99, "u7d": 0.1,
+                                 "r5h": 9999999999, "r7d": 9999999999,
+                                 "s5h": "exceeded", "s7d": "allowed"})
+
+    fire = scheduler._make_async_fire(task, bot, spawn_fn)
+    asyncio.run(fire())
+
+    assert spawn_called == []
+    assert "跳过本轮" in bot.feishu.posts[0]["title"]
 
 
 # ────────────────── schedule_wake：排定后往话题贴可见公告 ──────────────────

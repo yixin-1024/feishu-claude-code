@@ -21,6 +21,15 @@ from agy_runner import (
 from claude_runner import is_fatal_error_text
 
 
+@pytest.fixture(autouse=True)
+def _single_pass_by_default(monkeypatch):
+    """默认关掉自动续跑：本文件绝大多数用例验的是「一次 pass」的解析与错误处理。
+
+    验续跑循环本身的用例自己 setenv("AGY_AUTO_CONTINUE", "1") 打开。
+    """
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "0")
+
+
 class FakeStdout:
     def __init__(self, lines):
         self._lines = list(lines)
@@ -592,6 +601,159 @@ def test_run_agy_tool_error_does_not_block_stale_history_suppression(monkeypatch
     assert text == "RECOVERED_AFTER_TOOL_ERROR"
     assert cid == "test-cid-tool-err"
     assert used_fresh is False
+
+
+# 2026-09-17 线上实例：会话 3327763a 本轮 step 55~75 全部 DONE、答案和飞书文档都已产出，
+# 本轮日志里一条 503 都没有，agy 却在 result 里回灌了 step 33 留下的旧 503，
+# 于是整轮被判失败 + dispatcher 白白重试 3 次。
+_STALE_503 = (
+    "API error (attempt 1): UNAVAILABLE (code 503): "
+    "No capacity available for model gemini-3.8-flash-high on the server"
+)
+
+
+def _stale_503_stream(cid):
+    step_done_event = json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": cid,
+            "step_index": 75,
+            "state": "DONE",
+            "step_type": "agent_response",
+            "text_delta": "DOC_CREATED_OK\n",
+        },
+    }).encode("utf-8") + b"\n"
+    result_event = json.dumps({
+        "event": "result",
+        "result": {
+            "conversation_id": cid,
+            "status": "ERROR",
+            "response": "DOC_CREATED_OK\n",
+            "error": _STALE_503,
+        },
+    }).encode("utf-8") + b"\n"
+    return [step_done_event, result_event]
+
+
+def test_run_agy_stale_503_absent_from_run_log_suppressed(monkeypatch):
+    """本轮日志里查无此错 + 本轮无 step 报错 + 回答已完成 → 判为历史污染，正常返回答案"""
+    captured = {}
+    fake_proc = FakeProc(_stale_503_stream("test-cid-503-stale"))
+    fake_proc.returncode = 0
+    _patch_exec(monkeypatch, fake_proc, captured)
+    monkeypatch.setattr(agy_runner, "_extract_agy_log_error", lambda *a, **k: "")
+    # 本轮真实日志：正常跑完，没有任何 503
+    monkeypatch.setattr(
+        agy_runner,
+        "_read_agy_log_text",
+        lambda *a, **k: (
+            "I0917 12:12:34.152345 1 session.go:130] Print mode: resuming conversation\n"
+            "I0917 12:13:25.204036 1 manager.go:783] CLI store manager shutting down\n"
+        ),
+    )
+
+    text, cid, used_fresh = asyncio.run(run_agy(message="probe", cwd="/tmp"))
+    assert text == "DOC_CREATED_OK"
+    assert cid == "test-cid-503-stale"
+    assert used_fresh is False
+
+
+def test_run_agy_stale_error_with_only_streamed_full_text_suppressed(monkeypatch):
+    """当回答全由 text_delta 流式生成（result.response 为空且 step 仅 ACTIVE 未 DONE），若日志查无此错，仍应判定为历史污染并返回 full_text"""
+    captured = {}
+    step_active_event = json.dumps({
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": "test-cid-streamed-only",
+            "step_index": 80,
+            "state": "ACTIVE",
+            "step_type": "agent_response",
+            "text_delta": "STREAMED_TEXT_ONLY_OK\n",
+        },
+    }).encode("utf-8") + b"\n"
+    stale_error_result_event = json.dumps({
+        "event": "result",
+        "result": {
+            "conversation_id": "test-cid-streamed-only",
+            "status": "ERROR",
+            "response": "",
+            "error": _STALE_503,
+        },
+    }).encode("utf-8") + b"\n"
+    fake_proc = FakeProc([step_active_event, stale_error_result_event])
+    fake_proc.returncode = 0
+    _patch_exec(monkeypatch, fake_proc, captured)
+    monkeypatch.setattr(agy_runner, "_extract_agy_log_error", lambda *a, **k: "")
+    monkeypatch.setattr(
+        agy_runner,
+        "_read_agy_log_text",
+        lambda *a, **k: "I0918 12:00:00 1 manager.go:783] CLI store manager shutting down\n",
+    )
+
+    text, cid, used_fresh = asyncio.run(run_agy(message="probe", cwd="/tmp"))
+    assert text == "STREAMED_TEXT_ONLY_OK"
+    assert cid == "test-cid-streamed-only"
+    assert used_fresh is False
+
+
+def test_run_agy_real_503_in_run_log_still_raises(monkeypatch):
+    """同一条 503 文案，只要本轮日志里真有痕迹，就必须照旧报错，不能被净化吞掉"""
+    captured = {}
+    fake_proc = FakeProc(_stale_503_stream("test-cid-503-real"))
+    fake_proc.returncode = 0
+    _patch_exec(monkeypatch, fake_proc, captured)
+    monkeypatch.setattr(agy_runner, "_extract_agy_log_error", lambda *a, **k: "")
+    monkeypatch.setattr(
+        agy_runner,
+        "_read_agy_log_text",
+        lambda *a, **k: (
+            "I0916 23:53:28.819252 459 run.go:389] Run: attempt 1 failed "
+            "(UNAVAILABLE (code 503): No capacity available for model "
+            "gemini-3.8-flash-high on the server), retrying in 4s\n"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="503"):
+        asyncio.run(run_agy(message="probe", cwd="/tmp"))
+
+
+def test_run_agy_no_run_log_keeps_error(monkeypatch):
+    """拿不到本轮日志时无从对账，一律保留错误——宁可多报错也别吞掉真失败"""
+    captured = {}
+    fake_proc = FakeProc(_stale_503_stream("test-cid-503-nolog"))
+    fake_proc.returncode = 0
+    _patch_exec(monkeypatch, fake_proc, captured)
+    monkeypatch.setattr(agy_runner, "_extract_agy_log_error", lambda *a, **k: "")
+    monkeypatch.setattr(agy_runner, "_read_agy_log_text", lambda *a, **k: "")
+
+    with pytest.raises(RuntimeError, match="503"):
+        asyncio.run(run_agy(message="probe", cwd="/tmp"))
+
+
+def test_error_seen_in_run_log_ignores_attempt_prefix_and_weak_phrases():
+    assert agy_runner._error_seen_in_run_log(
+        _STALE_503,
+        "run.go:389] Run: attempt 3 failed (UNAVAILABLE (code 503): No capacity "
+        "available for model gemini-3.8-flash-high on the server), retrying in 4s",
+    ) is True
+    assert agy_runner._error_seen_in_run_log(_STALE_503, "everything is fine\n") is False
+    # 没有辨识度的错误（纯状态字）无从对账 → 当成真错误
+    assert agy_runner._error_seen_in_run_log("ERROR", "everything is fine\n") is True
+    # URL 中的 path 参数不应作为匹配项，避免误伤包含正常请求 URL 的日志
+    conn_reset_err = (
+        'API error (attempt 2): request failed: Post '
+        '"https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse": '
+        'read tcp 198.18.0.1:53387->172.217.117.4:443: read: connection reset by peer'
+    )
+    normal_rpc_log = (
+        "I0918 13:11:55.091308 678 http_helpers.go:299] URL: "
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse "
+        "Trace: 0x8d703be15eb8269d ResponseID: BMisavvLIb3U9tMPjZfz2Qs\n"
+    )
+    assert agy_runner._error_seen_in_run_log(conn_reset_err, normal_rpc_log) is False
+    assert agy_runner._error_seen_in_run_log(
+        conn_reset_err, normal_rpc_log + "connection reset by peer\n"
+    ) is True
 
 
 
@@ -1181,3 +1343,305 @@ def test_clean_leaked_output_reports_failure_exit_code():
 def test_extract_agy_log_error_returns_empty_string_when_nothing_found():
     """兜底分支必须返回 ""，不能因为后续顶层代码把 return 顶掉而变成 None。"""
     assert _extract_agy_log_error(None, after_ts=0, stderr_text="warning: noise") == ""
+
+
+# ── 自动续跑（"做到一半就停"的治本） ──────────────────────────────────
+def test_auto_continue_nudges_until_sentinel(monkeypatch):
+    """没吐完成标记就续同一 conversation 再催一轮，吐了就收工。"""
+    calls = []
+    chunks = []
+
+    async def fake_pass(**kwargs):
+        calls.append((kwargs.get("message"), kwargs.get("session_id")))
+        done = len(calls) >= 2  # 第二轮才宣告全部完成
+        return f"pass{len(calls)}", "conv-1", done
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+
+    text, sid, fallback = asyncio.run(run_agy(
+        message="干活", cwd="/tmp", on_text_chunk=chunks.append,
+    ))
+
+    assert (text, sid, fallback) == ("pass2", "conv-1", False)
+    assert calls[0][0] == "干活" and calls[0][1] is None
+    # 第二轮必须续同一条 conversation，而不是开新会话把上下文扔了
+    assert calls[1][1] == "conv-1"
+    assert "继续未完成的工作" in calls[1][0]
+    assert any("自动续跑 · 第 2 轮" in c for c in chunks)
+
+
+def test_auto_continue_first_pass_carries_hint_and_stops_on_sentinel(monkeypatch):
+    """首轮把完成标记的用法塞进 system prompt；一轮就宣告完成时不再催。"""
+    calls = []
+
+    async def fake_pass(**kwargs):
+        calls.append(kwargs)
+        return "done", "conv-9", True
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+
+    text, sid, _ = asyncio.run(run_agy(
+        message="干活", cwd="/tmp", append_system_prompt="原有提示",
+    ))
+
+    assert (text, sid) == ("done", "conv-9")
+    assert len(calls) == 1
+    assert calls[0]["sentinel"] == agy_runner.DONE_SENTINEL
+    assert "原有提示" in calls[0]["append_system_prompt"]
+    assert agy_runner.DONE_SENTINEL in calls[0]["append_system_prompt"]
+
+
+def test_auto_continue_respects_max_passes(monkeypatch):
+    """模型始终不吐标记时按轮数封顶，不能无限续。"""
+    calls = []
+
+    async def fake_pass(**kwargs):
+        calls.append(kwargs.get("message"))
+        return "still working", "conv-2", False
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setenv("AGY_MAX_CONTINUE", "2")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+
+    with pytest.raises(agy_runner.IncompleteTaskError, match="次数上限") as exc:
+        asyncio.run(run_agy(message="干活", cwd="/tmp"))
+    assert exc.value.cc_session_id == "conv-2"
+    assert len(calls) == 3  # 首轮 + 2 次续跑
+
+
+def test_auto_continue_disabled_runs_single_pass(monkeypatch):
+    """关掉开关退回单轮老行为，且不给 prompt 塞标记提示。"""
+    calls = []
+
+    async def fake_pass(**kwargs):
+        calls.append(kwargs)
+        return "one shot", "conv-3", False
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "0")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+
+    text, sid, fallback = asyncio.run(run_agy(message="干活", cwd="/tmp"))
+
+    assert (text, sid, fallback) == ("one shot", "conv-3", False)
+    assert len(calls) == 1
+    assert calls[0]["sentinel"] == ""
+    assert calls[0].get("append_system_prompt") is None
+
+
+def test_auto_continue_per_profile_override(monkeypatch):
+    """<PROFILE>_AGY_AUTO_CONTINUE 可以单独关掉某个 bot 的续跑。"""
+    calls = []
+
+    async def fake_pass(**kwargs):
+        calls.append(kwargs)
+        return "one shot", "conv-4", False
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setenv("AGYBOT_AGY_AUTO_CONTINUE", "0")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+
+    asyncio.run(run_agy(
+        message="干活", cwd="/tmp", extra_env={"CC_LARK_PROFILE": "agybot"},
+    ))
+
+    assert len(calls) == 1
+
+
+def test_auto_continue_honors_manual_stop_between_passes(monkeypatch):
+    """上一 pass 已正常退出时收到 /stop，不能再催下一轮。"""
+    stopped = {"value": False}
+    calls = []
+    chunks = []
+
+    async def fake_pass(**kwargs):
+        calls.append(kwargs.get("message"))
+        stopped["value"] = True
+        return "partial", "conv-5", False
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+
+    text, sid, fallback = asyncio.run(run_agy(
+        message="干活", cwd="/tmp",
+        should_stop=lambda: stopped["value"],
+        on_text_chunk=chunks.append,
+    ))
+
+    assert (text, sid, fallback) == ("partial", "conv-5", False)
+    assert calls == ["干活"]
+    assert not any("自动续跑" in c for c in chunks)
+
+
+def test_auto_continue_does_not_spawn_if_stop_arrives_during_boundary(monkeypatch):
+    """分隔符回调让出事件循环后，必须再读一次取消状态。"""
+    stopped = {"value": False}
+    calls = []
+
+    async def fake_pass(**kwargs):
+        calls.append(kwargs.get("message"))
+        return "partial", "conv-6", False
+
+    async def on_chunk(chunk):
+        if "自动续跑" in chunk:
+            stopped["value"] = True
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+
+    text, _, _ = asyncio.run(run_agy(
+        message="干活", cwd="/tmp",
+        should_stop=lambda: stopped["value"],
+        on_text_chunk=on_chunk,
+    ))
+
+    assert text == "partial"
+    assert calls == ["干活"]
+
+
+def test_auto_continue_stops_when_process_killed(monkeypatch):
+    """进程被 killpg（returncode 变负）后不再续跑。"""
+    calls = []
+
+    class _Killed:
+        returncode = -15
+
+    async def fake_pass(**kwargs):
+        calls.append(kwargs.get("message"))
+        await kwargs["on_process_start"](_Killed())
+        return "partial", "conv-7", False
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+
+    text, _, _ = asyncio.run(run_agy(message="干活", cwd="/tmp"))
+
+    assert text == "partial"
+    assert calls == ["干活"]
+
+
+def test_split_sentinel_holds_back_partial_marker():
+    """标记被切成两个 delta 时不能漏半截到卡片上。"""
+    sentinel = agy_runner.DONE_SENTINEL
+    head = sentinel[:4]
+    out, tail, saw = agy_runner.split_sentinel("活干完了" + head, sentinel)
+    assert (out, tail, saw) == ("活干完了", head, False)
+    out2, tail2, saw2 = agy_runner.split_sentinel(tail + sentinel[4:], sentinel)
+    assert (out2, tail2, saw2) == ("", "", True)
+
+
+def test_run_agy_strips_sentinel_from_stream_and_final(monkeypatch):
+    """完成标记不能出现在流式正文或最终文本里。"""
+    sentinel = agy_runner.DONE_SENTINEL
+    lines = [
+        json.dumps({"event": "init", "conversation_id": "conv-s"}).encode() + b"\n",
+        json.dumps({"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "agent_response", "state": "ACTIVE",
+            "text_delta": "活干完了\n" + sentinel[:5],
+        }}).encode() + b"\n",
+        json.dumps({"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "agent_response", "state": "DONE",
+            "text_delta": sentinel[5:],
+        }}).encode() + b"\n",
+        json.dumps({"event": "result", "result": {
+            "conversation_id": "conv-s", "status": "SUCCESS",
+            "response": "活干完了\n" + sentinel,
+        }}).encode() + b"\n",
+    ]
+    chunks = []
+    _patch_exec(monkeypatch, FakeProc(lines), {})
+
+    text, cid, done = asyncio.run(agy_runner._run_agy_once(
+        message="hi", cwd="/tmp", sentinel=sentinel, on_text_chunk=chunks.append,
+    ))
+
+    assert (text, cid, done) == ("活干完了", "conv-s", True)
+    assert sentinel not in "".join(chunks)
+    assert "".join(chunks) == "活干完了\n"
+
+
+@pytest.mark.parametrize("stream_text, final_text, done", [
+    ("进度\n" + agy_runner.DONE_SENTINEL, "正在扫描海外信源与官方更新…", False),
+    ("进度\n" + agy_runner.DONE_SENTINEL, "", False),
+    ("", "说明中的 " + agy_runner.DONE_SENTINEL, False),
+    ("", "```\n" + agy_runner.DONE_SENTINEL + "\n```", False),
+    ("", "已交付\n" + agy_runner.DONE_SENTINEL + "\n", True),
+])
+def test_completion_uses_final_response_not_intermediate_marker(
+    monkeypatch, stream_text, final_text, done,
+):
+    lines = [
+        json.dumps({"event": "step_update", "step_update": {
+            "step_index": 1, "step_type": "agent_response", "state": "DONE",
+            "text_delta": stream_text,
+        }}).encode() + b"\n",
+        json.dumps({"event": "result", "result": {
+            "conversation_id": CID, "status": "SUCCESS", "response": final_text,
+        }}).encode() + b"\n",
+    ]
+    _patch_exec(monkeypatch, FakeProc(lines), {})
+    result = asyncio.run(agy_runner._run_agy_once(
+        message="hi", cwd="/tmp", sentinel=agy_runner.DONE_SENTINEL,
+    ))
+    assert result[2] is done
+
+
+def test_auto_continue_time_budget_is_not_success(monkeypatch):
+    async def fake_pass(**kwargs):
+        return "正在扫描", "conv-time", False
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setenv("AGY_CONTINUE_BUDGET_SEC", "0")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+    with pytest.raises(agy_runner.IncompleteTaskError, match="时间上限") as exc:
+        asyncio.run(run_agy(message="干活"))
+    assert exc.value.cc_session_id == "conv-time"
+
+
+def test_auto_continue_follows_replacement_session(monkeypatch):
+    sessions = []
+
+    async def fake_pass(**kwargs):
+        sessions.append(kwargs["session_id"])
+        return "完成" if len(sessions) == 2 else "进度", "replacement", len(sessions) == 2
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+    assert asyncio.run(run_agy(message="干活", session_id="expired"))[1] == "replacement"
+    assert sessions == ["expired", "replacement"]
+
+
+def test_auto_continue_without_session_does_not_replay_task(monkeypatch):
+    calls = []
+
+    async def fake_pass(**kwargs):
+        calls.append(kwargs)
+        return "正在扫描", None, False
+
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    monkeypatch.setattr(agy_runner, "_run_agy_pass", fake_pass)
+    with pytest.raises(agy_runner.IncompleteTaskError, match="未取得可恢复的会话"):
+        asyncio.run(run_agy(message="发布"))
+    assert len(calls) == 1
+
+
+def test_progress_only_success_resumes_through_real_stream_parser(monkeypatch):
+    """Reproduce the 09-22 incident: rc=0/SUCCESS with a progress-only reply."""
+    monkeypatch.setenv("AGY_AUTO_CONTINUE", "1")
+    _patch_exec(monkeypatch, FakeProc([]), {})
+    commands = []
+    responses = ["正在扫描海外信源与官方更新…", "已交付\n" + agy_runner.DONE_SENTINEL]
+
+    async def fake_exec(*args, **kwargs):
+        commands.append(args)
+        return FakeProc([json.dumps({"event": "result", "result": {
+            "conversation_id": CID, "status": "SUCCESS",
+            "response": responses[len(commands) - 1],
+        }}).encode() + b"\n"])
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    text, sid, _ = asyncio.run(run_agy(message="执行工作流", cwd="/tmp"))
+    assert (text, sid) == ("已交付", CID)
+    assert len(commands) == 2
+    assert commands[1][commands[1].index("--conversation") + 1] == CID

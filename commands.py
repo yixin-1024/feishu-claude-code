@@ -279,6 +279,32 @@ BOT_COMMANDS = {
     *MODEL_SHORTCUTS,
 }
 
+# ── 免排队（lock-free）命令 ───────────────────────────────────────────────
+# 这些 /xxx 只读当前状态、不改 session、不拉 runner，和「前面那条消息在跑什么」
+# 毫无关系。让它们跟在 per-chat 锁后面排队，只会得到"任务跑 20 分钟、想看一眼
+# /usage 也得等 20 分钟"这种纯粹的体验损失，所以 dispatcher 在锁外直接放行。
+#
+# 判定必须保守：只要**可能写 session**（开新会话 / 换 runner / 换模型 / 改 cwd），
+# 就得留在锁里 —— 正在跑的那个 run 结束时会把 session_id 写回 store，并发改写会串台。
+READONLY_COMMANDS = frozenset({
+    "help", "h", "status", "usage", "accounts", "skills", "mcp", "ls",
+})
+
+# 这些只有「不带参数」时是纯展示（列当前值 + 给切换按钮）；一带参数就落库。
+# 按钮点出去走的是 handle_menu_command，本来就在锁外，行为一致。
+READONLY_WHEN_BARE = frozenset({
+    "resume", "workspace", "ws", "model", "runner", "effort", "mode",
+})
+
+
+def is_lock_free_command(cmd: str, args: str = "") -> bool:
+    """这条命令能不能绕过 per-chat 锁、和正在跑的任务并行处理。"""
+    cmd = (cmd or "").lower()
+    if cmd in READONLY_COMMANDS:
+        return True
+    return cmd in READONLY_WHEN_BARE and not (args or "").strip()
+
+
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 APP_PATH = "/Applications/cc-lark.app"
 
@@ -682,16 +708,37 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
             }
         return "\n".join(lines)
 
+    # 凭证被 env 钉死时，credentials.json 的活跃 slot 只是个名义值 —— 真正在跑的是
+    # env 那份 token。顶部必须按它展示，否则账户名和额度全是错的（2026-09-14 实测：
+    # 卡片说在跑 info，实际一直是 env token 的 reg 席位）。
+    pin_key = ""
+    pinned_acc = None
+    try:
+        from account_switcher import pinned_env_credential, probe_pinned_env_credential
+        pin_key, _ = pinned_env_credential()
+        if pin_key:
+            pinned_acc = probe_pinned_env_credential()
+    except Exception:
+        pin_key, pinned_acc = "", None
+
     # 顶部：当前 active 账户的详尽 bar
-    cur = accounts.get(current) if current else None
+    cur = pinned_acc if pin_key else (accounts.get(current) if current else None)
     lines: list[str] = []
+    if pin_key:
+        lines.append(
+            f"📌 凭证被 env `{pin_key}` 钉死，真正在跑的是它（不是账户池里的 "
+            f"`{current or '?'}`）；下面「其他账户」切了都**不生效**，"
+            "要换号得改 .env 里的 token 或注释掉该行后重启服务。"
+        )
+        lines.append("")
     if cur and not cur.probe_error and cur.u5h is not None:
         data = {
             "u5h": cur.u5h, "u7d": cur.u7d, "r5h": cur.r5h, "r7d": cur.r7d,
             "s5h": cur.s5h, "s7d": cur.s7d,
             "scoped7d": getattr(cur, "scoped7d", None) or [],
         }
-        lines.extend(_usage_single_account_lines(data, account_label=cur.name))
+        lines.extend(_usage_single_account_lines(
+            data, account_label=("env-token（钉死）" if pin_key else cur.name)))
     else:
         # current 探测失败 / 没识别 → 直接 fetch keychain 兜底
         data = fetch_quota_headers()
@@ -2373,10 +2420,12 @@ async def handle_command(
         return await _handle_workspace_command(args, user_id, chat_id, store)
 
     elif cmd == "skills":
-        return _list_skills(chat_id)
+        # 走线程：要 os.walk 整个 plugins/skills 目录树，插件多时能卡住事件循环
+        return await asyncio.to_thread(_list_skills, chat_id)
 
     elif cmd == "mcp":
-        return _list_mcp()
+        # 走线程：内部是 `claude mcp list` 子进程，最长 10s
+        return await asyncio.to_thread(_list_mcp)
 
     elif cmd == "usage":
         cur = await store.get_current_raw(user_id, chat_id)
@@ -2510,7 +2559,10 @@ async def handle_command(
             lines.append(f"Runner: `maka`")
             lines.append(f"模型: `{model}`")
             return _wrap_usage_output(lines)
-        return _get_usage(chat_id)
+        # 走线程：_get_usage 内部 probe_all() 会给**每个账户**发一次真实 API 请求
+        # （单次就有 10s 超时）。留在事件循环里跑 = 这段时间全 profile 的卡片推送、
+        # 流式刷新、WS 回调集体冻住，正是「/usage 一点整个 bot 就卡住」的根因。
+        return await asyncio.to_thread(_get_usage, chat_id)
 
     elif cmd == "accounts":
         cur = await store.get_current(user_id, chat_id)

@@ -456,3 +456,52 @@ def test_ngrok_reuse_only_matches_callback_port():
 
     assert http_server._matching_ngrok_tunnel(tunnels, 9981) == "https://callback.example"
     assert http_server._matching_ngrok_tunnel(tunnels, 9999) is None
+
+
+def _dispatch_family(payload, monkeypatch, bots):
+    """不起服务器直接驱动 /dispatch 的入口校验，拿到它解析出的 target_bot。"""
+    monkeypatch.setattr(http_server, "_bots", bots)
+    responses = []
+    fake_self = SimpleNamespace(
+        client_address=("127.0.0.1", 12345),
+        _respond=lambda code, data: responses.append((code, data)),
+        _mcp_respond=lambda endpoint, prof, result: responses.append((400, result)),
+    )
+    fake_self._resolve_bot_by_profile = (
+        lambda name: http_server._CardCallbackHandler._resolve_bot_by_profile(fake_self, name)
+    )
+    p, bot, target = http_server._CardCallbackHandler._resolve_dispatch_family(
+        fake_self, "dispatch", json.dumps(payload).encode(),
+    )
+    return p, bot, target, responses
+
+
+def test_dispatch_passes_chat_id_into_agent_resolution(monkeypatch):
+    """同家族别名必须带着目标群解析：否则会挑中不在本群的同族 bot（建话题 230002）。"""
+    bots = {
+        # dict 顺序把"不在本群"的 seesaw 排前面，复刻线上踩到的那一跳
+        "seesaw": _Bot("seesaw"),
+        "spx": _Bot("spx"),
+    }
+    bots["seesaw"].profile.runner = "claude"
+    bots["seesaw"].profile.allowed_group_chat_ids = {"oc_elsewhere"}
+    bots["spx"].profile.runner = "claude"
+    bots["spx"].profile.allowed_group_chat_ids = {"oc_allowed"}
+
+    seen = {}
+    real = http_server.resolve_target_agent
+    monkeypatch.setattr(
+        http_server, "resolve_target_agent",
+        lambda *a, **kw: (seen.update(kw), real(*a, **kw))[1],
+    )
+
+    p, bot, target, responses = _dispatch_family(
+        {"profile": "spx", "chat_id": "oc_allowed", "agent": "claude", "prompt": "干活"},
+        monkeypatch, bots,
+    )
+
+    assert responses == []
+    assert seen["chat_id"] == "oc_allowed"
+    assert seen["exclude"] == "spx"
+    # 调用方自己就在这个 claude 家族里 → 选自己，而不是不在本群的 seesaw
+    assert target.profile.name == "spx"

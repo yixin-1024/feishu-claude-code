@@ -24,6 +24,8 @@ scheduled_tasks.yaml
 inbox_config.yaml
 external_triggers.yaml
 external_groups.yaml
+# 工作域路由表（群 ↔ 项目目录），含真实 chat_id / 本机路径，按 .example 模板自行创建
+workspaces.json
 # 改 cron 前留的手动快照（scheduled_tasks.yaml.bak-<日期> 等），不进历史
 *.yaml.bak-*
 

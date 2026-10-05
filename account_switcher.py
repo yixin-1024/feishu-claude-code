@@ -1391,6 +1391,12 @@ def switch_account_manually(name: str) -> tuple[bool, str]:
         global _last_spawn_probe_at
         with _spawn_probe_lock:
             _last_spawn_probe_at = now
+        pin_key, _ = pinned_env_credential()
+        if pin_key:
+            # 切是切了，但 claude 实际读的是 env 那份 —— 不告诉用户的话，他会以为
+            # 自己换了号，卡片也会跟着自报错误的账户名。
+            msg = (f"{msg} ⚠️ 注意：凭证被 {pin_key}（env）钉死，claude 实际仍用 env 那份 token，"
+                   f"切账户池不生效。要真的换号请改 .env 里的 token 或注释掉该行后重启服务")
         return True, msg
     finally:
         _ACCOUNT_SWITCH_LOCK.release()
@@ -1408,6 +1414,8 @@ def maybe_switch_before_spawn(*, force: bool = False) -> Optional[str]:
     sw = _DEFAULT_SWITCHER
     if sw is None or not getattr(sw, "enabled", False):
         return None
+    if pinned_env_credential()[0]:
+        return None  # 凭证被 env 钉死，账户池不生效，切了也白切
     now = time.time()
     if not force:
         with _spawn_probe_lock:
@@ -1431,6 +1439,37 @@ def maybe_switch_before_spawn(*, force: bool = False) -> Optional[str]:
 #   - 这里只在**已经撞墙**时触发，一轮一次；
 #   - 单独开关 ACCOUNT_SWITCH_ON_LIMIT（默认开），AUTO_SWITCH=0 也能用；
 #   - 不受 cooldown / manual_hold 约束——用户手选的账户既然撞墙了，换掉正是他要的。
+
+# ── 凭证被 env 钉死（setup-token / 三方中转）────────────────────────
+# CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY 优先级高于
+# ~/.claude 的凭证：claude CLI 只认 env 那份，账户池里 use 哪个 slot 都不改变真正
+# 发出去的请求。此时切号不但无效，还会把活跃 slot 改掉，让卡片自报的账户名和真正
+# 在跑的席位对不上（2026-09-14 财务机实测：名义 info、实际 reg，撞墙后又"自动切到
+# reg"，切了个寂寞，还按 info 的窗口把活推迟了 4 小时）。
+_POOL_PINNING_ENVS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+
+def pinned_env_credential() -> tuple[str, str]:
+    """env 里钉死的凭证 → (env 变量名, token)；没钉死返回 ("", "")。"""
+    for key in _POOL_PINNING_ENVS:
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            return key, val
+    return "", ""
+
+
+def probe_pinned_env_credential() -> Optional[Account]:
+    """探 env 钉死的那份凭证自己的额度 —— 它才是真正在跑的席位，配额恢复时刻必须
+    按它算，不能拿账户池里名义上的当前 slot 顶替。探不出来返回 None。"""
+    key, token = pinned_env_credential()
+    if not token:
+        return None
+    try:
+        return _probe_one(Account(name=f"env:{key}", access_token=token))
+    except Exception as e:  # noqa: BLE001
+        print(f"[switcher] 探 env 钉死凭证失败: {type(e).__name__}: {e}", flush=True)
+        return None
+
 
 def switch_on_limit_enabled() -> bool:
     raw = os.getenv("ACCOUNT_SWITCH_ON_LIMIT", "1")
@@ -1456,6 +1495,19 @@ def emergency_switch_on_limit(*, notify: bool = True) -> dict:
         out["reason"] = "另一个账户切换正在进行"
         return out
     try:
+        pin_key, _ = pinned_env_credential()
+        if pin_key:
+            # 凭证被 env 钉死：切账户池不会改变真正发出去的请求，切了反而把活跃
+            # slot 改乱。只探它自己的窗口，把准确的恢复时刻交给调用方排唤醒。
+            out["from"] = f"env:{pin_key}"
+            pinned_acc = probe_pinned_env_credential()
+            if pinned_acc is not None and pinned_acc.r5h:
+                out["current_reset_epoch"] = float(pinned_acc.r5h)
+            out["reason"] = (
+                f"凭证被 {pin_key} 钉死（env 优先于 ~/.claude 凭证），账户池不生效 → 不切号。"
+                "要换号请改 .env 里的 token 或注释掉该行后重启服务"
+            )
+            return out
         accounts = probe_all()
         current = current_account_name()
         out["from"] = current

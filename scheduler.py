@@ -1193,6 +1193,11 @@ def _quota_skip_reason(q: dict) -> tuple[str, list[tuple[str, int | None]]] | No
     return ("Claude Max 用量触及刹车线（留额度给人工交互）", lines)
 
 
+def _bot_runner(bot) -> str:
+    """该 bot 用哪个后端跑任务。取不到时按 claude 兜底（历史行为）。"""
+    return (getattr(getattr(bot, "profile", None), "runner", "") or "claude").strip().lower()
+
+
 def _make_async_fire(task: ScheduledTask, bot, spawn_fn: SpawnFn):
     """生成无参 async coroutine。fire_task_now 直接 await，sync wrapper 投到 bot_loop。"""
     async def _fire():
@@ -1201,12 +1206,23 @@ def _make_async_fire(task: ScheduledTask, bot, spawn_fn: SpawnFn):
             # ── 派单前预检 quota：用量耗尽时派出去也是死（Claude CLI 会立刻
             # 注入 synthetic rate_limit 事件让 PTY runner 退出），不如直接跳过、
             # 在群里发一条说明，等下次 cron 再试。
-            try:
-                from commands import fetch_quota_headers
-                q = await asyncio.to_thread(fetch_quota_headers)
-            except Exception as e:
-                print(f"{tag} ⚠️ quota 预检失败 {type(e).__name__}: {e}，继续派单", flush=True)
+            #
+            # ⚠️ 只有 claude runner 吃本机的 Claude Max 订阅额度。codex（ChatGPT
+            # 订阅）/ agy（Antigravity）/ opencode / mimo / grok / maka 各有各的
+            # 额度池，拿 Claude 的用量刹它们的车 = 无关额度互相误伤（实测 agy 的
+            # cc-version-watch 被「Claude 5h 99%」挡掉整轮）。别的后端暂时没有
+            # 刹车线，一律照派。
+            runner = _bot_runner(bot)
+            if runner != "claude":
+                print(f"{tag} runner={runner}，不吃 Claude Max 额度，跳过用量预检", flush=True)
                 q = {"ok": False}
+            else:
+                try:
+                    from commands import fetch_quota_headers
+                    q = await asyncio.to_thread(fetch_quota_headers)
+                except Exception as e:
+                    print(f"{tag} ⚠️ quota 预检失败 {type(e).__name__}: {e}，继续派单", flush=True)
+                    q = {"ok": False}
             skip = _quota_skip_reason(q)
             if skip is not None:
                 reason, detail_lines = skip

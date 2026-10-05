@@ -15,6 +15,8 @@ import sys
 import time
 from typing import Any, Callable, Optional
 
+from auto_continue import CONTINUE_NUDGE, CONTINUE_SYSTEM_HINT, DONE_SENTINEL
+
 IDLE_TIMEOUT = 3600
 
 # codex `exec` 往 stderr 打的一批「无害噪音」——它们永远会出现、跟成败无关，绝不能被当成
@@ -44,30 +46,11 @@ def _clean_stderr(text: str) -> str:
 # 一个只在【整件事真正全部完成】时才输出的完成标记；只要这一轮 pass 没吐标记，就
 # resume 同一 session 自动催它继续，直到吐标记 / 触顶（轮数或墙钟预算）。标记本身
 # 从流式与最终文本里剥掉，用户看不到。
-_DONE_SENTINEL = "⟦CC_TASK_DONE⟧"
-
-_CONTINUE_SYSTEM_HINT = (
-    "【运行环境：自动续跑】你运行在一个会自动让你续跑的环境里——你这一轮回复结束后，"
-    "只要任务还没真正全部完成，系统会自动把你唤醒继续，无需用户催促。因此：任务未完成时"
-    "不要停下等待、不要只汇报进度或计划就收尾、不要问『要我继续吗』；请持续推进直到交付"
-    "全部要求的产物。仅当【整件任务确实已全部完成】时，在你最终消息的最后单独一行原样输出"
-    "完成标记：{sentinel}。任务尚未全部完成时，绝对不要输出该标记。"
-    "\n⚠️ 既然环境已经会自动续跑你，就【不要】为了『回来接着干自己没干完的活』或『稍后回来自检/复核』"
-    "去调 wake_me_in / schedule_cron 给自己排唤醒——那是多余的，会在任务早已干完后 fire 出"
-    "『该自动唤醒已过期』的噪音。wake_me_in 只在你必须等一个【真实墙钟事件】（等 CI 跑完、等部署、"
-    "等限流恢复、或用户明确要的定时提醒）时才用；『继续推进本任务』一律靠本轮内的自动续跑，别排 wake。"
-    "\n(Environment auto-continues you: keep working across turns until everything is truly "
-    "done; do NOT stop to report progress or ask to continue. Emit the exact marker "
-    "{sentinel} on its own final line ONLY when the whole task is fully complete. Since you are "
-    "auto-continued, do NOT call wake_me_in/schedule_cron just to resume your own unfinished work "
-    "or self-check later — use wake_me_in only to await a real wall-clock event (CI, deploy, "
-    "rate-limit recovery, or an explicit timed reminder).)"
-)
-
-_CONTINUE_NUDGE = (
-    "继续未完成的工作，直到全部要求的产物都交付完毕。若已全部完成，在最后单独一行输出 "
-    "{sentinel}；若还没完成，就继续推进、不要输出该标记，也不要只汇报进度/计划就停下。"
-)
+# 标记与两段提示词由 auto_continue 统一提供 —— agy 后端有同样的毛病、用同一套话术，
+# 两份文案必须逐字一致（见 auto_continue 模块注释）。
+_DONE_SENTINEL = DONE_SENTINEL
+_CONTINUE_SYSTEM_HINT = CONTINUE_SYSTEM_HINT
+_CONTINUE_NUDGE = CONTINUE_NUDGE
 
 
 def _auto_continue_enabled(extra_env: Optional[dict]) -> bool:

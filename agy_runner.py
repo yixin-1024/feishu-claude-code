@@ -60,9 +60,17 @@ import re
 import shutil
 import sys
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 import uuid
 
+from auto_continue import (
+    CONTINUE_NUDGE,
+    CONTINUE_SYSTEM_HINT,
+    DONE_SENTINEL,
+    IncompleteTaskError,
+    has_final_sentinel,
+    split_sentinel,
+)
 from bot_config import PERMISSION_MODE, resolve_claude_wall_clock_limit
 from claude_runner import _fire_callback, _has_children, is_fatal_error_text
 
@@ -404,12 +412,12 @@ def _is_agy_startup_noise(line: str) -> bool:
     return any(n in low for n in _AGY_STARTUP_NOISE)
 
 
-def _extract_agy_log_error(
+def _read_agy_log_text(
     log_file: Optional[str] = None,
     after_ts: float = 0.0,
     stderr_text: str = "",
 ) -> str:
-    """从 agy 日志或 stderr 中提取底层的真实错误（HTTP 503/429/529/400、Status、Message 等）。"""
+    """读回本轮 agy 进程自己的运行日志（尾部 200KB）+ stderr，拼成一段文本。"""
     target_file = log_file if (log_file and os.path.isfile(log_file)) else None
     if not target_file and after_ts > 0:
         target_file = _find_recent_agy_log(after_ts)
@@ -425,7 +433,16 @@ def _extract_agy_log_error(
         except Exception:
             pass
 
-    combined_text = f"{log_content}\n{stderr_text}" if log_content else stderr_text
+    return f"{log_content}\n{stderr_text}" if log_content else stderr_text
+
+
+def _extract_agy_log_error(
+    log_file: Optional[str] = None,
+    after_ts: float = 0.0,
+    stderr_text: str = "",
+) -> str:
+    """从 agy 日志或 stderr 中提取底层的真实错误（HTTP 503/429/529/400、Status、Message 等）。"""
+    combined_text = _read_agy_log_text(log_file, after_ts, stderr_text)
     if not combined_text.strip():
         return ""
 
@@ -496,6 +513,49 @@ def _extract_agy_log_error(
             return lines[-1]
 
     return ""
+
+
+# agy 自己重试时给错误加的前缀，比对日志时要先剥掉（日志里写的是
+# `run.go:389] Run: attempt 1 failed (UNAVAILABLE (code 503): ...)`，
+# 而 result 事件里写的是 `API error (attempt 1): UNAVAILABLE (code 503): ...`）
+_AGY_ERR_PREFIX_RE = re.compile(r"^(?:api\s+)?error\s*\(attempt\s*\d+\)\s*:\s*", re.IGNORECASE)
+
+
+def _error_signature_phrases(error_text: str) -> list:
+    """把一条错误文案切成几段足够有辨识度的短语，用于回日志里对账。"""
+    text = " ".join((error_text or "").split())
+    text = _AGY_ERR_PREFIX_RE.sub("", text)
+    # 剥掉 URL（避免 URL 中的 path 参数如 streamGenerateContent?alt=sse 匹配日常正常请求日志）
+    text = re.sub(r"https?://\S+", " ", text)
+    phrases = []
+    for raw in re.split(r"[:：,，;；]", text):
+        piece = raw.strip(" .()[]{}\"'")
+        # 只留有实际词义的片段：纯状态码 / 单词太短的（如 "ERROR"）没有辨识度
+        if len(re.sub(r"[^A-Za-z一-鿿]", "", piece)) >= 12:
+            phrases.append(piece.lower())
+    return phrases
+
+
+def _error_seen_in_run_log(error_text: str, log_text: str) -> bool:
+    """这条错误是不是真的在**本轮进程自己**的日志里出现过。
+
+    agy CLI 的 result 事件会把 LastRunErrorDetails 里翻到的**历史** step 错误
+    原样回灌（2026-09-17 实测：会话 3327763a 本轮 step 55~75 全部 DONE、本轮日志
+    里一条 503 都没有，result 却回了 step 33 留下的 `API error (attempt 1):
+    UNAVAILABLE (code 503)`），于是一次已经答完的任务被判成失败，还带着 dispatcher
+    白白重试 3 次。真发生在本轮的 API 错误一定会在日志里留痕（`agent executor
+    error:` 或 `run.go:389] Run: attempt N failed (...)`），所以「日志里查无此错」
+    就是判定历史污染的通用依据——不用再靠穷举错误文案的白名单。
+
+    判不出来时一律返回 True（当成真错误），宁可多报错也不吞掉真失败。
+    """
+    if not (log_text or "").strip():
+        return True
+    phrases = _error_signature_phrases(error_text)
+    if not phrases:
+        return True
+    low_log = log_text.lower()
+    return any(p in low_log for p in phrases)
 
 
 LEAK_START_RE = re.compile(
@@ -667,11 +727,14 @@ async def _run_agy_once(
     print_timeout: str = DEFAULT_PRINT_TIMEOUT,
     dangerously_skip_permissions: bool = True,
     idle_timeout_sec: int = IDLE_TIMEOUT,
+    sentinel: str = "",
 ) -> tuple[str, Optional[str], bool]:
-    """返回 (full_text, conversation_id, used_fresh_session_fallback)。
+    """跑一次 agy pass。返回 (full_text, conversation_id, saw_sentinel)。
 
-    used_fresh_session_fallback 恒为 False：agy 遇到不存在的 conversation 会
-    自己开新会话，不需要 runner 再补一次。
+    saw_sentinel：最终回答是否以独占一行的 `sentinel` 结尾。
+    没开自动续跑（sentinel 为空）时恒为 False —— 这一位在老调用方那里的含义是
+    used_fresh_session_fallback，而那一位对 agy 本来就恒为 False（遇到不存在的
+    conversation 它会自己开新会话，不需要 runner 再补一次），所以复用不冲突。
     """
     del on_status  # agy 没有独立状态事件通道，正文/工具事件已够用
 
@@ -792,9 +855,17 @@ async def _run_agy_once(
     current_turn_has_error_step = False
     last_agent_response_done = False
     is_stale_history_error = False
+    turn_completed_clean = False
+    status = ""
+    resp_str = ""
+    result_seen = False
+    err_str = ""
     current_step_index: Optional[int] = None
     current_step_text: str = ""
     current_step_is_leaked: bool = False
+    saw_sentinel = False
+    last_response_text = ""
+    sentinel_tail = ""  # 攒着的、有可能是完成标记前半截的流式尾巴
 
     idle_seconds = 0
     loop = asyncio.get_event_loop()
@@ -863,6 +934,10 @@ async def _run_agy_once(
                 current_step_index = idx
                 current_step_text = ""
                 current_step_is_leaked = False
+                # 上一步攒着的疑似标记前缀到此为止不可能再拼成完整标记了，放行
+                if sentinel_tail:
+                    await _fire_callback(on_text_chunk, sentinel_tail)
+                    sentinel_tail = ""
             elif (
                 step_type == "agent_response"
                 and state in ("DONE", "ERROR")
@@ -888,6 +963,7 @@ async def _run_agy_once(
                 if chunk:
                     full_text += chunk
                     current_step_text += chunk
+                    last_response_text = current_step_text
                     if not current_step_is_leaked:
                         stripped_step = current_step_text.strip()
                         if any(
@@ -901,7 +977,13 @@ async def _run_agy_once(
                         ):
                             current_step_is_leaked = True
                     if not current_step_is_leaked:
-                        await _fire_callback(on_text_chunk, chunk)
+                        # 完成标记会被拆成多个 token 吐出来，不能对单个 delta 直接
+                        # replace —— 尾巴像标记前缀就先攒着（见 split_sentinel）。
+                        emit, sentinel_tail, _ = split_sentinel(
+                            sentinel_tail + chunk, sentinel,
+                        )
+                        if emit:
+                            await _fire_callback(on_text_chunk, emit)
 
             elif step_type == "tool":
                 info = step.get("tool_info") or {}
@@ -920,6 +1002,7 @@ async def _run_agy_once(
                     await _fire_callback(on_tool_use, name, params)
 
         elif event == "result":
+            result_seen = True
             result = data.get("result") or {}
             sid = result.get("conversation_id")
             if sid:
@@ -954,11 +1037,13 @@ async def _run_agy_once(
                     "user location is not supported",
                 )
             )
-            is_stale_history_error = (
-                is_stale_template
-                and not current_turn_has_error_step
-                and (last_agent_response_done or bool(resp_str.strip()))
+            # 「本轮干干净净地跑完了」：没有任何非工具 step 报错，且回答已完整生成。
+            # 这是后面两条净化通道（已知污染模版 / 日志查无此错）共同的前置条件。
+            turn_completed_clean = (
+                not current_turn_has_error_step
+                and (last_agent_response_done or bool(resp_str.strip()) or bool(full_text.strip()))
             )
+            is_stale_history_error = is_stale_template and turn_completed_clean
 
             if (status and status != "SUCCESS") or is_stream_interrupted or is_exec_terminated:
                 error_detail = (
@@ -972,6 +1057,22 @@ async def _run_agy_once(
             if usage:
                 await _fire_callback(on_usage, usage)
 
+    # 流结束了，攒着的尾巴不可能再拼成完整标记，放行
+    if sentinel_tail:
+        await _fire_callback(on_text_chunk, sentinel_tail)
+        sentinel_tail = ""
+
+    # result.response 会整段覆盖 full_text，标记只能在这里统一剥（流式那条通道
+    # 是另一份缓冲，两边都要剥）。
+    # Intermediate progress and quoted markers must not complete the task.
+    # result.response is authoritative when present; otherwise use only the
+    # last response step, not the concatenation of every intermediate response.
+    saw_sentinel = has_final_sentinel(
+        resp_str if result_seen else last_response_text, sentinel,
+    )
+    if sentinel and sentinel in full_text:
+        full_text = full_text.replace(sentinel, "").strip()
+
     stderr_output = await proc.stderr.read()
     await proc.wait()
     stderr_text = stderr_output.decode("utf-8", errors="replace").strip()
@@ -982,6 +1083,18 @@ async def _run_agy_once(
         after_ts=start_wall_time,
         stderr_text=stderr_text,
     )
+
+    # 泛化的历史污染判定：本轮跑得干干净净、日志里却查无此错 → 这条错误不是本轮
+    # 发生的，只能是 agy 从历史 steps 里翻出来回灌的（见 _error_seen_in_run_log）。
+    # 靠日志对账而不是穷举文案，新冒出来的污染文案（如 503 No capacity）也能拦住。
+    if error_detail and not is_stale_history_error and turn_completed_clean:
+        run_log_text = _read_agy_log_text(
+            run_log_file,
+            after_ts=start_wall_time,
+            stderr_text=stderr_text,
+        )
+        if not _error_seen_in_run_log(str(error_detail), run_log_text):
+            is_stale_history_error = True
 
     # 历史错误污染防护：若报错属于已知的 agy CLI 历史倒序扫描污染模版，
     # 且本轮没有任何 step 报错、回答已完整生成（last_agent_response_done 或 full_text/resp_str 非空），
@@ -1020,7 +1133,7 @@ async def _run_agy_once(
                 os.unlink(run_log_file)
             except OSError:
                 pass
-        return clean_leaked_system_output(full_text).strip(), new_session_id, False
+        return clean_leaked_system_output(full_text).strip(), new_session_id, saw_sentinel
 
     # 成功执行且无错误，清理当前轮的独立临时日志
     if run_log_file and os.path.exists(run_log_file):
@@ -1029,7 +1142,7 @@ async def _run_agy_once(
         except OSError:
             pass
 
-    return clean_leaked_system_output(full_text).strip(), new_session_id, False
+    return clean_leaked_system_output(full_text).strip(), new_session_id, saw_sentinel
 
 
 # ── Antigravity 后端的间歇性抽风 ────────────────────────────────────────
@@ -1061,7 +1174,7 @@ def is_flaky_upstream_error(text: str) -> bool:
     return any(m in low for m in _AGY_FLAKY_MARKERS)
 
 
-async def run_agy(**kwargs):
+async def _run_agy_pass(**kwargs):
     """_run_agy_once + 针对上游随机抽风的就地快速重试。
 
     只对 is_flaky_upstream_error 命中的错误重试，其余错误（认证 / 额度 / 参数
@@ -1095,3 +1208,141 @@ def _env_int_agy(name: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return v if v >= 0 else default
+
+
+# ── 自动续跑（agy 后端"做到一半就停"的治本） ────────────────────────────
+# `agy -p` 和 `codex exec` 一样，一次调用只跑一段有界的 agentic pass：gemini 做完
+# 一段活、吐一句"当前正在…，完成后向您汇报"，进程 rc=0 退出，turn 就结束了。
+# 2026-09-21 实测（SGB 开户回执那条 thread）：模型连续两轮都停在"正在准备下发…"，
+# 还顺手给自己排了 10 分钟后的 wake 当"续跑"用，于是每 10 分钟复述一遍同样的计划。
+# 根因不是错误处理，而是**最终态判据**——runner 只看得到"进程正常退出 + result
+# .status=SUCCESS"，而这两样在"只说不做"时同样成立。真正知道整件事有没有干完的
+# 只有模型自己，所以这里照搬 codex 那套：给它一个只在全部完成时才输出的标记，
+# 没吐标记就 --conversation 续同一会话催它继续，直到吐标记 / 触顶。
+_AGY_MAX_CONTINUE_DEFAULT = 6
+_AGY_CONTINUE_BUDGET_SEC_DEFAULT = 2400.0
+
+
+def _auto_continue_enabled(extra_env: Optional[dict]) -> bool:
+    """全局 AGY_AUTO_CONTINUE（默认开）；<PROFILE>_AGY_AUTO_CONTINUE 可 per-profile 覆盖。"""
+    def _truthy(v: str) -> bool:
+        return (v or "").strip().lower() not in ("0", "false", "no", "off")
+
+    profile = ((extra_env or {}).get("CC_LARK_PROFILE") or "").strip().upper()
+    if profile:
+        override = os.getenv(f"{profile}_AGY_AUTO_CONTINUE")
+        if override is not None:
+            return _truthy(override)
+    return _truthy(os.getenv("AGY_AUTO_CONTINUE", "1"))
+
+
+def _max_continue_passes() -> int:
+    return _env_int_agy("AGY_MAX_CONTINUE", _AGY_MAX_CONTINUE_DEFAULT)
+
+
+def _continue_budget_sec() -> float:
+    try:
+        return max(0.0, float(os.getenv("AGY_CONTINUE_BUDGET_SEC", "").strip()))
+    except (TypeError, ValueError):
+        return _AGY_CONTINUE_BUDGET_SEC_DEFAULT
+
+
+async def run_agy(**kwargs):
+    """agy 后端入口。默认在内部自动续跑，直到模型宣告整件任务完成或触顶。
+
+    循环里每一轮都是完整的 `_run_agy_pass`（含上游抽风的就地重试），resume 同一
+    conversation，直到：① 模型输出完成标记；② 轮数达到 AGY_MAX_CONTINUE；
+    ③ 累计墙钟超过 AGY_CONTINUE_BUDGET_SEC；④ /stop。关掉自动续跑
+    （AGY_AUTO_CONTINUE=0 或 <PROFILE>_AGY_AUTO_CONTINUE=0）退回单轮老行为。
+    流式回调、session、usage 逐轮透传，最终返回最后一轮的干净文本（已剥标记）。
+    """
+    should_stop = kwargs.pop("should_stop", None)
+    extra_env = kwargs.get("extra_env")
+
+    # 记住每一轮的进程句柄：某轮被 /stop、/restart 杀掉时 returncode 会变负，
+    # 必须立刻停循环，否则用户已经叫停了还会再 spawn 一个 agy。
+    _last_proc: dict[str, Any] = {"p": None}
+    outer_on_process_start = kwargs.pop("on_process_start", None)
+
+    async def _track_start(proc):
+        _last_proc["p"] = proc
+        await _fire_callback(outer_on_process_start, proc)
+
+    kwargs["on_process_start"] = _track_start
+
+    def _stop_requested() -> bool:
+        rc = getattr(_last_proc.get("p"), "returncode", None)
+        if isinstance(rc, int) and rc < 0:
+            return True
+        if should_stop is None:
+            return False
+        try:
+            return bool(should_stop())
+        except Exception:
+            # 外部取消探针不该让 runner 自己崩；进程信号仍是第二道兜底。
+            return False
+
+    if _stop_requested():
+        return "", kwargs.get("session_id"), False
+
+    if not _auto_continue_enabled(extra_env):
+        text, sid, _ = await _run_agy_pass(sentinel="", **kwargs)
+        return text, sid, False
+
+    message = kwargs.pop("message")
+    append_system_prompt = kwargs.pop("append_system_prompt", None)
+    on_text_chunk = kwargs.get("on_text_chunk")
+    sess = kwargs.pop("session_id", None)
+
+    sentinel = DONE_SENTINEL
+    hint = CONTINUE_SYSTEM_HINT.format(sentinel=sentinel)
+    first_sys = f"{append_system_prompt}\n\n{hint}".strip() if append_system_prompt else hint
+
+    started = time.monotonic()
+    budget = _continue_budget_sec()
+    max_passes = _max_continue_passes()
+    final_text = ""
+    session_out: Optional[str] = None
+
+    for pass_idx in range(max_passes + 1):
+        # /stop 可能正落在两个 pass 之间，此时上一进程已经 rc=0，
+        # 光看负 returncode 推断不出取消，必须先读显式状态。
+        if _stop_requested():
+            break
+        if pass_idx == 0:
+            prompt, sysp = message, first_sys
+        else:
+            prompt, sysp = CONTINUE_NUDGE.format(sentinel=sentinel), None
+            # 打一条带编号的分界符，让用户一眼看出这是【本轮内的自动续跑】把同一
+            # 任务往前推（同一 conversation），不是外层又触发了一个新任务。
+            await _fire_callback(
+                on_text_chunk,
+                f"\n\n━━━━━━━ 🔁 自动续跑 · 第 {pass_idx + 1} 轮 ━━━━━━━\n\n",
+            )
+            # 上面的异步回调会让出事件循环，/stop 可能正好在这期间到达。
+            if _stop_requested():
+                break
+
+        final_text, sid, done = await _run_agy_pass(
+            message=prompt, session_id=sess, append_system_prompt=sysp,
+            sentinel=sentinel, **kwargs,
+        )
+        if sid:
+            session_out = sess = sid  # CLI may replace an expired conversation.
+
+        if done or _stop_requested():
+            break
+        if time.monotonic() - started >= budget:
+            raise IncompleteTaskError(
+                f"自动续跑已达到时间上限（{budget:g} 秒），尚未确认任务完成。", sess,
+            )
+        if pass_idx == max_passes:
+            raise IncompleteTaskError(
+                f"自动续跑已达到次数上限（{max_passes} 次），尚未确认任务完成。", sess,
+            )
+        if not sess:
+            raise IncompleteTaskError(
+                "任务尚未完成，且未取得可恢复的会话；已停止以避免重复执行。", None,
+            )
+
+    return final_text, session_out, False

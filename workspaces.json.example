@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "工作域路由表模板：拷成 workspaces.json 再改（真实 chat_id / 本机路径不进 git）。",
+    "一个工作域 = 一个项目 = 一个『派活入口群』 + 一个工作目录。",
+    "dispatch_task(workspace=\"<name>\") 就会把子会话开在这个群、钉在这个目录里；",
+    "省略 workspace = 维持原行为，派在调用方所在的当前群。",
+    "",
+    "配置要求：",
+    "  1) chat_id 必须在对应 profile 的 <PROFILE>_ALLOWED_GROUP_CHAT_IDS 里，",
+    "     否则会被『bot 不在该群』的闸门挡下（http_server._bot_serves_chat）。",
+    "  2) cwd 建议与 .env 里的 <PROFILE>_CHAT_CWD_<chat_id> 一致。",
+    "  3) 同一目录对应多个群时只挑一个当入口，其余放 other_chats（仅备查、不参与路由）。",
+    "  4) aliases 写用户**会用嘴说**的叫法（中英文都行）；匹配对大小写与 - _ . 空格不敏感。",
+    "  5) agent 可选：该工作域默认用哪个后端跑（\"gpt\" / \"agy\" / \"gemini\" …）。",
+    "     调用方显式传 agent 时永远以调用方为准，这里只是没点名时的默认。"
+  ],
+  "workspaces": [
+    {
+      "name": "myproject",
+      "aliases": ["我的项目", "mp"],
+      "chat_id": "oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "chat_name": "MyProject 开发群",
+      "cwd": "/Users/me/work/myproject",
+      "desc": "一句话说清这个工作域是干什么的 —— 模型靠它判断该往哪派活",
+      "agent": "",
+      "other_chats": [
+        {"chat_id": "oc_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy", "name": "MyProject 反馈群（同目录，非入口）"}
+      ]
+    },
+    {
+      "name": "bot",
+      "aliases": ["cc-lark", "机器人"],
+      "chat_id": "oc_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "chat_name": "cc-lark",
+      "cwd": "/Users/me/work/feishu-claude-code",
+      "desc": "cc-lark 机器人底座本身",
+      "agent": "",
+      "other_chats": []
+    }
+  ]
+}

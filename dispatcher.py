@@ -39,11 +39,13 @@ from card_security import (
     verify_action_value,
 )
 from agent_runner import run_agent
+from auto_continue import IncompleteTaskError
 from claude_runner import is_safeguards_error_text
 from feishu_client import _err_desc
+from display_pages import publish_full_display
 from commands import (
     MODEL_SHORTCUTS, ModelShortcutUnavailable, apply_model_shortcut,
-    parse_command, handle_command,
+    is_lock_free_command, parse_command, handle_command,
 )
 from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
 from lark_prompts import render_lark_prompt
@@ -789,7 +791,8 @@ _AUTH_RESUME_NUDGE_WRITE = (
     "只补做剩下的步骤，然后给出最终回复。"
 )
 _RESET_TEXT_RE = re.compile(
-    r"resets?\s+(?:([A-Z][a-z]{2})\s+(\d{1,2}),?\s+)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)",
+    r"resets?\s+(?:([A-Z][a-z]{2})\s+(\d{1,2}),?\s+)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)"
+    r"(?:\s*\(?\s*(UTC|GMT)\s*\)?)?",
     re.IGNORECASE,
 )
 
@@ -831,7 +834,8 @@ def _limit_detail(exc: BaseException) -> str:
 
 def _parse_reset_minutes(text: str, now: Optional[float] = None) -> Optional[int]:
     """从 Anthropic 的限流文案里解析 "resets 12:20pm" / "resets 11pm" /
-    "resets Sep 5 at 3pm" → 距现在多少分钟（按 Asia/Shanghai，与文案一致）。
+    "resets Sep 5 at 3pm" / "resets 5:50am (UTC)" → 距现在多少分钟
+    （带 (UTC)/(GMT) 后缀按 UTC，否则按 Asia/Shanghai，与文案一致）。
     解析不出来或超过 24h（wake 上限）返回 None。"""
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
@@ -839,8 +843,10 @@ def _parse_reset_minutes(text: str, now: Optional[float] = None) -> Optional[int
     m = _RESET_TEXT_RE.search(text or "")
     if not m:
         return None
-    mon, day, hh, mm, ampm = m.groups()
-    tz = ZoneInfo("Asia/Shanghai")
+    mon, day, hh, mm, ampm, tzname = m.groups()
+    # 文案大多是本地时区（"resets 12:20pm"），但撞 session limit 时 Anthropic 会给
+    # "resets 5:50am (UTC)" —— 按北京解释会把唤醒排晚十几个小时。
+    tz = ZoneInfo("UTC") if (tzname or "").upper() in ("UTC", "GMT") else ZoneInfo("Asia/Shanghai")
     now_dt = datetime.fromtimestamp(now if now is not None else time.time(), tz)
     hour = int(hh) % 12 + (12 if ampm.lower() == "pm" else 0)
     minute = int(mm or 0)
@@ -1020,6 +1026,66 @@ async def _show_command_menu(bot: BotInstance, user_id: str, chat_id: str, is_gr
         log(bot.profile.name, "menu", "error", f"命令菜单发送失败: {e}")
 
 
+async def _send_command_reply(
+    bot: BotInstance, user_id: str, is_group: bool, msg_id: str, reply,
+) -> None:
+    """把 handle_command 的返回值渲染成一张卡片发出去。
+
+    reply 可以是纯文本，也可以是 {"text", "buttons"}（/model、/usage 这类带
+    切换按钮的卡）。群里回原消息、私聊直发给用户。
+    """
+    if isinstance(reply, dict):
+        reply_text, reply_buttons = reply["text"], reply.get("buttons", [])
+    else:
+        reply_text, reply_buttons = reply, []
+
+    for btn in reply_buttons:
+        val = btn.get("value")
+        if isinstance(val, dict):
+            val.setdefault("profile", bot.profile.name)
+            val["_cc_uid"] = user_id
+
+    if is_group:
+        card_id = await bot.feishu.reply_card(msg_id, content=reply_text, loading=False)
+    else:
+        card_id = await bot.feishu.send_card_to_user(user_id, content=reply_text, loading=False)
+
+    if reply_buttons:
+        try:
+            short = all(len(b["text"]) <= 12 for b in reply_buttons)
+            await bot.feishu.update_card_with_buttons(
+                card_id, reply_text, reply_buttons, flow=short,
+            )
+        except Exception as btn_err:
+            log(bot.profile.name, "btn", "warn", f"按钮渲染失败: {btn_err}")
+
+
+async def _run_lock_free_command(
+    bot: BotInstance, user_id: str, chat_id: str, is_group: bool,
+    cmd: str, args: str, msg_id: str,
+) -> None:
+    """在 per-chat 锁**外面**跑一条只读命令，和运行中的任务并行。
+
+    只读命令（/usage /status /help …）跟前面那条消息没有任何关联，排队等它跑完
+    纯属浪费。判定见 commands.is_lock_free_command。
+    """
+    tag = bot.profile.name
+    log(tag, "cmd", "info", f"执行 {cmd}（免排队，与运行中任务并行）")
+    try:
+        reply = await handle_command(cmd, args, user_id, chat_id, bot.store, bot=bot)
+    except Exception as e:
+        log(tag, "cmd", "error", f"/{cmd} 执行异常: {type(e).__name__}: {e}")
+        traceback.print_exc(file=sys.stdout)
+        sys.stdout.flush()
+        reply = f"❌ `/{cmd}` 执行失败：{type(e).__name__}: {e}"
+    if reply is None:
+        return
+    try:
+        await _send_command_reply(bot, user_id, is_group, msg_id, reply)
+    except Exception as e:
+        log(tag, "cmd", "error", f"/{cmd} 回复失败: {_err_desc(e)}")
+
+
 # ── 核心消息处理 ─────────────────────────────────────────────
 
 async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
@@ -1083,7 +1149,7 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
             log(tag, "acl", "info", f"user={user_id} 不在 allowlist")
             return
 
-    # /stop 和 / 在锁外处理
+    # 锁外快路径：/stop、/restart、/ 命令菜单，以及所有只读命令（不排队）
     if msg.message_type == "text":
         try:
             _text = json.loads(msg.content).get("text", "").strip()
@@ -1116,6 +1182,18 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
             await _handle_restart_request(bot, user_id, is_group, msg.message_id)
             return
 
+        # 只读命令（/usage /status /help /skills …）不进队列：它们跟前面那条消息
+        # 毫无关系，也不会动 session，没理由陪着一个跑 20 分钟的任务一起等。
+        # 每条消息本来就是 loop 上独立的 task，这里 await 掉即是真并行。
+        if _parsed_lock_free and is_lock_free_command(*_parsed_lock_free):
+            if is_group and not await _is_current_bot_mentioned(bot, msg):
+                return
+            await _run_lock_free_command(
+                bot, user_id, chat_id, is_group,
+                _parsed_lock_free[0], _parsed_lock_free[1], msg.message_id,
+            )
+            return
+
         if _text == "/":
             if is_group and not await _is_current_bot_mentioned(bot, msg):
                 return
@@ -1138,7 +1216,12 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
 
     if lock.locked():
         try:
-            await bot.feishu.reply_text(msg.message_id, "📬 前面还有任务在跑，排队中（/stop 可打断）")
+            await bot.feishu.reply_text(
+                msg.message_id,
+                # 纯文本通道（Lark 这条不过 markdown），别加反引号
+                "📬 前面还有任务在跑，排队中（/stop 可打断；"
+                "/status、/usage 这类只读命令不用排队，随时可发）",
+            )
         except Exception:
             pass
 
@@ -1414,6 +1497,7 @@ async def _execute_run(
     push_muted_until = 0.0
     _PUSH_INTERVAL = 0.4
     _MAX_STREAM_DISPLAY = 2500
+    full_process = (session.runner or "").strip().lower() == "agy"
 
     start_ts = time.time()
     last_output_ts = start_ts
@@ -1482,7 +1566,8 @@ async def _execute_run(
                 parts.append("")
             d = accumulated
             if len(d) > _MAX_STREAM_DISPLAY:
-                d = "...\n\n" + d[-_MAX_STREAM_DISPLAY:]
+                d = ("…（运行中显示最近进度，结束后展示完整过程）\n\n"
+                     if full_process else "...\n\n") + d[-_MAX_STREAM_DISPLAY:]
             parts.append(d)
         body = "\n".join(parts) if parts else "⏳ 思考中..."
         # 快照正文（不含 footer），供 /stop 保留停止前进度用。收到停止后不再
@@ -1790,10 +1875,14 @@ async def _execute_run(
                             limit_switched = True
                         else:
                             auth_switched = True
-                        await push(
-                            "🔁 撞到 Claude Max 用量墙，正在探测其他账户额度…" if is_rate_limit
-                            else "🔁 当前账户凭证已失效（token 被顶掉 / 吊销），正在探测其他账户…"
-                        )
+                        if _account_pool_pinned(bot):
+                            await push("🔁 撞到 Claude Max 用量墙；凭证被 env 钉死（账户池不生效），"
+                                       "正在探测配额恢复时刻…")
+                        else:
+                            await push(
+                                "🔁 撞到 Claude Max 用量墙，正在探测其他账户额度…" if is_rate_limit
+                                else "🔁 当前账户凭证已失效（token 被顶掉 / 吊销），正在探测其他账户…"
+                            )
                         try:
                             limit_info = await asyncio.to_thread(_emergency_account_switch)
                         except Exception as sw_err:  # noqa: BLE001
@@ -2014,8 +2103,15 @@ async def _execute_run(
                 if attempts > 0
                 else f"❌ Agent 执行出错：{clean}"
             )
+            incomplete = isinstance(last_exc, IncompleteTaskError)
+            if incomplete:
+                err_brief = f"⚠️ 任务未完成：{clean}"
             if resumable_sid:
-                err_brief += "\n\n💾 上下文已保留，配额恢复后发『继续』即可接着上次进度跑。"
+                err_brief += (
+                    "\n\n💾 上下文已保留，发『继续』即可接着上次进度跑。"
+                    if incomplete else
+                    "\n\n💾 上下文已保留，配额恢复后发『继续』即可接着上次进度跑。"
+                )
             if _is_auth_failure_error(last_exc) and not _account_pool_pinned(bot):
                 err_brief += (
                     "\n\n🔑 这是**凭证失效**（不是额度）：两台机器共用同一批订阅号，"
@@ -2036,13 +2132,18 @@ async def _execute_run(
                 partial_parts.append("\n".join(tool_history[-_TOOL_HISTORY_SHOWN:]))
             if accumulated:
                 d = accumulated
-                if len(d) > _MAX_STREAM_DISPLAY:
+                if not full_process and len(d) > _MAX_STREAM_DISPLAY:
                     d = "...\n\n" + d[-_MAX_STREAM_DISPLAY:]
                 partial_parts.append(d)
             if partial_parts:
+                progress_label = (
+                    "⚠️ **任务尚未完成**（以上为已执行的进度）"
+                    if incomplete else
+                    "⚠️ **任务没有执行完，中途报错了**（以上为出错前的进度）"
+                )
                 err_card = (
                     "\n\n".join(partial_parts)
-                    + "\n\n---\n\n⚠️ **任务没有执行完，中途报错了**（以上为出错前的进度）\n\n"
+                    + f"\n\n---\n\n{progress_label}\n\n"
                     + err_brief
                 )
             else:
@@ -2052,7 +2153,13 @@ async def _execute_run(
                     return
                 try:
                     # 终态（报错）卡同样走确认写，防止停在流式快照（见 update_card_final）。
-                    await bot.feishu.update_card_final(card_msg_id, err_card)
+                    if full_process:
+                        await publish_full_display(
+                            bot.feishu, err_card, card_id=card_msg_id,
+                            reply_to=notify_msg_id if is_group else None,
+                            user_id=user_id, stopped=_stopping)
+                    else:
+                        await bot.feishu.update_card_final(card_msg_id, err_card)
                 except Exception:
                     pass
                 if _stopping():
@@ -2066,6 +2173,8 @@ async def _execute_run(
                 err_notify = "❌ 异常退出" + (
                     f"（已自动重试 {retry_count} 次）" if retry_count > 0 else ""
                 )
+                if incomplete:
+                    err_notify = "⚠️ 任务未完成，自动续跑已停止（详情见卡片）"
                 try:
                     if is_group and notify_msg_id:
                         await bot.feishu.reply_text(notify_msg_id, err_notify)
@@ -2082,7 +2191,7 @@ async def _execute_run(
         # 选项只从最终产出里认，别被过程叙述里的候选文本污染。
         options = _extract_options(result_text) or ask_options
         if process_text:
-            if len(process_text) > _MAX_STREAM_DISPLAY:
+            if not full_process and len(process_text) > _MAX_STREAM_DISPLAY:
                 process_text = (
                     "…（过程较长，仅显示末段）\n\n"
                     + process_text[-_MAX_STREAM_DISPLAY:]
@@ -2105,7 +2214,18 @@ async def _execute_run(
             if _stopping():
                 return
             try:
-                if options:
+                if full_process:
+                    buttons = [
+                        {"text": display, "value": {
+                            "reply": value, "cid": chat_id,
+                            "profile": bot.profile.name, "_cc_uid": user_id,
+                        }} for display, value in options
+                    ]
+                    card_patched = await publish_full_display(
+                        bot.feishu, final, card_id=card_msg_id,
+                        reply_to=notify_msg_id if is_group else None,
+                        user_id=user_id, stopped=_stopping, buttons=buttons)
+                elif options:
                     buttons = [
                         {"text": display, "value": {
                             "reply": value,
@@ -2128,7 +2248,8 @@ async def _execute_run(
                     await bot.feishu.finalize_streaming_card(card_msg_id)
                 if _stopping():
                     return
-                card_patched = True
+                if not full_process:
+                    card_patched = True
             except Exception as e:
                 if _stopping():
                     return
@@ -2402,32 +2523,7 @@ async def _process_message(
         log(tag, "cmd", "info", f"执行 {cmd}")
         reply = await handle_command(cmd, args, user_id, chat_id, bot.store, bot=bot)
         if reply is not None:
-            if isinstance(reply, dict):
-                reply_text, reply_buttons = reply["text"], reply.get("buttons", [])
-            else:
-                reply_text, reply_buttons = reply, []
-
-            for btn in reply_buttons:
-                val = btn.get("value")
-                if isinstance(val, dict):
-                    val.setdefault("profile", bot.profile.name)
-                    val["_cc_uid"] = user_id
-
-            if reply_buttons:
-                if is_group:
-                    card_id = await bot.feishu.reply_card(msg.message_id, content=reply_text, loading=False)
-                else:
-                    card_id = await bot.feishu.send_card_to_user(user_id, content=reply_text, loading=False)
-                try:
-                    short = all(len(b["text"]) <= 12 for b in reply_buttons)
-                    await bot.feishu.update_card_with_buttons(card_id, reply_text, reply_buttons, flow=short)
-                except Exception as btn_err:
-                    log(tag, "btn", "warn", f"按钮渲染失败: {btn_err}")
-            else:
-                if is_group:
-                    await bot.feishu.reply_card(msg.message_id, content=reply_text, loading=False)
-                else:
-                    await bot.feishu.send_card_to_user(user_id, content=reply_text, loading=False)
+            await _send_command_reply(bot, user_id, is_group, msg.message_id, reply)
             return
 
     # ── 普通消息 → 调用当前 profile 的 agent ─────────────────
@@ -3629,7 +3725,7 @@ async def _dispatch_wake_parent_debounced(ptid: str) -> None:
 async def dispatch_task(
     bot: BotInstance, *, user_id: str, group_chat_id: str,
     title: str, prompt: str, cap: int = DISPATCH_CONCURRENCY_CAP,
-    parent_thread: str = "", parent_anchor: str = "",
+    parent_thread: str = "", parent_anchor: str = "", parent_chat: str = "",
     target_bot: "BotInstance | None" = None,
     model: str = "", effort: str = "",
     cwd: str = "", workspace: str = "", body_header: str = "",
@@ -3641,6 +3737,11 @@ async def dispatch_task(
 
     parent_thread/parent_anchor：派发方（主 agent）所在 thread + 其锚点消息。给了就启用
     "子会话结束→回报父 thread + 批次全完→唤醒父 agent"的工程化闭环（见 _DISPATCH_PARENTS）。
+
+    parent_chat：派发方**自己所在的群**。同群派发时它等于 group_chat_id，可以省；但
+    **跨群派发（workspace 路由）时两者不同**——子会话开在目标群，父 thread 仍在原群。
+    批次收口要 resume 的是父 session，其 chat_key 是 `父群:父thread`，这里取错群就
+    拼出一个不存在的 key，父 agent 永远醒不过来。缺省回退 group_chat_id（旧行为）。
 
     target_bot：**跨 agent 派发**——子会话在 target_bot 名下跑（可为异后端 bot，如
     codex=GPT / opencode=Gemini / mimo / grok=Grok CLI），从而实现 claude 调 GPT 这类跨 agent 编排。
@@ -3756,7 +3857,8 @@ async def dispatch_task(
     if parent_thread and parent_anchor:
         grp = _DISPATCH_PARENTS.setdefault(parent_thread, {
             "bot": bot, "thread": parent_thread, "anchor": parent_anchor,
-            "chat": group_chat_id, "user": user, "pending": 0, "results": [],
+            # 父在哪个群：跨群派发时**不是** group_chat_id（那是子会话的群）
+            "chat": parent_chat or group_chat_id, "user": user, "pending": 0, "results": [],
         })
         grp["pending"] += 1
         # 新 dispatch 进来 → 作废上一次"疑似收口"的 debounce（把这一波并进来），
@@ -3764,6 +3866,15 @@ async def dispatch_task(
         _timer = grp.pop("wake_timer", None)
         if _timer is not None and not _timer.done():
             _timer.cancel()
+
+    # Local completion mailbox is independent of Lark parent-thread notifications.
+    # In particular, cc voice intentionally disables those notifications.
+    import task_results
+    try:
+        task_results.begin(thread_id=thread_id, profile=bot.profile.name,
+                           user_id=user_id, title=topic_title, chat_id=group_chat_id)
+    except Exception as e:
+        log(bot.profile.name, "dispatch", "warn", f"completion mailbox unavailable: {type(e).__name__}")
 
     # fire-and-forget：子会话独立跑，不阻塞派发返回。进目标群的 _DISPATCH_CHILDREN
     # 桶（per-chat cap 依据）兼防 GC。
@@ -3787,8 +3898,9 @@ async def dispatch_task(
         ok = False
         result_text = ""
         fail_reason = ""
+        cancelled = fut.cancelled()
         try:
-            exc = fut.exception()
+            exc = fut.exception() if not cancelled else None
         except Exception:
             exc = None
         if exc is not None:
@@ -3796,7 +3908,7 @@ async def dispatch_task(
         else:
             r = None
             try:
-                r = fut.result()
+                r = fut.result() if not cancelled else None
             except Exception:
                 pass
             if isinstance(r, tuple) and len(r) == 2:
@@ -3810,6 +3922,13 @@ async def dispatch_task(
                 result_text = r or ""
                 if not ok:
                     fail_reason = "子会话未返回结果"
+        if cancelled:
+            fail_reason = "子任务已取消"
+        try:
+            task_results.finish(_thread, ok=ok, text=result_text if ok else fail_reason,
+                                cancelled=cancelled)
+        except Exception as e:
+            log(bot.profile.name, "dispatch", "warn", f"completion result write failed: {type(e).__name__}")
         # 1) 每个子会话结束 → 回报父 thread（含结果摘要；工程化保证，子崩了也报）
         if parent_anchor:
             status = "✅ 完成" if ok else f"⚠️ 未完成（{fail_reason[:120]}）"
@@ -3848,7 +3967,9 @@ async def dispatch_task(
     return {"ok": True, "thread_id": thread_id, "anchor_message_id": anchor,
             "active_after": active + 1, "cap": cap,
             "agent": child_bot.profile.name, "agent_runner": child_bot.profile.runner,
-            "model": model, "effort": effort}
+            "model": model, "effort": effort,
+            # 派到哪儿了：跨群派发时调用方必须能在回执里看见（不然它以为还在本群）
+            "chat_id": group_chat_id, "workspace": workspace, "cwd": cwd}
 
 
 # ── 会话移交（handover）───────────────────────────────────────────────────

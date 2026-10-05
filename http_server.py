@@ -176,26 +176,61 @@ def _resolve_callback_bot(header: dict) -> Optional[BotInstance]:
 
 # 跨 agent 派发：dispatch_task 的 `agent` 参数 → 已加载的目标 bot。
 # runner 家族别名让编排 agent 用直觉名字（"gpt"）而不用记内部 profile 名。
-_AGENT_RUNNER_ALIASES = {
-    "gpt": "codex", "codex": "codex", "openai": "codex", "chatgpt": "codex", "o1": "codex",
-    "claude": "claude", "anthropic": "claude",
-    "gemini": "opencode", "opencode": "opencode",
-    "mimo": "mimo",
-    "grok": "grok", "xai": "grok",
-    "maka": "maka", "apache-maka": "maka",
-    "agy": "agy", "antigravity": "agy",
-}
+from agent_alias import AGENT_RUNNER_ALIASES as _AGENT_RUNNER_ALIASES
+
+# 跨群派发：dispatch_task 的 `workspace` 参数 → 目标群 + 工作目录。
+# cc_mcp_server 也读同一张表（用来渲染工具说明 + 预检名字），但**权威解析在这边**：
+# 客户端只需要传名字，chat_id / cwd 一律以路由表为准，不信客户端传来的值。
+import workspaces as _workspaces
+
+
+def resolve_workspace_target(spec: str, fallback_chat_id: str) -> tuple[str, str, str, str]:
+    """把 `workspace` 名字解析成 (chat_id, cwd, 规范名, err)。
+
+    spec 为空 = 不路由，原样返回调用方所在的群（向后兼容：省略参数时行为与从前逐字一致）。
+    解析不到 / 目录不存在都返回 err，绝不静默派到别处。
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return fallback_chat_id, "", "", ""
+    ws, err = _workspaces.resolve(spec)
+    if ws is None:
+        return "", "", "", err
+    if ws.cwd and not os.path.isdir(ws.cwd):
+        return "", "", "", f"工作域 {ws.name!r} 的目录不存在：{ws.cwd}"
+    return ws.chat_id, ws.cwd, ws.name, ""
+
+
+def _bot_serves_chat(bot: BotInstance, chat_id: str) -> bool:
+    """这个 bot 能在 chat_id 这个群里干活吗？
+
+    沿用既有的群白名单闸门（`*` = 任意群）——external_api 拒绝派发用的也是这一份。
+    它是"bot 是否被拉进/允许进这个群"的最好本地近似：不在白名单的 bot 就算被选中，
+    建话题也会被 Lark 拒掉（230002 Bot/User can NOT be out of the chat）。
+    """
+    if not chat_id:
+        return True
+    groups = set(getattr(bot.profile, "allowed_group_chat_ids", set()) or set())
+    return "*" in groups or chat_id in groups
 
 
 def resolve_target_agent(
-    bots: dict[str, BotInstance], spec: str, *, exclude: str = "",
+    bots: dict[str, BotInstance], spec: str, *, exclude: str = "", chat_id: str = "",
 ) -> tuple[Optional[BotInstance], str]:
     """把 dispatch_task 的 `agent` 解析成目标 bot。返回 (bot, err)。
 
     解析顺序：① 精确 profile 名（区分/不区分大小写）→ ② runner 家族别名
     （gpt/codex→codex, claude→claude, gemini/opencode→opencode, mimo→mimo,
-    grok/xai→grok, maka→maka, agy/antigravity→agy），
-    别名命中多个时优先选 != 调用方(exclude) 的那个。命中不到返回 (None, 错误说明+可选项)。
+    grok/xai→grok, maka→maka, agy/antigravity→agy）。命中不到返回 (None, 错误说明+可选项)。
+
+    别名命中多个时（chat_id = 派发目标群，给了才生效）：
+      ① 先滤掉**不能在本群干活**的候选（见 _bot_serves_chat）；一个都不剩才退回全集，
+         保证最坏情况不比从前差。
+      ② 剩下的里若**包含调用方自己**（exclude）就选自己：用户点名的是这个家族、而
+         调用方必定在本群，绝不能为了"优先选别人"把它踢给一个不在群里的同族 bot
+         （实测：spx 里 agent="claude" 被踢给 seesaw → 建话题 230002 → HTTP 400）。
+      ③ 否则仍优先选 != 调用方的候选（跨 agent 的正常语义：spx 里 agent="gpt" → codex bot）。
+    不给 chat_id 时维持旧行为（无群上下文就无从判断"自己一定在场"）。
     """
     spec = (spec or "").strip()
     if not spec:
@@ -209,6 +244,11 @@ def resolve_target_agent(
     want = _AGENT_RUNNER_ALIASES.get(low)
     if want:
         cands = [b for b in bots.values() if b.profile.runner == want]
+        if chat_id:
+            cands = [b for b in cands if _bot_serves_chat(b, chat_id)] or cands
+            mine = [b for b in cands if b.profile.name == exclude]
+            if mine:
+                return mine[0], ""
         pref = [b for b in cands if b.profile.name != exclude]
         chosen = pref or cands
         if chosen:
@@ -654,14 +694,59 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             self._mcp_respond(endpoint, _prof,
                               {"ok": False, "error": "profile 未加载（多 bot 必须指定 profile）"})
             return None, None, None
+        # 跨群：workspace 指定"派到哪个项目的群"。调用方传来的 chat_id 永远是它**自己
+        # 所在的群**；解析成功就把 p["chat_id"] 覆盖成目标群，下游（agent 解析 / 并发
+        # 闸门 / 建话题）自然全部按目标群走，而 _caller_chat_id 留着给父上下文用。
+        caller_chat = (p.get("chat_id") or p.get("group_chat_id") or "").strip()
+        p["_caller_chat_id"] = caller_chat
+        try:
+            ws_chat, ws_cwd, ws_name, ws_err = resolve_workspace_target(
+                p.get("workspace") or "", caller_chat)
+        except Exception as e:  # noqa: BLE001 — 路由表坏了也只能是清晰报错，不能 500
+            ws_chat, ws_cwd, ws_name, ws_err = "", "", "", f"工作域解析失败: {type(e).__name__}: {e}"
+        if ws_err:
+            self._mcp_respond(endpoint, _prof, {"ok": False, "error": ws_err})
+            return None, None, None
+        p["chat_id"] = ws_chat
+        p["cwd"] = ws_cwd
+        p["workspace"] = ws_name
+        # 工作域可以钉一个默认 agent；调用方显式点名的永远优先。
+        if ws_name and not (p.get("agent") or "").strip():
+            ws_obj, _ = _workspaces.resolve(ws_name)
+            if ws_obj is not None and ws_obj.agent:
+                p["agent"] = ws_obj.agent
         # 跨 agent：agent 参数指定异后端目标 bot（如 "gpt"→codex）。缺省=同 bot。
         _agent = (p.get("agent") or "").strip()
         target_bot = None
         if _agent:
-            target_bot, err = resolve_target_agent(_bots, _agent, exclude=bot.profile.name)
+            # 带上派发目标群：同家族候选里必须先排掉"不在本群"的 bot（否则建话题 230002）
+            target_bot, err = resolve_target_agent(
+                _bots, _agent, exclude=bot.profile.name, chat_id=ws_chat,
+            )
             if target_bot is None:
                 self._mcp_respond(endpoint, _prof, {"ok": False, "error": err})
                 return None, None, None
+        # 跨群派发（workspace 路由过）才校验"这个 bot 在不在目标群"。同群派发不查是
+        # 有意的：会话本来就跑在那个群里，白名单为空只代表该 profile 的群入站被关掉，
+        # 不代表 bot 不在群里——在这里改判成硬拒会掐掉一批本来能跑的派发。
+        # 而跨群没有这层保证：不拦就是 Lark 侧一个 230002，或者更糟——活被悄悄派到
+        # 一个用户根本不会去看的地方。
+        acting = target_bot or bot
+        if ws_name and getattr(acting.profile, "is_telegram", False):
+            # 工作域指向的是 Lark 群（oc_…）；Telegram bot 往那儿建话题发不出去。
+            self._mcp_respond(endpoint, _prof, {"ok": False, "error": (
+                f"工作域路由是 Lark 群的概念，Telegram 会话（bot {acting.profile.name}）"
+                f"用不了——去掉 workspace 参数即在当前会话里派。"
+            )})
+            return None, None, None
+        if ws_name and not _bot_serves_chat(acting, ws_chat):
+            where = f"工作域 {ws_name!r} 的群 " if ws_name else "目标群 "
+            self._mcp_respond(endpoint, _prof, {"ok": False, "error": (
+                f"bot {acting.profile.name}[{acting.profile.runner}] 不在{where}{ws_chat}"
+                f"（不在它的群白名单里），派发已拒绝。把该 bot 拉进那个群并加进 "
+                f"{acting.profile.name.upper()}_ALLOWED_GROUP_CHAT_IDS，或换一个在群里的 agent。"
+            )})
+            return None, None, None
         return p, bot, target_bot
 
     def _handle_dispatch(self, body: bytes):
@@ -680,6 +765,12 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                     prompt=p.get("prompt") or "",
                     parent_thread=(p.get("parent_thread") or "").strip(),
                     parent_anchor=(p.get("parent_anchor") or "").strip(),
+                    # 跨群派发时父 thread 在**调用方自己的群**里，不在子会话那个群；
+                    # 批次收口要 resume 的是父 session，chat 取错就唤不醒（键对不上）。
+                    parent_chat=(p.get("_caller_chat_id") or "").strip(),
+                    # 工作域钉死子会话的工作目录（不依赖目标群在 .env 里的那份映射）
+                    cwd=(p.get("cwd") or "").strip(),
+                    workspace=(p.get("workspace") or "").strip(),
                     target_bot=target_bot,
                     # 子会话是全新 session，不继承派发方的 /model /effort —— 要指定
                     # 只能显式带上（别名解析 + 校验在 dispatcher 侧统一做）。
@@ -703,6 +794,14 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         if p is None:
             return
         _prof = (p.get("profile") or "").strip()
+        if p.get("workspace"):
+            # 移交要收尾原话题（取消唤醒 + 贴移交标记），这套收尾是按**一个群**写的；
+            # 跨群移交没实现，宁可明说也不半吊子地交出去。
+            self._mcp_respond("handover", _prof, {"ok": False, "error": (
+                "handover 不支持跨工作域移交（它要收尾原话题的唤醒与标记）。"
+                "要把活挪去别的项目群，请用 dispatch_task(workspace=…)。"
+            )})
+            return
         brief = p.get("brief")
         if not isinstance(brief, dict):
             self._mcp_respond("handover", _prof, {
@@ -814,10 +913,30 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             self._respond(400, {"ok": False, "error": f"bad json: {e}"})
             return
         _prof = (p.get("profile") or "").strip()
+        # 跨群定时：workspace 决定这条 cron 每次在哪个群开话题（同 dispatch 的路由表）。
+        try:
+            chat_id, _cwd, ws_name, ws_err = resolve_workspace_target(
+                p.get("workspace") or "", (p.get("chat_id") or "").strip())
+        except Exception as e:  # noqa: BLE001
+            chat_id, ws_name, ws_err = "", "", f"工作域解析失败: {type(e).__name__}: {e}"
+        if ws_err:
+            self._mcp_respond("schedule_cron", _prof, {"ok": False, "error": ws_err})
+            return
+        # 跨群定时才校验群成员资格（同 /dispatch 的口径，理由见那边）：跑这条 cron 的
+        # bot 不在目标群，就会每次触发都在 Lark 侧建话题失败（230002），而 cron 的失败
+        # 没人盯着——必须在写进 yaml 之前拦下来。
+        _bot = self._resolve_bot_by_profile(_prof)
+        if ws_name and _bot is not None and not _bot_serves_chat(_bot, chat_id):
+            where = f"工作域 {ws_name!r} 的群 "
+            self._mcp_respond("schedule_cron", _prof, {"ok": False, "error": (
+                f"bot {_bot.profile.name} 不在{where}{chat_id}（不在它的群白名单里），"
+                f"定时任务已拒绝创建。"
+            )})
+            return
         try:
             result = _handlers.schedule_cron(
                 profile=_prof,
-                chat_id=(p.get("chat_id") or "").strip(),
+                chat_id=chat_id,
                 user_id=(p.get("user_id") or "").strip(),
                 cron=(p.get("cron") or "").strip(),
                 prompt=p.get("prompt") or "",
@@ -828,6 +947,10 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._mcp_error("schedule_cron", _prof, e)
             return
+        # 回显工作域：调用方据此确认路由**真的生效了**（老 bot 不回这个字段，
+        # cc_mcp_server 就能识破"你还没 /restart"而不是以为派对了群）。
+        if isinstance(result, dict) and result.get("ok"):
+            result = {**result, "workspace": ws_name, "chat_id": chat_id}
         self._mcp_respond("schedule_cron", _prof, result)
 
     def _handle_list_crons(self, body: bytes = b""):

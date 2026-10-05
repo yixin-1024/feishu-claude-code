@@ -34,6 +34,7 @@ def _isolate_sessions(tmp_path, monkeypatch):
     # 否则下次 bot 启动会真的去把"上次没跑完的活"投回群里。
     monkeypatch.setenv("CC_LARK_RESUME_STORE", str(tmp_path / "pending_resumes.json"))
     monkeypatch.setenv("CC_LARK_TASK_ROUTES", str(tmp_path / "task_routes.json"))
+    monkeypatch.setenv("CC_LARK_TASK_RESULTS_DIR", str(tmp_path / "task_results"))
     # 会话移交简报同理：测试里的假移交不该在仓库 data/handovers/ 里堆文件。
     monkeypatch.setenv("CC_LARK_HANDOVER_DIR", str(tmp_path / "handovers"))
     # agy 账号快照 / keychain 同理，而且更凶：~/.gemini/accounts 里是**真凭证**，
@@ -46,6 +47,13 @@ def _isolate_sessions(tmp_path, monkeypatch):
                         lambda raw: (False, "test: keychain 写入已被隔离挡住"))
     monkeypatch.setattr(_aas, "_delete_keychain",
                         lambda: (False, "test: keychain 删除已被隔离挡住"))
+
+    # 钉死凭证的 env（CLAUDE_CODE_OAUTH_TOKEN 等）同理：财务机的 .env 里真钉着一个
+    # setup-token，而 pytest 会话里 bot_config 一被 import 就 load_dotenv(override=True)
+    # 把它灌进 os.environ —— 于是"账户池被架空"的生产状态漏进测试，账户池相关用例
+    # 在那台机器上集体变红。测试要验 pinned 行为的自己 monkeypatch.setenv 打开。
+    for _pin_key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(_pin_key, raising=False)
 
     import resume_store as _rs
     _rs._ATTEMPTS.clear()
