@@ -465,6 +465,15 @@ async def run_qoder(
         # 本轮各条 assistant 消息的 credits（同一条消息会分几次事件到，按 id 取最大）。
         # result 里的 total_credits 是**整个会话累计**，本轮花了多少只能自己加。
         message_credits: dict[str, tuple[float, bool]] = {}
+        # 开了 --include-partial-messages 后，credits 不在 assistant 事件里，而是在每条
+        # 消息收尾的 stream_event/message_delta.usage 里；用 message_start 的 id 对上号
+        current_message_id: dict = {}
+
+        def _record_credits(msg_id: str, credits, billable) -> None:
+            if not msg_id or not isinstance(credits, (int, float)):
+                return
+            prev = message_credits.get(msg_id, (0.0, True))[0]
+            message_credits[msg_id] = (max(prev, float(credits)), billable is not False)
 
         idle_seconds = 0
         loop = asyncio.get_event_loop()
@@ -525,6 +534,19 @@ async def run_qoder(
                     # 子 agent 的流和主流各自从 index 0 数起，键里要带上 parent
                     block_key = (data.get("parent_tool_use_id"), evt.get("index"))
 
+                    if evt_type == "message_start":
+                        current_message_id[data.get("parent_tool_use_id")] = (
+                            (evt.get("message") or {}).get("id")
+                            or f"anon-{len(current_message_id)}-{len(message_credits)}"
+                        )
+                    elif evt_type == "message_delta":
+                        delta_usage = evt.get("usage") or {}
+                        _record_credits(
+                            current_message_id.get(data.get("parent_tool_use_id"), ""),
+                            delta_usage.get("credits"),
+                            delta_usage.get("billable", True),
+                        )
+
                     if evt_type == "content_block_delta":
                         delta = evt.get("delta", {})
                         delta_type = delta.get("type")
@@ -568,13 +590,8 @@ async def run_qoder(
                 elif event_type == "assistant":
                     msg = data.get("message") or {}
                     msg_usage = msg.get("usage") or {}
-                    msg_credits = msg_usage.get("credits")
-                    if msg.get("id") and isinstance(msg_credits, (int, float)):
-                        prev = message_credits.get(msg["id"], (0.0, True))[0]
-                        message_credits[msg["id"]] = (
-                            max(prev, float(msg_credits)),
-                            msg_usage.get("billable", True) is not False,
-                        )
+                    _record_credits(msg.get("id") or "", msg_usage.get("credits"),
+                                    msg_usage.get("billable", True))
                     # 整条 assistant 消息里带着完整的 tool_use；流里漏掉的（没有 partial
                     # 事件 / 没收到 stop）在这里补报
                     if not data.get("parent_tool_use_id"):

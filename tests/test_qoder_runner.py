@@ -360,6 +360,37 @@ def test_turn_credits_sum_billable_messages_only(monkeypatch):
     assert qoder_runner.format_credits_suffix(u) == "本轮 2.50 credits · 会话累计 69.78 credits"
 
 
+def test_turn_credits_from_message_delta_in_partial_mode(monkeypatch):
+    # 实测 --include-partial-messages 下：assistant 事件的 usage 没有 credits，
+    # credits 在 message_delta.usage 里（Qwen3.8-Flash：0.257、billable=false）
+    lines = [
+        b'{"type":"system","subtype":"init","session_id":"' + SID.encode() + b'"}\n',
+        _ev({"type": "message_start", "message": {"id": "m1", "usage": {}}}),
+        _ev({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "2"}}),
+        (json.dumps({"type": "assistant", "session_id": SID,
+                     "message": {"id": "m1", "content": [{"type": "text", "text": "2"}], "usage": {}}}) + "\n").encode(),
+        _ev({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"credits": 0.25724, "billable": False}}),
+        _ev({"type": "message_start", "message": {"id": "m2", "usage": {}}}),
+        _ev({"type": "message_delta", "usage": {"credits": 0.4, "billable": True}}),
+        # 同一条消息若 assistant 事件里也带了 credits，不能算两遍
+        (json.dumps({"type": "assistant", "session_id": SID,
+                     "message": {"id": "m2", "content": [], "usage": {"credits": 0.4, "billable": True}}}) + "\n").encode(),
+        b'{"type":"result","subtype":"success","is_error":false,"result":"2","total_credits":0,'
+        b'"session_id":"' + SID.encode() + b'","usage":{"context_usage_ratio":0.16}}\n',
+    ]
+    _patch_exec(monkeypatch, [FakeProc(lines)], {})
+    usages = []
+    asyncio.run(run_qoder(message="x", cwd="/tmp", on_usage=usages.append))
+
+    u = usages[-1]
+    assert u["_turn_credits"] == 0.4
+    assert u["_turn_free_credits"] == 0.2572
+    assert "_session_credits" not in u
+    assert qoder_runner.format_credits_suffix(u) == "本轮 0.40 credits"
+    free_only = {**u, "_turn_credits": 0.0}
+    assert qoder_runner.format_credits_suffix(free_only) == "本轮免费"
+
+
 def test_credits_suffix_variants():
     f = qoder_runner.format_credits_suffix
     assert f({"_turn_credits": 0.0, "_turn_free_credits": 1.25, "_session_credits": 69.78}) == \
