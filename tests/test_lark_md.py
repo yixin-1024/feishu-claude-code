@@ -94,3 +94,25 @@ def test_card_dict_normalizes_content():
     content = card["body"]["elements"][0]["content"]
     assert "\\rightarrow" not in content
     assert content == '走到 → 你“**狡辩**”；'
+
+
+# 2026-10-06：飞书网关 WAF 把反引号包住的 sleep+整数当注入，403 空 body → 卡片收尾失败
+def test_waf_backtick_sleep_is_defanged():
+    out = norm("依次跑 3 个 `sleep 6`，第 9 秒插话")
+    assert "`sleep 6`" not in out
+    assert out.replace("⁠", "") == "依次跑 3 个 `sleep 6`，第 9 秒插话"
+
+
+def test_waf_sleep_variants():
+    assert "⁠" in norm("`SLEEP 60`")
+    assert "⁠" in norm("```\n`sleep 1`\n```")
+    # 实测网关放行的形状不动
+    for ok in ("sleep 6", "`sleep 0.5`", "`timeout 5 sleep 6`", "`usleep 6`", "`sleep 6 `"):
+        assert norm(ok) == ok, ok
+
+
+def test_waf_waitfor_delay_is_defanged():
+    out = norm("waitfor delay '0:0:5'")
+    assert out != "waitfor delay '0:0:5'"
+    assert out.replace("⁠", "") == "waitfor delay '0:0:5'"
+    assert norm("waitfor delay") == "waitfor delay"

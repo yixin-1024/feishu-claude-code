@@ -55,6 +55,9 @@ def _err_desc(e: BaseException) -> str:
     httpx 的超时/连接类异常（ReadTimeout / ConnectTimeout / ConnectError …）str() 是空串，
     只打 {e} 会得到 "重试: " 这种看不出所以然的日志，必须带上类名。
     """
+    if isinstance(e, json.JSONDecodeError) and e.pos == 0:
+        # SDK 解析空 body：多半是网关 403 拦了内容（见 lark_md._defang_waf），重试没用
+        return f"JSONDecodeError（飞书回了空响应，多为网关 WAF 拦截内容）: {e}"
     text = str(e)
     return f"{type(e).__name__}: {text}" if text else type(e).__name__
 

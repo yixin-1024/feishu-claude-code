@@ -9,6 +9,8 @@
    原样显示、加粗失效。这里把标点挪到 `**` 外面 → `她觉得你"**狡辩**"；`。
 
 代码块（围栏和行内）一律原样保留——里面的 `$` 和 `*` 本来就该是字面量。
+
+另外顺手绕开飞书网关 WAF 的误拦（见 `_defang_waf`），这一步对全文生效。
 """
 
 import re
@@ -210,6 +212,25 @@ def _fix_emphasis(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------- 网关 WAF
+
+# 飞书开放平台入口网关（响应头 server=TLB）把个别字面量当注入攻击，直接回
+# 403 + 空 body；SDK 解析空 body 报 `JSONDecodeError: Expecting value`，卡片
+# 收尾和文本回退一起挂，卡片定格在上一帧（2026-10-06 现场，同一话题断两次）。
+# 实测命中的只有两种形状：反引号紧贴的 sleep + 空格 + 整数 + 反引号（shell
+# 命令替换式延时注入），和 SQL Server 的 waitfor delay '…'。在关键字后插一个
+# 零宽 U+2060 就放行，显示不变。规则是黑盒，只处理实测过的形状；代码块里
+# 一样会被拦，所以这一步对全文做、不跳过代码。
+_WAF_SLEEP = re.compile(r"(?i)(`sleep)(\s+\d+`)")
+_WAF_WAITFOR = re.compile(r"(?i)(waitfor)(\s+delay\s*')")
+_WORD_JOINER = "⁠"
+
+
+def _defang_waf(text: str) -> str:
+    text = _WAF_SLEEP.sub(rf"\1{_WORD_JOINER}\2", text)
+    return _WAF_WAITFOR.sub(rf"\1{_WORD_JOINER}\2", text)
+
+
 # ---------------------------------------------------------------- 入口
 
 def normalize_lark_md(text: str) -> str:
@@ -219,4 +240,4 @@ def normalize_lark_md(text: str) -> str:
     parts = _CODE_SPLIT.split(text)
     for i in range(0, len(parts), 2):  # 偶数下标是代码块之外的正文
         parts[i] = _fix_emphasis(_strip_latex(parts[i]))
-    return "".join(parts)
+    return _defang_waf("".join(parts))
