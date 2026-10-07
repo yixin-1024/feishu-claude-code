@@ -644,3 +644,57 @@ def test_driver_send_retypes_when_composer_was_swapped(monkeypatch):
     ns["_messages_after"] = lambda room, after, limit=30: [{"id": "m1", "account_user_id": "user-1"}]
     assert ns["_send"]("R1", {"calpico-R1"}, "你好呀", []) == "m1"
     assert inserted == ["你好呀", "你好呀"]
+
+
+# ── driver：截图前把豆包的电脑面板打开（10-08 网页改版后它默认不显示了）──────────
+
+def _panel_ns(monkeypatch, answers):
+    ns = _driver_ns()
+    monkeypatch.setattr(ns["_time"], "sleep", lambda s: None)
+    calls = []
+
+    def fake_ev(expr, timeout=60):
+        for key in ("_PANEL_LIVE_JS", "_PANEL_PROFILE_JS", "_PANEL_COMPUTER_JS", "_ESCAPE_JS"):
+            if expr == ns[key]:
+                calls.append(key)
+                seq = answers[key]
+                return seq.pop(0) if len(seq) > 1 else seq[0]
+        raise AssertionError(expr)
+
+    ns["_ev"] = fake_ev
+    return ns, calls
+
+
+def test_driver_panel_already_open_touches_nothing(monkeypatch):
+    ns, calls = _panel_ns(monkeypatch, {"_PANEL_LIVE_JS": [True], "_PANEL_PROFILE_JS": ["ok"],
+                                        "_PANEL_COMPUTER_JS": ["ok"], "_ESCAPE_JS": [None]})
+    assert ns["_ensure_panel"]() is None
+    assert calls == ["_PANEL_LIVE_JS"]
+
+
+def test_driver_opens_panel_via_dot_profile(monkeypatch):
+    ns, calls = _panel_ns(monkeypatch, {"_PANEL_LIVE_JS": [False, False, True], "_PANEL_PROFILE_JS": ["ok"],
+                                        "_PANEL_COMPUTER_JS": ["loading", "ok"], "_ESCAPE_JS": [None]})
+    assert ns["_ensure_panel"]() is None
+    assert calls.count("_PANEL_PROFILE_JS") == 1 and calls.count("_PANEL_COMPUTER_JS") == 2
+    assert "_ESCAPE_JS" not in calls
+
+
+def test_driver_panel_entry_missing_closes_profile_dialog(monkeypatch):
+    clock = iter(range(0, 1000, 3))
+    ns, calls = _panel_ns(monkeypatch, {"_PANEL_LIVE_JS": [False], "_PANEL_PROFILE_JS": ["ok"],
+                                        "_PANEL_COMPUTER_JS": ["missing"], "_ESCAPE_JS": [None]})
+    monkeypatch.setattr(ns["_time"], "time", lambda: next(clock))
+    assert ns["_ensure_panel"]() == "个人资料里没找到电脑入口"
+    assert calls[-1] == "_ESCAPE_JS"
+
+
+def test_driver_panel_selectors_never_match_pause_or_call():
+    # 同一个弹窗里有「暂停 豆包」「呼叫」，面板上有「获取控制权」——选择器只认「…的电脑」
+    import re
+    ns = _driver_ns()
+    pat = re.search(r"\.find\(b=>/(.+?)/i\.test\(first\(b\)\)\)", ns["_PANEL_COMPUTER_JS"]).group(1)
+    rx = re.compile(pat.replace("\\'", "'"), re.I)
+    assert rx.search("豆包的电脑")
+    for label in ("暂停 豆包", "活跃", "呼叫", "电脑", "获取控制权", "Slack"):
+        assert not rx.search(label), label

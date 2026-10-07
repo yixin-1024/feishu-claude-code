@@ -544,13 +544,68 @@ def _wants_screen(m):
                 or _SCREEN_HINT_RE.search(c.get("text") or ""))
 
 
+# 10-08 网页改版后右侧的电脑面板默认不显示了，入口在 Dot 的个人资料弹窗里：
+# 顶栏头像「打开豆包的个人资料」→「电脑」一栏的「豆包的电脑 / 已连接」。只点这两个；
+# 同一个弹窗里还有「暂停 豆包」「呼叫」，面板上还有「获取控制权」，都不能碰。
+# 等待都放在 Python 这边：后台标签的 setTimeout 会被 Chrome 节流到一分钟一次。
+# 「开着」看右侧那块大画面：个人资料弹窗里也有一个 48×32 的缩略图 video，截图够用，但不算面板开着
+_PANEL_LIVE_JS = r"""[...document.querySelectorAll('video')].some(v=>(v.srcObject||v.videoWidth>0)&&v.getBoundingClientRect().width>=200)"""
+# 头像是个动画 iframe，后台新开、从没显示过的标签里它不渲染（10-08 实测，切成窗口当前标签也不行），
+# 那种标签就找不到这个入口，只能等它被显示过一次
+_PANEL_PROFILE_JS = r"""(()=>{
+  const b=[...document.querySelectorAll('button')].find(b=>!b.closest('aside,nav')
+    &&/^(打开|关闭).+的个人资料$|^(Open|Close) .+'s profile$/i.test(b.getAttribute('aria-label')||''));
+  if(!b) return 'missing';
+  if(!/^(关闭|Close)/i.test(b.getAttribute('aria-label'))) b.click();  // 已经开着就别再点，点了是关
+  return 'ok';})()"""
+_PANEL_COMPUTER_JS = r"""(()=>{
+  const first=b=>((b.innerText||'').trim().split('\n')[0]||'').trim();
+  const b=[...document.querySelectorAll('[role=dialog] button,[role=dialog] [role=button]')]
+    .find(b=>/.的电脑$|.'s computer$/i.test(first(b)));
+  if(!b) return 'missing';
+  if(/正在加载|Loading/i.test(b.innerText||'')) return 'loading';
+  b.click(); return 'ok';})()"""
+_ESCAPE_JS = r"""document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',keyCode:27,bubbles:true}))"""
+
+
+def _ensure_panel():
+    """右侧的电脑面板没开就打开它。返回 None = 画面已经在了；否则返回打不开的原因。"""
+    if _ev(_PANEL_LIVE_JS, 10):
+        return None
+    if _ev(_PANEL_PROFILE_JS, 10) != "ok":
+        return "找不到豆包的个人资料入口"
+    st = "missing"
+    deadline = _time.time() + 10
+    while _time.time() < deadline:
+        st = _ev(_PANEL_COMPUTER_JS, 10)
+        if st == "ok":
+            break
+        _time.sleep(0.4)
+    if st != "ok":
+        _ev(_ESCAPE_JS, 10)  # 把打开的个人资料弹窗关掉，别留在页面上
+        return "个人资料里没找到电脑入口" if st == "missing" else "电脑状态一直在加载"
+    deadline = _time.time() + 15
+    while _time.time() < deadline:
+        if _ev(_PANEL_LIVE_JS, 10):
+            return None
+        _time.sleep(0.5)
+    return "电脑面板打开了，但画面没连上"
+
+
 def _screen_files(delay=1.5):
     """截一张云电脑画面（能认出二维码就再裁一张），返回 files 列表项。"""
     import base64 as _b64
     _time.sleep(delay)  # 豆包通常是先开页面再说话，给页面一点渲染时间
-    r = _ev(_SCREEN_JS, 30)
+    try:
+        why = _ensure_panel()
+    except _DotsError as e:
+        why = str(e)
+    r = _ev(_SCREEN_JS, 30)  # 面板没打开也试一下：缩略图那路 video 照样能取到整帧
     if not isinstance(r, dict) or not r.get("ok"):
-        return [{"name": "豆包云电脑画面", "error": (r or {}).get("why") or "截不到画面"}]
+        err = (r or {}).get("why") or "截不到画面"
+        if why:
+            err += "；自动打开面板也没成功：%s" % why
+        return [{"name": "豆包云电脑画面", "error": err}]
     _os.makedirs(_DL_DIR, exist_ok=True)
     stamp = str(int(_time.time() * 1000))
     out = []
@@ -742,6 +797,10 @@ def _main():
         elif _ACTION == "stream":
             cursor = _AFTER or _latest_id(room)
             _emit("cursor", id=cursor)
+            try:
+                _ensure_panel()  # 用户要电脑面板默认开着（10-08）；截图前还会再确认一次
+            except Exception:  # noqa: BLE001
+                pass
             _stream(room, dot_ids, cursor)
         else:
             with open(_env("DOTS_PROMPT_FILE"), encoding="utf-8") as f:
