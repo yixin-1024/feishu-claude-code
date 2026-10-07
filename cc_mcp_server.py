@@ -1088,7 +1088,14 @@ def _post_steer(args: dict, *, stop_first: bool, verb: str) -> dict:
         return _err(f"Failed to reach cc-lark: {type(e).__name__}: {e}")
     if not body.get("ok"):
         return _err(f"{verb} rejected: {body.get('error', 'unknown error')}")
-    if stop_first:
+    if body.get("injected"):
+        # bot 直接写进了正在跑的 claude 进程（运行中插话），没杀进程、没排队
+        detail = (
+            "interrupted the running turn and the same process is continuing with the new "
+            "instruction — context intact" if stop_first else
+            "written into the running process; it runs right after the current turn"
+        )
+    elif stop_first:
         detail = "stopped its current run and redirected it" if body.get("stopped") else \
                  "no run was active — it will run the new instruction directly"
     else:
