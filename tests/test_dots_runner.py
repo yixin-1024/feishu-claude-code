@@ -519,3 +519,128 @@ def test_driver_api_retries_network_blips_and_5xx(monkeypatch):
     ns["_ev"] = fake_ev
     assert ns["_api"]("/backend-api/x") == {"items": []}
     assert len(calls) == 3
+
+
+# ── driver：找 / 开 Dots 标签页（10-07：标签被关了，转发器报了一晚上 no_tab）────────
+
+_ROOM_PATH = "/dots/01a0f09e-4f2c-70d1-9e34-67a3aeb94018"
+
+
+def _tab_ns(monkeypatch, tmp_path, pages, *, rooms=("R1",), paths=None):
+    """假 Chrome：pages 是现有标签；createTarget 会往里加一个；paths 是新标签依次跳过的地址。"""
+    ns = _driver_ns()
+    monkeypatch.setattr(ns["_time"], "sleep", lambda s: None)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ns["_WAKE_FILE"] = str(tmp_path / "cc-dots-wake-p")
+    log = {"created": [], "closed": []}
+
+    def cdp(method, **kw):
+        if method == "Target.getTargets":
+            return {"targetInfos": list(pages)}
+        if method == "Target.createTarget":
+            log["created"].append(kw)
+            tid = "NEW%d" % len(log["created"])
+            pages.append({"type": "page", "targetId": tid, "url": kw["url"], "browserContextId": "C0"})
+            return {"targetId": tid}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "S-" + kw["targetId"]}
+        if method == "Target.getTargetInfo":
+            t = next(p for p in pages if p["targetId"] == kw["targetId"])
+            return {"targetInfo": {"browserContextId": t["browserContextId"]}}
+        if method == "Target.closeTarget":
+            log["closed"].append(kw["targetId"])
+            pages[:] = [p for p in pages if p["targetId"] != kw["targetId"]]
+            return {}
+        if method == "Target.getBrowserContexts":
+            return {"browserContextIds": [], "defaultBrowserContextId": "C0"}
+        return {}
+
+    seq = iter(paths or [])
+
+    def fake_ev(expr, timeout=60):
+        assert expr == ns["_PAGE_JS"], expr
+        path = next(seq, _ROOM_PATH)
+        log.setdefault("paths", []).append(path)
+        return {"ready": "complete", "path": path, "composer": path == _ROOM_PATH}
+
+    ns["cdp"] = cdp
+    ns["_ev"] = fake_ev
+    ns["_api"] = lambda path, *a, **k: {"items": [
+        {"id": r, "name": "豆包", "members": [{"account_user_id": "calpico-" + r, "name": "豆包"}]} for r in rooms]}
+    return ns, log
+
+
+def test_driver_uses_existing_dots_tab(monkeypatch, tmp_path):
+    pages = [{"type": "page", "targetId": "OLD", "url": "https://chatgpt.com" + _ROOM_PATH, "browserContextId": "C0"}]
+    ns, log = _tab_ns(monkeypatch, tmp_path, pages)
+    ns["_attach"](need_composer=True)
+    assert ns["_SID"] == "S-OLD" and log["created"] == []
+
+
+def test_driver_opens_background_tab_and_waits_for_route_jumps(monkeypatch, tmp_path):
+    ns, log = _tab_ns(monkeypatch, tmp_path, [], paths=["/dots", "/dots/home", _ROOM_PATH])
+    ns["_remember"](room="R1")
+    ns["_attach"](need_composer=True)
+    assert log["created"] == [{"url": "https://chatgpt.com/dots", "background": True}]
+    assert log["closed"] == [] and ns["_SID"] == "S-NEW1"
+    # /dots → /dots/home 时输入框随时会被换掉，要等到落在对话页
+    assert log["paths"][:3] == ["/dots", "/dots/home", _ROOM_PATH]
+
+
+def test_driver_wrong_account_in_default_context_falls_back_to_chrome_profile(monkeypatch, tmp_path):
+    import subprocess
+    pages = []
+    ns, log = _tab_ns(monkeypatch, tmp_path, pages, rooms=("OTHER",))
+    ns["_remember"](room="R1", profile_dir="Profile 38")
+    runs = []
+
+    def fake_run(args, **kw):
+        runs.append(args)
+        if args[0] == "/bin/sh":  # lsappinfo 查前台 app
+            return subprocess.CompletedProcess(args, 0, stdout='[ NULL ] ASN:0x0-0x1:\n    bundleID="com.larksuite.larkApp"\n')
+        if "--profile-directory=Profile 38" in args:
+            pages.append({"type": "page", "targetId": "VIA_OPEN", "url": "https://chatgpt.com/dots", "browserContextId": "C38"})
+        return subprocess.CompletedProcess(args, 0, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    ns["_attach"](need_composer=True)
+    # 默认上下文登录的是别的账号：那个标签要关掉，不能把话发给别人的 Dot
+    assert log["closed"] == ["NEW1"]
+    assert ns["_SID"] == "S-VIA_OPEN"
+    assert ["/usr/bin/open", "-g", "-na", "Google Chrome", "--args",
+            "--profile-directory=Profile 38", "https://chatgpt.com/dots"] in runs
+    # open 会把 Chrome 拉到前台，开完要把用户原来的前台 app 切回去
+    assert runs[-1] == ["/usr/bin/open", "-b", "com.larksuite.larkApp"]
+
+
+def test_driver_no_tab_and_nothing_works_says_so(monkeypatch, tmp_path):
+    ns, log = _tab_ns(monkeypatch, tmp_path, [], rooms=())
+    with pytest.raises(Exception) as ei:
+        ns["_attach"]()
+    assert ei.value.code == "no_tab" and "DOTS_CHROME_PROFILE" in str(ei.value)
+    assert log["closed"] == ["NEW1"]
+
+
+def test_driver_send_retypes_when_composer_was_swapped(monkeypatch):
+    ns = _driver_ns()
+    monkeypatch.setattr(ns["_time"], "sleep", lambda s: None)
+    typed = iter(["", "你好呀"])  # 第一次写进了被换掉的输入框，读回来是空的
+
+    def fake_ev(expr, timeout=60):
+        if expr == ns["_PAGE_JS"]:
+            return {"ready": "complete", "path": _ROOM_PATH, "composer": True}
+        if expr == ns["_COMPOSER_JS"]:
+            return "ok"
+        if expr == ns["_COMPOSER_TEXT_JS"]:
+            return next(typed)
+        if "b.click()" in expr:
+            return "ok"
+        return None
+
+    inserted = []
+    ns["_ev"] = fake_ev
+    ns["cdp"] = lambda m, **k: inserted.append(k["text"]) if m == "Input.insertText" else {}
+    ns["_latest_id"] = lambda room: "a0"
+    ns["_messages_after"] = lambda room, after, limit=30: [{"id": "m1", "account_user_id": "user-1"}]
+    assert ns["_send"]("R1", {"calpico-R1"}, "你好呀", []) == "m1"
+    assert inserted == ["你好呀", "你好呀"]

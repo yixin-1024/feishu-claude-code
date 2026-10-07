@@ -26,10 +26,15 @@ DOTS_ACTION：
 - 发消息必须在页面里模拟输入 + 点「发送」：服务端直调会被反爬令牌拦，不去绕。
 - 全程用**显式 CDP session**（Target.attachToTarget + session_id=），不调 switch_tab，
   所以不会抢 browser-harness daemon 的「当前标签」，也不会把标签切到前台打扰用户。
+- Chrome 里没开 Dots 页面时自己开一个（10-07：用户关了标签，转发器报了一晚上 no_tab）：
+  先在 CDP 的默认上下文里开后台标签，核对是同一个 Dot 才留下；不行再用 `open
+  --profile-directory` 让 Chrome 在登录了 Dots 的资料里打开，开完把用户原来的前台 app 切回去。
+  CDP 只能在默认上下文里建标签，别的资料会报「Failed to find browser context」，所以要有后一条。
 """
 
 import json as _json
 import os as _os
+import re as _re
 import time as _time
 
 
@@ -68,6 +73,10 @@ _WAKE_FILE = _env("DOTS_WAKE_FILE")                          # runner 往这里 
 _DL_DIR = _env("DOTS_DL_DIR", "/tmp/cc-dots-files")
 _DL_MAX = _env_float("DOTS_DL_MAX_BYTES", 30 * 1024 * 1024)  # Lark 文件上限 30MB
 _SEND_CONFIRM = max(5.0, _env_float("DOTS_SEND_CONFIRM_SEC", 30))
+_HOME_URL = _env("DOTS_HOME_URL", "https://chatgpt.com/dots")
+_CHROME_PROFILE = _env("DOTS_CHROME_PROFILE")                # 如 "Profile 38"；不配就用自己记下的
+_OPEN_WAIT = max(10.0, _env_float("DOTS_OPEN_WAIT_SEC", 30))  # 新开的标签最多等这么久加载完
+_SETTLE = max(3.0, _env_float("DOTS_SETTLE_SEC", 20))        # 发送前最多等页面跳完这么久
 
 _SID = None
 
@@ -153,26 +162,240 @@ def _busy():
         return "?"
 
 
-def _attach():
-    global _SID
+# ── 找 / 开 Dots 标签页 ─────────────────────────────────
+_PAGE_JS = r"""(()=>({ready:document.readyState, path:location.pathname,
+  composer:!!document.querySelector('.ProseMirror[contenteditable=true]')}))()"""
+# 豆包页面打开后会自己跳两次：/dots → /dots/home → /dots/<对话 id>，每跳一次输入框就重建一次。
+# 10-07 23:53「写进去的是 ''」就是字写进了马上要被换掉的那个输入框。停在对话页才算跳完。
+_ROOM_PATH_RE = _re.compile(r"/dots/[0-9a-f]{8}-[0-9a-f]{4}-")
+
+_CTX = None  # 当前挂着的标签在哪个 browserContext（= 哪个 Chrome 资料）
+
+
+def _memo_path():
+    # 每个 bot profile 一份：runner 给的 wake 文件名里带着 profile 名（cc-dots-wake-<profile>）
+    key = _os.path.basename(_WAKE_FILE).replace("cc-dots-wake-", "") if _WAKE_FILE else ""
+    return _os.path.join(_os.path.expanduser("~/.cache/cc-dots"), "chrome-%s.json" % (key or "default"))
+
+
+def _memo():
+    """自己记下的 {room: Dot 房间, profile_dir: 登录了 Dots 的 Chrome 资料目录}。"""
+    try:
+        with open(_memo_path(), encoding="utf-8") as f:
+            d = _json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _remember(**kw):
+    d = _memo()
+    if all(d.get(k) == v for k, v in kw.items()):
+        return
+    d.update(kw)
+    try:
+        _os.makedirs(_os.path.dirname(_memo_path()), exist_ok=True)
+        tmp = _memo_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(d, f, ensure_ascii=False)
+        _os.replace(tmp, _memo_path())
+    except OSError:
+        pass
+
+
+def _dots_pages():
     targets = cdp("Target.getTargets")["targetInfos"]
     pages = [t for t in targets if t.get("type") == "page" and _URL_MATCH in (t.get("url") or "")]
-    if not pages:
-        raise _DotsError(
-            "no_tab",
-            "Chrome 里没找到 Dots 页面（URL 含 %r）。请在登录了 Dots 的 Chrome profile 里打开 "
-            "https://chatgpt.com/dots 并保持标签页开着。" % _URL_MATCH,
-        )
-    _SID = cdp("Target.attachToTarget", targetId=pages[0]["targetId"], flatten=True)["sessionId"]
-    state = _ev("document.readyState", 20)
-    if state not in ("interactive", "complete"):
-        raise _DotsError("tab_unavailable", "Dots 标签页未就绪（readyState=%r），可能被 Chrome 休眠了，点开一下再试。" % state)
+    pages.sort(key=lambda t: 0 if _ROOM_PATH_RE.search(t.get("url") or "") else 1)  # 停在对话页的优先
+    return pages
+
+
+def _attach_to(target_id):
+    global _SID, _CTX
+    _detach()
+    _SID = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
+    try:
+        _CTX = cdp("Target.getTargetInfo", targetId=target_id)["targetInfo"].get("browserContextId")
+    except Exception:
+        _CTX = None
 
 
 def _detach():
+    global _SID
     if _SID:
         try:
             cdp("Target.detachFromTarget", sessionId=_SID)
+        except Exception:
+            pass
+    _SID = None
+
+
+def _settle(timeout, need_composer=False, need_room=False):
+    """等页面加载完；need_room 还要等它跳到对话页，need_composer 还要等输入框出来。
+    超时了但页面本身能用（比如 Dots 改了路由）就照常往下走，页面一直没加载出来才报错。"""
+    deadline = _time.time() + timeout
+    reloaded = False
+    while True:
+        try:
+            st = _ev(_PAGE_JS, 10) or {}
+        except _DotsError:
+            st = {}
+        loaded = st.get("ready") in ("interactive", "complete")
+        usable = loaded and (st.get("composer") or not need_composer)
+        path = st.get("path") or ""
+        # 跳出了 /dots（没登录会被带去登录页）就别干等，交给调用方去核对
+        if usable and (not need_room or _ROOM_PATH_RE.search(path) or "/dots" not in path):
+            return
+        now = _time.time()
+        if now >= deadline:
+            if usable:
+                return
+            raise _DotsError(
+                "tab_unavailable",
+                "Dots 标签页没加载出来（%s），可能被 Chrome 休眠了或掉了登录，点开看一下再试。"
+                % ("找不到输入框" if loaded else "readyState=%r" % st.get("ready")),
+            )
+        # 后台标签被 Chrome 省内存丢弃后是个空壳，刷新一次把它叫回来
+        if not loaded and not reloaded and now > deadline - timeout / 2:
+            reloaded = True
+            try:
+                cdp("Page.reload", session_id=_SID)
+            except Exception:
+                pass
+        _time.sleep(0.5)
+
+
+def _front_app():
+    import subprocess as _sp
+    try:
+        out = _sp.run(["/bin/sh", "-c", 'lsappinfo info -only bundleid "$(lsappinfo front)"'],
+                      capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+    m = _re.search(r'bundleID="([^"]+)"', out or "")
+    return m.group(1) if m else ""
+
+
+def _is_our_dot(memo):
+    """新开的标签登录的是不是我们那个 Dot：账号下得有记下来的房间（还没记过就有 Dot 就行）。
+    CDP 的默认上下文不一定是登录了 Dots 的那个 Chrome 资料，别把话发给别的账号。"""
+    try:
+        if not memo.get("room"):
+            _resolve_room()
+            return True
+        items = _api("/backend-api/messaging/rooms?limit=32").get("items") or []
+        return any(r.get("id") == memo["room"] for r in items)
+    except _DotsError:
+        return False
+
+
+def _open_in_default_context(memo):
+    """在 CDP 默认上下文里开一个后台标签（不抢前台、不弹窗）。不是我们的 Dot 就关掉。"""
+    try:
+        tid = cdp("Target.createTarget", url=_HOME_URL, background=True)["targetId"]
+    except Exception:
+        return False
+    try:
+        _attach_to(tid)
+        _settle(_OPEN_WAIT, need_room=True)
+        if _is_our_dot(memo):
+            return True
+    except _DotsError:
+        pass
+    _detach()
+    try:
+        cdp("Target.closeTarget", targetId=tid)
+    except Exception:
+        pass
+    return False
+
+
+def _open_with_profile(profile_dir):
+    """让 Chrome 自己在指定资料里打开 Dots。open 会把 Chrome 拉到前台（-g 也拦不住，10-07
+    实测），所以开完把用户原来在用的 app 切回去。"""
+    import subprocess as _sp
+    front = _front_app()
+    try:
+        _sp.run(["/usr/bin/open", "-g", "-na", "Google Chrome", "--args",
+                 "--profile-directory=" + profile_dir, _HOME_URL], capture_output=True, timeout=15)
+        deadline = _time.time() + 20
+        while _time.time() < deadline:
+            pages = _dots_pages()
+            if pages:
+                _attach_to(pages[0]["targetId"])
+                _settle(_OPEN_WAIT, need_room=True)
+                return True
+            _time.sleep(0.5)
+        return False
+    except _DotsError:
+        return False
+    finally:
+        if front and front != "com.google.Chrome":
+            try:
+                _sp.run(["/usr/bin/open", "-b", front], capture_output=True, timeout=10)
+            except Exception:
+                pass
+
+
+def _open_tab():
+    import fcntl as _fcntl
+    memo = _memo()
+    prof = _CHROME_PROFILE or memo.get("profile_dir") or ""
+    _os.makedirs(_os.path.dirname(_memo_path()), exist_ok=True)
+    with open(_memo_path() + ".lock", "w") as lk:
+        _fcntl.flock(lk, _fcntl.LOCK_EX)  # 转发器和发消息可能同时发现没标签，别各开一个
+        pages = _dots_pages()
+        if pages:  # 等锁的时候别人已经开好了
+            _attach_to(pages[0]["targetId"])
+            _settle(_OPEN_WAIT, need_room=True)
+            return
+        if _open_in_default_context(memo):
+            return
+        if prof and _open_with_profile(prof):
+            return
+    raise _DotsError(
+        "no_tab",
+        "Chrome 里没有 Dots 页面，自动打开也没成功%s。请在登录了 Dots 的 Chrome 资料里打开 %s 并保持标签页开着。"
+        % ("" if prof else "（还不知道是哪个 Chrome 资料，可以配 DOTS_CHROME_PROFILE）", _HOME_URL),
+    )
+
+
+def _attach(need_composer=False):
+    pages = _dots_pages()
+    if pages:
+        _attach_to(pages[0]["targetId"])
+    else:
+        _open_tab()
+    _settle(_SETTLE, need_composer=need_composer, need_room=need_composer)
+
+
+def _learn_profile_dir():
+    """记下 Dots 标签在哪个 Chrome 资料目录，留给以后 open --profile-directory 兜底。
+    只能在默认上下文里开 chrome://version 读（CDP 只能在那里建标签），不在就算了。"""
+    if _CHROME_PROFILE or _memo().get("profile_dir") or not _CTX:
+        return
+    if _CTX != cdp("Target.getBrowserContexts").get("defaultBrowserContextId"):
+        return
+    tid = cdp("Target.createTarget", url="chrome://version", background=True)["targetId"]
+    sid = None
+    try:
+        sid = cdp("Target.attachToTarget", targetId=tid, flatten=True)["sessionId"]
+        for _ in range(20):
+            r = cdp("Runtime.evaluate", session_id=sid, returnByValue=True, _response_timeout=10,
+                    expression="(document.getElementById('profile_path')||{}).innerText||''")
+            path = ((r.get("result") or {}).get("value") or "").strip().rstrip("/")
+            if path:
+                _remember(profile_dir=_os.path.basename(path))
+                return
+            _time.sleep(0.3)
+    finally:
+        if sid:
+            try:
+                cdp("Target.detachFromTarget", sessionId=sid)
+            except Exception:
+                pass
+        try:
+            cdp("Target.closeTarget", targetId=tid)
         except Exception:
             pass
 
@@ -420,6 +643,15 @@ def _send(room, dot_ids, text, files):
     _type_prompt(text)
     _time.sleep(0.5)
     typed = _ev(_COMPOSER_TEXT_JS, 10) or ""
+    if text.strip() and _norm(text)[:20] not in _norm(typed) and not files:
+        # 输入框在打字的半路被换掉了（页面又跳了一次）：等它稳下来再打一遍。
+        # 带附件的不重来，附件可能还挂在上面，再传一遍会重复。
+        _clear_composer()
+        _settle(_SETTLE, need_composer=True, need_room=True)
+        if _ev(_COMPOSER_JS, 20) == "ok":
+            _type_prompt(text)
+            _time.sleep(0.5)
+            typed = _ev(_COMPOSER_TEXT_JS, 10) or ""
     if text.strip() and _norm(text)[:20] not in _norm(typed):
         _clear_composer()
         raise _DotsError("type_failed", "往 Dots 输入框写入失败（写进去的是 %r）。" % typed[:80])
@@ -493,8 +725,13 @@ def _stream(room, dot_ids, cursor):
 
 def _main():
     try:
-        _attach()
+        _attach(need_composer=_ACTION == "send")
         room, name, dot_ids = _resolve_room()
+        _remember(room=room)
+        try:
+            _learn_profile_dir()
+        except Exception:  # noqa: BLE001 — 只是给以后兜底用的，学不到不影响这次
+            pass
         _emit("room", room=room, name=name)
         if _ACTION == "status":
             label = _busy()

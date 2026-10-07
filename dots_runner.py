@@ -24,6 +24,8 @@
 配置（全局 DOTS_*，可用 <PROFILE>_DOTS_* 按 profile 覆盖）：
   DOTS_BROWSER_HARNESS_BIN  默认 ~/.local/bin/browser-harness
   DOTS_URL_MATCH            标签页 URL 子串，默认 chatgpt.com/dots
+  DOTS_CHROME_PROFILE       登录了 Dots 的 Chrome 资料目录（如 "Profile 38"）。没开 Dots 标签时 driver
+                            会自己开，这个只是最后一道兜底用的；不配的话 driver 会自己记下来
   DOTS_ROOM_ID / DOTS_NAME  账号下有多个 Dot 时指定一个（默认取最近活跃的）
   DOTS_POLL_SEC=2.5  DOTS_IDLE_POLL_SEC=15  DOTS_ACTIVE_WINDOW_SEC=300   转发器轮询节奏
   DOTS_NOTIFY_OPEN_ID       还没人私聊过时，豆包主动发的消息转给谁（默认白名单里第一个）
@@ -210,7 +212,7 @@ def _driver_env(profile_name: str, action: str, **extra) -> dict:
     env = dict(os.environ)
     env["PATH"] = os.pathsep.join([os.path.expanduser("~/.local/bin"), env.get("PATH", "")])
     env["DOTS_ACTION"] = action
-    for key in ("URL_MATCH", "ROOM_ID", "NAME", "POLL_SEC", "IDLE_POLL_SEC", "ACTIVE_WINDOW_SEC"):
+    for key in ("URL_MATCH", "ROOM_ID", "NAME", "POLL_SEC", "IDLE_POLL_SEC", "ACTIVE_WINDOW_SEC", "CHROME_PROFILE"):
         v = dots_cfg(profile_name, key)
         if v:
             env[f"DOTS_{key}"] = v
