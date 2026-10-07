@@ -1320,16 +1320,13 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
 
     lock = bot._ensure_chat_lock(chat_id)
 
+    # 任务在跑时，新消息先试着直接插进正在跑的进程（不排队）；! 开头 = 打断改道
+    if lock.locked() and not bot.profile.is_trinity:
+        if await _inject_or_steer(bot, user_id, chat_id, is_group, thread_id, msg, lock):
+            return
+
     if lock.locked():
-        try:
-            await bot.feishu.reply_text(
-                msg.message_id,
-                # 纯文本通道（Lark 这条不过 markdown），别加反引号
-                "📬 前面还有任务在跑，排队中（/stop 可打断；"
-                "/status、/usage 这类只读命令不用排队，随时可发）",
-            )
-        except Exception:
-            pass
+        await _reply_queued_notice(bot, msg.message_id)
 
     async with lock:
         try:
@@ -1351,6 +1348,161 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
                     await bot.feishu.send_text_to_user(user_id, err_text)
             except Exception:
                 pass
+
+
+async def _reply_queued_notice(bot: BotInstance, message_id: str) -> None:
+    try:
+        await bot.feishu.reply_text(
+            message_id,
+            # 纯文本通道（Lark 这条不过 markdown），别加反引号
+            "📬 前面还有任务在跑，排队中（/stop 可打断；"
+            "/status、/usage 这类只读命令不用排队，随时可发）",
+        )
+    except Exception:
+        pass
+
+
+# ── 运行中插话 ────────────────────────────────────────────────────────────
+# 话题里任务在跑时又来一条消息：claude print 后端开了 CLAUDE_PRINT_STREAM_INPUT 时
+# 直接写进正在跑的进程，不再排队等整个任务结束（实测见 claude_runner.RunInput）。
+_STEER_MARKS = ("!", "！")
+_INJECT_FRAME = (
+    "【任务进行中 · 用户追加的消息】你正在做上面的任务时，用户在话题里又发了下面这条。"
+    "是补充或修正就据此调整后接着做；是新问题就先简短回答，再接着做原来的任务。\n\n"
+)
+_STEER_FRAME = (
+    "【用户打断了你正在做的事】上一步已被中止（正在跑的命令可能只执行了一部分，必要时先核实）。"
+    "请改按下面的新指令继续，不要重复已经做过的写操作 / 命令 / 文件改动：\n\n"
+)
+
+
+def _raw_text_of(msg, is_group: bool) -> str:
+    """text / post 消息去掉 @ 后的文字，只用来判断是不是命令、是不是 ! 开头。"""
+    try:
+        if msg.message_type == "text":
+            t = json.loads(msg.content).get("text", "")
+        elif msg.message_type == "post":
+            t = parse_post_content(msg.content)
+        else:
+            return ""
+    except Exception:
+        return ""
+    if is_group:
+        t = strip_lark_mentions(t, getattr(msg, "mentions", None))
+    return (t or "").strip()
+
+
+def _strip_steer_mark(text: str) -> str:
+    """去掉开头的一个 ! / ！（连同后面的空白）。带图富文本的正文是「文字内容：！…」。"""
+    t = (text or "").lstrip()
+    if t[:1] in _STEER_MARKS:
+        return t[1:].lstrip()
+    return re.sub(r"(文字内容：)\s*[!！]\s*", r"\1", text or "", count=1)
+
+
+async def _inject_or_steer(
+    bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, msg,
+    lock: asyncio.Lock,
+) -> bool:
+    """话题里有任务在跑时的新消息。返回 True = 已处理，False = 照旧排队。
+
+    - 普通消息：priority=next 写进正在跑的进程，当前这一步（工具调用）做完就送达。
+    - 第一个字是 ! 或 ！：软中断当前这一轮，立刻按新指令接着跑（同进程、上下文不丢）。
+      插不进进程（其他后端 / 没开 stream 输入 / 还在等并发额度）时，退回「停掉当前
+      任务，再按新指令续跑」。
+    先发的图片 / 文件照旧经话题上下文带进去（和正常一条消息一样走 _attach_thread_context）。
+    """
+    tag = bot.profile.name
+    run = bot.active_runs.get_run(user_id, chat_id)
+    if run is None or run.stop_requested:
+        return False
+    raw = _raw_text_of(msg, is_group)
+    if raw.startswith("/"):
+        return False  # 命令走原路径（排队后照常处理）
+    steer = raw[:1] in _STEER_MARKS
+    run_input = getattr(run, "input", None)
+    if not steer and not (run_input is not None and getattr(run_input, "open", False)):
+        return False
+
+    extracted = await _extract_message_text(bot, user_id, is_group, thread_id, msg)
+    if extracted is None:
+        return True
+    text, preview_text = extracted
+    if steer:
+        text = _strip_steer_mark(text)
+        preview_text = _strip_steer_mark(preview_text)
+    if thread_id:
+        text = await _attach_thread_context(bot, user_id, chat_id, thread_id, msg, text)
+        if text is None:
+            return True
+    if not text.strip():
+        try:
+            await bot.feishu.reply_text(
+                msg.message_id, "ℹ️ 这条消息没有内容，也没有新的话题消息可读，没有插进任务。")
+        except Exception:
+            pass
+        return True
+    preview = _short_arg((preview_text or raw or "[附件]").strip(), 60)
+
+    # 判断和写入之间有好几次网络请求（下载附件、拉话题历史），进程可能已经收尾——重新取
+    run = bot.active_runs.get_run(user_id, chat_id)
+    run_input = getattr(run, "input", None) if run is not None else None
+    if run is not None and not run.stop_requested and run_input is not None:
+        body = (
+            _turn_header(msg.message_id, user_id, thread_id=thread_id)
+            + (_STEER_FRAME if steer else _INJECT_FRAME)
+            + text
+        )
+        uid = await (run_input.steer(body) if steer else run_input.send(body, "next"))
+        if uid:
+            log(tag, "inject", "info",
+                f"{'打断改道' if steer else '插话'}已写进运行中的进程 "
+                f"uid={uid[:8]} len={len(text)} chat={chat_id[:24]}")
+            if run.on_inject is not None:
+                try:
+                    await run.on_inject(preview, steer)
+                except Exception as e:
+                    log(tag, "inject", "warn", f"卡片标记插话失败: {_err_desc(e)}")
+            try:
+                await bot.feishu.reply_text(
+                    msg.message_id,
+                    "⏹ 已打断当前任务，按这条新指令接着做" if steer else
+                    "📨 已插进正在执行的任务：当前这一步做完就处理，不用等整个任务结束",
+                )
+            except Exception:
+                pass
+            return True
+        log(tag, "inject", "info", "进程正好在收尾，插不进去，改走排队")
+
+    if steer and run is not None and not run.stop_requested:
+        # 插不进进程：停掉当前任务，拿到锁后按新指令续跑（resume 同一会话）
+        log(tag, "inject", "info", f"! 打断：当前任务没有可写入的进程，停掉后续跑 chat={chat_id[:24]}")
+        try:
+            await stop_run(bot.active_runs, user_id, chat_id,
+                           on_stopped=lambda r: _announce_stopped_run(bot, r))
+        except Exception as e:
+            log(tag, "inject", "warn", f"停止当前任务失败: {_err_desc(e)}")
+        text = _STEER_FRAME + text
+    elif lock.locked():
+        await _reply_queued_notice(bot, msg.message_id)
+
+    async with lock:
+        try:
+            await _start_agent_run(
+                bot, user_id, chat_id, is_group, thread_id, msg, text, preview_text)
+        except Exception as e:
+            log(tag, "msg", "error", f"消息处理异常: {type(e).__name__}: {e}")
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
+            try:
+                err_text = f"❌ 异常退出：{type(e).__name__}: {e}"
+                if is_group:
+                    await bot.feishu.reply_text(msg.message_id, err_text)
+                else:
+                    await bot.feishu.send_text_to_user(user_id, err_text)
+            except Exception:
+                pass
+    return True
 
 
 def _queued_card_text() -> str:
@@ -1804,6 +1956,35 @@ async def _execute_run(
 
     heartbeat_task = asyncio.create_task(_heartbeat())
 
+    # ── 运行中插话（claude print 后端 + CLAUDE_PRINT_STREAM_INPUT）──────────
+    # 一个进程可能跑好几轮（插话没赶上工具间隙 / 被 ! 打断改道），每轮的最终文本都收着，
+    # 收尾时一起展示，别让前一轮的完整回答被挤进「过程」区截掉。
+    turn_results: list[str] = []
+    cur_input = None  # 这次 run_agent 拿到的 RunInput（进程意外退出时从它取没送达的插话）
+
+    async def _on_turn_result(final: str):
+        final = (final or "").strip()
+        if final:
+            turn_results.append(final)
+
+    def _attach_input(run_input):
+        nonlocal cur_input
+        cur_input = run_input
+        run_input.on_turn_result = _on_turn_result
+        active_run.input = run_input
+
+    async def _mark_injection(preview: str, steer: bool):
+        """在卡片上标出插话的位置（插进正在跑的进程那一刻）。"""
+        nonlocal accumulated, last_push_time
+        if _stopping():
+            return
+        label = "⏹ **打断，改为**" if steer else "📩 **插话**"
+        accumulated += f"\n\n{label}：{preview}\n\n"
+        await push(_build_display())
+        last_push_time = time.time()
+
+    active_run.on_inject = _mark_injection
+
     # 本轮消息 id / 提问者写在用户消息最前面（system prompt 里不放每轮都变的字段）
     claude_msg = _turn_header(notify_msg_id, user_id, thread_id=thread_id) + text
     # 外层 try/finally 让 active_run 的生命周期对齐 lock —— 后处理（卡片 patch、发✅、
@@ -1835,6 +2016,17 @@ async def _execute_run(
 
         try:
             while True:
+                # 上一个进程意外退出（续跑 / 切号 / 降级重试）时，已经插进去但模型还没
+                # 开始处理的话会跟着进程一起没了——补在这次的消息后面。
+                prev_input, cur_input = cur_input, None
+                active_run.input = None
+                if prev_input is not None:
+                    turn_results.clear()  # 和重试分支清 accumulated 对齐：卡片从续跑那轮重新画
+                lost = prev_input.undelivered() if prev_input is not None else []
+                if lost:
+                    claude_msg += _undelivered_block(lost)
+                    log(bot.profile.name, "inject", "info",
+                        f"进程重启，补发 {len(lost)} 条未送达的插话")
                 try:
                     # 一轮只写一行（以前"开始调用..."和"开始调用 runner=..."各写一行，纯重复）
                     if retry_count == 0:
@@ -1861,6 +2053,7 @@ async def _execute_run(
                         should_stop=_stopping,
                         append_system_prompt=append_system_prompt or None,
                         wake_context=wake_context,
+                        on_input_ready=_attach_input,
                     )
                     # /stop 或 /restart 已接管最终卡片；runner 被 TERM 后即使带着
                     # partial output“成功”返回，也不能再把中断提示覆盖成结果 + ✅。
@@ -2204,6 +2397,7 @@ async def _execute_run(
                 except Exception:
                     pass
             clean = _format_run_error(last_exc)
+            lost = cur_input.undelivered() if cur_input is not None else []
             attempts = retry_count + stall_count
             err_brief = (
                 f"❌ 自动重试 {attempts} 次后仍失败：{clean}"
@@ -2255,6 +2449,11 @@ async def _execute_run(
                 )
             else:
                 err_card = err_brief
+            if lost:
+                err_card += (
+                    "\n\n📭 任务中途补充的这些话还没来得及处理，需要的话请重发：\n"
+                    + "\n".join(f"- {_short_arg(t.strip(), 60)}" for t in lost)
+                )
             async with active_run.card_update_lock:
                 if _stopping():
                     return
@@ -2293,7 +2492,11 @@ async def _execute_run(
 
         # 收尾卡片 = 中间过程（去掉工具执行行）+ 分隔 + 最终产出。process 为空
         # （单段自包含回复）时退回只显示干净结论，不给简单回答强加过程区。
-        process_text, result_text = _split_process_and_result(accumulated, full_text)
+        if len(turn_results) > 1:
+            process_text, result_text = _compose_multi_turn(accumulated, turn_results)
+            full_text = result_text
+        else:
+            process_text, result_text = _split_process_and_result(accumulated, full_text)
         final = result_text or "（无输出）"
         # 选项只从最终产出里认，别被过程叙述里的候选文本污染。
         options = _extract_options(result_text) or ask_options
@@ -2425,6 +2628,8 @@ async def _execute_run(
         # interactive 卡"初始快照"限制，本来也拿不到子的最终答案文本）。错误路径上面已 return（→None）。
         return full_text
     finally:
+        active_run.input = None
+        active_run.on_inject = None
         _drop_resume(bot, active_run)
         bot.active_runs.clear_run(user_id, chat_id, active_run)
 
@@ -2438,142 +2643,10 @@ async def _process_message(
     log(tag, "process", "info",
         f"user={user_id[:8]}... chat={chat_id[:10]}... "
         f"thread={thread_id[:10] if thread_id else '-'} is_group={is_group}")
-    text = ""
-    preview_text = ""
-
-    if msg.message_type == "text":
-        try:
-            text = json.loads(msg.content).get("text", "").strip()
-        except Exception:
-            return
-        if not text:
-            return
-
-        if is_group:
-            text = strip_lark_mentions(text, getattr(msg, 'mentions', None))
-            if not text and not thread_id:
-                return
-
-        preview_text = text
-        log(tag, "text", "info", f"{text[:50] if text else '(空)'}")
-
-    elif msg.message_type == "image":
-        try:
-            image_key = json.loads(msg.content).get("image_key", "")
-            if not image_key:
-                return
-            img_path = await bot.feishu.download_image(msg.message_id, image_key)
-            text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
-            preview_text = "[图片]"
-        except Exception as e:
-            log(tag, "image", "error", f"下载图片失败: {e}")
-            if is_group:
-                try:
-                    await bot.feishu.reply_card(msg.message_id, content=f"❌ 下载图片失败：{e}", loading=False)
-                except Exception:
-                    pass
-            else:
-                await bot.feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
-            return
-
-    elif msg.message_type == "audio":
-        try:
-            content_obj = json.loads(msg.content)
-            file_key = content_obj.get("file_key", "")
-            if not file_key:
-                return
-            duration_ms = int(content_obj.get("duration") or 0)
-            audio_path = await bot.feishu.download_file(
-                msg.message_id, file_key, msg_type="audio", file_name="voice.opus",
-            )
-            transcript = await bot.feishu.speech_to_text(audio_path, file_id=msg.message_id)
-            if not transcript:
-                raise RuntimeError("识别结果为空（可能没说话或环境噪音过大）")
-            text = (
-                f"[用户发送了一条语音消息（{duration_ms // 1000}s），以下为自动转写，"
-                f"可能存在同音字/分词误差，请按口语理解]\n{transcript}"
-            )
-            preview_text = f"🎤 {transcript[:40]}"
-            log(tag, "audio", "info", f"转写 {duration_ms}ms → {transcript[:50]}")
-        except Exception as e:
-            log(tag, "audio", "error", f"语音转写失败: {e}")
-            if is_group:
-                try:
-                    await bot.feishu.reply_card(msg.message_id, content=f"❌ 语音转写失败：{e}", loading=False)
-                except Exception:
-                    pass
-            else:
-                await bot.feishu.send_text_to_user(user_id, f"❌ 语音转写失败：{e}")
-            return
-
-    elif msg.message_type == "file":
-        try:
-            content_obj = json.loads(msg.content)
-            file_key = content_obj.get("file_key", "")
-            file_name = content_obj.get("file_name", "") or "file"
-            if not file_key:
-                return
-            fpath = await bot.feishu.download_file(
-                msg.message_id, file_key, msg_type="file", file_name=file_name,
-            )
-            text = (
-                f"[用户发送了文件：{file_name}，本地路径：{fpath}。"
-                f"请根据需要读取该文件并分析，用中文回复。]"
-            )
-            # Telegram 的文件/视频可以带一句说明（caption），Lark 的 file 消息没有
-            # 这个字段，所以这里读到就带上、读不到就照旧。
-            caption = (content_obj.get("caption") or "").strip()
-            if caption:
-                text += f"\n用户对这个文件的说明：{caption}"
-            preview_text = f"[文件 {file_name}]"
-        except Exception as e:
-            log(tag, "file", "error", f"下载文件失败: {e}")
-            if is_group:
-                try:
-                    await bot.feishu.reply_card(msg.message_id, content=f"❌ 下载文件失败：{e}", loading=False)
-                except Exception:
-                    pass
-            else:
-                await bot.feishu.send_text_to_user(user_id, f"❌ 下载文件失败：{e}")
-            return
-
-    elif msg.message_type == "post":
-        post_text = parse_post_content(msg.content).strip()
-        image_keys = extract_post_image_keys(msg.content)
-
-        if is_group:
-            post_text = strip_lark_mentions(post_text, getattr(msg, 'mentions', None))
-
-        img_paths: list[str] = []
-        for ik in image_keys:
-            try:
-                path = await bot.feishu.download_image(msg.message_id, ik)
-                img_paths.append(path)
-            except Exception as e:
-                log(tag, "post", "warn", f"下载 post 图片失败 key={ik[:8]}...: {e}")
-
-        if not post_text and not img_paths:
-            log(tag, "post", "info", "空内容，忽略")
-            return
-
-        if img_paths:
-            paths_list = "\n".join(f"  - {p}" for p in img_paths)
-            caption = post_text or "（无文字说明）"
-            text = (
-                f"[用户发送了富文本消息，含 {len(img_paths)} 张图片]\n"
-                f"文字内容：{caption}\n"
-                f"图片路径：\n{paths_list}\n"
-                f"请读取并分析这些图片，结合文字回复（中文）。"
-            )
-            preview_text = post_text[:40] if post_text else f"[富文本 + {len(img_paths)} 图]"
-        else:
-            text = post_text
-            preview_text = post_text
-
-        log(tag, "post", "info", f"text_len={len(post_text)} imgs={len(img_paths)}")
-
-    else:
+    extracted = await _extract_message_text(bot, user_id, is_group, thread_id, msg)
+    if extracted is None:
         return
+    text, preview_text = extracted
 
     # ── 斜杠命令 ──────────────────────────────────────────────
     parsed = parse_command(text)
@@ -2645,42 +2718,220 @@ async def _process_message(
     if thread_id and is_builtin_passthrough(text):
         log(tag, "thread", "info", "透传内置命令，跳过话题上下文注入")
     elif thread_id:
-        try:
-            last_seen = await bot.store.get_last_seen(user_id, chat_id)
-            context_block, ctx_paths, ctx_err = await build_thread_context(
-                bot.feishu, thread_id, last_seen, msg.message_id,
-                cli_profile=bot.profile.lark_cli_profile or bot.profile.name,
-            )
-            if ctx_err:
-                # 拉历史失败（多半缺 im:message.group_msg 权限）。不再静默吞掉：
-                # 结构化告警 + 告诉用户读不到历史。失败时【不推进 last_seen】，
-                # 权限修好后下次仍能补全这段 backlog。
-                log(tag, "thread", "warn", f"拉取话题历史失败（缺权限？）: {ctx_err}")
-                hint = _thread_ctx_error_hint(ctx_err)
-                if text.strip():
-                    text = f"{hint}\n\n【用户说】\n{text}"
-                else:
-                    # 只 @ 没正文，本来就指望历史 → 直接回提示，不浪费一次 runner 调用
-                    try:
-                        await bot.feishu.reply_card(
-                            msg.message_id, content=hint, loading=False,
-                        )
-                    except Exception:
-                        pass
-                    return
-            else:
-                if context_block:
-                    log(tag, "thread", "info",
-                        f"注入上下文 last_seen={last_seen[:12] if last_seen else '-'}, "
-                        f"附件={len(ctx_paths)}")
-                    if text.strip():
-                        text = f"{context_block}\n\n【用户刚刚 @ 你并说】\n{text}"
-                    else:
-                        text = f"{context_block}\n\n【用户刚刚 @ 你，没有新正文，请基于上方内容回复】"
-                await bot.store.set_last_seen(user_id, chat_id, msg.message_id)
-        except Exception as e:
-            log(tag, "thread", "warn", f"构建上下文失败（继续处理当前消息）: {e}")
+        text = await _attach_thread_context(bot, user_id, chat_id, thread_id, msg, text)
+        if text is None:
+            return
 
+    await _start_agent_run(
+        bot, user_id, chat_id, is_group, thread_id, msg, text, preview_text,
+        session=session, trinity_ctx=trinity_ctx,
+    )
+
+
+async def _extract_message_text(
+    bot: BotInstance, user_id: str, is_group: bool, thread_id: str, msg,
+) -> Optional[tuple[str, str]]:
+    """把一条飞书消息转成给 agent 的正文：下载图片 / 文件、语音转写、富文本拆图。
+
+    返回 (text, preview_text)；None = 不用处理（空消息，或已经向用户报过错）。
+    群聊话题里只 @ 没正文时返回空 text，由话题上下文补齐。
+    """
+    tag = bot.profile.name
+    text = ""
+    preview_text = ""
+
+    if msg.message_type == "text":
+        try:
+            text = json.loads(msg.content).get("text", "").strip()
+        except Exception:
+            return None
+        if not text:
+            return None
+
+        if is_group:
+            text = strip_lark_mentions(text, getattr(msg, 'mentions', None))
+            if not text and not thread_id:
+                return None
+
+        preview_text = text
+        log(tag, "text", "info", f"{text[:50] if text else '(空)'}")
+
+    elif msg.message_type == "image":
+        try:
+            image_key = json.loads(msg.content).get("image_key", "")
+            if not image_key:
+                return None
+            img_path = await bot.feishu.download_image(msg.message_id, image_key)
+            text = f"[用户发送了一张图片，路径：{img_path}，请读取并分析这张图片，直接回复用中文]"
+            preview_text = "[图片]"
+        except Exception as e:
+            log(tag, "image", "error", f"下载图片失败: {e}")
+            if is_group:
+                try:
+                    await bot.feishu.reply_card(msg.message_id, content=f"❌ 下载图片失败：{e}", loading=False)
+                except Exception:
+                    pass
+            else:
+                await bot.feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
+            return None
+
+    elif msg.message_type == "audio":
+        try:
+            content_obj = json.loads(msg.content)
+            file_key = content_obj.get("file_key", "")
+            if not file_key:
+                return None
+            duration_ms = int(content_obj.get("duration") or 0)
+            audio_path = await bot.feishu.download_file(
+                msg.message_id, file_key, msg_type="audio", file_name="voice.opus",
+            )
+            transcript = await bot.feishu.speech_to_text(audio_path, file_id=msg.message_id)
+            if not transcript:
+                raise RuntimeError("识别结果为空（可能没说话或环境噪音过大）")
+            text = (
+                f"[用户发送了一条语音消息（{duration_ms // 1000}s），以下为自动转写，"
+                f"可能存在同音字/分词误差，请按口语理解]\n{transcript}"
+            )
+            preview_text = f"🎤 {transcript[:40]}"
+            log(tag, "audio", "info", f"转写 {duration_ms}ms → {transcript[:50]}")
+        except Exception as e:
+            log(tag, "audio", "error", f"语音转写失败: {e}")
+            if is_group:
+                try:
+                    await bot.feishu.reply_card(msg.message_id, content=f"❌ 语音转写失败：{e}", loading=False)
+                except Exception:
+                    pass
+            else:
+                await bot.feishu.send_text_to_user(user_id, f"❌ 语音转写失败：{e}")
+            return None
+
+    elif msg.message_type == "file":
+        try:
+            content_obj = json.loads(msg.content)
+            file_key = content_obj.get("file_key", "")
+            file_name = content_obj.get("file_name", "") or "file"
+            if not file_key:
+                return None
+            fpath = await bot.feishu.download_file(
+                msg.message_id, file_key, msg_type="file", file_name=file_name,
+            )
+            text = (
+                f"[用户发送了文件：{file_name}，本地路径：{fpath}。"
+                f"请根据需要读取该文件并分析，用中文回复。]"
+            )
+            # Telegram 的文件/视频可以带一句说明（caption），Lark 的 file 消息没有
+            # 这个字段，所以这里读到就带上、读不到就照旧。
+            caption = (content_obj.get("caption") or "").strip()
+            if caption:
+                text += f"\n用户对这个文件的说明：{caption}"
+            preview_text = f"[文件 {file_name}]"
+        except Exception as e:
+            log(tag, "file", "error", f"下载文件失败: {e}")
+            if is_group:
+                try:
+                    await bot.feishu.reply_card(msg.message_id, content=f"❌ 下载文件失败：{e}", loading=False)
+                except Exception:
+                    pass
+            else:
+                await bot.feishu.send_text_to_user(user_id, f"❌ 下载文件失败：{e}")
+            return None
+
+    elif msg.message_type == "post":
+        post_text = parse_post_content(msg.content).strip()
+        image_keys = extract_post_image_keys(msg.content)
+
+        if is_group:
+            post_text = strip_lark_mentions(post_text, getattr(msg, 'mentions', None))
+
+        img_paths: list[str] = []
+        for ik in image_keys:
+            try:
+                path = await bot.feishu.download_image(msg.message_id, ik)
+                img_paths.append(path)
+            except Exception as e:
+                log(tag, "post", "warn", f"下载 post 图片失败 key={ik[:8]}...: {e}")
+
+        if not post_text and not img_paths:
+            log(tag, "post", "info", "空内容，忽略")
+            return None
+
+        if img_paths:
+            paths_list = "\n".join(f"  - {p}" for p in img_paths)
+            caption = post_text or "（无文字说明）"
+            text = (
+                f"[用户发送了富文本消息，含 {len(img_paths)} 张图片]\n"
+                f"文字内容：{caption}\n"
+                f"图片路径：\n{paths_list}\n"
+                f"请读取并分析这些图片，结合文字回复（中文）。"
+            )
+            preview_text = post_text[:40] if post_text else f"[富文本 + {len(img_paths)} 图]"
+        else:
+            text = post_text
+            preview_text = post_text
+
+        log(tag, "post", "info", f"text_len={len(post_text)} imgs={len(img_paths)}")
+
+    else:
+        return None
+
+    return text, preview_text
+
+
+async def _attach_thread_context(
+    bot: BotInstance, user_id: str, chat_id: str, thread_id: str, msg, text: str,
+) -> Optional[str]:
+    """把上次读到之后的话题消息（含先发的图片 / 文件）拼到 text 前面，并推进 last_seen。
+
+    返回拼好的正文；None = 已经回了用户提示（拉历史失败又没有正文），不用再跑。
+    """
+    tag = bot.profile.name
+    try:
+        last_seen = await bot.store.get_last_seen(user_id, chat_id)
+        context_block, ctx_paths, ctx_err = await build_thread_context(
+            bot.feishu, thread_id, last_seen, msg.message_id,
+            cli_profile=bot.profile.lark_cli_profile or bot.profile.name,
+        )
+        if ctx_err:
+            # 拉历史失败（多半缺 im:message.group_msg 权限）。不再静默吞掉：
+            # 结构化告警 + 告诉用户读不到历史。失败时【不推进 last_seen】，
+            # 权限修好后下次仍能补全这段 backlog。
+            log(tag, "thread", "warn", f"拉取话题历史失败（缺权限？）: {ctx_err}")
+            hint = _thread_ctx_error_hint(ctx_err)
+            if text.strip():
+                text = f"{hint}\n\n【用户说】\n{text}"
+            else:
+                # 只 @ 没正文，本来就指望历史 → 直接回提示，不浪费一次 runner 调用
+                try:
+                    await bot.feishu.reply_card(
+                        msg.message_id, content=hint, loading=False,
+                    )
+                except Exception:
+                    pass
+                return None
+        else:
+            if context_block:
+                log(tag, "thread", "info",
+                    f"注入上下文 last_seen={last_seen[:12] if last_seen else '-'}, "
+                    f"附件={len(ctx_paths)}")
+                if text.strip():
+                    text = f"{context_block}\n\n【用户刚刚 @ 你并说】\n{text}"
+                else:
+                    text = f"{context_block}\n\n【用户刚刚 @ 你，没有新正文，请基于上方内容回复】"
+            await bot.store.set_last_seen(user_id, chat_id, msg.message_id)
+    except Exception as e:
+        log(tag, "thread", "warn", f"构建上下文失败（继续处理当前消息）: {e}")
+    return text
+
+
+async def _start_agent_run(
+    bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, msg,
+    text: str, preview_text: str, *, session=None,
+    trinity_ctx: Optional[TrinityContext] = None,
+):
+    """开占位卡片、拼系统提示，交给 _run_and_display 跑。调用方须已持有 per-chat lock。"""
+    tag = bot.profile.name
+    if session is None:
+        session = await bot.store.get_current(user_id, chat_id)
     if not text.strip():
         try:
             await bot.feishu.reply_card(
@@ -2837,6 +3088,32 @@ def _split_process_and_result(accumulated: str, result: str) -> tuple[str, str]:
     if proc.endswith(res):
         proc = proc[: len(proc) - len(res)].strip()
     return proc, res
+
+
+def _compose_multi_turn(accumulated: str, turn_results: list[str]) -> tuple[str, str]:
+    """一个进程跑了好几轮（插话 / 打断改道）时的收尾拆分。
+
+    结论区 = 每一轮的最终文本依次排开（后面几轮是对插话的回复）；过程区 = 流式
+    累积的文字里抠掉这些最终文本，剩下的叙述和插话标记。"""
+    from agy_runner import clean_leaked_system_output
+    proc = accumulated or ""
+    for res in reversed(turn_results):
+        i = proc.rfind(res)
+        if i >= 0:
+            proc = proc[:i] + proc[i + len(res):]
+    proc = clean_leaked_system_output(re.sub(r"\n{3,}", "\n\n", proc).strip())
+    cleaned = [clean_leaked_system_output(r) for r in turn_results]
+    result = cleaned[0] + "".join(
+        f"\n\n---\n\n📩 **插话的回复**\n\n{r}" for r in cleaned[1:]
+    )
+    return proc, result
+
+
+def _undelivered_block(texts: list[str]) -> str:
+    return (
+        "\n\n【任务中途用户还补充了下面这些话，进程中断前没来得及处理，请一并处理】\n\n"
+        + "\n\n---\n\n".join(t.strip() for t in texts)
+    )
 
 
 # Claude CLI TUI 输出的 ANSI 控制序列（CSI / OSC / DEC private mode / 单字符）。
@@ -4433,6 +4710,40 @@ async def steer_or_append_thread(
     running = run is not None and not run.stop_requested
     busy = running or bot._ensure_chat_lock(chat_id).locked()
     anchor = (run.card_msg_id if run else "") or anchor
+
+    # 目标任务的进程能直接写（claude print + stream 输入）：不杀进程、不排队，直接写进去。
+    # steer = 软中断 + now；append = later（当前这一轮做完再执行）。
+    run_input = getattr(run, "input", None) if running else None
+    if run_input is not None and getattr(run_input, "open", False):
+        if stop_first:
+            uid = await run_input.steer(_STEER_FRAME + instruction.strip())
+            head, title = "⏹ 已打断当前任务，按新指令接着做（同一进程，上下文完整）", "🛠 打断并改指令"
+        else:
+            uid = await run_input.send(
+                "【编排 agent 追加的指令，当前这一轮做完后执行】\n\n" + instruction.strip(), "later")
+            head, title = "📨 已排进正在跑的任务，当前这一轮做完就接着执行", "➕ 追加指令"
+        if uid:
+            log(bot.profile.name, "inject", "info",
+                f"MCP {'steer' if stop_first else 'append'} 已写进运行中的进程 uid={uid[:8]}")
+            if run.on_inject is not None:
+                try:
+                    await run.on_inject(_short_arg(instruction.strip(), 60), stop_first)
+                except Exception:
+                    pass
+            body_text = f"{head}\n执行者：{bot.profile.name}\n\n【完整指令】\n{instruction.strip()}"
+            try:
+                await bot.feishu.reply_post(anchor, title=title, body_text=body_text)
+            except Exception:
+                try:
+                    await bot.feishu.reply_text(anchor, body_text)
+                except Exception:
+                    pass
+            return {
+                "ok": True, "thread_id": thread_id,
+                "agent": bot.profile.name,
+                "mode": "steer" if stop_first else "append",
+                "stopped": False, "queued": False, "injected": True,
+            }
 
     do_stop = stop_first and running
     if do_stop:

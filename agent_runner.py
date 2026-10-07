@@ -34,10 +34,13 @@ async def run_agent(
     should_stop: Optional[Callable[[], bool]] = None,
     append_system_prompt: Optional[str] = None,
     wake_context: Optional[dict] = None,
+    on_input_ready: Optional[Callable[[object], None]] = None,
 ) -> tuple[str, Optional[str], bool]:
     """wake_context: 本轮 Lark 会话上下文（CC_LARK_* 形态）。
 
     Claude/Codex 后端会把它透传给 cc_mcp_server，让 wake/dispatch/cron 能定向到本话题。
+    on_input_ready: 只有 claude print 后端（开了 CLAUDE_PRINT_STREAM_INPUT）会回调，
+    拿到的 RunInput 可往运行中的进程补消息；其他后端忽略。
     """
     backend = (runner or profile.runner or "claude").strip().lower()
     if backend == "dots":
@@ -251,6 +254,7 @@ async def run_agent(
     if profile.claude_runner:
         # profile 级子后端选择优先于 claude env 文件，便于单独切换某个 bot。
         claude_env = {**claude_env, "CLAUDE_RUNNER": profile.claude_runner}
+    input_kwargs = {"on_input_ready": on_input_ready} if on_input_ready is not None else {}
     return await run_claude(
         message=message,
         session_id=session_id,
@@ -265,4 +269,5 @@ async def run_agent(
         on_status=on_status,
         append_system_prompt=append_system_prompt,
         extra_env=claude_env or None,
+        **input_kwargs,
     )

@@ -735,12 +735,12 @@ def test_safe_stale_callback_query_has_no_grace_but_fails_closed():
 # ── 消息类型 → dispatcher 分支 ──────────────────────────────
 
 def test_safe_every_produced_type_has_a_dispatcher_branch():
-    """网关只会产出 text/image/post/audio/file 这 5 种；_process_message 的
-    else 分支是"直接 return"，多一种就是静默丢消息。"""
+    """网关只会产出 text/image/post/audio/file 这 5 种；_extract_message_text（从
+    _process_message 拆出来的按类型取正文）的 else 分支是"直接 return"，多一种就是静默丢消息。"""
     import inspect
     import dispatcher
 
-    src = inspect.getsource(dispatcher._process_message)
+    src = inspect.getsource(dispatcher._extract_message_text)
     bot = _bot()
     samples = {
         "text": _msg(),

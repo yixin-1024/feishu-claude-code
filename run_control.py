@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import subprocess
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
@@ -28,6 +29,57 @@ def _kill_pgroup(proc, sig: int) -> bool:
         return False
 
 
+def _descendant_pids(pid) -> list[int]:
+    """pid 的整棵子孙进程（pgrep -P 逐层找；Linux / macOS 通用）。拿不到就空列表。"""
+    try:
+        root = int(pid)
+    except (TypeError, ValueError):
+        return []
+    if root <= 1:
+        return []
+    found: list[int] = []
+    frontier = [root]
+    while frontier and len(found) < 500:
+        try:
+            out = subprocess.run(
+                ["pgrep", "-P", ",".join(str(p) for p in frontier)],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+        except Exception:
+            break
+        frontier = [int(x) for x in out.split() if x.isdigit() and int(x) not in found]
+        found.extend(frontier)
+    return found
+
+
+def _terminate_pids(pids: list[int]) -> None:
+    """SIGTERM 还活着的进程（已经退出的忽略）。只用于刚记下的 runner 子孙进程。"""
+    me = os.getpid()
+    for pid in pids:
+        if pid in (me, os.getppid()) or pid <= 1:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _kill_orphaned_group(proc) -> None:
+    """组长已经退出后，SIGTERM 它留下的同组进程。
+
+    组长被回收后 getpgid(pid) 会失败，_kill_pgroup 用不了；runner 都是
+    start_new_session=True 起的，pgid == 组长 pid，直接按 pid killpg。绝不碰 bot
+    自己所在的组。组里已经没人时 ProcessLookupError，忽略。
+    """
+    try:
+        pgid = int(proc.pid)
+        if pgid <= 1 or pgid == os.getpgrp():
+            return
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, AttributeError, TypeError, ValueError):
+        pass
+
+
 @dataclass
 class ActiveRun:
     user_id: str
@@ -51,6 +103,11 @@ class ActiveRun:
     resume_key: str = ""
     # True = 收尾时别删落盘记录（重启中断，留给下个进程续跑）。
     keep_resume: bool = False
+    # ── 运行中插话（claude print 后端 + CLAUDE_PRINT_STREAM_INPUT）──────
+    # input：claude_runner.RunInput，进程开着时可往里补消息 / 软中断；其他后端为 None。
+    # on_inject(preview, steer)：_execute_run 挂的回调，在卡片上标出插话位置。
+    input: object | None = None
+    on_inject: Callable[[str, bool], Awaitable[None]] | None = field(default=None, repr=False)
 
 
 def _key(user_id: str, chat_id: str) -> str:
@@ -118,6 +175,27 @@ async def stop_run(
 
     active_run.stop_requested = True
     proc = active_run.proc
+    run_input = getattr(active_run, "input", None)
+    if (
+        proc is not None
+        and getattr(proc, "returncode", None) is None
+        and run_input is not None
+        and getattr(run_input, "open", False)
+    ):
+        # stream-json 输入的 claude 进程先软中断再关 stdin：正在跑的工具当场结束，
+        # 进程自己退出，session 里留下标准的「被用户打断」记录（之后 resume 不会
+        # 接到半截的轮次）。退不掉再走下面的 SIGTERM / SIGKILL。
+        # Bash 工具跑的命令在各自独立的 session / 进程组里（实测 sid≠claude），killpg
+        # 打不到；先记下整棵进程树，CLI 退出后还活着的逐个补刀。
+        tree = _descendant_pids(getattr(proc, "pid", None))
+        try:
+            await run_input.stop()
+            await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
+        except Exception:
+            pass
+        if getattr(proc, "returncode", None) is not None:
+            _kill_orphaned_group(proc)
+            _terminate_pids(tree)
     if proc is not None and getattr(proc, "returncode", None) is None:
         if not _kill_pgroup(proc, signal.SIGTERM):
             try:
