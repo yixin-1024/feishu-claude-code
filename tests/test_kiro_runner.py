@@ -289,3 +289,58 @@ def test_resolve_kiro_bin_prefers_configured(monkeypatch):
     assert kiro_runner.resolve_kiro_bin("~/bin/kiro-cli") == os.path.expanduser("~/bin/kiro-cli")
     monkeypatch.setattr(kiro_runner.shutil, "which", lambda name: "/usr/local/bin/kiro-cli")
     assert kiro_runner.resolve_kiro_bin(None) == "/usr/local/bin/kiro-cli"
+
+
+def test_default_effort_from_env_when_not_overridden(monkeypatch, agents_dir):
+    monkeypatch.setenv("KIRO_EFFORT", "medium")
+    captured = {}
+    _patch_exec(monkeypatch, [FakeProc(STREAM), FakeProc(STREAM)], captured)
+    _run(agents_dir, extra_env={"CC_LARK_PROFILE": "kiro"})
+    cmd = captured["calls"][0]["cmd"]
+    assert cmd[cmd.index("--effort") + 1] == "medium"
+    _run(agents_dir, effort="max", extra_env={"CC_LARK_PROFILE": "kiro"})
+    cmd = captured["calls"][1]["cmd"]
+    assert cmd[cmd.index("--effort") + 1] == "max"
+
+
+def test_default_effort_ignores_bad_value(monkeypatch):
+    monkeypatch.setenv("KIRO_EFFORT", "turbo")
+    assert kiro_runner.default_effort("kiro") is None
+    monkeypatch.setenv("KIRO_KIRO_EFFORT", "high")
+    assert kiro_runner.default_effort("kiro") == "high"
+
+
+USAGE_SCREEN = """
+› /usage
+────────────────────────────────────────
+ Estimated Usage | resets on 2026-11-01 | KIRO PRO
+ Credits (0.47 of 1000 covered in plan)
+ ████████████████ 0.0%
+ Since your account is through your organization, for account management please contact your account administrator.
+ esc to close                     Tab to switch to /context
+"""
+
+
+def test_parse_usage_screen():
+    u = kiro_runner.parse_kiro_usage_screen(USAGE_SCREEN)
+    assert u["plan"] == "KIRO PRO"
+    assert u["resets"] == "2026-11-01"
+    assert u["plan_credits"] == (0.47, 1000.0)
+
+
+def test_usage_lines_render_remaining_credits(monkeypatch):
+    import commands
+    monkeypatch.setattr(kiro_runner, "fetch_kiro_plan_usage", lambda *a, **k: {
+        "plan": "KIRO PRO", "resets": "2026-11-01", "plan_credits": (12.5, 1000.0)})
+    lines = commands._kiro_plan_lines(None)
+    assert lines[0] == "**订阅额度** — KIRO PRO（2026-11-01 重置）"
+    assert "已用 12.5 / 1000，剩 987.5" in lines
+
+
+def test_usage_lines_report_failure(monkeypatch):
+    import commands
+
+    def boom(*a, **k):
+        raise RuntimeError("no panel")
+    monkeypatch.setattr(kiro_runner, "fetch_kiro_plan_usage", boom)
+    assert "读取失败" in commands._kiro_plan_lines(None)[0]

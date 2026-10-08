@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -132,6 +133,16 @@ def _normalize_effort(effort: Optional[str]) -> Optional[str]:
     return e
 
 
+def default_effort(profile_name: Optional[str] = None) -> Optional[str]:
+    """profile 级默认强度：<PROFILE>_KIRO_EFFORT 优先，再退到 KIRO_EFFORT；非法值当没配。"""
+    prof = (profile_name or "").strip().upper()
+    raw = (os.getenv(f"{prof}_KIRO_EFFORT") if prof else None) or os.getenv("KIRO_EFFORT") or ""
+    try:
+        return _normalize_effort(raw)
+    except ValueError:
+        return None
+
+
 def context_window_for(model: Optional[str]) -> int:
     override = (os.getenv("KIRO_CONTEXT_WINDOW") or "").strip()
     if override.isdigit() and int(override) > 0:
@@ -160,6 +171,117 @@ def list_kiro_models(kiro_bin: Optional[str] = None, timeout: float = 30.0) -> l
     if models:
         _models_cache[key] = (time.time(), models)
     return models
+
+
+# ── 套餐额度（/usage）────────────────────────────────────────────
+# credits 余量只在交互界面的 /usage 面板里有（"Credits (0.47 of 1000 covered in plan)"）。
+# 开一个伪终端跑交互式 kiro-cli，敲 /usage 读屏再退出——不调模型、不花 credits。
+KIRO_USAGE_CWD = os.path.expanduser("~/.feishu-claude/kiro-usage")
+_USAGE_CACHE_TTL = 30
+_usage_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _screen_text(raw: bytes) -> str:
+    """TUI 输出转纯文本：光标右移换成空格，其余控制序列去掉。"""
+    t = raw.decode("utf-8", "replace")
+    t = re.sub(r"\x1b\[(\d*)C", lambda m: " " * int(m.group(1) or 1), t)
+    t = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", t)
+    t = re.sub(r"\x1b\[[0-9;?<>=]*[ -/]*[@-~]", "", t)
+    t = re.sub(r"\x1b[()][A-Za-z0-9]", "", t)
+    return t.replace("\r", "\n")
+
+
+def parse_kiro_usage_screen(text: str) -> dict:
+    """从 /usage 面板抠套餐额度；TUI 会重绘，同一项取最后一次出现的。"""
+    out: dict = {}
+    head = re.findall(r"Estimated\s+Usage\s*\|\s*resets\s+on\s+([0-9-]+)\s*\|\s*([^\n]+)", text, re.I)
+    if head:
+        out["resets"] = head[-1][0].strip()
+        out["plan"] = re.sub(r"\s+", " ", head[-1][1]).strip()
+    cred = re.findall(r"Credits\s*\(\s*([\d.,]+)\s+of\s+([\d.,]+)\s+covered\s+in\s+plan\s*\)", text, re.I)
+    if cred:
+        used, total = (float(x.replace(",", "")) for x in cred[-1])
+        out["plan_credits"] = (used, total)
+    over = re.findall(r"Overages?\s*[:(]?\s*([^\n)]+)", text, re.I)
+    if over:
+        out["overage"] = over[-1].strip()
+    return out
+
+
+def fetch_kiro_plan_usage(kiro_bin: Optional[str] = None, timeout: float = 40.0) -> dict:
+    """跑一次交互式 /usage，返回 parse_kiro_usage_screen 的结果；失败抛 RuntimeError。"""
+    import fcntl
+    import pty
+    import select
+    import signal
+    import struct
+    import termios
+
+    key = kiro_bin or ""
+    hit = _usage_cache.get(key)
+    if hit and time.time() - hit[0] < _USAGE_CACHE_TTL:
+        return hit[1]
+    os.makedirs(KIRO_USAGE_CWD, exist_ok=True)
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 140, 0, 0))
+    proc = subprocess.Popen(
+        [resolve_kiro_bin(kiro_bin), "chat", "--agent-engine", "v2"],
+        stdin=slave, stdout=slave, stderr=slave, cwd=KIRO_USAGE_CWD,
+        env=dict(os.environ, TERM="xterm-256color", CC_LARK_MIRROR_OFF="1"),
+        start_new_session=True, close_fds=True,
+    )
+    os.close(slave)
+    buf = bytearray()
+    deadline = time.time() + timeout
+
+    def pump(sec: float, until: Optional[str] = None, start: int = 0) -> bool:
+        end = min(time.time() + sec, deadline)
+        while time.time() < end:
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                return False
+            if not chunk:
+                return False
+            buf.extend(chunk)
+            if b"\x1b[6n" in chunk:  # 终端问光标位置，不答它会一直等
+                os.write(master, b"\x1b[1;1R")
+            if until and re.search(until, _screen_text(bytes(buf[start:])), re.I):
+                return True
+        return False
+
+    try:
+        pump(25, r"ask a question|describe a task")
+        mark = len(buf)
+        os.write(master, b"/usage")
+        pump(1.0)
+        os.write(master, b"\r")
+        pump(15, r"Credits\s*\(\s*[\d.,]+\s+of\s+[\d.,]+", start=mark)
+        pump(0.6)
+        result = parse_kiro_usage_screen(_screen_text(bytes(buf[mark:])))
+    finally:
+        try:
+            os.write(master, b"\x1b")
+            os.write(master, b"/quit\r")
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait(timeout=2)
+        os.close(master)
+    if "plan_credits" not in result:
+        tail = _screen_text(bytes(buf))[-300:].strip()
+        raise RuntimeError(f"没读到 /usage 面板：{tail[-160:]!r}")
+    _usage_cache[key] = (time.time(), result)
+    return result
 
 
 def _with_claude_context(append_system_prompt: Optional[str], cwd: Optional[str]) -> str:
@@ -291,7 +413,8 @@ async def run_kiro(
 ) -> tuple[str, Optional[str], bool]:
     """返回 (full_text, session_id, used_fresh_session_fallback)。"""
     del on_status  # kiro 没有独立的状态事件通道
-    resolved_effort = _normalize_effort(effort)
+    # /effort 没覆盖时用 profile 默认（KIRO_EFFORT）；session 里只存覆盖值
+    resolved_effort = _normalize_effort(effort) or default_effort((extra_env or {}).get("CC_LARK_PROFILE"))
     trust_all = bool(dangerously_skip_permissions) or (permission_mode or "").lower() in (
         "bypasspermissions", "bypass_permissions",
     )

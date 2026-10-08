@@ -209,11 +209,8 @@ def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[s
         return value if value in QODER_EFFORT_LEVELS else None
 
     if runner == "kiro":
-        raw = os.getenv(f"{profile_name.upper()}_KIRO_EFFORT") if profile_name else None
-        if raw is None:
-            raw = os.getenv("KIRO_EFFORT")
-        value = (raw or "").strip().lower()
-        return value if value in KIRO_EFFORT_LEVELS else None
+        from kiro_runner import default_effort
+        return default_effort(profile_name)
 
     return None
 
@@ -1287,6 +1284,32 @@ def _qoder_plan_lines(profile) -> list[str]:
     org = u.get("org_package")
     if org and org.upper() != "N/A":
         lines.append(f"组织资源包：{org}")
+    return lines
+
+
+def _kiro_plan_lines(profile) -> list[str]:
+    """Kiro 套餐额度（交互式 /usage 面板）；读不到就给一句原因。"""
+    from kiro_runner import fetch_kiro_plan_usage
+
+    try:
+        u = fetch_kiro_plan_usage(getattr(profile, "kiro_bin", "") or None)
+    except Exception as e:  # noqa: BLE001
+        return [f"**订阅额度**：读取失败（{type(e).__name__}: {str(e)[:120]}）"]
+    head = "**订阅额度**"
+    if u.get("plan"):
+        head += f" — {u['plan']}"
+    if u.get("resets"):
+        head += f"（{u['resets']} 重置）"
+    lines = [head]
+    used, total = u["plan_credits"]
+    if total > 0:
+        left = max(total - used, 0)
+        lines.append(f"套餐 credits 剩余 {_fmt_pct_bar(left / total)}")
+        lines.append(f"已用 {used:g} / {total:g}，剩 {left:g}")
+    else:
+        lines.append(f"套餐 credits：已用 {used:g}（无额度）")
+    if u.get("overage"):
+        lines.append(f"超额：{u['overage']}")
     return lines
 
 
@@ -2682,7 +2705,7 @@ async def handle_command(
             lines.append("Runner: `kiro`")
             lines.append(f"模型: `{model}`")
             lines.append("")
-            lines.append("套餐剩余额度只在 kiro-cli 交互界面的 `/usage` 里有（Kiro Pro 每月 1000 credits）。")
+            lines.extend(await asyncio.to_thread(_kiro_plan_lines, getattr(bot, "profile", None)))
             return _wrap_usage_output(lines)
         if runner == "grok":
             model = cur.get("model_override") or store.default_model

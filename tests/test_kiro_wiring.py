@@ -214,8 +214,13 @@ def test_kiro_prompt_uses_claude_runtime_mcp_section_with_adapter():
 
 
 @pytest.mark.asyncio
-async def test_usage_command_for_kiro(store):
+async def test_usage_command_for_kiro(store, monkeypatch):
+    import kiro_runner
+    monkeypatch.setattr(kiro_runner, "fetch_kiro_plan_usage", lambda *a, **k: {
+        "plan": "KIRO PRO", "resets": "2026-11-01", "plan_credits": (0.47, 1000.0)})
     reply = await handle_command("usage", "", "u", "oc_1", store, bot=_bot())
     text = reply["text"] if isinstance(reply, dict) else reply
     assert "Kiro CLI 用量" in text
     assert "Runner: `kiro`" in text
+    assert "KIRO PRO（2026-11-01 重置）" in text
+    assert "已用 0.47 / 1000，剩 999.53" in text
