@@ -62,6 +62,7 @@ KIRO_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 KIRO_HOME = os.path.expanduser("~/.kiro")
 KIRO_AGENTS_DIR = os.path.join(KIRO_HOME, "agents")
 KIRO_SKILLS_DIR = os.path.join(KIRO_HOME, "skills")
+KIRO_USER_MCP_JSON = os.path.join(KIRO_HOME, "settings", "mcp.json")
 _TEMP_AGENT_PREFIX = "cc-lark-"
 _STALE_AGENT_SEC = 6 * 3600
 
@@ -321,6 +322,32 @@ def _cleanup_stale_agents(agents_dir: str) -> None:
         pass
 
 
+def _picked_user_mcp_servers(path: Optional[str] = None) -> dict:
+    """CC_LARK_KIRO_MCP_SERVERS 点名的个人 MCP（逗号分隔的名字），从 ~/.kiro/settings/mcp.json 原样取。
+
+    useLegacyMcpJson 是全带或全不带；这里只带点了名的（Mac 上是 mac = Computer Use，它自己按
+    CC_LARK_USER_ID 只放行 owner），微信聊天记录那类照样留在 bot 外面。禁用的 / 没有的跳过。
+    """
+    names = [n.strip() for n in os.getenv("CC_LARK_KIRO_MCP_SERVERS", "").split(",") if n.strip()]
+    if not names:
+        return {}
+    path = path or KIRO_USER_MCP_JSON
+    try:
+        with open(path, encoding="utf-8") as fh:
+            servers = (json.load(fh) or {}).get("mcpServers") or {}
+    except (OSError, ValueError) as exc:
+        print(f"[run_kiro] 读不了 {path}，点名的 MCP 跳过: {exc}", flush=True)
+        return {}
+    picked = {}
+    for n in names:
+        cfg = servers.get(n)
+        if isinstance(cfg, dict) and not cfg.get("disabled"):
+            picked[n] = cfg
+        else:
+            print(f"[run_kiro] CC_LARK_KIRO_MCP_SERVERS 里的 {n} 在 {path} 里没有或已禁用，跳过", flush=True)
+    return picked
+
+
 def write_temp_agent(
     system_prompt: str,
     mcp_cfg: Optional[dict],
@@ -331,21 +358,25 @@ def write_temp_agent(
     os.makedirs(agents_dir, exist_ok=True)
     _cleanup_stale_agents(agents_dir)
     name = f"{_TEMP_AGENT_PREFIX}{uuid.uuid4().hex[:12]}"
+    use_user_mcp = os.getenv("CC_LARK_KIRO_USER_MCP", "0") == "1"
+    servers = {} if use_user_mcp else _picked_user_mcp_servers()
+    servers.update((mcp_cfg or {}).get("mcpServers") or {})  # 重名时 cc-lark 的为准
     cfg = {
         "name": name,
         "description": "cc-lark 每轮生成的临时 agent（跑完即删）",
         "prompt": system_prompt or None,
-        "mcpServers": (mcp_cfg or {}).get("mcpServers") or {},
+        "mcpServers": servers,
         "tools": ["*"],
         "allowedTools": ["*"] if trust_all else [],
         "resources": list(DEFAULT_RESOURCES),
         "hooks": {},
         "toolsSettings": {},
         # 用户自己在 ~/.kiro/settings/mcp.json 里配的 MCP 默认不带进 bot：那是个人工具（Mac 上是
-        # 微信聊天记录），群里的 bot 不该拿到；CC_LARK_KIRO_USER_MCP=1 打开。
+        # 微信聊天记录），群里的 bot 不该拿到；CC_LARK_KIRO_USER_MCP=1 全带，
+        # CC_LARK_KIRO_MCP_SERVERS=a,b 只带点名的（见 _picked_user_mcp_servers）。
         # ⚠️ 这个开关只管「并进本 agent」——会话开头 CLI 仍会按默认 agent 连一遍全局 MCP，
         # 连不上的 server（如只有 /sse 的 chatlog，405）会让每轮白等 30 秒，得在 mcp.json 里禁掉。
-        "useLegacyMcpJson": os.getenv("CC_LARK_KIRO_USER_MCP", "0") == "1",
+        "useLegacyMcpJson": use_user_mcp,
     }
     path = os.path.join(agents_dir, f"{name}.json")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

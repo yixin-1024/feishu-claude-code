@@ -182,7 +182,27 @@ def test_injects_cc_lark_mcp_into_temp_agent(monkeypatch, agents_dir):
     assert "CC_LARK_CONTROL_TOKEN" not in server["env"]
 
 
+def test_named_user_mcp_servers_join_temp_agent(monkeypatch, agents_dir, tmp_path):
+    user_mcp = tmp_path / "mcp.json"
+    user_mcp.write_text(json.dumps({"mcpServers": {
+        "mac": {"command": "/usr/bin/python3", "args": ["mac_cu_mcp.py"], "env": {"MAC_CU_HOST": "local"}},
+        "chatlog": {"url": "http://127.0.0.1:5030/sse"},
+        "off": {"command": "x", "disabled": True},
+    }}))
+    monkeypatch.setattr(kiro_runner, "KIRO_USER_MCP_JSON", str(user_mcp))
+    monkeypatch.setenv("CC_LARK_KIRO_MCP_SERVERS", "mac, off, missing")
+    captured, cfg = {}, {}
+    _patch_exec(monkeypatch, [FakeProc(STREAM)], captured)
+    _run(agents_dir, on_process_start=lambda p: cfg.update(
+        json.load(open(os.path.join(agents_dir, os.listdir(agents_dir)[0])))),
+         extra_env={"CC_LARK_THREAD_ID": "omt_k", "CC_LARK_PROFILE": "kiro"})
+    assert set(cfg["mcpServers"]) == {"cc-lark", "mac"}  # 没点名的 / 禁用的 / 不存在的都不带
+    assert cfg["mcpServers"]["mac"]["env"]["MAC_CU_HOST"] == "local"
+    assert cfg["useLegacyMcpJson"] is False
+
+
 def test_no_thread_means_no_mcp(monkeypatch, agents_dir):
+    monkeypatch.delenv("CC_LARK_KIRO_MCP_SERVERS", raising=False)
     captured, cfg = {}, {}
     _patch_exec(monkeypatch, [FakeProc(STREAM)], captured)
     _run(agents_dir, on_process_start=lambda p: cfg.update(
