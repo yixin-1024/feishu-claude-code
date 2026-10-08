@@ -146,6 +146,7 @@ def test_streams_text_tools_usage_and_cleans_up_agent(monkeypatch, agents_dir):
     assert agent_seen["cfg"]["prompt"] == "SYS PROMPT"
     assert agent_seen["cfg"]["tools"] == ["*"] and agent_seen["cfg"]["allowedTools"] == ["*"]
     assert any(r.startswith("skill://") for r in agent_seen["cfg"]["resources"])
+    assert agent_seen["cfg"]["useLegacyMcpJson"] is False  # 个人 MCP 默认不带进 bot
     assert os.listdir(agents_dir) == []  # 跑完删掉
 
 

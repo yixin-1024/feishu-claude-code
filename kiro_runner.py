@@ -341,8 +341,11 @@ def write_temp_agent(
         "resources": list(DEFAULT_RESOURCES),
         "hooks": {},
         "toolsSettings": {},
-        # 用户自己在 ~/.kiro/settings/mcp.json 里配的 MCP 照样加载
-        "useLegacyMcpJson": True,
+        # 用户自己在 ~/.kiro/settings/mcp.json 里配的 MCP 默认不带进 bot：那是个人工具（Mac 上是
+        # 微信聊天记录），群里的 bot 不该拿到；CC_LARK_KIRO_USER_MCP=1 打开。
+        # ⚠️ 这个开关只管「并进本 agent」——会话开头 CLI 仍会按默认 agent 连一遍全局 MCP，
+        # 连不上的 server（如只有 /sse 的 chatlog，405）会让每轮白等 30 秒，得在 mcp.json 里禁掉。
+        "useLegacyMcpJson": os.getenv("CC_LARK_KIRO_USER_MCP", "0") == "1",
     }
     path = os.path.join(agents_dir, f"{name}.json")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
