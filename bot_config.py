@@ -33,6 +33,7 @@
 import io
 import json
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from typing import Optional
@@ -117,6 +118,11 @@ AGY_ONLY_MODELS = frozenset({
 QODER_TIER_MODELS = frozenset({"auto", "ultimate", "performance", "efficient", "sonus", "cantus"})
 QODER_MODEL_PREFIXES = ("qwen", "kimi-", "glm-", "deepseek-v", "deepseek-flash", "minimax-", "qoder")
 
+# kiro 的模型名（kiro-cli chat --list-models，2.28.0）：auto + Claude / GPT-5.6 / 开源权重。
+# Claude 那批写法是 claude-opus-5.5（点号），和 Claude Code 的 claude-opus-5-5 不是一回事。
+KIRO_MODEL_PREFIXES = ("gpt-5", "glm-", "deepseek-", "minimax-", "qwen3-", "kiro")
+_KIRO_CLAUDE_MODEL_RE = re.compile(r"^claude-(opus|sonnet|haiku)-\d+(\.\d+)?$")
+
 
 def is_model_compatible_with_runner(model: str, runner: str) -> bool:
     """判定 model 是否属于该 runner，防止把 Claude 模型（如 opus）误注入 agy/codex 等异构后端。"""
@@ -133,6 +139,9 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
         # 排除，否则会被下面的 claude-* 前缀误放行。注意用 AGY_ONLY_MODELS 而不是
         # AGY_THIRD_PARTY_MODELS —— claude-sonnet-4-6 两边都合法。
         if low in AGY_ONLY_MODELS:
+            return False
+        # kiro 的点号写法（claude-opus-5.5）Claude CLI 不认
+        if re.match(r"^claude-[a-z]+-\d+\.\d+$", low):
             return False
         # claude: opus, sonnet, haiku, fable, opusplan, best, 或 claude-* 开头，或 [1m] 结尾（非 google/quotio）
         if low.startswith("claude") or low in {"opus", "sonnet", "haiku", "fable", "opusplan", "best"}:
@@ -174,6 +183,14 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
         return (
             low in QODER_TIER_MODELS
             or low.startswith(QODER_MODEL_PREFIXES)
+        )
+
+    if runner == "kiro":
+        # kiro: auto + 它托管的模型（kiro-cli chat --list-models），或 kiro-* 别名
+        return (
+            low == "auto"
+            or low.startswith(KIRO_MODEL_PREFIXES)
+            or bool(_KIRO_CLAUDE_MODEL_RE.match(low))
         )
 
     if runner == "dots":
@@ -370,6 +387,10 @@ class Profile:
     qoder_api_key: str = ""
     qoder_dangerous_skip: int = 1
     qoder_idle_timeout_sec: int = 600
+    # kiro runner 配置（Kiro CLI，kiro-cli）。沿用本机 `kiro-cli login` 的登录态。
+    kiro_bin: str = ""
+    kiro_dangerous_skip: int = 1
+    kiro_idle_timeout_sec: int = 600
     # "会话群" chat_id：bot 在其它群被 @ 时（=调度 session），会被指引把任务派单到
     # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
     dispatch_chat_id: str = ""
@@ -471,9 +492,9 @@ def _load_profile(name: str) -> Profile:
 
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
-    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "dots"}:
+    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
         raise ValueError(
-            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka / agy / qoder / dots，"
+            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka / agy / qoder / kiro / dots，"
             f"当前: {runner}"
         )
     claude_runner = env("CLAUDE_RUNNER").strip().lower()
@@ -546,6 +567,14 @@ def _load_profile(name: str) -> Profile:
         qoder_idle = int(env("QODER_IDLE_TIMEOUT_SEC", os.getenv("QODER_IDLE_TIMEOUT_SEC", "600")) or "600")
     except ValueError:
         qoder_idle = 600
+    try:
+        kiro_skip = int(env("KIRO_DANGEROUS_SKIP", os.getenv("KIRO_DANGEROUS_SKIP", "1")) or "1")
+    except ValueError:
+        kiro_skip = 1
+    try:
+        kiro_idle = int(env("KIRO_IDLE_TIMEOUT_SEC", os.getenv("KIRO_IDLE_TIMEOUT_SEC", "600")) or "600")
+    except ValueError:
+        kiro_idle = 600
     return Profile(
         name=name,
         app_id=app_id,
@@ -621,6 +650,9 @@ def _load_profile(name: str) -> Profile:
         qoder_api_key=env("QODER_API_KEY", os.getenv("QODER_API_KEY", "")).strip(),
         qoder_dangerous_skip=max(0, min(1, qoder_skip)),
         qoder_idle_timeout_sec=max(0, qoder_idle),
+        kiro_bin=env("KIRO_BIN", os.getenv("KIRO_BIN", "")).strip(),
+        kiro_dangerous_skip=max(0, min(1, kiro_skip)),
+        kiro_idle_timeout_sec=max(0, kiro_idle),
         dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
         role=role,
         court_chat_id=env("COURT_CHAT_ID").strip(),
@@ -710,6 +742,14 @@ def _load_legacy_profile() -> Optional[Profile]:
         qoder_idle = int(os.getenv("QODER_IDLE_TIMEOUT_SEC", "600") or "600")
     except ValueError:
         qoder_idle = 600
+    try:
+        kiro_skip = int(os.getenv("KIRO_DANGEROUS_SKIP", "1") or "1")
+    except ValueError:
+        kiro_skip = 1
+    try:
+        kiro_idle = int(os.getenv("KIRO_IDLE_TIMEOUT_SEC", "600") or "600")
+    except ValueError:
+        kiro_idle = 600
     return Profile(
         name=legacy_name,
         app_id=app_id,
@@ -774,6 +814,9 @@ def _load_legacy_profile() -> Optional[Profile]:
         qoder_api_key=os.getenv("QODER_API_KEY", "").strip(),
         qoder_dangerous_skip=max(0, min(1, qoder_skip)),
         qoder_idle_timeout_sec=max(0, qoder_idle),
+        kiro_bin=os.getenv("KIRO_BIN", "").strip(),
+        kiro_dangerous_skip=max(0, min(1, kiro_skip)),
+        kiro_idle_timeout_sec=max(0, kiro_idle),
     )
 
 

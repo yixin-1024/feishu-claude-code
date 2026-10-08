@@ -392,7 +392,7 @@ class SessionStore:
         )
         self._default_cwd = default_cwd or DEFAULT_CWD
         self._default_runner = (default_runner or DEFAULT_RUNNER or "claude").strip().lower()
-        if self._default_runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "dots"}:
+        if self._default_runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
             self._default_runner = "claude"
         self._default_model = default_model or DEFAULT_MODEL
         self._chat_default_cwd = chat_default_cwd or {}
@@ -901,9 +901,11 @@ class SessionStore:
             normalized = "dots"
         if normalized in {"qodercli", "qoder-cli"}:
             normalized = "qoder"
-        if normalized not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "dots"}:
+        if normalized in {"kiro-cli", "kirocli"}:
+            normalized = "kiro"
+        if normalized not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
             raise ValueError(
-                "runner must be 'claude', 'codex', 'opencode', 'mimo', 'grok', 'maka', 'agy', 'qoder' or 'dots'"
+                "runner must be 'claude', 'codex', 'opencode', 'mimo', 'grok', 'maka', 'agy', 'qoder', 'kiro' or 'dots'"
             )
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]

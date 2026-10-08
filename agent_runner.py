@@ -1,4 +1,4 @@
-"""Claude / Codex / OpenCode / MiMo / Grok / Maka / agy / Qoder / Dots 后端分发入口。"""
+"""Claude / Codex / OpenCode / MiMo / Grok / Maka / agy / Qoder / Kiro / Dots 后端分发入口。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from grok_runner import run_grok
 from maka_runner import run_maka
 from agy_runner import run_agy
 from qoder_runner import run_qoder
+from kiro_runner import run_kiro
 from dots_runner import run_dots
 
 
@@ -219,6 +220,30 @@ async def run_agent(
             dangerously_skip_permissions=bool(profile.qoder_dangerous_skip),
             idle_timeout_sec=profile.qoder_idle_timeout_sec,
             extra_env=qoder_env,
+        )
+
+    if backend == "kiro":
+        # kiro 没有 --mcp-config：kiro_runner 把 cc-lark MCP（CC_LARK_* 显式写进 env）和
+        # 系统提示一起写进本轮的临时 agent 配置。
+        kiro_env = dict(wake_context or {})
+        kiro_env["CC_LARK_PROFILE"] = profile.name
+        return await run_kiro(
+            message=message,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            on_usage=on_usage,
+            on_status=on_status,
+            append_system_prompt=append_system_prompt,
+            kiro_bin=profile.kiro_bin,
+            dangerously_skip_permissions=bool(profile.kiro_dangerous_skip),
+            idle_timeout_sec=profile.kiro_idle_timeout_sec,
+            extra_env=kiro_env,
         )
 
     if backend == "codex":

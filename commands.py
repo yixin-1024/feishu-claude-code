@@ -28,6 +28,7 @@ from bot_config import (
 from grok_runner import GROK_EFFORT_LEVELS
 from agy_runner import AGY_EFFORT_LEVELS, resolve_agy_bin
 from qoder_runner import QODER_EFFORT_LEVELS
+from kiro_runner import KIRO_EFFORT_LEVELS
 from run_control import RUN_GATE
 from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title, _find_session_file
 
@@ -144,6 +145,19 @@ MODEL_ALIASES = {
     "qoder-glm": "GLM-5.3",
     "qoder-deepseek": "DeepSeek-V4-Pro",
     "qoder-minimax": "MiniMax-M3",
+    # Kiro CLI（kiro-cli）：名字照 `kiro-cli chat --list-models`，Claude 那批是点号写法
+    "kiro": "auto",
+    "kiro-auto": "auto",
+    "kiro-opus": "claude-opus-5.5",
+    "kiro-sonnet": "claude-sonnet-5.5",
+    "kiro-haiku": "claude-haiku-4.5",
+    "kiro-gpt": "gpt-5.6-terra",
+    "kiro-gpt-sol": "gpt-5.6-sol",
+    "kiro-gpt-luna": "gpt-5.6-luna",
+    "kiro-deepseek": "deepseek-3.2",
+    "kiro-glm": "glm-5",
+    "kiro-minimax": "minimax-m2.5",
+    "kiro-qwen": "qwen3-coder-next",
     # OpenAI Dots（网页里的 Dot）：模型由 Dot 自己决定，只有一个占位名
     "dots": "dots",
     "dot": "dots",
@@ -194,6 +208,13 @@ def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[s
         value = (raw or "").strip().lower()
         return value if value in QODER_EFFORT_LEVELS else None
 
+    if runner == "kiro":
+        raw = os.getenv(f"{profile_name.upper()}_KIRO_EFFORT") if profile_name else None
+        if raw is None:
+            raw = os.getenv("KIRO_EFFORT")
+        value = (raw or "").strip().lower()
+        return value if value in KIRO_EFFORT_LEVELS else None
+
     return None
 
 
@@ -233,7 +254,7 @@ HELP_TEXT = """\
 `/new` 或 `/clear` — 开始新 session
 `/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
-`/runner [codex|claude|opencode|mimo|grok|maka|agy|qoder]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka / Antigravity / Qoder CLI
+`/runner [codex|claude|opencode|mimo|grok|maka|agy|qoder|kiro]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka / Antigravity / Qoder CLI / Kiro CLI
 `/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID；会重开 session）
 `/fable` `/opus` `/sonnet` `/haiku` `[指令]` — 快捷切模型并**直接执行后面的指令**，沿用当前 session 不丢上下文（例：`/opus 帮我查一下数据库`；仅 claude runner 可用）
 `/effort [级别]` — 设置当前对话推理强度（default / low / medium / high / xhigh / max / ultra）
@@ -1288,6 +1309,8 @@ def _runner_default_model(bot, runner: str) -> str:
     if runner == "qoder":
         # Qwen3.8-Flash 限时免费（/model 面板 0.10x、实测 0 credits），Auto 一轮能吃掉几十 credits
         return "Qwen3.8-Flash"
+    if runner == "kiro":
+        return "auto"
     if runner == "dots":
         return "dots"
     return "sonnet[1m]"
@@ -2243,6 +2266,7 @@ async def handle_command(
                     {"text": "Maka", "value": {"action": "run_cmd", "cmd": "/runner maka", "cid": chat_id}},
                     {"text": "Antigravity", "value": {"action": "run_cmd", "cmd": "/runner agy", "cid": chat_id}},
                     {"text": "Qoder", "value": {"action": "run_cmd", "cmd": "/runner qoder", "cid": chat_id}},
+                    {"text": "Kiro", "value": {"action": "run_cmd", "cmd": "/runner kiro", "cid": chat_id}},
                     {"text": "OpenAI Dots", "value": {"action": "run_cmd", "cmd": "/runner dots", "cid": chat_id}},
                 ],
             }
@@ -2261,8 +2285,10 @@ async def handle_command(
             requested = "dots"
         if requested in {"qodercli", "qoder-cli"}:
             requested = "qoder"
-        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka", "agy", "qoder", "dots"}:
-            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）、`agy`（Antigravity CLI）、`qoder`（Qoder CLI）、`dots`（网页版 OpenAI Dots）".format(args)
+        if requested in {"kiro-cli", "kirocli"}:
+            requested = "kiro"
+        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
+            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）、`agy`（Antigravity CLI）、`qoder`（Qoder CLI）、`kiro`（Kiro CLI）、`dots`（网页版 OpenAI Dots）".format(args)
         model = _runner_default_model(bot, requested)
         await store.set_runner(user_id, chat_id, requested, model=model)
         return f"✅ 已切换 runner 为 `{requested}`，模型 `{model}`。已开始新 session。"
@@ -2321,6 +2347,18 @@ async def handle_command(
                     {"text": "GLM-5.3", "value": {"action": "run_cmd", "cmd": "/model qoder-glm", "cid": chat_id}},
                     {"text": "🐋 DeepSeek V4 Pro", "value": {"action": "run_cmd", "cmd": "/model qoder-deepseek", "cid": chat_id}},
                 ]
+            elif runner == "kiro":
+                buttons = [
+                    {"text": "🧭 Auto 1x", "value": {"action": "run_cmd", "cmd": "/model kiro-auto", "cid": chat_id}},
+                    {"text": "🧠 Opus 5.5 2x", "value": {"action": "run_cmd", "cmd": "/model kiro-opus", "cid": chat_id}},
+                    {"text": "⚡ Sonnet 5.5 1.3x", "value": {"action": "run_cmd", "cmd": "/model kiro-sonnet", "cid": chat_id}},
+                    {"text": "🪶 Haiku 4.5 0.4x", "value": {"action": "run_cmd", "cmd": "/model kiro-haiku", "cid": chat_id}},
+                    {"text": "🤖 GPT-5.6 Terra 2.2x", "value": {"action": "run_cmd", "cmd": "/model kiro-gpt", "cid": chat_id}},
+                    {"text": "☀️ GPT-5.6 Sol 4.4x", "value": {"action": "run_cmd", "cmd": "/model kiro-gpt-sol", "cid": chat_id}},
+                    {"text": "🌙 GPT-5.6 Luna 0.6x", "value": {"action": "run_cmd", "cmd": "/model kiro-gpt-luna", "cid": chat_id}},
+                    {"text": "🐋 DeepSeek 3.2 0.25x", "value": {"action": "run_cmd", "cmd": "/model kiro-deepseek", "cid": chat_id}},
+                    {"text": "🇨🇳 Qwen3 Coder 0.05x", "value": {"action": "run_cmd", "cmd": "/model kiro-qwen", "cid": chat_id}},
+                ]
             elif runner == "grok":
                 buttons = [
                     {"text": "🤖 GPT-5.4", "value": {"action": "run_cmd", "cmd": "/model wow-gpt", "cid": chat_id}},
@@ -2373,6 +2411,8 @@ async def handle_command(
             levels = GROK_EFFORT_LEVELS
         elif runner == "qoder":
             levels = QODER_EFFORT_LEVELS
+        elif runner == "kiro":
+            levels = KIRO_EFFORT_LEVELS
         elif runner == "maka":
             # maka 的 --thinking 档位（off 对应 cc-lark 的 none，由 maka_runner 归一）
             levels = ("minimal", "low", "medium", "high", "xhigh", "max")
@@ -2388,7 +2428,7 @@ async def handle_command(
                 )
             levels = AGY_EFFORT_LEVELS
         else:
-            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok`、`maka`、`agy` 或 `qoder`。"
+            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok`、`maka`、`agy`、`qoder` 或 `kiro`。"
 
         raw = await store.get_current_raw(user_id, chat_id)
         overridden = bool(raw.get("effort_override"))
@@ -2458,7 +2498,7 @@ async def handle_command(
         quota_line = (
             await asyncio.to_thread(_format_codex_rate_line, cur.get("session_id"))
             if runner == "codex"
-            else "" if runner in {"opencode", "mimo", "grok", "maka", "agy", "qoder", "dots"}
+            else "" if runner in {"opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}
             else await asyncio.to_thread(_get_quota_compact)
         )
 
@@ -2468,7 +2508,7 @@ async def handle_command(
             f"Runner: `{runner}`",
             f"模型: `{model}`",
         ]
-        if runner in {"claude", "codex", "grok", "maka", "agy", "qoder"}:
+        if runner in {"claude", "codex", "grok", "maka", "agy", "qoder", "kiro"}:
             effort_override = cur.get("effort_override")
             effort = _effective_effort_label(store, bot, runner, effort_override)
             effort_status = "当前对话覆盖" if effort_override else "跟随默认"
@@ -2623,6 +2663,26 @@ async def handle_command(
             lines.append(f"模型: `{model}`")
             lines.append("")
             lines.extend(await asyncio.to_thread(_qoder_plan_lines, getattr(bot, "profile", None)))
+            return _wrap_usage_output(lines)
+        if runner == "kiro":
+            model = cur.get("model_override") or store.default_model
+            lines = ["📈 **Kiro CLI 用量**"]
+            last_usage = cur.get("last_usage") or None
+            ctx_line = _format_context_line(
+                cur.get("session_id"),
+                model,
+                runner="kiro",
+                current_usage=last_usage,
+            )
+            if ctx_line:
+                lines.append(ctx_line)
+            turn = (last_usage or {}).get("_turn_credits")
+            if isinstance(turn, (int, float)):
+                lines.append(f"上一轮 credits: {turn:.2f}")
+            lines.append("Runner: `kiro`")
+            lines.append(f"模型: `{model}`")
+            lines.append("")
+            lines.append("套餐剩余额度只在 kiro-cli 交互界面的 `/usage` 里有（Kiro Pro 每月 1000 credits）。")
             return _wrap_usage_output(lines)
         if runner == "grok":
             model = cur.get("model_override") or store.default_model

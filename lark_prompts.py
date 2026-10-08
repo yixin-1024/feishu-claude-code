@@ -174,6 +174,17 @@ _AGY_MCP_ADAPTER = (
     "就当成不存在。\n\n"
 )
 
+# kiro(Kiro CLI) 把 MCP 工具按 `@<server>/<tool>` 挂进工具列表，没有 ToolSearch 那套
+# deferred 加载。下面这段贴在 claude 版说明前面做名字转译。
+_KIRO_MCP_ADAPTER = (
+    "【本后端（Kiro CLI）怎么调下面这些工具】\n"
+    "下文按 Claude 的命名写作 `mcp__cc-lark__<tool>`；在 Kiro 里它们就是 MCP server "
+    "`cc-lark` 下的同名工具（工具列表里显示成 `@cc-lark/wake_me_in` 这类），已经直接加载好，"
+    "**不需要也没有** ToolSearch / tool_search 这一步，直接按名字调用、参数原样传。"
+    "Kiro 自己的子 agent（delegate）同样跑在本轮进程组里，本轮结束就没了；要活过本轮的"
+    "并行子任务照样用 `dispatch_task`。\n\n"
+)
+
 _AGY_SYSTEM_NOTIFICATION_GUARD = (
     "【后台任务与系统通知处理规范】\n"
     "- 当收到后台异步任务（run_command 等 background task）或系统消息完成的回执通知时（如包含 `Command execution finished`、"
@@ -200,7 +211,7 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
     except Exception:  # noqa: BLE001 — 常量拿不到就退回历史默认
         _idle, _stuck = 300, 3600
 
-    if backend in {"claude", "codex", "qoder"} or backend not in {"opencode", "mimo", "grok", "maka", "agy"}:
+    if backend in {"claude", "codex", "qoder", "kiro"} or backend not in {"opencode", "mimo", "grok", "maka", "agy"}:
         if backend == "codex":
             idle = int(getattr(profile, "codex_idle_timeout_sec", 3600) or 3600)
             rules = [f"连续 {_fmt_minutes(idle)}没有任何新输出 → 强杀"]
@@ -214,6 +225,8 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
                 # qoder_runner 的判活和 claude print 同构（无输出且无子进程 / 有子进程但卡住 /
                 # wall-clock），只是「无输出」的阈值取 profile 的 qoder_idle_timeout_sec
                 _idle = int(getattr(profile, "qoder_idle_timeout_sec", 600) or 600)
+            elif backend == "kiro":
+                _idle = int(getattr(profile, "kiro_idle_timeout_sec", 600) or 600)
             rules = [
                 f"{_fmt_minutes(_idle)}内完全无输出且无子进程 → 强杀",
                 f"有子进程但你 {_fmt_minutes(_stuck)}没新输出 → 强杀",
@@ -366,8 +379,10 @@ def render_lark_prompt(
         ),
     }
     # qoder 的 MCP 工具名与 Claude 完全一致（mcp__cc-lark__*），直接用 Claude 那份
-    if backend in {"claude", "codex", "agy", "qoder"}:
+    if backend in {"claude", "codex", "agy", "qoder", "kiro"}:
         runtime_mcp_section = render("_runtime_mcp_claude", shared_ctx)
+        if backend == "kiro":
+            runtime_mcp_section = _KIRO_MCP_ADAPTER + runtime_mcp_section
         if backend == "agy":
             # agy 不把 MCP 工具铺平成 mcp__<server>__<tool>，而是统一走 call_mcp_tool，
             # 并前置后台任务回执防复读规范

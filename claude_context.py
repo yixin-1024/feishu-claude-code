@@ -1,4 +1,4 @@
-"""把本机 Claude Code 的规则 / 记忆 / skill 接给非 Claude 后端（目前是 qoder）。
+"""把本机 Claude Code 的规则 / 记忆 / skill 接给非 Claude 后端（qoder、kiro）。
 
 用户的长期规则和记忆都记在 Claude Code 那边，换个后端就全丢了：
   - 全局规则 ~/.claude/CLAUDE.md、项目规则 <dir>/CLAUDE.md —— qoder 只认 AGENTS.md
