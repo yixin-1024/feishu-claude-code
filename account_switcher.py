@@ -752,12 +752,15 @@ def urlopen_with_retry(req, *, context=None, timeout=10, retries=2, backoff=0.6)
     raise last_exc  # 理论不可达
 
 
-def _probe_one(acc: Account, is_current: bool = False) -> Account:
+def _probe_one(acc: Account, is_current: bool = False, *, refreshable: bool = True) -> Account:
     """同步阻塞探测单个账户。失败时填 probe_error，不抛。
 
     is_current=True（该账户 == 当前 keychain 活跃账户）：任何 refresh 都带
     sync_keychain，把轮换后的新 token 同步回 keychain，避免 cc-lark 在 CLI 背后
-    把活账户的 token 轮废。"""
+    把活账户的 token 轮废。
+
+    refreshable=False：setup-token 这类没有 refresh_token、也不在账户池里的凭证。
+    401/403 直接判失效，绝不按 acc.name 去刷 ~/.claude/accounts 里的同名 slot。"""
     import urllib.request
     import urllib.error
     import ssl
@@ -825,6 +828,9 @@ def _probe_one(acc: Account, is_current: bool = False) -> Account:
     headers, http_code, err = _send_probe(acc.access_token)
     if err is not None:
         acc.probe_error = err
+        return acc
+    if http_code in (401, 403) and not refreshable:
+        acc.probe_error = f"auth {http_code} — token 已失效或被吊销，需重新 `claude setup-token`"
         return acc
     if http_code in (401, 403):
         # access_token 还没到本地 expiresAt 但服务端已废（典型场景：用户在 Claude
@@ -1490,6 +1496,10 @@ def maybe_switch_before_spawn(*, force: bool = False) -> Optional[str]:
     这是同步阻塞调用（内部 probe_all 走网络）——调用方若在 asyncio loop 里，
     应丢到 executor 跑，别堵事件循环。"""
     global _last_spawn_probe_at
+    try:
+        sync_env_token_from_pool()  # 终端里改了选中的 token，这一拍就跟上
+    except Exception as e:  # noqa: BLE001
+        print(f"[switcher] 同步 env token 失败: {e}", flush=True)
     sw = _DEFAULT_SWITCHER
     if sw is None or not getattr(sw, "enabled", False):
         return None
@@ -1529,7 +1539,11 @@ _POOL_PINNING_ENVS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHRO
 
 
 def pinned_env_credential() -> tuple[str, str]:
-    """env 里钉死的凭证 → (env 变量名, token)；没钉死返回 ("", "")。"""
+    """env 里钉死的凭证 → (env 变量名, token)；没钉死返回 ("", "")。
+
+    登记了 env token 池时先按池里选中的那个同步 os.environ，保证探额度和
+    spawn 用的是同一份。"""
+    sync_env_token_from_pool()
     for key in _POOL_PINNING_ENVS:
         val = (os.environ.get(key) or "").strip()
         if val:
@@ -1543,11 +1557,163 @@ def probe_pinned_env_credential() -> Optional[Account]:
     key, token = pinned_env_credential()
     if not token:
         return None
+    name = (active_env_token_name() if key == _ENV_TOKEN_KEY else "") or f"env:{key}"
     try:
-        return _probe_one(Account(name=f"env:{key}", access_token=token))
+        return _probe_one(Account(name=name, access_token=token), refreshable=False)
     except Exception as e:  # noqa: BLE001
         print(f"[switcher] 探 env 钉死凭证失败: {type(e).__name__}: {e}", flush=True)
         return None
+
+
+# ── env token 池：几个 setup-token 之间切换 ─────────────────────────
+# 凭证被 env 钉死时账户池不生效，但钉的那份本身可以换：把 `claude setup-token`
+# 生成的长期 token 登记进 ENV_TOKENS_FILE，选中哪个就把它写进本进程的
+# os.environ[CLAUDE_CODE_OAUTH_TOKEN]——之后 spawn 的 claude 都继承它，正在跑的
+# 不受影响，不用改 .env 也不用重启。文件是真相源：探额度 / spawn 前都按它同步，
+# 所以终端里 `token-use` 改的选择下一轮也生效。池为空 = 功能关闭，只认 .env 那份。
+ENV_TOKENS_FILE = os.path.expanduser("~/.claude/env_tokens.json")
+_ENV_TOKEN_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def _load_env_tokens() -> dict:
+    """{"active": 名字, "tokens": {名字: token}}（登记顺序）；文件不存在 / 坏了按空池算。"""
+    try:
+        with open(ENV_TOKENS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    raw = d.get("tokens") if isinstance(d, dict) else None
+    tokens = {
+        str(k): v.strip() for k, v in (raw.items() if isinstance(raw, dict) else ())
+        if isinstance(v, str) and v.strip()
+    }
+    active = str(d.get("active") or "") if isinstance(d, dict) else ""
+    if active not in tokens:
+        active = next(iter(tokens), "")
+    return {"active": active, "tokens": tokens}
+
+
+def _save_env_tokens(pool: dict) -> None:
+    os.makedirs(os.path.dirname(ENV_TOKENS_FILE), mode=0o700, exist_ok=True)
+    tmp = ENV_TOKENS_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"active": pool.get("active") or "", "tokens": pool.get("tokens") or {}},
+                  f, indent=2)
+    os.replace(tmp, ENV_TOKENS_FILE)
+
+
+def env_token_names() -> list[str]:
+    """登记的 token 名（登记顺序）；空列表 = 没启用 token 池。"""
+    return list(_load_env_tokens()["tokens"])
+
+
+def active_env_token_name() -> str:
+    return _load_env_tokens()["active"]
+
+
+def list_env_tokens() -> list[dict]:
+    """[{name, active, fp}]，fp 是 token 的 sha256 前 8 位（核对用，不泄露 token）。"""
+    pool = _load_env_tokens()
+    return [
+        {"name": n, "active": n == pool["active"],
+         "fp": hashlib.sha256(t.encode()).hexdigest()[:8]}
+        for n, t in pool["tokens"].items()
+    ]
+
+
+def sync_env_token_from_pool() -> str:
+    """把池里选中的 token 写进本进程 env（不同才写），返回选中的名字；池为空返回 ""。"""
+    pool = _load_env_tokens()
+    name = pool["active"]
+    if not name:
+        return ""
+    token = pool["tokens"][name]
+    if os.environ.get(_ENV_TOKEN_KEY) != token:
+        os.environ[_ENV_TOKEN_KEY] = token
+        print(f"[switcher] env token → {name}", flush=True)
+    return name
+
+
+def add_env_token(name: str, token: str) -> tuple[bool, str]:
+    """登记（或覆盖同名）一个 setup-token。池里第一个自动成为选中项。"""
+    err = _validate_name(name)
+    if err:
+        return False, err
+    token = (token or "").strip()
+    if not token.startswith("sk-ant-") or any(c.isspace() for c in token):
+        return False, "token 应是 `claude setup-token` 输出的 sk-ant-… 那一整串"
+    with _ACCOUNT_SWITCH_LOCK:
+        pool = _load_env_tokens()
+        dup = next((n for n, t in pool["tokens"].items() if t == token and n != name), None)
+        if dup:
+            return False, f"这个 token 已经登记为 `{dup}`"
+        replaced = name in pool["tokens"]
+        pool["tokens"][name] = token
+        pool["active"] = pool["active"] or name
+        _save_env_tokens(pool)
+    return True, f"{'已更新' if replaced else '已登记'} token `{name}`"
+
+
+def remove_env_token(name: str) -> tuple[bool, str]:
+    with _ACCOUNT_SWITCH_LOCK:
+        pool = _load_env_tokens()
+        if name not in pool["tokens"]:
+            return False, f"没有登记名为 `{name}` 的 token"
+        if name == pool["active"] and len(pool["tokens"]) > 1:
+            return False, f"`{name}` 正在用，先切到别的再删"
+        del pool["tokens"][name]
+        _save_env_tokens(pool)
+    msg = f"已删除 token `{name}`"
+    if not pool["tokens"]:
+        msg += "；池已空，正在跑的 bot 仍用它直到重启（重启后回到 .env 那份）"
+    return True, msg
+
+
+def _activate_env_token_locked(name: str) -> tuple[bool, str]:
+    """调用方须持有 _ACCOUNT_SWITCH_LOCK。返回 (ok, "switched"|"already"|错误文案)。"""
+    pool = _load_env_tokens()
+    if name not in pool["tokens"]:
+        avail = "、".join(f"`{n}`" for n in pool["tokens"]) or "（无）"
+        return False, f"没有登记名为 `{name}` 的 token（已登记：{avail}）"
+    if pool["active"] == name:
+        sync_env_token_from_pool()
+        return True, "already"
+    pool["active"] = name
+    _save_env_tokens(pool)
+    sync_env_token_from_pool()
+    return True, "switched"
+
+
+def switch_env_token(name: str) -> tuple[bool, str]:
+    """手动切到池里的 `name`。返回 (ok, "switched"|"already"|错误文案)。"""
+    if not _ACCOUNT_SWITCH_LOCK.acquire(timeout=20):
+        return False, "另一个账户切换正在进行，稍后再试"
+    try:
+        return _activate_env_token_locked(name)
+    finally:
+        _ACCOUNT_SWITCH_LOCK.release()
+
+
+def _probe_env_token(acc: Account) -> Account:
+    try:
+        return _probe_one(acc, refreshable=False)
+    except Exception as e:  # noqa: BLE001
+        acc.probe_error = f"probe crashed: {e}"
+        return acc
+
+
+def probe_env_tokens(parallel: int = 4) -> dict[str, Account]:
+    """并行探测池里每个 token 的额度 → {名字: Account}（登记顺序）。"""
+    tokens = _load_env_tokens()["tokens"]
+    accs = [Account(name=n, access_token=t) for n, t in tokens.items()]
+    if not accs:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(parallel, len(accs)),
+                            thread_name_prefix="tok-probe") as ex:
+        list(ex.map(_probe_env_token, accs))
+    return {a.name: a for a in accs}
 
 
 def switch_on_limit_enabled() -> bool:
@@ -1575,6 +1741,8 @@ def emergency_switch_on_limit(*, notify: bool = True) -> dict:
         return out
     try:
         pin_key, _ = pinned_env_credential()
+        if pin_key == _ENV_TOKEN_KEY and len(env_token_names()) > 1:
+            return _emergency_switch_env_token(out, notify=notify)
         if pin_key:
             # 凭证被 env 钉死：切账户池不会改变真正发出去的请求，切了反而把活跃
             # slot 改乱。只探它自己的窗口，把准确的恢复时刻交给调用方排唤醒。
@@ -1645,6 +1813,46 @@ def emergency_switch_on_limit(*, notify: bool = True) -> dict:
         return out
     finally:
         _ACCOUNT_SWITCH_LOCK.release()
+
+
+def _emergency_switch_env_token(out: dict, *, notify: bool) -> dict:
+    """emergency_switch_on_limit 的 token 池分支（调用方已持有 _ACCOUNT_SWITCH_LOCK）：
+    当前 token 撞墙 → 切到池里最有余量的另一个。"""
+    accounts = probe_env_tokens()
+    current = active_env_token_name()
+    out["from"] = current
+    now = time.time()
+    for acc in accounts.values():
+        evaluate(acc, current, now=now)
+    cur = accounts.get(current)
+    if cur is not None and cur.r5h:
+        out["current_reset_epoch"] = float(cur.r5h)
+    candidates = [a for a in accounts.values() if a.usable and a.name != current]
+    if not candidates:
+        why = "; ".join(
+            f"{a.name}: {', '.join(a.reasons) if a.reasons else 'ok'}"
+            for a in accounts.values() if a.name != current
+        )
+        out["reason"] = f"其他 token 也没余量（{why}）"
+        return out
+    best = max(candidates, key=lambda a: a.score)
+    ok, msg = _activate_env_token_locked(best.name)
+    if not ok:
+        out["reason"] = f"切换到 {best.name} 失败：{msg}"
+        return out
+    u5 = f"{best.u5h*100:.0f}%" if best.u5h is not None else "?"
+    u7 = f"{best.u7d*100:.0f}%" if best.u7d is not None else "?"
+    out["switched"] = best.name
+    out["reason"] = f"5h 已用 {u5} / 7d 已用 {u7}"
+    print(f"[switcher] 用量墙切 env token {current or '?'} → {best.name}（{out['reason']}）", flush=True)
+    if notify and _DEFAULT_SWITCHER is not None:
+        try:
+            _DEFAULT_SWITCHER._notify(
+                f"🔁 **撞用量墙，token 已紧急切换**\n从 `{current or '?'}` → `{best.name}`（新 token {out['reason']}）"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 # ── Orchestrator ─────────────────────────────────────────────────
@@ -1851,6 +2059,14 @@ def _cli_main(argv: list[str]) -> int:
     sr = sub.add_parser("rm", help="Delete a saved account file")
     sr.add_argument("name")
 
+    ta = sub.add_parser("token-add", help="Register a `claude setup-token` token as <name> (token read from stdin)")
+    ta.add_argument("name")
+    sub.add_parser("token-list", help="List registered env tokens (* = selected)")
+    tu = sub.add_parser("token-use", help="Select env token <name> (the bot picks it up on its next spawn)")
+    tu.add_argument("name")
+    tr = sub.add_parser("token-rm", help="Unregister env token <name>")
+    tr.add_argument("name")
+
     args = p.parse_args(argv)
 
     if args.cmd in (None, "help"):
@@ -1905,6 +2121,35 @@ def _cli_main(argv: list[str]) -> int:
 
     if args.cmd == "rm":
         ok, msg = remove_account(args.name)
+        print(msg)
+        return 0 if ok else 1
+
+    if args.cmd == "token-add":
+        if sys.stdin.isatty():
+            import getpass
+            token = getpass.getpass("token: ")
+        else:
+            token = sys.stdin.readline()
+        ok, msg = add_env_token(args.name, token)
+        print(msg)
+        return 0 if ok else 1
+
+    if args.cmd == "token-list":
+        rows = list_env_tokens()
+        if not rows:
+            print(f"(no env tokens — {ENV_TOKENS_FILE} is empty; the bot uses .env's token)")
+            return 0
+        for r in rows:
+            print(f"{'*' if r['active'] else ' '} {r['name']:<20} sha256:{r['fp']}")
+        return 0
+
+    if args.cmd == "token-use":
+        ok, msg = switch_env_token(args.name)
+        print(msg)
+        return 0 if ok else 1
+
+    if args.cmd == "token-rm":
+        ok, msg = remove_env_token(args.name)
         print(msg)
         return 0 if ok else 1
 

@@ -60,6 +60,10 @@ def _isolate_sessions(tmp_path, monkeypatch):
     # 在那台机器上集体变红。测试要验 pinned 行为的自己 monkeypatch.setenv 打开。
     for _pin_key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(_pin_key, raising=False)
+    # env token 池（~/.claude/env_tokens.json）同理：里面是真 token，读到了会把
+    # 上面删掉的 CLAUDE_CODE_OAUTH_TOKEN 又同步回 os.environ。
+    import account_switcher as _acs
+    monkeypatch.setattr(_acs, "ENV_TOKENS_FILE", str(tmp_path / "env_tokens.json"))
 
     import resume_store as _rs
     _rs._ATTEMPTS.clear()

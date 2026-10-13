@@ -714,6 +714,75 @@ def _usage_single_account_lines(data: dict, account_label: Optional[str] = None)
     return lines
 
 
+def _usage_other_line(a, now_ts: float, tail: str = "") -> str:
+    """/usage 里「其他账户」的一行简表（用量 / 重置 / 分模型周额度 / 可用性）。
+    tail 为空且账户不可用时补上第一条原因。"""
+    if a.probe_error:
+        return f"  `{a.name}` — ⚠️ {a.probe_error}"
+    u5 = f"{a.u5h*100:.0f}%" if a.u5h is not None else "?"
+    u7 = f"{a.u7d*100:.0f}%" if a.u7d is not None else "?"
+    mark = "✅" if a.usable else "❌"
+    r5_part = f" (重置 {_fmt_reset_short(a.r5h - now_ts)})" if a.r5h else ""
+    r7_part = f" (重置 {_fmt_reset_short(a.r7d - now_ts)})" if a.r7d else ""
+    sc_part = ""
+    for sc in getattr(a, "scoped7d", None) or []:
+        if sc.get("u") is not None:
+            sc_part += f" · {sc.get('name', '?').lower()} `{sc['u']*100:.0f}%`"
+    if not tail and not a.usable and a.reasons:
+        tail = f"（{a.reasons[0]}）"
+    return (
+        f"  `{a.name}` · 5h `{u5}`{r5_part} · 7d `{u7}`{r7_part}{sc_part} · score `{a.score:.2f}` {mark}{tail}"
+    )
+
+
+def _account_usage_data(acc) -> dict:
+    """Account → _usage_single_account_lines 吃的 dict。"""
+    return {
+        "u5h": acc.u5h, "u7d": acc.u7d, "r5h": acc.r5h, "r7d": acc.r7d,
+        "s5h": acc.s5h, "s7d": acc.s7d,
+        "scoped7d": getattr(acc, "scoped7d", None) or [],
+    }
+
+
+def _get_env_token_usage(chat_id: Optional[str] = None) -> "str | dict":
+    """登记了 env token 池时的 /usage：顶部是正在用的 token，下面每个其他 token 一行，
+    底部一个 token 一个切换按钮。"""
+    from account_switcher import (
+        active_env_token_name, evaluate, probe_env_tokens, switch_on_limit_enabled,
+    )
+    active = active_env_token_name()
+    accounts = probe_env_tokens()
+    for a in accounts.values():
+        evaluate(a, active)
+    cur = accounts.get(active)
+    lines: list[str] = []
+    if cur is not None and not cur.probe_error and cur.u5h is not None:
+        lines.extend(_usage_single_account_lines(_account_usage_data(cur), account_label=active))
+    else:
+        err = (cur.probe_error if cur is not None else None) or "未知"
+        lines += [f"📊 **Claude Max 用量** — 当前 `{active}`", "", f"⚠️ 用量获取失败：{err}"]
+
+    others = [a for a in accounts.values() if a.name != active]
+    if others:
+        now_ts = time.time()
+        lines += ["", "**其他 token：**"]
+        lines.extend(_usage_other_line(a, now_ts) for a in others)
+        lines.append("")
+        lines.append(
+            "撞墙自动切换：✅ 当前 token 撞到用量墙时自动切到有余量的另一个并续跑"
+            if switch_on_limit_enabled()
+            else "撞墙自动切换：⏸ 已关闭（`.env` 里 `ACCOUNT_SWITCH_ON_LIMIT=0`）"
+        )
+
+    buttons = _account_switch_buttons(chat_id, for_usage=True) if chat_id else []
+    if not buttons:
+        return "\n".join(lines)
+    if any(b.get("value", {}).get("action") == "switch_usage" for b in buttons):
+        lines.append("")
+        lines.append("👇 点 token 按钮切换（新任务立即用它，正在跑的不受影响）· 🔄 刷新用量：")
+    return {"text": "\n".join(lines), "buttons": buttons}
+
+
 def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
     """渲染 /usage 命令的完整输出。
 
@@ -721,7 +790,15 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
     其他账户的一行简表（用量 / score / 是否可用），再显示自动切换开关，最后
     附上账户切换按钮（与 `/switch` 同款）——传入 chat_id 时才带按钮，返回
     `{"text", "buttons"}` dict；否则（或没保存账户）返回纯文本。
+
+    登记了 env token 池（account_switcher.ENV_TOKENS_FILE）时整页换成 token 视图。
     """
+    try:
+        from account_switcher import env_token_names
+        if env_token_names():
+            return _get_env_token_usage(chat_id)
+    except Exception:
+        pass
     accounts: dict = {}
     current: Optional[str] = None
     try:
@@ -817,32 +894,12 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
         cur_usable = bool(cur and cur.usable)
         now_ts = time.time()
         for a in others:
-            if a.probe_error:
-                lines.append(f"  `{a.name}` — ⚠️ {a.probe_error}")
-                continue
-            u5 = f"{a.u5h*100:.0f}%" if a.u5h is not None else "?"
-            u7 = f"{a.u7d*100:.0f}%" if a.u7d is not None else "?"
-            mark = "✅" if a.usable else "❌"
-            r5_part = ""
-            if a.r5h:
-                r5_part = f" (重置 {_fmt_reset_short(a.r5h - now_ts)})"
-            r7_part = ""
-            if a.r7d:
-                r7_part = f" (重置 {_fmt_reset_short(a.r7d - now_ts)})"
-            sc_part = ""
-            for sc in getattr(a, "scoped7d", None) or []:
-                if sc.get("u") is not None:
-                    sc_part += f" · {sc.get('name', '?').lower()} `{sc['u']*100:.0f}%`"
             tail = ""
             if a is best_other and cur_usable and (a.score - cur_score) >= 0.15:
                 tail = "（推荐切换）"
             elif a is best_other and not cur_usable:
                 tail = "（当前不可用，候选）"
-            elif not a.usable and a.reasons:
-                tail = f"（{a.reasons[0]}）"
-            lines.append(
-                f"  `{a.name}` · 5h `{u5}`{r5_part} · 7d `{u7}`{r7_part}{sc_part} · score `{a.score:.2f}` {mark}{tail}"
-            )
+            lines.append(_usage_other_line(a, now_ts, tail))
 
     # 自动切换开关状态
     auto_on = os.getenv("ACCOUNT_AUTO_SWITCH", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -1369,12 +1426,28 @@ def _get_accounts() -> str:
     except Exception as e:
         return f"❌ account_switcher 加载失败：{e}"
     try:
-        accounts = probe_all()
-        current = current_account_name()
+        from account_switcher import (
+            active_env_token_name, env_token_names, probe_env_tokens,
+        )
+        if env_token_names():
+            accounts, current = probe_env_tokens(), active_env_token_name()
+        else:
+            accounts, current = probe_all(), current_account_name()
     except Exception as e:
         return f"❌ 探测账户失败：{e}"
     sw = AccountSwitcher()  # 无 send_fn、纯渲染
     return sw.render_matrix(accounts, current)
+
+
+def _claude_switch_rows() -> tuple[list[dict], bool]:
+    """切换按钮的数据源 → (rows, token_mode)。每行至少有 name / active。
+
+    登记了 env token 池时切的是 token（账户池被 env 钉死、切了也不生效）；
+    否则是 ~/.claude/accounts 里的 saved 账户。"""
+    from account_switcher import env_token_names, list_accounts_summary, list_env_tokens
+    if env_token_names():
+        return list_env_tokens(), True
+    return list_accounts_summary(), False
 
 
 def _account_switch_buttons(chat_id: str, *, for_usage: bool = False) -> list[dict]:
@@ -1390,8 +1463,7 @@ def _account_switch_buttons(chat_id: str, *, for_usage: bool = False) -> list[di
     - 只要 for_usage=True 且有 chat_id，末尾必带「🔄 刷新」按钮，点击原地重跑 `/usage`。
     """
     try:
-        from account_switcher import list_accounts_summary
-        rows = list_accounts_summary()
+        rows, _ = _claude_switch_rows()
     except Exception:
         rows = []
     buttons: list[dict] = []
@@ -1418,14 +1490,22 @@ def _account_switch_buttons(chat_id: str, *, for_usage: bool = False) -> list[di
 def _get_account_switch_picker(chat_id: str) -> dict | str:
     """构建 `/switch` 无参数时的账户选择卡片，不发 quota 探测请求。"""
     try:
-        from account_switcher import list_accounts_summary
-        rows = list_accounts_summary()
+        rows, token_mode = _claude_switch_rows()
     except Exception as e:
         return f"❌ 读取 Claude Code 账户失败：{e}"
     if not rows:
         return "❌ 没有已保存的 Claude Code 账户。请先在本机运行 `claude-switch save <名称>`。"
 
     current = next((row["name"] for row in rows if row.get("active")), None)
+    if token_mode:
+        return {
+            "text": (
+                "👤 **切换 Claude token**\n"
+                f"当前 token：`{current}`\n"
+                "新启动的任务立即用选中的 token；不改变当前 chat 的 runner / model。"
+            ),
+            "buttons": _account_switch_buttons(chat_id),
+        }
     current_line = f"当前账户：`{current}`" if current else "当前账户：`未识别`"
     return {
         "text": (
@@ -1439,6 +1519,20 @@ def _get_account_switch_picker(chat_id: str) -> dict | str:
 
 def _switch_claude_account(name: str) -> str:
     """同步执行一次显式 Claude Code 账户切换，供 asyncio.to_thread 调用。"""
+    try:
+        from account_switcher import env_token_names, switch_env_token
+        if env_token_names():
+            ok, detail = switch_env_token(name)
+            if not ok:
+                return f"❌ 切换 token 失败：{detail}"
+            if detail == "already":
+                return f"✅ 当前已经是 token `{name}`。"
+            return (
+                f"✅ 已切换到 token `{name}`。\n"
+                "新启动的 Claude Code 任务会使用它；正在运行的任务不受影响。"
+            )
+    except Exception as e:
+        return f"❌ 切换 token 失败：{e}"
     try:
         from account_switcher import (
             list_account_files,

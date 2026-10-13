@@ -45,14 +45,16 @@ def test_probe_pinned_uses_env_token_not_pool(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-env")
     seen = {}
 
-    def fake_probe(acc, is_current=False):
+    def fake_probe(acc, is_current=False, **kw):
         seen["token"] = acc.access_token
+        seen["refreshable"] = kw.get("refreshable", True)
         acc.u5h, acc.u7d, acc.r5h = 0.07, 0.22, int(time.time()) + 60
         return acc
 
     monkeypatch.setattr(accs, "_probe_one", fake_probe)
     out = accs.probe_pinned_env_credential()
     assert seen["token"] == "tok-env", "必须探 env 那份凭证本身"
+    assert seen["refreshable"] is False, "env 凭证不在账户池里，401 时不许去刷同名 slot"
     assert out.u5h == 0.07
 
 

@@ -828,6 +828,15 @@ def _account_pool_pinned(bot=None) -> bool:
     return bool((getattr(getattr(bot, "profile", None), "claude_env_file", "") or "").strip())
 
 
+def _env_token_pool_switchable() -> bool:
+    """登记了 ≥2 个 env token：凭证钉死也能在它们之间切（见 account_switcher）。"""
+    try:
+        from account_switcher import env_token_names
+        return len(env_token_names()) > 1
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _limit_detail(exc: BaseException) -> str:
     """把「Claude Max 用量已达上限：You've hit your session limit · resets 12:20pm」
     里冒号后的那截抠出来给用户看。"""
@@ -2175,7 +2184,7 @@ async def _execute_run(
                             limit_switched = True
                         else:
                             auth_switched = True
-                        if _account_pool_pinned(bot):
+                        if _account_pool_pinned(bot) and not _env_token_pool_switchable():
                             await push("🔁 撞到 Claude Max 用量墙；凭证被 env 钉死（账户池不生效），"
                                        "正在探测配额恢复时刻…")
                         else:
