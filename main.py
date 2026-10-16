@@ -291,14 +291,19 @@ def main():
     # ACCOUNT_AUTO_SWITCH=1 启用多账户智能切换；冷却默认 30 min
     enable_switch = os.getenv("ACCOUNT_AUTO_SWITCH", "0").strip().lower() in ("1", "true", "yes", "on")
     switch_cooldown = int(os.getenv("ACCOUNT_SWITCH_COOLDOWN_SEC", "1800"))
-    try:
-        runtime.start_quota_watcher(
-            notify_profile, notify_open_id, interval,
-            enable_account_switcher=enable_switch,
-            switcher_cooldown_sec=switch_cooldown,
-        )
-    except Exception as e:
-        print(f"⚠️ quota_watcher 启动失败: {e}")
+    # 没有 claude profile 的机器（如手机上只跑 qoder）不碰 Claude 凭证：否则启动自检
+    # 会私信 owner「缺 claudeAiOauth」，quota 轮询也只会报错。
+    if any(getattr(p, "runner", "") == "claude" for p in config.PROFILES):
+        try:
+            runtime.start_quota_watcher(
+                notify_profile, notify_open_id, interval,
+                enable_account_switcher=enable_switch,
+                switcher_cooldown_sec=switch_cooldown,
+            )
+        except Exception as e:
+            print(f"⚠️ quota_watcher 启动失败: {e}")
+    else:
+        print("   Claude 额度监控: 跳过（没有 claude 后端的 profile）")
 
     # 9.1) Codex 额度监控：每 30 min 查一次，窗口重置时私信 owner（仅当有 codex profile）
     if any(getattr(p, "runner", "") == "codex" for p in config.PROFILES):
