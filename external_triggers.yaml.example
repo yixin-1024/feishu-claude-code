@@ -41,6 +41,13 @@ clients:
     # 可选来源 IP 白名单（走反代时必须同时配 trusted_proxy_ips）
     # allow_ips: [203.0.113.10]
 
+  - id: partner-backend
+    secret_env: CC_LARK_API_SECRET_PARTNER_BACKEND
+    routes: [partner-intake]
+    # 允许调 POST /api/v1/chats 给 dynamic_chat route 登记群（会改群白名单 + 群 workspace）。
+    # 默认 false；只给真的要建群的后端开。
+    manage_chats: true
+
 # ── 路由（一个业务事件 = 一个 route）──────────────────────────
 routes:
   # ── workspace: projects/spx → 群「spx 开发bot」───────────────
@@ -87,3 +94,28 @@ routes:
     instruction: |
       线上监控触发了一条告警。请只做**只读**排查：看日志、看指标、给出可能根因与
       建议动作，不要自行改配置或重启服务。结论贴在本话题。
+
+  # ── workspace: workspaces/partner-onboarding → 每个合作方一个群（动态群）──
+  # dynamic_chat: 群不写死，请求带 chat_id；但只认先经 POST /api/v1/chats 登记过的群
+  # （登记时校验 bot 在群 + 加群白名单 + 群 workspace 钉成下面的 cwd，和 /group add 同一份落盘）。
+  # 同一 case 的下一轮带 thread_id，就回帖进原话题、resume 原会话接着跑（只认本 route+本群派过的话题）。
+  partner-intake:
+    profile: main
+    dynamic_chat: true
+    # continue_threads: true                       # 默认跟随 dynamic_chat
+    # chat_id: oc_xxxxdefault                      # 可选：请求不带 chat_id 时的默认群
+    user_id: ${SPX_OWNER_OPEN_ID}
+    cwd: /home/yixin/workspaces/partner-onboarding
+    workspace_label: partner-onboarding
+    topic_title: "合作方进件"
+    required_vars: [case_id, end_user_id, round, kind, env]
+    optional_vars: [partner_name, currency, request_id]
+    allow_free_prompt: false
+    prompt_template: |
+      合作方进件 case {{vars.case_id}}（end user {{vars.end_user_id}}，第 {{vars.round}} 轮，
+      kind={{vars.kind}}，env={{vars.env}}）。合作方：{{vars.partner_name}}；
+      币种：{{vars.currency}}；request_id：{{vars.request_id}}。
+
+      按本 workspace 的 AGENTS.md / runbook 处理：先 GET /context 拉 case，
+      再 claim → 分类 → 证件核验 → 抽取 → 筛查 → opinion → decision。
+      过程和结论都写在本话题里。

@@ -943,6 +943,49 @@ class FeishuClient:
 
         return await asyncio.to_thread(_http)
 
+    async def is_bot_in_chat(self, chat_id: str) -> tuple[bool, str]:
+        """bot 自己是不是该群成员（GET /im/v1/chats/{id}/members/is_in_chat，tenant 身份）。
+
+        返回 (是否在群, 说明)。Lark 回非 0 code（群不存在 / id 非法 / 无权限）按「不在群」
+        处理并把 code+msg 带回去 —— 调用方要 fail-closed；网络异常照常抛出。"""
+        def _http() -> tuple[bool, str]:
+            import ssl
+            import urllib.error
+            import urllib.parse
+            import urllib.request
+            ctx = ssl.create_default_context()
+            token_body = json.dumps({
+                "app_id": self._app_id, "app_secret": self._app_secret
+            }).encode()
+            token_req = urllib.request.Request(
+                f"{self._domain}/open-apis/auth/v3/tenant_access_token/internal",
+                data=token_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(token_req, context=ctx, timeout=15) as r:
+                token = json.loads(r.read())["tenant_access_token"]
+            req = urllib.request.Request(
+                f"{self._domain}/open-apis/im/v1/chats/"
+                f"{urllib.parse.quote(chat_id, safe='')}/members/is_in_chat",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            try:
+                with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
+                    data = json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                # Lark 对非法 / 不存在的群回 4xx + JSON 错误体
+                try:
+                    data = json.loads(e.read())
+                except Exception:
+                    raise e
+            if data.get("code") != 0:
+                return False, f"lark code={data.get('code')} msg={str(data.get('msg') or '')[:200]}"
+            in_chat = bool((data.get("data") or {}).get("is_in_chat"))
+            return in_chat, "" if in_chat else "bot is not a member of this chat"
+
+        return await asyncio.to_thread(_http)
+
     async def list_thread_messages(self, thread_id: str, limit: int = 200) -> list:
         """列出话题里的消息，按创建时间升序。返回 Message 对象列表。"""
         messages: list = []

@@ -4385,6 +4385,94 @@ async def dispatch_task(
             "chat_id": group_chat_id, "workspace": workspace, "cwd": cwd}
 
 
+async def continue_task(
+    bot: BotInstance, *, group_chat_id: str, thread_id: str,
+    title: str, prompt: str,
+    model: str = "", effort: str = "",
+    cwd: str = "", workspace: str = "", body_header: str = "",
+) -> dict:
+    """在一条**已有**派单话题里续一轮：完整 prompt 以回帖贴进话题，再 resume 该话题的
+    session 跑一轮（外部触发 API 的 thread_id 用——同一 case 的补件/复审留在同一话题）。
+
+    和 dispatch_task 的区别：不建新话题、不开新 session、不占 per-chat 派发 cap；
+    话题忙时排在当前 run 后面（等 per-chat 锁，不丢），和 append_to_task 同一套
+    _deliver_followup 机械。执行者 / 会话归属人取派单时落的 task_routes 记录，
+    不认调用方传的人——没有记录就拒绝，不猜。
+
+    cwd/workspace：每轮都按 route 配置重新钉一次，外部输入碰不到工作目录。
+    """
+    if not (group_chat_id and thread_id):
+        return {"ok": False, "error": "缺少 group_chat_id / thread_id"}
+    if not (prompt and prompt.strip()):
+        return {"ok": False, "error": "prompt 不能为空"}
+    try:
+        model = normalize_model(model)
+        effort = normalize_effort(effort, "dispatch_task")
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    try:
+        route = task_routes.get(group_chat_id, thread_id)
+    except Exception as e:
+        return {"ok": False, "error": f"任务归属记录损坏，未续跑: {e}"}
+    if not route:
+        return {"ok": False, "error": "该话题没有派单归属记录，无法续跑"}
+    target = dict(_bots).get(route["profile"]) or (bot if bot.profile.name == route["profile"] else None)
+    if target is None:
+        return {"ok": False, "error": f"目标 bot {route['profile']} 未加载"}
+    user, anchor = route["user_id"], route["anchor"]
+    thread_id = route["thread_id"]
+    if thread_id.startswith("om_"):
+        try:
+            actual = await target.feishu.get_message_thread_id(thread_id)
+        except Exception as e:
+            return {"ok": False, "error": f"无法解析话题 thread_id: {type(e).__name__}: {e}"}
+        if not actual or not actual.startswith("omt_"):
+            return {"ok": False, "error": "无法解析话题 thread_id"}
+        thread_id = actual
+        try:
+            task_routes.bind(**{**route, "thread_id": actual})
+        except Exception as e:
+            log(target.profile.name, "dispatch", "warn", f"续跑：归属记录规范化失败: {e}")
+
+    chat_id = f"{group_chat_id}:{thread_id}"
+    busy = target._ensure_chat_lock(chat_id).locked()
+    topic_title = (title.strip() if (title and title.strip())
+                   else prompt.strip().splitlines()[0])[:60]
+    try:
+        reply_mid = await target.feishu.reply_post(
+            anchor, title=f"🔁 {topic_title}",
+            body_text=_format_dispatch_body(prompt, body_header),
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"往话题贴续跑指令失败: {type(e).__name__}: {e}"}
+
+    try:
+        if model:
+            await target.store.set_model(user, chat_id, normalize_model_for_runner(
+                model, target.profile.runner))
+        if effort:
+            await target.store.set_effort(user, chat_id, effort)
+        if cwd:
+            await target.store.set_cwd(user, chat_id, cwd, workspace or None)
+    except Exception as e:
+        log(target.profile.name, "dispatch", "warn", f"续跑：会话设置写入失败: {type(e).__name__}: {e}")
+
+    t = asyncio.create_task(_deliver_followup(
+        target, user_id=user, chat_id=chat_id, thread_id=thread_id,
+        anchor_message_id=reply_mid or anchor, instruction=prompt.strip(),
+        stop_first=False, is_group=True,
+    ))
+    _DISPATCH_TASKS.add(t)
+    t.add_done_callback(_DISPATCH_TASKS.discard)
+    log(target.profile.name, "dispatch", "info",
+        f"续跑已有话题 chat={group_chat_id[:12]}... thread={thread_id[:14]}... "
+        f"queued={busy} prompt_len={len(prompt)}")
+    return {"ok": True, "thread_id": thread_id, "anchor_message_id": reply_mid or anchor,
+            "agent": target.profile.name, "agent_runner": target.profile.runner,
+            "model": model, "effort": effort, "queued": busy,
+            "chat_id": group_chat_id, "workspace": workspace, "cwd": cwd}
+
+
 # ── 会话移交（handover）───────────────────────────────────────────────────
 # 与 dispatch_task 的区别只有一句话：**移交不要求回报**。
 #   dispatch_task = 派子任务，子会话跑完回报父 thread、整波跑完唤醒父 agent 收口；

@@ -666,13 +666,16 @@ curl -X POST https://<你的域名>/api/v1/agent-tasks \
 | `POST /api/v1/agent-tasks` | 触发一条任务（→ 群里新话题 + 独立会话），返回 `thread_id` |
 | `GET /api/v1/agent-tasks/<thread_id>` | 查这条任务的话题记录（只能查自己派的） |
 | `GET /api/v1/routes` | 列出该 client 可用的 route |
+| `POST /api/v1/chats` | 给 `dynamic_chat` route 登记一个群（client 要 `manage_chats: true`） |
+| `GET /api/v1/chats?route=<route>` | 列出已登记的动态群（不带 `route` = 该 client 可用的全部动态 route） |
 | `GET /api/v1/healthz` | 凭证自检 |
 
 **设计边界（重要）**：
 
 - **群和 workspace 由配置钉死**。调用方只能挑一个已配置的 `route`；跑在哪个群、哪个
   `cwd`、什么模型/强度都写在 `external_triggers.yaml`，请求体里的 `cwd` / `profile` /
-  `chat_id` 一律被忽略。route 的 `chat_id` 还必须在该 profile 的群白名单里，否则拒发。
+  `chat_id` 一律被忽略（唯一例外是 `dynamic_chat` route 的 `chat_id`，见下节，且只认登记过的群）。
+  route 的 `chat_id` 还必须在该 profile 的群白名单里，否则拒发。
 - **群和 workspace 成对**：`chat_id` 是每条 route 各自的字段——一个 workspace 对应它
   自己的群，任务就落到那个群里被监控（spx 的活进 spx 群，cc-lark 的活进 cc-lark 群）。
   加载/热重载时会拿群在 `.env` 里的 `<PROFILE>_CHAT_CWD_<chat_id>` 交叉核对，对不上就在
@@ -693,6 +696,46 @@ curl -X POST https://<你的域名>/api/v1/agent-tasks \
   受全局并发闸门 `CC_LARK_MAX_CONCURRENT_RUNS`（默认 4）约束——超额的排队等额度，不丢。
 - 改 `external_triggers.yaml` 后 `POST /reload`（control 面）即时生效；只有改 `.env`
   里的密钥才需要重启。
+
+### 动态群 + 续同一话题（`dynamic_chat` / `thread_id`）
+
+有的业务**每个客户一个群**、群是后端运行时建的（例：合作方进件，每个合作方一个话题群），
+配置里写不死；同一个 case 的补件/复审又要留在**原话题**里接着处理。route 打开
+`dynamic_chat: true` 后：
+
+1. 后端建好群、把 bot 拉进去后先登记（幂等，可重复调）：
+
+   ```bash
+   curl -X POST https://<你的域名>/api/v1/chats \
+     -H "Authorization: Bearer spx-backend:$CC_LARK_API_SECRET_SPX_BACKEND" \
+     -H "Content-Type: application/json" \
+     -d '{"route": "partner-intake", "chat_id": "oc_...", "name": "SPX × Acme"}'
+   # → 201 {"ok":true,"created":true,...}；再调一次 → 200 {"created":false}
+   ```
+
+   登记会：① 调 Lark `is_in_chat` 确认 bot 真在群里（不在 → 409）；② 把群加进 route 所属
+   profile 的群白名单，并把群的 workspace 设成 route 的 `cwd`——和 `/group add <chat_id> <cwd>`
+   是**同一份**内存 + `.env` 落盘（`<PROFILE>_ALLOWED_GROUP_CHAT_IDS` / `<PROFILE>_CHAT_CWD_<chat_id>`），
+   **实时生效、不用重启**，之后人在这个群里 @bot 也自动跑在该 workspace；③ 记进登记簿
+   `data/external_api_chats.json`（原子写、0600，重启后仍在；可用 `CC_LARK_API_CHATS_FILE` 改路径）。
+   **不许借它改道已有的群**：群已映射到别的 workspace、已被别的 route 登记、或是手工加白但没有
+   workspace 映射的群，一律 409。
+2. 派单时带 `chat_id`：只认本 route 登记过的群（或 route 自己配置的默认 `chat_id`），否则 403。
+3. 补件 / 下一轮带 `thread_id`（上一轮响应里的 `thread_id`）：不开新话题，而是把渲染后的提示词
+   **回帖进原话题**，再 resume 该话题的会话跑一轮（话题正忙就排在当前 run 后面，不丢）。
+   只认**同一 route + 同一群**派出过的话题（登记簿里有记录，不过期），否则 409。
+
+```bash
+curl -X POST https://<你的域名>/api/v1/agent-tasks \
+  -H "Authorization: Bearer spx-backend:$CC_LARK_API_SECRET_SPX_BACKEND" \
+  -H "X-Idempotency-Key: intake-123-2" -H "Content-Type: application/json" \
+  -d '{"route": "partner-intake", "chat_id": "oc_...", "thread_id": "omt_...",
+       "vars": {"case_id": "123", "end_user_id": "9", "round": "2", "kind": "PERSONAL", "env": "staging"}}'
+# → 202 {"ok":true,"task_id":"...","thread_id":"omt_...（同一条）","chat_id":"oc_...","continued":true}
+```
+
+没开 `dynamic_chat` 的 route 行为完全不变：请求体里的 `chat_id` / `thread_id` 照旧被忽略。
+`continue_threads: true` 可以单独给老 route 打开「带 thread_id 续话题」（默认跟随 `dynamic_chat`）。
 
 **公网暴露**：该 API 挂在 callback listener（`CALLBACK_PORT`）上，和 Lark 卡片回调同
 一个入口——本地开发直接用现成的 ngrok 隧道即可；生产用自己的域名，在 Caddy/nginx 上

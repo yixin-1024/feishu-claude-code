@@ -464,7 +464,8 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
 
         if not self.control_plane:
             if parsed.path.startswith(external_api.API_PREFIX):
-                self._handle_external_api("GET", parsed.path, b"")
+                # 带上 query：GET /api/v1/chats?route= 要用（external_api.handle 自己拆）
+                self._handle_external_api("GET", self.path, b"")
                 return
             self._respond(404, {"error": "not found"})
             return

@@ -15,6 +15,13 @@
     不存在"忘了配就裸奔"的中间态。可选 HMAC 签名 + 时间戳（防重放）。
   · **幂等**：后端重试是常态。Idempotency-Key 命中就回上次的 thread_id，
     不会在群里刷出第二条话题。状态落盘，重启后仍然生效。
+  · **动态群（dynamic_chat）**：有的业务每个客户一个群、群是后端运行时建的，
+    配置里写不死。这类 route 允许请求带 chat_id，但只认先经 `POST /api/v1/chats`
+    登记过的群（登记 = 校验 bot 在群 + 加群白名单 + 群 workspace 钉成 route 的 cwd，
+    和 `/group add` 同一份落盘）。cwd 仍然只来自 route 配置。
+  · **续同一话题（thread_id）**：同一个 case 的补件/复审要留在原话题里。请求带
+    thread_id 时把提示词回帖进该话题、resume 它的 session 再跑一轮——只认本 route +
+    本群派出过的话题（登记簿里有记录），否则 409。
 
 本模块**不 import** dispatcher / bot_instance，业务能力由 configure() 注入，
 和 http_server 一样的路子；handle() 是纯同步函数（(status, payload)），
@@ -34,7 +41,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import parse_qs, urlsplit
 
+import group_allowlist
 from log_util import log
 
 try:
@@ -90,6 +99,10 @@ class Route:
     wrap_untrusted: bool = True
     max_prompt_chars: int = _MAX_PROMPT_CHARS
     agent: str = ""
+    # 请求可带 chat_id（只认经 /api/v1/chats 登记过的群）；此时 chat_id 配置项是可选的默认群
+    dynamic_chat: bool = False
+    # 请求可带 thread_id 续本 route 派出过的话题；缺省跟随 dynamic_chat
+    continue_threads: bool = False
 
     @classmethod
     def from_dict(cls, name: str, raw: dict) -> "Route":
@@ -97,14 +110,17 @@ class Route:
             raise ValueError(f"route 名 {name!r} 非法（只允许字母数字 . _ -，≤64 字符）")
         if not isinstance(raw, dict):
             raise ValueError(f"route {name!r}: 配置必须是 mapping")
-        missing = [k for k in ("profile", "chat_id", "cwd") if not str(raw.get(k) or "").strip()]
+        dynamic_chat = _as_bool(raw.get("dynamic_chat"), False)
+        # 动态群 route 的群由请求带、登记簿兜底，配置里的 chat_id 只是可选的默认群
+        required = ("profile", "cwd") if dynamic_chat else ("profile", "chat_id", "cwd")
+        missing = [k for k in required if not str(raw.get(k) or "").strip()]
         if missing:
             raise ValueError(f"route {name!r}: 缺少字段 {', '.join(missing)}")
         cwd = os.path.expanduser(str(raw["cwd"]).strip())
         if not os.path.isabs(cwd):
             raise ValueError(f"route {name!r}: cwd 必须是绝对路径（现在是 {cwd!r}）")
-        chat_id = str(raw["chat_id"]).strip()
-        if not chat_id.startswith("oc_"):
+        chat_id = str(raw.get("chat_id") or "").strip()
+        if chat_id and not chat_id.startswith("oc_"):
             raise ValueError(f"route {name!r}: chat_id 必须是群 id（oc_ 开头），现在是 {chat_id!r}")
         tmpl = str(raw.get("prompt_template") or "")
         instruction = str(raw.get("instruction") or "")
@@ -132,6 +148,8 @@ class Route:
             wrap_untrusted=_as_bool(raw.get("wrap_untrusted"), True),
             max_prompt_chars=max(200, min(max_chars, _MAX_PROMPT_CHARS)),
             agent=str(raw.get("agent") or "").strip(),
+            dynamic_chat=dynamic_chat,
+            continue_threads=_as_bool(raw.get("continue_threads"), dynamic_chat),
         )
         declared = set(route.required_vars) | set(route.optional_vars)
         for var in declared:
@@ -166,6 +184,8 @@ class Client:
     rate_limit_per_min: int = 30
     require_signature: bool = False
     allow_ips: list[str] = field(default_factory=list)
+    # 可调 POST /api/v1/chats 给 dynamic_chat route 登记群（会改群白名单，默认关）
+    manage_chats: bool = False
 
     def may_use(self, route_name: str) -> bool:
         return "*" in self.routes or route_name in self.routes
@@ -202,6 +222,10 @@ class ExternalApiDeps:
     dispatch: Callable[..., Awaitable[dict]]          # dispatcher.dispatch_task
     read_thread: Callable[..., Awaitable[dict]]       # dispatcher.read_thread
     run_coro: Callable[[Awaitable, float], Any]       # 把 coroutine 投到 bot_loop 并等结果
+    # 以下三个只服务 dynamic_chat / thread_id；没注入时对应能力返回 501，老 route 不受影响
+    continue_thread: Optional[Callable[..., Awaitable[dict]]] = None   # dispatcher.continue_task
+    check_membership: Optional[Callable[..., Awaitable[tuple]]] = None  # (bot, chat_id) -> (in_chat, detail)
+    add_group: Optional[Callable[..., Awaitable[tuple]]] = None        # (bot, chat_id, cwd) -> (changed, info)
 
 
 _config = ApiConfig()
@@ -209,15 +233,19 @@ _config_path = ""
 _deps: Optional[ExternalApiDeps] = None
 _state_path = ""
 _state: dict = {"idempotency": {}, "tasks": {}}
+# 动态群登记簿：route -> {chat_id: rec}；threads: thread_id -> 派出它的 route/群。
+# 和 _state 分开放：_state 按 TTL 修剪，登记簿不能过期（补件可能隔几周才来）。
+_chats_path = ""
+_chats: dict = {"routes": {}, "threads": {}}
 _lock = threading.Lock()
 _rate_hits: dict[str, list[float]] = {}
 _seen_signatures: dict[str, float] = {}
 
 
 def configure(*, config: ApiConfig, deps: ExternalApiDeps, state_path: str = "",
-              config_path: str = "") -> None:
-    """启动时调一次：注入配置 + 业务回调，并载入落盘状态（幂等/任务台账）。"""
-    global _config, _config_path, _deps, _state_path, _state
+              config_path: str = "", chats_path: str = "") -> None:
+    """启动时调一次：注入配置 + 业务回调，并载入落盘状态（幂等/任务台账/动态群登记簿）。"""
+    global _config, _config_path, _deps, _state_path, _state, _chats_path, _chats
     _config = config
     _config_path = config_path
     _deps = deps
@@ -227,6 +255,12 @@ def configure(*, config: ApiConfig, deps: ExternalApiDeps, state_path: str = "",
         or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "external_api_state.json")
     )
     _state = _load_state(_state_path)
+    _chats_path = os.path.expanduser(
+        chats_path
+        or os.getenv("CC_LARK_API_CHATS_FILE")
+        or os.path.join(os.path.dirname(_state_path) or ".", "external_api_chats.json")
+    )
+    _chats = _load_chats(_chats_path)
     for line in audit_route_groups():
         log("global", "extapi", "warn", f"群/workspace 不一致 —— {line}")
 
@@ -254,15 +288,23 @@ def audit_route_groups(config: Optional[ApiConfig] = None) -> list[str]:
         if bot is None:
             continue
         mapping = getattr(bot.profile, "chat_default_cwd", None) or {}
-        group_cwd = mapping.get(route.chat_id)
-        if not group_cwd:
-            continue
-        if os.path.realpath(group_cwd) != os.path.realpath(route.cwd):
+        group_cwd = mapping.get(route.chat_id) if route.chat_id else ""
+        if group_cwd and os.path.realpath(group_cwd) != os.path.realpath(route.cwd):
             findings.append(
                 f"route {route.name!r}: 群 {route.chat_id} 在 .env 里的 workspace 是 "
                 f"{group_cwd}，但 route 配的 cwd 是 {route.cwd} —— 群和目录对不上，"
                 f"确认这是故意的（多 workspace 共用监控群）还是配错了群？"
             )
+        if not route.dynamic_chat:
+            continue
+        # 登记过的动态群：群 workspace 必须仍是 route 的 cwd（被人 /group add 改走了要喊出来）
+        for chat_id in sorted((_chats.get("routes") or {}).get(route.name) or {}):
+            got = mapping.get(chat_id)
+            if not got or os.path.realpath(got) != os.path.realpath(route.cwd):
+                findings.append(
+                    f"route {route.name!r}: 已登记的群 {chat_id} 当前 workspace 是 "
+                    f"{got or '（未映射）'}，不是 route 的 cwd {route.cwd} —— 重新 POST /api/v1/chats 修复"
+                )
     return findings
 
 
@@ -368,6 +410,7 @@ def _parse_client(item: Any, routes: dict[str, Route]) -> dict[str, Client]:
         rate_limit_per_min=max(1, rate),
         require_signature=_as_bool(item.get("require_signature"), False),
         allow_ips=[str(ip).strip() for ip in (item.get("allow_ips") or []) if str(ip).strip()],
+        manage_chats=_as_bool(item.get("manage_chats"), False),
     )}
 
 
@@ -411,6 +454,73 @@ def _save_state() -> None:
         os.replace(tmp, _state_path)
     except Exception as e:
         log("global", "extapi", "warn", f"状态落盘失败: {type(e).__name__}: {e}")
+
+
+def _load_chats(path: str) -> dict:
+    """读动态群登记簿。坏文件不能悄悄变成空登记簿后被覆盖掉——改名留证、从空开始并告警。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("top level must be an object")
+        routes = data.get("routes") or {}
+        threads = data.get("threads") or {}
+        if not isinstance(routes, dict) or not isinstance(threads, dict):
+            raise ValueError("routes / threads must be objects")
+        return {"routes": routes, "threads": threads}
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        broken = f"{path}.broken.{int(time.time())}"
+        try:
+            os.replace(path, broken)
+        except OSError:
+            broken = "(未能改名)"
+        log("global", "extapi", "error",
+            f"动态群登记簿损坏，已改名为 {broken} 并从空开始: {type(e).__name__}: {e}")
+    return {"routes": {}, "threads": {}}
+
+
+def _save_chats() -> bool:
+    """原子落盘登记簿（tmp + fsync + replace，0600）。调用方持 _lock。返回是否写成功。"""
+    if not _chats_path:
+        return True
+    try:
+        os.makedirs(os.path.dirname(_chats_path) or ".", mode=0o700, exist_ok=True)
+        tmp = f"{_chats_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_chats, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _chats_path)
+        return True
+    except Exception as e:
+        log("global", "extapi", "error", f"动态群登记簿落盘失败: {type(e).__name__}: {e}")
+        return False
+
+
+def _registered_chat(route_name: str, chat_id: str) -> Optional[dict]:
+    with _lock:
+        rec = ((_chats.get("routes") or {}).get(route_name) or {}).get(chat_id)
+    return dict(rec) if isinstance(rec, dict) else None
+
+
+def registered_chats(route_name: str) -> list[str]:
+    """某 route 已登记的动态群 id（启动横幅 / 排查用）。"""
+    with _lock:
+        return sorted(((_chats.get("routes") or {}).get(route_name) or {}).keys())
+
+
+def _thread_record(thread_id: str) -> Optional[dict]:
+    """按 thread_id（omt_）或话题根消息 id（om_）查登记簿里的话题记录。"""
+    with _lock:
+        threads = _chats.get("threads") or {}
+        rec = threads.get(thread_id)
+        if rec is None:
+            rec = next((r for r in threads.values()
+                        if isinstance(r, dict) and thread_id and r.get("anchor") == thread_id), None)
+    return dict(rec) if isinstance(rec, dict) else None
 
 
 # ── 鉴权 ──────────────────────────────────────────────────────
@@ -581,6 +691,9 @@ def handle(method: str, path: str, headers, body: bytes, peer_ip: str) -> tuple[
     if not is_enabled():
         return 503, {"ok": False, "error": "external trigger API is not configured"}
 
+    split = urlsplit(path or "")
+    path = split.path
+    query = {k: v[-1] for k, v in parse_qs(split.query).items() if v}
     sub = path[len(API_PREFIX):] if path.startswith(API_PREFIX) else ""
     if not sub.startswith("/"):
         return 404, {"ok": False, "error": "not found"}
@@ -596,13 +709,19 @@ def handle(method: str, path: str, headers, body: bytes, peer_ip: str) -> tuple[
 
     if method == "POST" and sub in ("/agent-tasks", "/agent-tasks/"):
         return _create_task(client, headers, body)
+    if method == "POST" and sub in ("/chats", "/chats/"):
+        return _register_chat(client, body)
+    if method == "GET" and sub in ("/chats", "/chats/"):
+        return _list_chats(client, query.get("route", "").strip())
     if method == "GET" and sub == "/routes":
         return 200, {"ok": True, "routes": [
             {"route": r.name, "profile": r.profile, "chat_id": r.chat_id,
              "workspace": r.workspace_label or r.cwd,
              "required_vars": r.required_vars,
              "optional_vars": r.optional_vars,
-             "accepts_free_prompt": r.allow_free_prompt}
+             "accepts_free_prompt": r.allow_free_prompt,
+             "dynamic_chat": r.dynamic_chat,
+             "continue_threads": r.continue_threads}
             for r in _config.routes.values() if client.may_use(r.name)
         ]}
     if method == "GET" and sub.startswith("/agent-tasks/"):
@@ -676,16 +795,52 @@ def _create_task(client: Client, headers, body: bytes) -> tuple[int, dict]:
                 f"→ thread={prev.get('thread_id')} task={prev.get('task_id')}")
             return 200, {**hit.get("result", {}), "ok": True, "deduped": True}
 
+    # 只有用得上这两个字段的 route 才校验 / 读取它们；老 route 对它们一无所知（照旧忽略）
+    req_chat = (payload.get("chat_id") or "") if route.dynamic_chat else ""
+    req_thread = (payload.get("thread_id") or "") if route.continue_threads else ""
+    if not isinstance(req_chat, str) or not isinstance(req_thread, str):
+        return 400, {"ok": False, "error": "chat_id / thread_id must be strings"}
+    req_chat, req_thread = req_chat.strip(), req_thread.strip()
+    if route.dynamic_chat:
+        chat_id = req_chat or route.chat_id
+        if not chat_id:
+            return 400, {"ok": False, "error": f"route {route_name!r} requires chat_id"}
+        # 配置里钉的默认群天然可信；请求带来的其它群必须先经 POST /api/v1/chats 登记
+        if chat_id != route.chat_id and _registered_chat(route.name, chat_id) is None:
+            log("global", "extapi", "warn",
+                f"client {client.client_id!r} 试图往未登记的群派发 route={route_name!r} chat={chat_id[:16]}")
+            return 403, {"ok": False,
+                         "error": f"chat {chat_id} is not registered for route {route_name!r} "
+                                  f"(register it with POST {API_PREFIX}/chats first)"}
+    else:
+        # 老 route 一字不改：body 里的 chat_id 和以前一样被忽略，群只认配置
+        chat_id = route.chat_id
+
+    thread_rec: Optional[dict] = None
+    # 没开 continue_threads 的 route 同理：thread_id 被忽略，照旧新开话题
+    if req_thread:
+        thread_rec = _thread_record(req_thread)
+        if (thread_rec is None or thread_rec.get("route") != route.name
+                or thread_rec.get("chat_id") != chat_id):
+            log("global", "extapi", "warn",
+                f"client {client.client_id!r} 试图续一条非本 route/群派出的话题 "
+                f"route={route_name!r} chat={chat_id[:16]} thread={req_thread[:18]}")
+            return 409, {"ok": False,
+                         "error": f"thread {req_thread} was not created by route {route_name!r} "
+                                  f"in chat {chat_id}"}
+        if _deps.continue_thread is None:
+            return 501, {"ok": False, "error": "thread continuation is not available"}
+
     bot = _deps.bots.get(route.profile)
     if bot is None:
         log("global", "extapi", "error", f"route {route_name!r} 指向未加载的 profile {route.profile!r}")
         return 500, {"ok": False, "error": f"profile {route.profile!r} is not loaded"}
     allowed_groups = set(getattr(bot.profile, "allowed_group_chat_ids", set()) or set())
-    if "*" not in allowed_groups and route.chat_id not in allowed_groups:
+    if "*" not in allowed_groups and chat_id not in allowed_groups:
         log("global", "extapi", "error",
             f"route {route_name!r} 的 chat_id 不在 profile {route.profile!r} 群白名单里，拒绝派发")
         return 500, {"ok": False,
-                     "error": f"chat {route.chat_id} is not allowlisted for profile {route.profile!r}"}
+                     "error": f"chat {chat_id} is not allowlisted for profile {route.profile!r}"}
     if not os.path.isdir(route.cwd):
         log("global", "extapi", "error", f"route {route_name!r} 的 workspace 不存在: {route.cwd}")
         return 500, {"ok": False, "error": f"workspace directory does not exist: {route.cwd}"}
@@ -702,16 +857,30 @@ def _create_task(client: Client, headers, body: bytes) -> tuple[int, dict]:
     if title_extra:
         title = f"{title} · {title_extra}"
     body_header = (
-        f"（外部事件触发的任务，正在独立处理…）\n"
+        f"（外部事件触发的{'续跑' if thread_rec else '任务'}，正在独立处理…）\n"
         f"route={route.name} · client={client.client_id} · source={source or '-'} · task_id={task_id}"
     )
 
+    action = "续跑" if thread_rec else "派发"
     try:
-        result = _deps.run_coro(
-            _deps.dispatch(
+        if thread_rec:
+            coro = _deps.continue_thread(
+                bot,
+                group_chat_id=chat_id,
+                thread_id=str(thread_rec.get("thread_id") or req_thread),
+                title=title,
+                prompt=final_prompt,
+                model=route.model,
+                effort=route.effort,
+                cwd=route.cwd,
+                workspace=route.workspace_label,
+                body_header=body_header,
+            )
+        else:
+            coro = _deps.dispatch(
                 bot,
                 user_id=route.user_id,
-                group_chat_id=route.chat_id,
+                group_chat_id=chat_id,
                 title=title,
                 prompt=final_prompt,
                 model=route.model,
@@ -720,53 +889,212 @@ def _create_task(client: Client, headers, body: bytes) -> tuple[int, dict]:
                 workspace=route.workspace_label,
                 body_header=body_header,
                 agent=route.agent,
-            ),
-            _DISPATCH_TIMEOUT_SEC,
-        )
+            )
+        result = _deps.run_coro(coro, _DISPATCH_TIMEOUT_SEC)
     except TimeoutError:
-        log("global", "extapi", "error", f"route {route_name!r} 派发超时（>{_DISPATCH_TIMEOUT_SEC}s）")
+        log("global", "extapi", "error", f"route {route_name!r} {action}超时（>{_DISPATCH_TIMEOUT_SEC}s）")
         return 504, {"ok": False, "error": "dispatch timed out; check the Lark group before retrying"}
     except Exception as e:
-        log("global", "extapi", "error", f"route {route_name!r} 派发异常: {type(e).__name__}: {e}")
+        log("global", "extapi", "error", f"route {route_name!r} {action}异常: {type(e).__name__}: {e}")
         return 500, {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     if not isinstance(result, dict) or not result.get("ok"):
         err = str((result or {}).get("error") or "dispatch failed")
         # 并发达上限属于"稍后重试"，语义上是 429 而不是 500
         code = 429 if "上限" in err or "cap" in err.lower() else 502
-        log("global", "extapi", "warn", f"route {route_name!r} 派发被拒: {err}")
+        log("global", "extapi", "warn", f"route {route_name!r} {action}被拒: {err}")
         return code, {"ok": False, "error": err}
 
+    thread_id = result.get("thread_id", "") or (thread_rec or {}).get("thread_id", "")
     out = {
         "ok": True,
         "task_id": task_id,
         "route": route.name,
         "profile": route.profile,
         "agent": result.get("agent") or route.profile,
-        "chat_id": route.chat_id,
-        "thread_id": result.get("thread_id", ""),
+        "chat_id": chat_id,
+        "thread_id": thread_id,
         "anchor_message_id": result.get("anchor_message_id", ""),
         "workspace": route.workspace_label or route.cwd,
         "model": result.get("model", ""),
         "effort": result.get("effort", ""),
         "deduped": False,
     }
+    if route.continue_threads or route.dynamic_chat:
+        out["continued"] = bool(thread_rec)
     now = time.time()
     with _lock:
         _prune_state(now)
-        _state["tasks"][out["thread_id"]] = {
+        _state["tasks"][thread_id] = {
             "at": now, "client": client.client_id, "route": route.name,
             "task_id": task_id, "profile": route.profile,
-            "chat_id": route.chat_id, "source": source,
+            "chat_id": chat_id, "source": source,
         }
         if idem:
             _state["idempotency"][f"{client.client_id}:{idem}"] = {"at": now, "result": out}
         _save_state()
+        if route.continue_threads and thread_id:
+            threads = _chats.setdefault("threads", {})
+            prev = threads.pop(str((thread_rec or {}).get("thread_id") or ""), None) if thread_rec else None
+            base = prev or threads.get(thread_id) or {}
+            threads[thread_id] = {
+                **base,
+                "route": route.name, "chat_id": chat_id, "profile": route.profile,
+                "thread_id": thread_id,
+                "anchor": base.get("anchor") or out["anchor_message_id"],
+                "client": base.get("client") or client.client_id,
+                "created_at": base.get("created_at") or now,
+                "first_task_id": base.get("first_task_id") or task_id,
+                "last_task_id": task_id, "last_at": now,
+                "rounds": int(base.get("rounds") or 0) + 1,
+            }
+            _save_chats()
 
     log("global", "extapi", "info",
-        f"派发成功 client={client.client_id} route={route.name} task={task_id} "
-        f"chat={route.chat_id[:12]}... thread={out['thread_id'][:14]}... cwd={route.cwd}")
+        f"{action}成功 client={client.client_id} route={route.name} task={task_id} "
+        f"chat={chat_id[:12]}... thread={out['thread_id'][:14]}... cwd={route.cwd}")
     return 202, out
+
+
+def _register_chat(client: Client, body: bytes) -> tuple[int, dict]:
+    """POST /chats {route, chat_id, name?}：给 dynamic_chat route 登记一个群。
+
+    登记 = 校验 bot 在群 → 群加进 profile 白名单 + 群 workspace 钉成 route 的 cwd
+    （和 `/group add` 同一份内存 + .env 落盘，实时生效）→ 记进登记簿。幂等：重复登记
+    同一群返回 200 + created=false，并顺手把白名单/映射修回来。
+
+    不许借它"改道"已有的群：群已经映射到别的 workspace、已被别的 route 登记、或者是
+    手工加白（没走本接口）的群，一律 409 —— 否则一个有 manage_chats 的后端就能把
+    开发群的 workspace 改成合作方目录。
+    """
+    if not client.manage_chats:
+        log("global", "extapi", "warn",
+            f"client {client.client_id!r} 无 manage_chats 却调了 POST /chats")
+        return 403, {"ok": False, "error": f"client {client.client_id!r} may not manage chats"}
+    try:
+        payload = json.loads(body or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("body must be a JSON object")
+    except Exception as e:
+        return 400, {"ok": False, "error": f"bad json: {e}"}
+    route_name = str(payload.get("route") or "").strip()
+    chat_id = payload.get("chat_id") or ""
+    name = payload.get("name") or ""
+    if not isinstance(chat_id, str) or not isinstance(name, str):
+        return 400, {"ok": False, "error": "chat_id / name must be strings"}
+    chat_id, name = chat_id.strip(), " ".join(name.split())[:100]
+
+    route = _config.routes.get(route_name)
+    if route is None:
+        return 404, {"ok": False, "error": f"unknown route {route_name!r}"}
+    if not client.may_use(route_name):
+        log("global", "extapi", "warn",
+            f"client {client.client_id!r} 试图给未授权 route {route_name!r} 登记群")
+        return 403, {"ok": False, "error": f"client {client.client_id!r} may not use route {route_name!r}"}
+    if not route.dynamic_chat:
+        return 400, {"ok": False, "error": f"route {route_name!r} is not dynamic_chat"}
+    if not group_allowlist.CHAT_ID_RE.match(chat_id):
+        return 400, {"ok": False, "error": "chat_id must look like oc_<letters/digits>"}
+    if _deps.check_membership is None or _deps.add_group is None:
+        return 501, {"ok": False, "error": "chat registration is not available"}
+    bot = _deps.bots.get(route.profile)
+    if bot is None:
+        return 500, {"ok": False, "error": f"profile {route.profile!r} is not loaded"}
+    if not os.path.isdir(route.cwd):
+        log("global", "extapi", "error", f"route {route_name!r} 的 workspace 不存在: {route.cwd}")
+        return 500, {"ok": False, "error": f"workspace directory does not exist: {route.cwd}"}
+
+    with _lock:
+        others = sorted(r for r, chats in (_chats.get("routes") or {}).items()
+                        if r != route.name and isinstance(chats, dict) and chat_id in chats)
+        existing = ((_chats.get("routes") or {}).get(route.name) or {}).get(chat_id)
+    if others:
+        return 409, {"ok": False, "error": f"chat {chat_id} is already registered for route {others[0]!r}"}
+    mapping = getattr(bot.profile, "chat_default_cwd", None) or {}
+    allowed = getattr(bot.profile, "allowed_group_chat_ids", None) or set()
+    cur_cwd = mapping.get(chat_id) or ""
+    if existing is None:
+        if cur_cwd and os.path.realpath(cur_cwd) != os.path.realpath(route.cwd):
+            log("global", "extapi", "warn",
+                f"拒绝登记：群 {chat_id[:16]} 已映射到别的 workspace（route={route_name!r}）")
+            return 409, {"ok": False,
+                         "error": f"chat {chat_id} is already mapped to another workspace"}
+        if chat_id in allowed and not cur_cwd:
+            return 409, {"ok": False,
+                         "error": f"chat {chat_id} is already allowlisted for profile "
+                                  f"{route.profile!r} outside this API; refusing to repoint it"}
+
+    try:
+        in_chat, detail = _deps.run_coro(_deps.check_membership(bot, chat_id), _READ_TIMEOUT_SEC)
+    except TimeoutError:
+        return 504, {"ok": False, "error": "membership check timed out"}
+    except Exception as e:
+        log("global", "extapi", "warn", f"群成员校验异常 chat={chat_id[:16]}: {type(e).__name__}: {e}")
+        return 502, {"ok": False, "error": f"membership check failed: {type(e).__name__}: {e}"}
+    if not in_chat:
+        log("global", "extapi", "warn",
+            f"拒绝登记：bot 不在群 {chat_id[:16]}（route={route_name!r}）: {detail}")
+        return 409, {"ok": False, "error": f"bot is not a member of chat {chat_id}",
+                     "detail": str(detail or "")[:300]}
+
+    try:
+        env_changed, info = _deps.run_coro(
+            _deps.add_group(bot, chat_id, route.cwd), _DISPATCH_TIMEOUT_SEC)
+    except TimeoutError:
+        return 504, {"ok": False, "error": "allowlist update timed out"}
+    except Exception as e:
+        log("global", "extapi", "error", f"加群白名单异常 chat={chat_id[:16]}: {type(e).__name__}: {e}")
+        return 500, {"ok": False, "error": f"allowlist update failed: {type(e).__name__}: {e}"}
+    if str(info).startswith("❌"):
+        log("global", "extapi", "error", f"加群白名单未落盘 chat={chat_id[:16]}: {info}")
+        return 500, {"ok": False, "error": f"allowlist was not persisted: {str(info).lstrip('❌ ')}"}
+
+    now = time.time()
+    with _lock:
+        bucket = _chats.setdefault("routes", {}).setdefault(route.name, {})
+        prev = bucket.get(chat_id) if isinstance(bucket.get(chat_id), dict) else {}
+        created = not prev
+        bucket[chat_id] = {
+            "chat_id": chat_id, "route": route.name, "profile": route.profile,
+            "cwd": route.cwd, "name": name or prev.get("name", ""),
+            "client": prev.get("client") or client.client_id,
+            "registered_at": prev.get("registered_at") or now, "updated_at": now,
+        }
+        saved = _save_chats()
+    if not saved:
+        return 500, {"ok": False, "error": "chat registry could not be saved; retry"}
+    log("global", "extapi", "info",
+        f"群登记{'成功' if created else '（已存在，已校正）'} client={client.client_id} "
+        f"route={route.name} chat={chat_id} name={name or '-'} profile={route.profile} "
+        f"cwd={route.cwd} env_changed={env_changed}")
+    return (201 if created else 200), {
+        "ok": True, "route": route.name, "chat_id": chat_id, "profile": route.profile,
+        "workspace": route.workspace_label or route.cwd, "created": created,
+    }
+
+
+def _list_chats(client: Client, route_name: str) -> tuple[int, dict]:
+    """GET /chats?route=：列出已登记的动态群（只列调用方能用的 route）。"""
+    if route_name:
+        route = _config.routes.get(route_name)
+        if route is None:
+            return 404, {"ok": False, "error": f"unknown route {route_name!r}"}
+        if not client.may_use(route_name):
+            return 403, {"ok": False, "error": f"client {client.client_id!r} may not use route {route_name!r}"}
+        names = [route_name]
+    else:
+        names = [r.name for r in _config.routes.values() if r.dynamic_chat and client.may_use(r.name)]
+    with _lock:
+        registry = _chats.get("routes") or {}
+        chats = [
+            {"route": rname, "chat_id": cid, "name": rec.get("name", ""),
+             "registered_at": int(rec.get("registered_at") or 0),
+             "updated_at": int(rec.get("updated_at") or 0)}
+            for rname in names
+            for cid, rec in sorted((registry.get(rname) or {}).items())
+            if isinstance(rec, dict)
+        ]
+    return 200, {"ok": True, "chats": chats}
 
 
 def _get_task(client: Client, thread_id: str) -> tuple[int, dict]:

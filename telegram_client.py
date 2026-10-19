@@ -971,6 +971,10 @@ class TelegramClient:
     async def list_thread_messages(self, thread_id: str, limit: int = 200) -> list:
         return self.buffer.thread_messages(thread_id, limit=limit)
 
+    async def is_bot_in_chat(self, chat_id: str) -> tuple[bool, str]:
+        """外部 API 的动态群登记只认 Lark 话题群；Telegram profile 一律按「不在群」拒绝。"""
+        return False, "telegram profiles do not support dynamic chat registration"
+
     async def batch_resolve_names(self, open_ids: list[str]) -> dict[str, str]:
         return self.buffer.names(list(open_ids or []))
 

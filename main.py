@@ -39,6 +39,7 @@ install_loop_proxy()
 import bot_config as config
 import dispatcher
 import external_api
+import group_allowlist
 import http_server
 import inbox_watcher
 import runtime
@@ -72,11 +73,21 @@ def _external_api_deps(bot_loop: asyncio.AbstractEventLoop) -> external_api.Exte
                 return {"ok": False, "error": err}
         return await dispatcher.dispatch_task(bot, target_bot=target_bot, **kwargs)
 
+    async def _check_membership(bot, chat_id: str):
+        return await bot.feishu.is_bot_in_chat(chat_id)
+
+    async def _add_group(bot, chat_id: str, cwd: str):
+        # 在 bot_loop 上改 profile 的白名单/映射：和 /group add 同一线程，不和消息处理抢
+        return group_allowlist.add_chat_to_profile(bot.profile, chat_id, cwd)
+
     return external_api.ExternalApiDeps(
         bots=_bots,
         dispatch=_dispatch,
         read_thread=dispatcher.read_thread,
         run_coro=_run_coro,
+        continue_thread=dispatcher.continue_task,
+        check_membership=_check_membership,
+        add_group=_add_group,
     )
 
 
@@ -201,7 +212,10 @@ def main():
         print(f"   外部触发 API: {base}/api/v1/agent-tasks  "
               f"（{len(ext_cfg.routes)} route / {len(ext_cfg.clients)} client）")
         for r in ext_cfg.routes.values():
-            print(f"     · {r.name:<20} profile={r.profile} chat={r.chat_id[:14]}... cwd={r.cwd}")
+            chat_desc = f"{r.chat_id[:14]}..." if r.chat_id else "-"
+            if r.dynamic_chat:
+                chat_desc += f" +{len(external_api.registered_chats(r.name))} 动态群"
+            print(f"     · {r.name:<20} profile={r.profile} chat={chat_desc} cwd={r.cwd}")
         # 群 ↔ workspace 对不上是最容易犯又最难发现的配置错（消息跑错群），启动就喊出来
         for line in external_api.audit_route_groups():
             print(f"   ⚠️ {line}")
