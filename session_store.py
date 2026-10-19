@@ -395,7 +395,10 @@ class SessionStore:
         if self._default_runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
             self._default_runner = "claude"
         self._default_model = default_model or DEFAULT_MODEL
-        self._chat_default_cwd = chat_default_cwd or {}
+        # 必须持有 profile 的同一个 dict（空 dict 也一样，不能 `or {}` 换成新对象）：
+        # /group add 和外部 API 的 /api/v1/chats 都是实时往 profile.chat_default_cwd 里加映射，
+        # 换了对象这里就永远看不到，新群的话题会落回 default_cwd。
+        self._chat_default_cwd = chat_default_cwd if chat_default_cwd is not None else {}
         self._sessions_file = _sessions_file_for(profile)
         self._save_lock = asyncio.Lock()  # 保护 _save() 的全局锁
         self._data: dict = self._load()
