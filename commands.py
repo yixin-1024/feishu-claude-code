@@ -30,6 +30,7 @@ from agy_runner import AGY_EFFORT_LEVELS, resolve_agy_bin
 from qoder_runner import QODER_EFFORT_LEVELS
 from kiro_runner import KIRO_EFFORT_LEVELS
 from run_control import RUN_GATE
+import group_allowlist
 from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title, _find_session_file
 
 PLUGINS_DIR = os.path.expanduser("~/.claude/plugins")
@@ -1962,56 +1963,10 @@ def _modify_env_add_chat_to_profile(
     """
     把 chat_id 追加到 .env 的 <PREFIX>_ALLOWED_GROUP_CHAT_IDS；
     若 cwd 非空，再追加/覆盖 <PREFIX>_CHAT_CWD_<chat_id>=<cwd>。
-    返回 (是否改动, 提示信息)。
+    返回 (是否改动, 提示信息)。实现在 group_allowlist（外部 API 加群走同一份）。
     """
-    env_path = os.path.join(REPO_ROOT, ".env")
-    if not os.path.isfile(env_path):
-        return False, f"❌ .env 不存在: {env_path}"
-
-    prefix = profile_name.upper()
-    allow_key = f"{prefix}_ALLOWED_GROUP_CHAT_IDS"
-    cwd_key = f"{prefix}_CHAT_CWD_{chat_id}"
-
-    with open(env_path, "r", encoding="utf-8") as f:
-        lines = f.read().splitlines()
-
-    changed = False
-    allow_seen = False
-    cwd_seen = False
-    out: list[str] = []
-    for ln in lines:
-        stripped = ln.lstrip()
-        if stripped.startswith(f"{allow_key}="):
-            allow_seen = True
-            head, _, val = ln.partition("=")
-            items = [x.strip() for x in val.split(",") if x.strip()]
-            if chat_id not in items:
-                items.append(chat_id)
-                ln = f"{head}={','.join(items)}"
-                changed = True
-            out.append(ln)
-            continue
-        if cwd is not None and stripped.startswith(f"{cwd_key}="):
-            cwd_seen = True
-            new_ln = f"{cwd_key}={cwd}"
-            if new_ln != ln:
-                changed = True
-            out.append(new_ln)
-            continue
-        out.append(ln)
-
-    if not allow_seen:
-        out.append(f"{allow_key}={chat_id}")
-        changed = True
-    if cwd is not None and not cwd_seen:
-        out.append(f"{cwd_key}={cwd}")
-        changed = True
-
-    if changed:
-        with open(env_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(out) + "\n")
-
-    return changed, env_path
+    return group_allowlist.persist_chat_to_env(
+        profile_name, chat_id, cwd, os.path.join(REPO_ROOT, ".env"))
 
 
 async def _handle_group_command(args: str, bot) -> str:
@@ -2035,12 +1990,12 @@ async def _handle_group_command(args: str, bot) -> str:
     if not chat_id.startswith("oc_"):
         return f"⚠️ chat_id 看起来不对（应以 `oc_` 开头）: `{chat_id}`"
 
-    profile = bot.profile
-    bot.profile.allowed_group_chat_ids.add(chat_id)
-    if cwd:
-        bot.profile.chat_default_cwd[chat_id] = cwd
+    if not group_allowlist.CHAT_ID_RE.match(chat_id):
+        return f"⚠️ chat_id 含非法字符（只允许 `oc_` + 字母数字）: `{chat_id}`"
 
-    changed, info = _modify_env_add_chat_to_profile(profile.name, chat_id, cwd)
+    profile = bot.profile
+    changed, info = group_allowlist.add_chat_to_profile(
+        profile, chat_id, cwd, os.path.join(REPO_ROOT, ".env"))
 
     lines = [
         f"✅ 已加白群 `{chat_id}` 到 profile **{profile.name}** —— 实时生效",
@@ -2049,6 +2004,8 @@ async def _handle_group_command(args: str, bot) -> str:
         lines.append(f"   默认 cwd: `{cwd}`")
     if changed:
         lines.append(f"   .env 已更新: `{info}`")
+    elif info.startswith("❌"):
+        lines.append(f"   ⚠️ .env 未落盘（重启后会丢）: {info}")
     else:
         lines.append("   .env 无变化（已存在）")
     lines.append("ℹ️  立即可用，无需 `/restart`。")
