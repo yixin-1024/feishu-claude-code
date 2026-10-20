@@ -24,6 +24,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1.model import (
     CreateMessageRequest,
     CreateMessageRequestBody,
+    GetMessageRequest,
     ListMessageRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
@@ -1011,6 +1012,33 @@ class FeishuClient:
             if not has_more or not page_token:
                 break
         return messages
+
+    async def list_chat_messages(self, chat_id: str, start_time: int, limit: int = 15) -> list:
+        """普通群（非话题）里 start_time（Unix 秒）之后最新的 limit 条消息，按创建时间升序。"""
+        req = (
+            ListMessageRequest.builder()
+            .container_id_type("chat")
+            .container_id(chat_id)
+            .start_time(str(int(start_time)))
+            .sort_type("ByCreateTimeDesc")
+            .page_size(min(50, max(1, limit)))
+            .build()
+        )
+        resp = await self.client.im.v1.message.alist(req)
+        if not resp.success():
+            raise RuntimeError(f"list chat messages 失败: {resp.code} {resp.msg}")
+        items = list((resp.data.items or []) if resp.data else [])[:limit]
+        items.reverse()
+        return items
+
+    async def get_message(self, message_id: str):
+        """GET /im/v1/messages/{id}，返回 Message 对象；拿不到返回 None。"""
+        req = GetMessageRequest.builder().message_id(message_id).build()
+        resp = await self.client.im.v1.message.aget(req)
+        if not resp.success():
+            raise RuntimeError(f"get message 失败: {resp.code} {resp.msg}")
+        items = (resp.data.items or []) if resp.data else []
+        return items[0] if items else None
 
     async def batch_resolve_names(self, open_ids: list[str]) -> dict[str, str]:
         """

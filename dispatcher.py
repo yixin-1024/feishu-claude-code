@@ -55,7 +55,7 @@ import handover_store
 import resume_store
 import task_routes
 from run_control import RUN_GATE, ActiveRun, stop_run
-from thread_context import build_thread_context
+from thread_context import build_chat_context, build_quoted_context, build_thread_context
 from trinity_dispatch import maybe_handle_trinity, TrinityContext
 import inbox_watcher
 
@@ -1444,6 +1444,8 @@ async def _inject_or_steer(
         text = await _attach_thread_context(bot, user_id, chat_id, thread_id, msg, text)
         if text is None:
             return True
+    elif is_group:
+        text = await _attach_chat_context(bot, chat_id, msg, text)
     if not text.strip():
         try:
             await bot.feishu.reply_text(
@@ -2730,6 +2732,8 @@ async def _process_message(
         text = await _attach_thread_context(bot, user_id, chat_id, thread_id, msg, text)
         if text is None:
             return
+    elif is_group:
+        text = await _attach_chat_context(bot, chat_id, msg, text)
 
     await _start_agent_run(
         bot, user_id, chat_id, is_group, thread_id, msg, text, preview_text,
@@ -2743,7 +2747,8 @@ async def _extract_message_text(
     """把一条飞书消息转成给 agent 的正文：下载图片 / 文件、语音转写、富文本拆图。
 
     返回 (text, preview_text)；None = 不用处理（空消息，或已经向用户报过错）。
-    群聊话题里只 @ 没正文时返回空 text，由话题上下文补齐。
+    群聊里只 @ 没正文时返回空 text：话题里由话题上下文补齐，普通群由群里最近的
+    消息补齐（_attach_chat_context）。
     """
     tag = bot.profile.name
     text = ""
@@ -2759,8 +2764,6 @@ async def _extract_message_text(
 
         if is_group:
             text = strip_lark_mentions(text, getattr(msg, 'mentions', None))
-            if not text and not thread_id:
-                return None
 
         preview_text = text
         log(tag, "text", "info", f"{text[:50] if text else '(空)'}")
@@ -2860,7 +2863,7 @@ async def _extract_message_text(
             except Exception as e:
                 log(tag, "post", "warn", f"下载 post 图片失败 key={ik[:8]}...: {e}")
 
-        if not post_text and not img_paths:
+        if not post_text and not img_paths and not is_group:
             log(tag, "post", "info", "空内容，忽略")
             return None
 
@@ -2932,6 +2935,46 @@ async def _attach_thread_context(
     return text
 
 
+async def _attach_chat_context(bot: BotInstance, chat_id: str, msg, text: str) -> str:
+    """普通群（非话题）里的 @：只 @ 没正文 → 拼上群里最近的消息；引用回复某条 → 拼上被引用的那条。
+
+    以前普通群里单独补的一条 @、或引用回复只写 @，都被当空消息直接丢掉，发的人等不到任何回应。
+    拉不到上下文时原样返回，空正文由 _start_agent_run 回一句提示，不再静默。
+    """
+    tag = bot.profile.name
+    parent_id = getattr(msg, "parent_id", None)
+    parent_id = parent_id if isinstance(parent_id, str) else ""
+    if text.strip() and not parent_id:
+        return text
+    cli_profile = bot.profile.lark_cli_profile or bot.profile.name
+    msg_chat_id = getattr(msg, "chat_id", None)
+    try:
+        if text.strip():
+            block, paths, err = await build_quoted_context(bot.feishu, parent_id, cli_profile=cli_profile)
+        else:
+            block, paths, err = await build_chat_context(
+                bot.feishu, msg_chat_id if isinstance(msg_chat_id, str) and msg_chat_id else chat_id,
+                msg.message_id,
+                parent_id=parent_id, cli_profile=cli_profile,
+            )
+    except Exception as e:
+        log(tag, "chat", "warn", f"构建群上下文失败（继续处理当前消息）: {e}")
+        return text
+    if err:
+        log(tag, "chat", "warn", f"拉取群消息失败: {err}")
+        return text
+    if not block:
+        return text
+    log(tag, "chat", "info",
+        f"注入群上下文 {'引用' if text.strip() else '最近消息'} 附件={len(paths)}")
+    if text.strip():
+        return f"{block}\n\n【用户引用回复上面这条消息，@ 你并说】\n{text}"
+    return (
+        f"{block}\n\n【用户刚刚 @ 你，没有写正文。请结合上方的消息判断要你做什么"
+        f"（通常是最近一条还没人回答的问题，或被引用的那条），直接回复】"
+    )
+
+
 async def _start_agent_run(
     bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, msg,
     text: str, preview_text: str, *, session=None,
@@ -2945,7 +2988,7 @@ async def _start_agent_run(
         try:
             await bot.feishu.reply_card(
                 msg.message_id,
-                content="ℹ️ 只 @ 了我但没有正文，也没有新的话题消息可读。请补一句说明你想做什么。",
+                content="ℹ️ 只 @ 了我但没有正文，也读不到前面的消息。请补一句说明你想做什么。",
                 loading=False,
             )
         except Exception:

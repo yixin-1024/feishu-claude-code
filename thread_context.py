@@ -8,6 +8,7 @@
 import asyncio
 import json
 import os
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -354,6 +355,107 @@ def _sender_label(
     return "unknown"
 
 
+async def _render_messages(
+    feishu: FeishuClient,
+    msgs: list,
+    cli_profile: str = "",
+    marks: Optional[dict] = None,
+) -> tuple[list[str], list[str]]:
+    """把一组消息渲染成「[序号] 发送者 (时间): 正文」，顺带下载其中的附件。
+
+    marks: message_id → 跟在发送者后面的标注（如「被引用」）。
+    返回 (lines, downloaded_paths)。
+    """
+    # 批量把 sender open_id 解析成真实姓名（bot 自己的消息不需要解析）。
+    # 一次接口拿完，_sender_label 直接查表，失败自动回退 user_<末6位>。
+    sender_ids = [
+        (m.sender.id or "")
+        for m in msgs
+        if m.sender and (m.sender.sender_type or "") != "app" and (m.sender.id or "")
+    ]
+    try:
+        name_map = await feishu.batch_resolve_names(sender_ids) if sender_ids else {}
+    except Exception as e:
+        print(f"[thread] 批量解析姓名失败（回退末6位）: {e}", flush=True)
+        name_map = {}
+
+    # bot（app_id）名字走静态表；本 bot 自己的 app_id 用于标 "(自己)"
+    bot_names = _bot_names()
+    self_app_id = getattr(feishu, "_app_id", "") or ""
+
+    # 正文读不到的卡片：借 owner 的 user 身份把真身捞回来（一次 mget 批量拿完）
+    need_fetch = [
+        (m.message_id or "") for m in msgs if _needs_user_fetch(m, feishu)
+    ]
+    card_texts = (
+        await _fetch_card_texts_as_user(need_fetch, cli_profile)
+        if need_fetch and cli_profile
+        else {}
+    )
+    if need_fetch:
+        print(
+            f"[thread] 卡片正文补捞: 需要 {len(need_fetch)} 条，捞到 {len(card_texts)} 条",
+            flush=True,
+        )
+
+    # 并发下载所有附件
+    download_tasks = []
+    download_meta = []  # [(kind, display_name), ...]
+    per_msg_indices: list[list[int]] = []  # 每条消息对应 download_tasks 的下标列表
+
+    for m in msgs:
+        att_indices = []
+        _text, atts = _extract(m, feishu, card_texts)
+        for att in atts:
+            if not att["key"]:
+                continue
+            task = feishu.download_file(
+                m.message_id,
+                att["key"],
+                msg_type=att["kind"],
+                file_name=att["name"],
+            )
+            att_indices.append(len(download_tasks))
+            download_tasks.append(task)
+            download_meta.append((att["kind"], att["name"] or att["key"][:8]))
+        per_msg_indices.append(att_indices)
+
+    if download_tasks:
+        results = await asyncio.gather(*download_tasks, return_exceptions=True)
+    else:
+        results = []
+
+    # 组装上下文文本
+    lines = []
+    all_paths = []
+    for seq, m in enumerate(msgs, 1):
+        text, _atts = _extract(m, feishu, card_texts)
+        sender = _sender_label(m, name_map, bot_names, self_app_id)
+        time_str = _fmt_time(m.create_time)
+        header = f"[{seq}] {sender}"
+        mark = (marks or {}).get(m.message_id or "", "")
+        if mark:
+            header += f"（{mark}）"
+        if time_str:
+            header += f" ({time_str})"
+
+        if text:
+            lines.append(f"{header}: {text}")
+        else:
+            lines.append(f"{header}:")
+
+        for ai in per_msg_indices[seq - 1]:
+            kind, display_name = download_meta[ai]
+            result = results[ai]
+            if isinstance(result, Exception):
+                lines.append(f"    · [{kind} 下载失败: {display_name}]")
+            else:
+                lines.append(f"    · 附件({kind}): {result}")
+                all_paths.append(result)
+
+    return lines, all_paths
+
+
 async def build_thread_context(
     feishu: FeishuClient,
     thread_id: str,
@@ -402,89 +504,7 @@ async def build_thread_context(
     if not unseen:
         return "", [], None
 
-    # 批量把 sender open_id 解析成真实姓名（bot 自己的消息不需要解析）。
-    # 一次接口拿完，_sender_label 直接查表，失败自动回退 user_<末6位>。
-    sender_ids = [
-        (m.sender.id or "")
-        for m in unseen
-        if m.sender and (m.sender.sender_type or "") != "app" and (m.sender.id or "")
-    ]
-    try:
-        name_map = await feishu.batch_resolve_names(sender_ids) if sender_ids else {}
-    except Exception as e:
-        print(f"[thread] 批量解析姓名失败（回退末6位）: {e}", flush=True)
-        name_map = {}
-
-    # bot（app_id）名字走静态表；本 bot 自己的 app_id 用于标 "(自己)"
-    bot_names = _bot_names()
-    self_app_id = getattr(feishu, "_app_id", "") or ""
-
-    # 正文读不到的卡片：借 owner 的 user 身份把真身捞回来（一次 mget 批量拿完）
-    need_fetch = [
-        (m.message_id or "") for m in unseen if _needs_user_fetch(m, feishu)
-    ]
-    card_texts = (
-        await _fetch_card_texts_as_user(need_fetch, cli_profile)
-        if need_fetch and cli_profile
-        else {}
-    )
-    if need_fetch:
-        print(
-            f"[thread] 卡片正文补捞: 需要 {len(need_fetch)} 条，捞到 {len(card_texts)} 条",
-            flush=True,
-        )
-
-    # 并发下载所有附件
-    download_tasks = []
-    download_meta = []  # [(kind, display_name), ...]
-    per_msg_indices: list[list[int]] = []  # 每条消息对应 download_tasks 的下标列表
-
-    for m in unseen:
-        att_indices = []
-        _text, atts = _extract(m, feishu, card_texts)
-        for att in atts:
-            if not att["key"]:
-                continue
-            task = feishu.download_file(
-                m.message_id,
-                att["key"],
-                msg_type=att["kind"],
-                file_name=att["name"],
-            )
-            att_indices.append(len(download_tasks))
-            download_tasks.append(task)
-            download_meta.append((att["kind"], att["name"] or att["key"][:8]))
-        per_msg_indices.append(att_indices)
-
-    if download_tasks:
-        results = await asyncio.gather(*download_tasks, return_exceptions=True)
-    else:
-        results = []
-
-    # 组装上下文文本
-    lines = []
-    all_paths = []
-    for seq, m in enumerate(unseen, 1):
-        text, _atts = _extract(m, feishu, card_texts)
-        sender = _sender_label(m, name_map, bot_names, self_app_id)
-        time_str = _fmt_time(m.create_time)
-        header = f"[{seq}] {sender}"
-        if time_str:
-            header += f" ({time_str})"
-
-        if text:
-            lines.append(f"{header}: {text}")
-        else:
-            lines.append(f"{header}:")
-
-        for ai in per_msg_indices[seq - 1]:
-            kind, display_name = download_meta[ai]
-            result = results[ai]
-            if isinstance(result, Exception):
-                lines.append(f"    · [{kind} 下载失败: {display_name}]")
-            else:
-                lines.append(f"    · 附件({kind}): {result}")
-                all_paths.append(result)
+    lines, all_paths = await _render_messages(feishu, unseen, cli_profile)
 
     prefix = (
         f"【话题历史 · {len(unseen)} 条（按时间顺序）】"
@@ -493,3 +513,71 @@ async def build_thread_context(
     )
     context = prefix + "\n" + "\n".join(lines)
     return context, all_paths, None
+
+
+# 普通群（非话题）只 @ 不写字时，往回看多久、最多几条。
+CHAT_CONTEXT_WINDOW_SEC = 30 * 60
+CHAT_CONTEXT_LIMIT = 15
+
+
+async def build_chat_context(
+    feishu: FeishuClient,
+    chat_id: str,
+    current_message_id: str,
+    parent_id: str = "",
+    cli_profile: str = "",
+    now: Optional[float] = None,
+) -> tuple[str, list[str], Optional[str]]:
+    """普通群里有人只 @ bot 不写字：把群里最近的消息（含附件）拼成上下文。
+
+    常见的发法是先发图、再发问题、最后单独补一条 @；或者引用回复某条消息、只写 @。
+    话题里有话题上下文兜底，普通群没有，于是这种 @ 以前被直接丢掉。
+
+    取最近 CHAT_CONTEXT_WINDOW_SEC 内最新的 CHAT_CONTEXT_LIMIT 条（不含当前这条）；
+    引用的那条（parent_id）不在里面就补到最前面，并标「被引用」。
+    返回值同 build_thread_context。
+    """
+    start = int((now if now is not None else time.time()) - CHAT_CONTEXT_WINDOW_SEC)
+    try:
+        msgs = await feishu.list_chat_messages(chat_id, start, limit=CHAT_CONTEXT_LIMIT + 1)
+    except Exception as e:
+        print(f"[chat] 拉取群消息失败 chat={chat_id[:12]}...: {e}", flush=True)
+        return "", [], str(e)
+    recent = [m for m in msgs if (m.message_id or "") != current_message_id]
+    recent = recent[-CHAT_CONTEXT_LIMIT:]
+
+    marks: dict[str, str] = {}
+    if parent_id:
+        marks[parent_id] = "被引用"
+        if not any((m.message_id or "") == parent_id for m in recent):
+            try:
+                parent = await feishu.get_message(parent_id)
+            except Exception as e:
+                print(f"[chat] 拉取被引用消息失败 id={parent_id[:12]}...: {e}", flush=True)
+                parent = None
+            if parent is not None:
+                recent.insert(0, parent)
+
+    if not recent:
+        return "", [], None
+
+    lines, all_paths = await _render_messages(feishu, recent, cli_profile, marks)
+    context = f"【群里最近的消息 · {len(recent)} 条（按时间顺序）】\n" + "\n".join(lines)
+    return context, all_paths, None
+
+
+async def build_quoted_context(
+    feishu: FeishuClient,
+    parent_id: str,
+    cli_profile: str = "",
+) -> tuple[str, list[str], Optional[str]]:
+    """普通群里引用回复某条消息并 @ bot：把被引用的那条（含附件）拼成上下文。"""
+    try:
+        parent = await feishu.get_message(parent_id)
+    except Exception as e:
+        print(f"[chat] 拉取被引用消息失败 id={parent_id[:12]}...: {e}", flush=True)
+        return "", [], str(e)
+    if parent is None:
+        return "", [], None
+    lines, all_paths = await _render_messages(feishu, [parent], cli_profile)
+    return "【用户引用的消息】\n" + "\n".join(lines), all_paths, None
