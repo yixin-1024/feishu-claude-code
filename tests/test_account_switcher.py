@@ -101,6 +101,22 @@ def test_evaluate_blocked_status_disqualifies():
     assert not a.usable
 
 
+def test_evaluate_without_5h_window_scores_on_7d_only():
+    # 2026-10-31 起 Ultra（原 Max 20x）陆续取消 5h 限额，响应里只剩 7d headers
+    a = mk("foo", u5=None, u7=0.3, r5_in=None, s5="unknown")
+    evaluate(a, current_name=None)
+    assert a.usable
+    # h5 视为满：0.65*0.7 + 0.30*1.0 = 0.755
+    assert 0.75 < a.score < 0.76
+
+
+def test_evaluate_without_5h_window_still_honours_7d_limit():
+    a = mk("foo", u5=None, u7=0.99, r5_in=None, s5="unknown")
+    evaluate(a, current_name=None)
+    assert not a.usable
+    assert any("7d" in r for r in a.reasons)
+
+
 def test_evaluate_probe_error_unusable():
     a = mk("foo", err="auth 401")
     a.u5h = None  # 探测失败时不会填

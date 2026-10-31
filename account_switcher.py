@@ -1051,8 +1051,9 @@ def evaluate(acc: Account, current_name: Optional[str], now: Optional[float] = N
     acc.is_current = (acc.name == current_name)
     acc.reasons = []
 
-    # 探测失败 → 不可用
-    if acc.probe_error or acc.u5h is None or acc.u7d is None:
+    # 探测失败 → 不可用。没有 5h headers 不算失败：2026-10-31 起 Ultra（原 Max 20x）
+    # 陆续取消了 5 小时限额，响应里只剩 7d，这时只按周额度算。
+    if acc.probe_error or acc.u7d is None:
         acc.usable = False
         acc.score = 0.0
         if acc.probe_error:
@@ -1066,7 +1067,7 @@ def evaluate(acc: Account, current_name: Optional[str], now: Optional[float] = N
         acc.usable = False
         acc.reasons.append(f"7d {acc.u7d*100:.0f}% ≥ {_HARD_LIMIT_UTIL*100:.0f}% hard limit")
     secs_to_5h_reset = max(0, (acc.r5h or 0) - now) if acc.r5h else None
-    if acc.u5h >= _HARD_LIMIT_UTIL and (secs_to_5h_reset is None or secs_to_5h_reset > _SHORT_RESET_GRACE_SEC):
+    if acc.u5h is not None and acc.u5h >= _HARD_LIMIT_UTIL and (secs_to_5h_reset is None or secs_to_5h_reset > _SHORT_RESET_GRACE_SEC):
         acc.usable = False
         acc.reasons.append(f"5h {acc.u5h*100:.0f}% ≥ {_HARD_LIMIT_UTIL*100:.0f}% (reset > 5 min)")
     if acc.s5h == "blocked":
@@ -1085,7 +1086,7 @@ def evaluate(acc: Account, current_name: Optional[str], now: Optional[float] = N
 
     # 打分
     h7 = 1.0 - acc.u7d
-    h5 = 1.0 - acc.u5h
+    h5 = 1.0 - acc.u5h if acc.u5h is not None else 1.0
     # 5h 快重置：把 h5 视为满
     if secs_to_5h_reset is not None and secs_to_5h_reset < _RESET_BONUS_WINDOW_SEC:
         h5 = 1.0
@@ -1798,7 +1799,7 @@ def emergency_switch_on_limit(*, notify: bool = True) -> dict:
         with _spawn_probe_lock:
             _last_spawn_probe_at = now
 
-        u5 = f"{best.u5h*100:.0f}%" if best.u5h is not None else "?"
+        u5 = f"{best.u5h*100:.0f}%" if best.u5h is not None else "无"
         u7 = f"{best.u7d*100:.0f}%" if best.u7d is not None else "?"
         out["switched"] = best.name
         out["reason"] = f"5h 已用 {u5} / 7d 已用 {u7}"
@@ -1840,7 +1841,7 @@ def _emergency_switch_env_token(out: dict, *, notify: bool) -> dict:
     if not ok:
         out["reason"] = f"切换到 {best.name} 失败：{msg}"
         return out
-    u5 = f"{best.u5h*100:.0f}%" if best.u5h is not None else "?"
+    u5 = f"{best.u5h*100:.0f}%" if best.u5h is not None else "无"
     u7 = f"{best.u7d*100:.0f}%" if best.u7d is not None else "?"
     out["switched"] = best.name
     out["reason"] = f"5h 已用 {u5} / 7d 已用 {u7}"

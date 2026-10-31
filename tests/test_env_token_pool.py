@@ -194,6 +194,40 @@ def test_usage_card_reports_dead_token(monkeypatch):
     assert "`b` — ⚠️ auth 403" in text
 
 
+def _drop_5h(probe, token):
+    """模拟已取消 5h 限额的号：探测响应里只有 7d headers。"""
+    def wrapped(acc, is_current=False, *, refreshable=True):
+        acc = probe(acc, is_current, refreshable=refreshable)
+        if acc.access_token == token:
+            acc.u5h = acc.r5h = None
+            acc.s5h = "unknown"
+        return acc
+    return wrapped
+
+
+def test_usage_card_handles_token_without_5h_window(monkeypatch):
+    _pool_ab()
+    probe = _fake_probe({TOK_A: (0.03, 0.4), TOK_B: (0.1, 0.2)})
+    monkeypatch.setattr(accs, "_probe_one", _drop_5h(_drop_5h(probe, TOK_A), TOK_B))
+
+    text = commands._get_usage("oc_chat")["text"]
+
+    assert "用量获取失败" not in text
+    assert "当前 `a`" in text and "已取消 5 小时限额" in text and "40.0%" in text
+    assert "`b` · 5h `无` · 7d `20%`" in text and "✅" in text
+
+
+def test_emergency_switch_accepts_token_without_5h_window(monkeypatch):
+    _pool_ab()
+    probe = _fake_probe({TOK_A: (1.0, 0.5), TOK_B: (0.1, 0.2)})
+    monkeypatch.setattr(accs, "_probe_one", _drop_5h(probe, TOK_B))
+
+    out = accs.emergency_switch_on_limit(notify=False)
+
+    assert out["switched"] == "b"
+    assert out["reason"] == "5h 已用 无 / 7d 已用 20%"
+
+
 def test_switch_command_and_picker_use_tokens(monkeypatch):
     _pool_ab()
     picker = commands._get_account_switch_picker("oc_chat")

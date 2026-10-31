@@ -698,9 +698,13 @@ def _usage_single_account_lines(data: dict, account_label: Optional[str] = None)
     if account_label:
         title += f" — 当前 `{account_label}`"
     lines = [title, ""]
-    lines.append(f"**5小时窗口**（状态：{data.get('s5h', '?')}）")
-    lines.append(_fmt_pct_bar(data.get("u5h")))
-    lines.append(f"重置时间：{_fmt_reset_ts(data.get('r5h'))}")
+    if data.get("u5h") is None and data.get("r5h") is None:
+        # Ultra（原 Max 20x）2026-10-31 起陆续取消 5 小时限额，响应里不再带 5h headers
+        lines.append("**5小时窗口**：无（这个号已取消 5 小时限额）")
+    else:
+        lines.append(f"**5小时窗口**（状态：{data.get('s5h', '?')}）")
+        lines.append(_fmt_pct_bar(data.get("u5h")))
+        lines.append(f"重置时间：{_fmt_reset_ts(data.get('r5h'))}")
     lines.append("")
     lines.append(f"**7天窗口**（状态：{data.get('s7d', '?')}）")
     lines.append(_fmt_pct_bar(data.get("u7d")))
@@ -720,7 +724,7 @@ def _usage_other_line(a, now_ts: float, tail: str = "") -> str:
     tail 为空且账户不可用时补上第一条原因。"""
     if a.probe_error:
         return f"  `{a.name}` — ⚠️ {a.probe_error}"
-    u5 = f"{a.u5h*100:.0f}%" if a.u5h is not None else "?"
+    u5 = f"{a.u5h*100:.0f}%" if a.u5h is not None else "无"
     u7 = f"{a.u7d*100:.0f}%" if a.u7d is not None else "?"
     mark = "✅" if a.usable else "❌"
     r5_part = f" (重置 {_fmt_reset_short(a.r5h - now_ts)})" if a.r5h else ""
@@ -757,7 +761,7 @@ def _get_env_token_usage(chat_id: Optional[str] = None) -> "str | dict":
         evaluate(a, active)
     cur = accounts.get(active)
     lines: list[str] = []
-    if cur is not None and not cur.probe_error and cur.u5h is not None:
+    if cur is not None and not cur.probe_error and cur.u7d is not None:
         lines.extend(_usage_single_account_lines(_account_usage_data(cur), account_label=active))
     else:
         err = (cur.probe_error if cur is not None else None) or "未知"
@@ -866,7 +870,7 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
             "要换号得改 .env 里的 token 或注释掉该行后重启服务。"
         )
         lines.append("")
-    if cur and not cur.probe_error and cur.u5h is not None:
+    if cur and not cur.probe_error and cur.u7d is not None:
         data = {
             "u5h": cur.u5h, "u7d": cur.u7d, "r5h": cur.r5h, "r7d": cur.r7d,
             "s5h": cur.s5h, "s7d": cur.s7d,
