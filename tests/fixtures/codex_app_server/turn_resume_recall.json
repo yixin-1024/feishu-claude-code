@@ -1,0 +1,350 @@
+[
+{
+"method": "thread/status/changed",
+"params": {
+"threadId": "$THREAD",
+"status": {
+"type": "active",
+"activeFlags": []
+}
+},
+"emittedAtMs": 1793589137101
+},
+{
+"method": "turn/started",
+"params": {
+"threadId": "$THREAD",
+"turn": {
+"id": "$TURN",
+"rootTurnId": "$TURN",
+"items": [],
+"itemsView": "notLoaded",
+"status": "inProgress",
+"error": null,
+"startedAt": 1793589137,
+"completedAt": null,
+"durationMs": null
+}
+},
+"emittedAtMs": 1793589137101
+},
+{
+"method": "item/started",
+"params": {
+"item": {
+"type": "userMessage",
+"id": "01a19a3e-5981-7e03-9814-0bf4d06bd959",
+"clientId": null,
+"content": [
+{
+"type": "text",
+"text": "What was the secret word you read earlier? Answer in one short sentence without using any tools.",
+"text_elements": []
+}
+]
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"startedAtMs": 1793589139843
+},
+"emittedAtMs": 1793589139843
+},
+{
+"method": "item/completed",
+"params": {
+"item": {
+"type": "userMessage",
+"id": "01a19a3e-5981-7e03-9814-0bf4d06bd959",
+"clientId": null,
+"content": [
+{
+"type": "text",
+"text": "What was the secret word you read earlier? Answer in one short sentence without using any tools.",
+"text_elements": []
+}
+]
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"completedAtMs": 1793589139843
+},
+"emittedAtMs": 1793589139849
+},
+{
+"method": "item/started",
+"params": {
+"item": {
+"type": "reasoning",
+"id": "rs_031f42655f3e3051016ae7ff95d300819196b3c2c3b35b371a",
+"summary": [],
+"content": []
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"startedAtMs": 1793589145352
+},
+"emittedAtMs": 1793589145352
+},
+{
+"method": "item/completed",
+"params": {
+"item": {
+"type": "reasoning",
+"id": "rs_031f42655f3e3051016ae7ff95d300819196b3c2c3b35b371a",
+"summary": [],
+"content": []
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"completedAtMs": 1793589145352
+},
+"emittedAtMs": 1793589145356
+},
+{
+"method": "item/started",
+"params": {
+"item": {
+"type": "agentMessage",
+"id": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"text": "",
+"phase": "final_answer",
+"memoryCitation": null,
+"delivery": null,
+"questions": null
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"startedAtMs": 1793589145358
+},
+"emittedAtMs": 1793589145358
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": "The"
+},
+"emittedAtMs": 1793589145358
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": " secret"
+},
+"emittedAtMs": 1793589145358
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": " word"
+},
+"emittedAtMs": 1793589145358
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": " was"
+},
+"emittedAtMs": 1793589145362
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": " MAG"
+},
+"emittedAtMs": 1793589145362
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": "ENTA"
+},
+"emittedAtMs": 1793589145362
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": "-"
+},
+"emittedAtMs": 1793589145362
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": "42"
+},
+"emittedAtMs": 1793589145362
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": ".\n"
+},
+"emittedAtMs": 1793589145362
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": "P"
+},
+"emittedAtMs": 1793589145516
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": "INE"
+},
+"emittedAtMs": 1793589145516
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"delta": "APPLE"
+},
+"emittedAtMs": 1793589145519
+},
+{
+"method": "item/completed",
+"params": {
+"item": {
+"type": "agentMessage",
+"id": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"text": "The secret word was MAGENTA-42.\nPINEAPPLE",
+"phase": "final_answer",
+"memoryCitation": null,
+"delivery": null,
+"questions": null
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"completedAtMs": 1793589145622
+},
+"emittedAtMs": 1793589145623
+},
+{
+"method": "thread/tokenUsage/updated",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"tokenUsage": {
+"total": {
+"totalTokens": 71974,
+"inputTokens": 71755,
+"cachedInputTokens": 60672,
+"cacheWriteInputTokens": 0,
+"outputTokens": 219,
+"reasoningOutputTokens": 34
+},
+"last": {
+"totalTokens": 24093,
+"inputTokens": 24041,
+"cachedInputTokens": 23808,
+"cacheWriteInputTokens": 0,
+"outputTokens": 52,
+"reasoningOutputTokens": 34
+},
+"modelContextWindow": 258400
+}
+},
+"emittedAtMs": 1793589145639
+},
+{
+"method": "account/rateLimits/updated",
+"params": {
+"rateLimits": {
+"limitId": "codex",
+"limitName": null,
+"normalModelSlug": null,
+"primary": {
+"usedPercent": 8,
+"windowDurationMins": 10080,
+"resetsAt": 1793774324
+},
+"secondary": null,
+"credits": {
+"hasCredits": false,
+"unlimited": false,
+"balance": "0"
+},
+"individualLimit": null,
+"spendControlReached": null,
+"planType": "prolite",
+"rateLimitReachedType": null
+}
+},
+"emittedAtMs": 1793589145639
+},
+{
+"method": "thread/status/changed",
+"params": {
+"threadId": "$THREAD",
+"status": {
+"type": "idle"
+}
+},
+"emittedAtMs": 1793589145661
+},
+{
+"method": "turn/completed",
+"params": {
+"threadId": "$THREAD",
+"turn": {
+"id": "$TURN",
+"rootTurnId": "$TURN",
+"items": [
+{
+"type": "agentMessage",
+"id": "msg_031f42655f3e3051016ae7ff95d2d48191b105c254f2760a53",
+"text": "The secret word was MAGENTA-42.\nPINEAPPLE",
+"phase": "final_answer",
+"memoryCitation": null,
+"delivery": null,
+"questions": null
+}
+],
+"itemsView": "summary",
+"status": "completed",
+"error": null,
+"startedAt": 1793589137,
+"completedAt": 1793589145,
+"durationMs": 8557
+}
+},
+"emittedAtMs": 1793589145661
+}
+]

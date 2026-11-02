@@ -40,8 +40,8 @@ async def run_agent(
     """wake_context: 本轮 Lark 会话上下文（CC_LARK_* 形态）。
 
     Claude/Codex 后端会把它透传给 cc_mcp_server，让 wake/dispatch/cron 能定向到本话题。
-    on_input_ready: 只有 claude print 后端（开了 CLAUDE_PRINT_STREAM_INPUT）会回调，
-    拿到的 RunInput 可往运行中的进程补消息；其他后端忽略。
+    on_input_ready: claude print 后端（开了 CLAUDE_PRINT_STREAM_INPUT）和 codex app-server
+    传输会回调，拿到的 RunInput 可往运行中的进程补消息 / 打断；其他后端忽略。
     """
     backend = (runner or profile.runner or "claude").strip().lower()
     if backend == "dots":
@@ -271,6 +271,7 @@ async def run_agent(
             dangerous_bypass_level=profile.codex_dangerous_bypass,
             idle_timeout_sec=profile.codex_idle_timeout_sec,
             extra_env=codex_env,
+            on_input_ready=on_input_ready,
         )
 
     claude_env = load_claude_extra_env(profile) or {}

@@ -10,6 +10,12 @@ import codex_runner
 from codex_runner import _clean_stderr, run_codex
 
 
+@pytest.fixture(autouse=True)
+def _exec_transport(monkeypatch):
+    """本文件测的是 exec 传输（回退路径）；app-server 传输见 test_codex_app_server.py。"""
+    monkeypatch.setenv("CODEX_TRANSPORT", "exec")
+
+
 class FakeStdout:
     def __init__(self, lines):
         self._lines = list(lines)

@@ -1,7 +1,13 @@
 """本地调用 Codex CLI 的统一入口。
 
-使用 `codex exec --json`，接口对齐 claude_runner.run_claude，方便 dispatcher
-按 profile 在 Claude/Codex 间分发。
+两种传输，接口都对齐 claude_runner.run_claude，方便 dispatcher 按 profile 在
+Claude/Codex 间分发：
+
+- app-server（默认）：`codex app-server` 的 stdio JSON-RPC，结构化事件、原生 resume、
+  turn/steer 运行中插话、turn/interrupt 停止。实现在 codex_app_server.py。
+- exec（回退）：`codex exec --json`，逐行解析事件流。
+
+用 CODEX_TRANSPORT=app-server|exec 切换，<PROFILE>_CODEX_TRANSPORT 可单独覆盖某个 bot。
 """
 
 from __future__ import annotations
@@ -127,16 +133,54 @@ def _continue_budget_sec() -> float:
         return 2700.0
 
 
+# Codex 桌面 App 并进 ChatGPT.app 之后，CLI 搬到了 codex-cli/bin 下（0.164 实测）；旧路径留着兼容。
+_APP_BUNDLE_BINS = (
+    "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+)
+
+
 def resolve_codex_bin(configured: Optional[str] = None) -> str:
     if configured:
         return configured
     found = shutil.which("codex")
     if found:
         return found
-    app_path = "/Applications/Codex.app/Contents/Resources/codex"
-    if os.path.exists(app_path):
-        return app_path
+    for app_path in _APP_BUNDLE_BINS:
+        if os.path.exists(app_path):
+            return app_path
     return "codex"
+
+
+_TRANSPORTS = ("app-server", "exec")
+DEFAULT_TRANSPORT = "app-server"
+
+
+def codex_transport(extra_env: Optional[dict] = None) -> str:
+    """<PROFILE>_CODEX_TRANSPORT 优先，其次 CODEX_TRANSPORT，默认 app-server。非法值退回默认。"""
+    profile = ((extra_env or {}).get("CC_LARK_PROFILE") or "").strip().upper()
+    raw = os.getenv(f"{profile}_CODEX_TRANSPORT") if profile else None
+    if raw is None:
+        raw = os.getenv("CODEX_TRANSPORT")
+    val = (raw or "").strip().lower().replace("_", "-")
+    if val in ("appserver", "app"):
+        val = "app-server"
+    if val in _TRANSPORTS:
+        return val
+    if val:
+        print(f"[codex_runner] 忽略非法 CODEX_TRANSPORT={raw!r}（可选 {_TRANSPORTS}）", file=sys.stderr)
+    return DEFAULT_TRANSPORT
+
+
+def _sandbox_and_approval(
+    sandbox_mode: Optional[str],
+    approval_policy: Optional[str],
+    dangerous_bypass_level: int,
+) -> tuple[str, str]:
+    """和 exec 参数等效的沙箱 / 审批：bypass=2 即 --dangerously-bypass-approvals-and-sandbox。"""
+    if max(0, min(2, int(dangerous_bypass_level or 0))) >= 2:
+        return "danger-full-access", "never"
+    return sandbox_mode or "danger-full-access", approval_policy or "never"
 
 
 def _to_toml_string(value: str) -> str:
@@ -565,8 +609,11 @@ async def run_codex(
     idle_timeout_sec: int = IDLE_TIMEOUT,
     extra_env: Optional[dict] = None,
     reasoning_effort: Optional[str] = None,
+    on_input_ready: Optional[Callable[[Any], None]] = None,
 ) -> tuple[str, Optional[str], bool]:
-    """codex 后端入口。默认在内部自动续跑，直到模型宣告整件任务完成或触顶。
+    """codex 后端入口。传输见 codex_transport()；app-server 走 _run_codex_app_server。
+
+    以下是 exec 传输的续跑逻辑——默认在内部自动续跑，直到模型宣告整件任务完成或触顶。
 
     单轮 `codex exec` 只跑一段有界的活就返回（"做到一半"的根因）。这里循环 resume
     同一 session 自动催它继续，直到：① 模型输出完成标记；② 轮数达到 CODEX_MAX_CONTINUE；
@@ -610,6 +657,19 @@ async def run_codex(
 
     if _stop_requested():
         return "", session_id, False
+
+    if codex_transport(extra_env) == "app-server":
+        return await _run_codex_app_server(
+            message, session_id=session_id, model=model, cwd=cwd,
+            on_text_chunk=on_text_chunk, on_tool_use=on_tool_use,
+            on_process_start=on_process_start, on_usage=on_usage, on_status=on_status,
+            on_input_ready=on_input_ready, should_stop=should_stop,
+            append_system_prompt=append_system_prompt, codex_bin=codex_bin,
+            sandbox_mode=sandbox_mode, approval_policy=approval_policy,
+            dangerous_bypass_level=dangerous_bypass_level,
+            idle_timeout_sec=idle_timeout_sec, extra_env=extra_env,
+            reasoning_effort=reasoning_effort,
+        )
 
     if not _auto_continue_enabled(extra_env):
         return await _run_codex_once(
@@ -663,3 +723,79 @@ async def run_codex(
             break
 
     return final_text, thread_out, False
+
+
+def _on_rate_limits_pushed(snapshot: dict) -> None:
+    try:
+        from codex_quota_watcher import observe_rate_limits
+        observe_rate_limits(snapshot)
+    except Exception as e:
+        print(f"[codex_runner] 额度推送处理失败: {e}", file=sys.stderr, flush=True)
+
+
+async def _run_codex_app_server(
+    message: str,
+    *,
+    session_id: Optional[str],
+    model: Optional[str],
+    cwd: Optional[str],
+    on_text_chunk, on_tool_use, on_process_start, on_usage, on_status,
+    on_input_ready, should_stop,
+    append_system_prompt: Optional[str],
+    codex_bin: Optional[str],
+    sandbox_mode: Optional[str],
+    approval_policy: Optional[str],
+    dangerous_bypass_level: int,
+    idle_timeout_sec: int,
+    extra_env: Optional[dict],
+    reasoning_effort: Optional[str],
+) -> tuple[str, Optional[str], bool]:
+    """app-server 传输：一个进程跑完这一轮（含插话 / 打断改道 / 完成标记续跑的后续 turn）。
+
+    - 系统提示走 thread 的 developerInstructions（start / resume 都带），不再拼进用户消息。
+    - CODEX_AUTO_CONTINUE 仍然生效：没吐完成标记就在同一进程同一 thread 上再开 turn 催，
+      不再拉新进程 resume；关掉时就是纯 turn 语义——turn/completed=completed 即完成，
+      interrupted / failed 抛 IncompleteTaskError（保留 session，发「继续」可接着做）。
+    """
+    import codex_app_server
+
+    effort = _reasoning_effort(extra_env, reasoning_effort)
+    sandbox, approval = _sandbox_and_approval(sandbox_mode, approval_policy, dangerous_bypass_level)
+    cmd = [resolve_codex_bin(codex_bin), "app-server", *_cc_lark_mcp_config_flags(extra_env)]
+
+    developer = (append_system_prompt or "").strip()
+    auto = None
+    if _auto_continue_enabled(extra_env):
+        hint = _CONTINUE_SYSTEM_HINT.format(sentinel=_DONE_SENTINEL)
+        developer = f"{developer}\n\n{hint}".strip() if developer else hint
+        auto = {
+            "sentinel": _DONE_SENTINEL,
+            "nudge": _CONTINUE_NUDGE.format(sentinel=_DONE_SENTINEL),
+            "max_passes": _max_continue_passes(),
+            "budget": _continue_budget_sec(),
+        }
+
+    async def _rate_limits(snapshot: dict):
+        await asyncio.to_thread(_on_rate_limits_pushed, snapshot)
+
+    return await codex_app_server.run_app_server_session(
+        cmd=cmd,
+        message=message,
+        session_id=session_id,
+        cwd=cwd,
+        model=model,
+        effort=effort,
+        sandbox=sandbox,
+        approval_policy=approval,
+        developer_instructions=developer or None,
+        on_text_chunk=on_text_chunk,
+        on_tool_use=on_tool_use,
+        on_process_start=on_process_start,
+        on_usage=on_usage,
+        on_status=on_status,
+        on_input_ready=on_input_ready,
+        on_rate_limits=_rate_limits,
+        should_stop=should_stop,
+        idle_timeout_sec=idle_timeout_sec,
+        auto_continue=auto,
+    )

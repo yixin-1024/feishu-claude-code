@@ -121,6 +121,7 @@ def _reasoning_config(cmd: list[str]) -> list[str]:
 
 
 def test_codex_resume_cli_explicit_effort_wins_over_profile_and_global_env(monkeypatch):
+    monkeypatch.setenv("CODEX_TRANSPORT", "exec")  # 断言的是 exec 的 -c 参数
     captured = {}
 
     async def fake_exec(*args, **kwargs):
@@ -151,6 +152,7 @@ def test_codex_resume_cli_explicit_effort_wins_over_profile_and_global_env(monke
 
 
 def test_codex_cli_profile_effort_wins_over_global_env(monkeypatch):
+    monkeypatch.setenv("CODEX_TRANSPORT", "exec")  # 断言的是 exec 的 -c 参数
     captured = {}
 
     async def fake_exec(*args, **kwargs):

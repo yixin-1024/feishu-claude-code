@@ -1372,7 +1372,8 @@ async def _reply_queued_notice(bot: BotInstance, message_id: str) -> None:
 
 
 # ── 运行中插话 ────────────────────────────────────────────────────────────
-# 话题里任务在跑时又来一条消息：claude print 后端开了 CLAUDE_PRINT_STREAM_INPUT 时
+# 话题里任务在跑时又来一条消息：claude print 后端开了 CLAUDE_PRINT_STREAM_INPUT、或 codex 走
+# app-server 传输（turn/steer）时
 # 直接写进正在跑的进程，不再排队等整个任务结束（实测见 claude_runner.RunInput）。
 _STEER_MARKS = ("!", "！")
 _INJECT_FRAME = (
@@ -1967,7 +1968,7 @@ async def _execute_run(
 
     heartbeat_task = asyncio.create_task(_heartbeat())
 
-    # ── 运行中插话（claude print 后端 + CLAUDE_PRINT_STREAM_INPUT）──────────
+    # ── 运行中插话（claude print 后端 + CLAUDE_PRINT_STREAM_INPUT / codex app-server）──
     # 一个进程可能跑好几轮（插话没赶上工具间隙 / 被 ! 打断改道），每轮的最终文本都收着，
     # 收尾时一起展示，别让前一轮的完整回答被挤进「过程」区截掉。
     turn_results: list[str] = []

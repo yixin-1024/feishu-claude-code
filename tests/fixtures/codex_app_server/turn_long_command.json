@@ -1,0 +1,278 @@
+[
+{
+"method": "thread/status/changed",
+"params": {
+"threadId": "$THREAD",
+"status": {
+"type": "active",
+"activeFlags": []
+}
+},
+"emittedAtMs": 1793589152980
+},
+{
+"method": "turn/started",
+"params": {
+"threadId": "$THREAD",
+"turn": {
+"id": "$TURN",
+"rootTurnId": "$TURN",
+"items": [],
+"itemsView": "notLoaded",
+"status": "inProgress",
+"error": null,
+"startedAt": 1793589152,
+"completedAt": null,
+"durationMs": null
+}
+},
+"emittedAtMs": 1793589152980
+},
+{
+"method": "item/started",
+"params": {
+"item": {
+"type": "userMessage",
+"id": "01a19a3e-9610-7651-bef0-b7bbb39e6e6e",
+"clientId": null,
+"content": [
+{
+"type": "text",
+"text": "Run the shell command `sleep 60; echo done` and report its output.",
+"text_elements": []
+}
+]
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"startedAtMs": 1793589155346
+},
+"emittedAtMs": 1793589155346
+},
+{
+"method": "item/completed",
+"params": {
+"item": {
+"type": "userMessage",
+"id": "01a19a3e-9610-7651-bef0-b7bbb39e6e6e",
+"clientId": null,
+"content": [
+{
+"type": "text",
+"text": "Run the shell command `sleep 60; echo done` and report its output.",
+"text_elements": []
+}
+]
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"completedAtMs": 1793589155346
+},
+"emittedAtMs": 1793589155349
+},
+{
+"method": "item/started",
+"params": {
+"item": {
+"type": "agentMessage",
+"id": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"text": "",
+"phase": "commentary",
+"memoryCitation": null,
+"delivery": null,
+"questions": null
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"startedAtMs": 1793589160265
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": "I"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": "’ll"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": " run"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": " the"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": " command"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": " and"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": " report"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": " its"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": " output"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": ".\n"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": "P"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": "INE"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": "APPLE"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/agentMessage/delta",
+"params": {
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"itemId": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"delta": "\n"
+},
+"emittedAtMs": 1793589160266
+},
+{
+"method": "item/completed",
+"params": {
+"item": {
+"type": "agentMessage",
+"id": "msg_02f4b984791544e7016ae7ffa3682c8191b4aa0593521f0f78",
+"text": "I’ll run the command and report its output.\nPINEAPPLE\n",
+"phase": "commentary",
+"memoryCitation": null,
+"delivery": null,
+"questions": null
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"completedAtMs": 1793589160266
+},
+"emittedAtMs": 1793589160269
+},
+{
+"method": "item/started",
+"params": {
+"item": {
+"type": "commandExecution",
+"id": "exec-60ee0842-73cf-406a-b6e9-9a6dd5daf37a",
+"pluginId": null,
+"scriptPath": null,
+"command": "/bin/zsh -lc 'sleep 60; echo done'",
+"cwd": "/tmp/cclark-codex-probe.UpwU",
+"processId": "14009",
+"source": "unifiedExecStartup",
+"status": "inProgress",
+"commandActions": [
+{
+"type": "unknown",
+"command": "sleep 60; echo done"
+}
+],
+"aggregatedOutput": null,
+"exitCode": null,
+"durationMs": null
+},
+"threadId": "$THREAD",
+"turnId": "$TURN",
+"startedAtMs": 1793589160594
+},
+"emittedAtMs": 1793589160594
+}
+]

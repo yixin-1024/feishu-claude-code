@@ -103,7 +103,7 @@ class ActiveRun:
     resume_key: str = ""
     # True = 收尾时别删落盘记录（重启中断，留给下个进程续跑）。
     keep_resume: bool = False
-    # ── 运行中插话（claude print 后端 + CLAUDE_PRINT_STREAM_INPUT）──────
+    # ── 运行中插话（claude print 后端 + CLAUDE_PRINT_STREAM_INPUT / codex app-server）──────
     # input：claude_runner.RunInput，进程开着时可往里补消息 / 软中断；其他后端为 None。
     # on_inject(preview, steer)：_execute_run 挂的回调，在卡片上标出插话位置。
     input: object | None = None
