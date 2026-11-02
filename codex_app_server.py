@@ -801,13 +801,26 @@ async def run_app_server_session(
         next_input: Optional[str] = message
         last_final = ""
 
+        # 同一进程连跑几个 turn（插话 / 打断改道 / 续跑）时，后一个 turn 的正文另起一段，
+        # 别和上一个 turn 的最后一句粘在一起
+        streamed = {"any": False, "turn_has_text": False}
+
+        async def _turn_text(chunk: str):
+            if not streamed["turn_has_text"]:
+                streamed["turn_has_text"] = True
+                if streamed["any"]:
+                    chunk = "\n\n" + chunk.lstrip("\n")
+            streamed["any"] = True
+            await _fire(on_text_chunk, chunk)
+
         while next_input is not None:
             if _stop_requested():
                 break
+            streamed["turn_has_text"] = False
             outcome = await _run_turn(
                 conn, run_input, thread_id, next_input,
                 model=model, effort=effort, cwd=cwd, sentinel=sentinel,
-                on_text_chunk=on_text_chunk, on_tool_use=on_tool_use, on_usage=on_usage,
+                on_text_chunk=_turn_text, on_tool_use=on_tool_use, on_usage=on_usage,
                 on_status=on_status, on_rate_limits=on_rate_limits,
                 idle_timeout_sec=idle_timeout_sec, last_frame=last_frame,
                 proc=proc, stderr_text=_stderr_text,

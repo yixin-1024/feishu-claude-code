@@ -234,8 +234,12 @@ def test_bang_steer_interrupts_and_restarts_with_new_instruction(fake):
         if name == "bash" and inp["status"] == "in_progress":
             await inputs[0].steer("do this instead")
 
-    text, _, _ = _run(message="sleep", codex_bin=codex_bin, on_input_ready=inputs.append, on_tool_use=on_tool)
+    chunks = []
+    text, _, _ = _run(message="sleep", codex_bin=codex_bin, on_input_ready=inputs.append, on_tool_use=on_tool,
+                      on_text_chunk=chunks.append)
     assert text == "switched"
+    # 新 turn 的正文另起一段（真机上见过 "...output.KIWI" 粘连）
+    assert "".join(chunks).endswith("PINEAPPLE\n\nswitched")
     log = read_log()
     assert len(_requests(log, "turn/interrupt")) == 1
     starts = _requests(log, "turn/start")
