@@ -395,6 +395,7 @@ python3 main.py
 | `CC_LARK_CRED_BACKEND` | 否 | 按平台 | Claude 凭证存储后端：`keychain`（macOS 默认）/ `file`（Linux 默认，读写 `~/.claude/.credentials.json`）。只在 headless macOS 这类特例下需要手动指定 |
 | `ACCOUNT_SWITCH_ON_LIMIT` | 否 | `1` | 撞 Claude Max 用量墙时一次性紧急切到有余量的 saved 账户并 resume 续跑（不依赖 `ACCOUNT_AUTO_SWITCH`） |
 | `CC_LARK_WAKE_ON_LIMIT` | 否 | `1` | 撞墙且无账户可切时，在本话题排一个到配额重置时刻的自动唤醒（仅话题群） |
+| `CODEX_TRANSPORT` | 否 | `app-server` | Codex 后端怎么调：`app-server` 走 `codex app-server` 的 stdio JSON-RPC（原生 thread resume、`turn/steer` 运行中插话、`turn/interrupt` 停止、额度推送给 codex 额度监控）；`exec` 退回旧的 `codex exec --json`。`<PROFILE>_CODEX_TRANSPORT` 可单独覆盖某个 bot。排障可设 `CODEX_APP_SERVER_TRACE=<文件>` 记下双向帧（含提示词和命令输出，用完关掉） |
 | `CODEX_MODEL_FALLBACK` | 否 | `gpt-5.5` | codex 模型被当前账户拒绝（400 "model is not supported…"）时本轮改用的模型；空串关闭 |
 | `CC_LARK_LOG_PATH` / `CC_LARK_LOG_MAX_MB` / `CC_LARK_LOG_KEEP` | 否 | `~/.feishu-claude/cc-lark.log` / `50` / `3` | bot 日志 copytruncate 轮转：超过阈值 MB 就轮转，保留 N 代；`CC_LARK_LOG_MAX_MB=0` 关闭 |
 
