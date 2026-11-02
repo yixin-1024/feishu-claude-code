@@ -1057,8 +1057,9 @@ def _fetch_codex_rate_limits(timeout: float = 8.0) -> dict:
     """通过 Codex app-server 读取当前账户的实时额度快照。"""
     proc = None
     try:
+        from codex_runner import resolve_codex_bin
         proc = subprocess.Popen(
-            ["codex", "app-server"],
+            [resolve_codex_bin(os.getenv("CODEX_BIN", "").strip() or None), "app-server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -1203,6 +1204,12 @@ def _fmt_codex_reset_ts(ts) -> str:
 def _get_codex_rate_limits() -> dict:
     """实时拉 Codex 额度快照；实时 RPC 不可用时回退到最近任务上报。"""
     rate_limits = _fetch_codex_rate_limits()
+    if not rate_limits:
+        # app-server 传输运行中推送的快照（几分钟内就有一份）比翻 session 文件新
+        from codex_quota_watcher import read_pushed_rate_limits
+        rate_limits = read_pushed_rate_limits()
+        if rate_limits:
+            rate_limits = {**rate_limits, "_source": "reported"}
     if not rate_limits:
         rate_limits = _read_latest_codex_rate_limits()
     return rate_limits

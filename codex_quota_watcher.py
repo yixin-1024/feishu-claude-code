@@ -104,23 +104,12 @@ def _detect_reset(
     return dropped or advanced_with_recovery
 
 
-def poll_once(send_fn: Callable[[str], None]) -> None:
-    """跑一次：拉 codex 额度 → 比对 state → 检测到重置就 send_fn。"""
-    # 延迟 import 避免与 commands 循环依赖
-    from commands import (
-        _get_codex_rate_limits,
-        _codex_window_label,
-        _fmt_codex_reset_ts,
-    )
-
-    rate_limits = _get_codex_rate_limits()
-    if not rate_limits:
-        # 拉取失败（codex 未登录 / app-server 起不来）——跳过这轮，不改 state
-        print("[codex_quota_watcher] 额度获取失败，跳过本轮", flush=True)
-        return
+def _process_snapshot(rate_limits: dict, send_fn: Callable[[str], None]) -> None:
+    """比对一份额度快照和 state：检测到重置就 send_fn。poll 和运行中推送共用。"""
+    from commands import _codex_window_label, _fmt_codex_reset_ts
 
     reset_blocks: list[str] = []
-    # RPC 放在锁外；只串行化本地 state 的读改写，避免慢请求长期占锁。
+    # 只串行化本地 state 的读改写，避免慢请求长期占锁。
     with _state_lock():
         state = _load_state()
 
@@ -162,11 +151,95 @@ def poll_once(send_fn: Callable[[str], None]) -> None:
             print(f"[codex_quota_watcher] send_fn 失败: {e}", flush=True)
 
 
+def poll_once(send_fn: Callable[[str], None]) -> None:
+    """跑一次：拉 codex 额度 → 比对 state → 检测到重置就 send_fn。"""
+    # 延迟 import 避免与 commands 循环依赖
+    from commands import _get_codex_rate_limits
+
+    rate_limits = _get_codex_rate_limits()
+    if not rate_limits:
+        # 拉取失败（codex 未登录 / app-server 起不来）——跳过这轮，不改 state
+        print("[codex_quota_watcher] 额度获取失败，跳过本轮", flush=True)
+        return
+    # RPC 在锁外；_process_snapshot 只锁本地 state。
+    _process_snapshot(rate_limits, send_fn)
+
+
+# ── 运行中推送（codex app-server 的 account/rateLimits/updated）──────────────
+# 每次模型响应后 app-server 都会推一份额度快照。落一份到磁盘给 /usage、/status 当
+# 「最近上报」（比翻 session 文件新），并在 watcher 已启动时立刻做一次重置检测——
+# 不用干等 30 分钟一次的 poll。推送很密，按 _OBSERVE_MIN_INTERVAL 节流。
+_PUSHED_FILE = os.path.join(_STATE_DIR, "codex_rate_limits_pushed.json")
+_OBSERVE_MIN_INTERVAL = 60.0
+_send_fn: Optional[Callable[[str], None]] = None
+_observe_lock = threading.Lock()
+_last_observed = 0.0
+
+
+def observe_rate_limits(snapshot: dict) -> bool:
+    """处理一份推送来的额度快照。返回 True = 这次真的处理了（没被过滤 / 节流）。"""
+    global _last_observed
+    if not isinstance(snapshot, dict):
+        return False
+    # 模型专属的额度（limitId 不是 codex）不进主窗口——和 t3code 的口径一致
+    limit_id = snapshot.get("limitId")
+    if limit_id and limit_id != "codex":
+        return False
+    windows = {k: snapshot.get(k) for k in ("primary", "secondary") if isinstance(snapshot.get(k), dict)}
+    if not windows:
+        return False
+    with _observe_lock:
+        now = time.monotonic()
+        if _last_observed and now - _last_observed < _OBSERVE_MIN_INTERVAL:
+            return False
+        _last_observed = now
+    record = {
+        **{k: {
+            "usedPercent": w.get("usedPercent"),
+            "windowDurationMins": w.get("windowDurationMins"),
+            "resetsAt": w.get("resetsAt"),
+        } for k, w in windows.items()},
+        "_source": "pushed",
+        "_at": time.time(),
+    }
+    try:
+        os.makedirs(_STATE_DIR, exist_ok=True)
+        tmp = _PUSHED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        os.replace(tmp, _PUSHED_FILE)
+    except Exception as e:
+        print(f"[codex_quota_watcher] 写推送快照失败: {e}", flush=True)
+    if _send_fn is not None:
+        _process_snapshot(record, _send_fn)
+    return True
+
+
+def read_pushed_rate_limits(max_age_sec: float = 6 * 3600) -> dict:
+    """最近一次运行中推送的额度快照（太旧就不要）。"""
+    try:
+        with open(_PUSHED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    at = float(data.get("_at") or 0)
+    if not at or time.time() - at > max_age_sec:
+        return {}
+    return data
+
+
 def start_watcher_thread(
     send_fn: Callable[[str], None],
     interval: int = DEFAULT_INTERVAL_SEC,
 ) -> threading.Thread:
-    """起后台线程定期 poll。send_fn 同步签名，内部自己 schedule 到 bot_loop。"""
+    """起后台线程定期 poll。send_fn 同步签名，内部自己 schedule 到 bot_loop。
+
+    同时登记 send_fn，让 observe_rate_limits（运行中推送）也能当场通报重置。
+    """
+    global _send_fn
+    _send_fn = send_fn
 
     def _loop():
         # 首轮延迟，等 bot 完全起来 + 错开 Claude quota_watcher
