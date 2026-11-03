@@ -57,6 +57,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -177,7 +178,63 @@ def _context_window_for(model: Optional[str]) -> int:
 # stdin），超长时从中间截断，保住头尾。
 _MAX_PROMPT_BYTES = 700_000
 
-_mcp_registered = False
+# 已经注册过 cc-lark MCP 的 mcp_config.json 路径。per-profile HOME 各有一份。
+_mcp_registered: set[str] = set()
+
+# ── per-profile HOME（<PREFIX>_AGY_HOME，2026-11-03）─────────────────────
+# 想让某个 bot 用它自己的 Google 账号，和别的 bot、终端里的 agy 分开时，
+# 用这个设置。OAuth 凭证绑 HOME（Linux 上是
+# <HOME>/.gemini/antigravity-cli/antigravity-oauth-token），所以 agy 进程要跑在
+# 这个 HOME 下。但 agy 起的命令（lark-cli / git / ssh / gh …）要读真 HOME 里的
+# 配置，所以还要设 BASH_ENV：agy 的 run_command 走 bash（实测），bash 启动时会先
+# source 这个脚本，把 HOME 改回真 HOME 再执行命令。
+_RESTORE_HOME_SCRIPT = ".cc-lark-restore-home.sh"
+
+
+def profile_home_paths(home: str) -> tuple[str, str, str]:
+    """给定 HOME 下的 (antigravity-cli 目录, mcp_config.json, 全局 skills 软链)。"""
+    groot = os.path.join(home, ".gemini")
+    return (
+        os.path.join(groot, "antigravity-cli"),
+        os.path.join(groot, "config", "mcp_config.json"),
+        os.path.join(groot, "config", "skills"),
+    )
+
+
+def ensure_profile_home(home: str, real_home: Optional[str] = None) -> str:
+    """幂等地备好 per-profile HOME：目录、skills 软链、还原 HOME 的 BASH_ENV 脚本。
+
+    返回脚本路径。只建缺的东西；凭证要另外在这个 HOME 下用 `agy` 走 OAuth 登录。
+    """
+    real_home = real_home or os.path.expanduser("~")
+    cli_dir, mcp_path, skills_link = profile_home_paths(home)
+    for d in (cli_dir, os.path.dirname(mcp_path)):
+        os.makedirs(d, exist_ok=True)
+    # agy 只认 ~/.gemini/config/skills 这一个全局 skill 根，不读 ~/.claude/skills
+    if os.path.isdir(AGY_SKILLS_SRC) and not os.path.lexists(skills_link):
+        try:
+            os.symlink(AGY_SKILLS_SRC, skills_link)
+        except OSError:
+            pass
+    script = os.path.join(home, _RESTORE_HOME_SCRIPT)
+    content = (
+        "# cc-lark 生成（agy_runner.ensure_profile_home）：agy 用这个 HOME 里的 Google 登录，\n"
+        "# 它起的命令要用真 HOME。只改 HOME 还是这个目录的情况，然后 unset，免得嵌套的 bash\n"
+        "# 把有意改过的 HOME 又改回去。\n"
+        f'if [ "$HOME" = {shlex.quote(home)} ]; then export HOME={shlex.quote(real_home)}; fi\n'
+        "unset BASH_ENV\n"
+    )
+    try:
+        with open(script, "r", encoding="utf-8") as fh:
+            current = fh.read()
+    except OSError:
+        current = None
+    if current != content:
+        tmp = f"{script}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp, script)
+    return script
 
 
 def resolve_agy_bin(configured: Optional[str] = None) -> str:
@@ -728,6 +785,7 @@ async def _run_agy_once(
     dangerously_skip_permissions: bool = True,
     idle_timeout_sec: int = IDLE_TIMEOUT,
     sentinel: str = "",
+    home: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
     """跑一次 agy pass。返回 (full_text, conversation_id, saw_sentinel)。
 
@@ -738,21 +796,34 @@ async def _run_agy_once(
     """
     del on_status  # agy 没有独立状态事件通道，正文/工具事件已够用
 
-    global _mcp_registered
+    # per-profile HOME：这个 bot 用自己那份 Google 登录（见 ensure_profile_home）
+    profile_home = os.path.expanduser(home.strip()) if (home or "").strip() else ""
+    mcp_config_path = profile_home_paths(profile_home)[1] if profile_home else AGY_MCP_CONFIG_PATH
+
     if (
-        not _mcp_registered
+        mcp_config_path not in _mcp_registered
         and (extra_env or {}).get("CC_LARK_THREAD_ID")
         and os.getenv("CC_LARK_WAKE_MCP", "1") != "0"
     ):
         try:
-            ensure_cc_lark_mcp()
+            if profile_home:
+                ensure_cc_lark_mcp(mcp_config_path)
+            else:
+                ensure_cc_lark_mcp()
         except OSError as exc:
             print(f"[run_agy] cc-mcp 注册跳过: {type(exc).__name__}: {exc}", flush=True)
-        _mcp_registered = True
+        _mcp_registered.add(mcp_config_path)
 
+    restore_home_script = ""
     try:
-        ensure_bot_home()
-        ensure_model_provider(model_provider)
+        if profile_home:
+            restore_home_script = ensure_profile_home(profile_home)
+            ensure_model_provider(
+                model_provider, os.path.join(profile_home_paths(profile_home)[0], "settings.json")
+            )
+        else:
+            ensure_bot_home()
+            ensure_model_provider(model_provider)
     except OSError as exc:
         print(f"[run_agy] settings.json 写入跳过: {type(exc).__name__}: {exc}", flush=True)
 
@@ -798,10 +869,15 @@ async def _run_agy_once(
     env = os.environ.copy()
     # 别让 bot spawn 出来的 agent 被 session-mirror hook 镜像回 Lark
     env["CC_LARK_MIRROR_OFF"] = "1"
+    # profile 指定了自己的 HOME：agy 用那里的登录，它起的 bash 由 BASH_ENV 还原真 HOME。
+    if profile_home:
+        env["HOME"] = profile_home
+        if restore_home_script:
+            env["BASH_ENV"] = restore_home_script
     # 走 bot 专用 HOME，别动用户手动登录的 ~/.gemini（见文件头 AGY_BOT_HOME）。
     # 但 provider 为空 = 要走 OAuth，而 OAuth 凭证绑 HOME、keychain 不共享，
     # 隔离 HOME 里必然未登录 → 会卡 60s 等授权再失败。这种组合直接退回真 HOME。
-    if AGY_BOT_HOME:
+    elif AGY_BOT_HOME:
         if (model_provider or "").strip():
             env["HOME"] = AGY_BOT_HOME
         else:

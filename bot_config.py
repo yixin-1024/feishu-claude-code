@@ -378,6 +378,11 @@ class Profile:
     agy_print_timeout: str = "24h"
     agy_dangerous_skip: int = 1
     agy_idle_timeout_sec: int = 600
+    # 这个 profile 的 agy 跑在哪个 HOME 下，也就是用哪份 Google 登录（OAuth 凭证绑
+    # HOME）。只认 <PREFIX>_AGY_HOME，没有全局回退。空 = 老行为：API key 模式用
+    # AGY_BOT_HOME，OAuth 模式共用真 ~/.gemini。设了就让这个 bot 用自己的号，
+    # agy 起的命令仍拿真 HOME（见 agy_runner.ensure_profile_home），/usage 也按它查。
+    agy_home: str = ""
     # qoder runner 配置（Qoder CLI，qodercli）。默认沿用本机 `qodercli login` /
     # Qoder 桌面 App 的登录态（~/.qoder）；qoder_api_key 注入 QODER_PERSONAL_ACCESS_TOKEN
     # （CLI 优先用它，适合没开浏览器登录的服务器）。qoder_config_dir 对应 --config-dir，
@@ -645,6 +650,7 @@ def _load_profile(name: str) -> Profile:
         agy_print_timeout=env("AGY_PRINT_TIMEOUT", os.getenv("AGY_PRINT_TIMEOUT", "24h")).strip() or "24h",
         agy_dangerous_skip=max(0, min(1, agy_skip)),
         agy_idle_timeout_sec=max(0, agy_idle),
+        agy_home=os.path.expanduser(env("AGY_HOME").strip()) if env("AGY_HOME").strip() else "",
         qoder_bin=env("QODER_BIN", os.getenv("QODER_BIN", "")).strip(),
         qoder_config_dir=env("QODER_CONFIG_DIR", os.getenv("QODER_CONFIG_DIR", "")).strip(),
         qoder_api_key=env("QODER_API_KEY", os.getenv("QODER_API_KEY", "")).strip(),

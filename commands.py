@@ -1268,12 +1268,50 @@ def _agy_iso_to_unix(text: str) -> Optional[int]:
         return None
 
 
-def _fetch_agy_quota() -> list[dict]:
-    """实时拉 agy 的订阅额度快照；拿不到就返回空列表（调用方降级提示）。"""
+def _agy_profile_home(profile) -> str:
+    """profile 的 agy 跑在哪个 HOME 下（<PREFIX>_AGY_HOME）；空串 = bot 进程自己的 HOME。"""
+    return (getattr(profile, "agy_home", "") or "").strip() if profile is not None else ""
+
+
+def _agy_api_key_provider(profile) -> str:
+    """profile 走 API key 时返回 provider 名（如 "gemini"），走 OAuth 返回空串。"""
+    return (getattr(profile, "agy_model_provider", "") or "").strip() if profile is not None else ""
+
+
+def _agy_oauth_email(home: str = "") -> str:
+    """从 agy 的 OAuth 凭证文件读登录邮箱。
+
+    这是 Linux 的存法（`<HOME>/.gemini/antigravity-cli/antigravity-oauth-token`，
+    JSON 里有 `id_token_email`）；macOS 存在 keychain，归 agy_account_switcher 管。
+    读不到返回空串。
+    """
+    path = os.path.join(
+        home or os.path.expanduser("~"), ".gemini", "antigravity-cli", "antigravity-oauth-token"
+    )
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    email = data.get("id_token_email") if isinstance(data, dict) else None
+    return email.strip() if isinstance(email, str) else ""
+
+
+def _fetch_agy_quota(profile=None) -> list[dict]:
+    """实时拉 agy 的订阅额度快照；拿不到就返回空列表（调用方降级提示）。
+
+    传了 profile 就照 runner 的方式起 agy：用它的 agy_bin，HOME 用它的 agy_home。
+    这样查到的是这个 bot 自己那个号的额度，不是本机全局登录的那个号。
+    """
+    home = _agy_profile_home(profile)
+    env = None
+    if home:
+        env = os.environ.copy()
+        env["HOME"] = home
     try:
         proc = subprocess.run(
             [
-                resolve_agy_bin(),
+                resolve_agy_bin(getattr(profile, "agy_bin", "") or None),
                 "--add-dir", tempfile.gettempdir(),
                 "--print-timeout", f"{_AGY_QUOTA_TIMEOUT}s",
                 "-p", "/usage",
@@ -1281,6 +1319,7 @@ def _fetch_agy_quota() -> list[dict]:
             capture_output=True,
             text=True,
             timeout=_AGY_QUOTA_TIMEOUT + 15,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError):
         return []
@@ -1590,7 +1629,9 @@ def _switch_claude_account(name: str) -> str:
 _AGY_SWITCH_SUBCMDS = {"save", "remove", "rm", "list", "ls", "logout"}
 
 
-def _agy_switch_buttons(chat_id: str, *, for_usage: bool = False) -> list[dict]:
+def _agy_switch_buttons(
+    chat_id: str, *, for_usage: bool = False, include_accounts: bool = True
+) -> list[dict]:
     """agy 账号切换按钮——`/accounts`、`/switch` 选择卡、`/usage` 底部共用。
 
     active 账号前缀 `●`。与 Claude 版 `_account_switch_buttons` 同语义：
@@ -1599,12 +1640,16 @@ def _agy_switch_buttons(chat_id: str, *, for_usage: bool = False) -> list[dict]:
     for_usage=True（`/usage` 底部）：
     - 仅当保存了 >1 个账号时才给切换按钮（点击走 `switch_usage` 动作原地重渲染）；
     - 只要有 chat_id，末尾必带「🔄 刷新」按钮。
+    include_accounts=False：不列账号按钮。profile 用自己的 agy_home 时就这样，
+    因为切号按钮切的是本机全局那份登录，跟这个 bot 用的号无关。
     """
-    try:
-        from agy_account_switcher import list_accounts_summary
-        rows = list_accounts_summary()
-    except Exception:
-        rows = []
+    rows: list[dict] = []
+    if include_accounts:
+        try:
+            from agy_account_switcher import list_accounts_summary
+            rows = list_accounts_summary()
+        except Exception:
+            rows = []
     buttons: list[dict] = []
     if for_usage:
         if len(rows) > 1:
@@ -2785,7 +2830,17 @@ async def handle_command(
             return _wrap_usage_output(lines)
         if runner == "agy":
             model = cur.get("model_override") or store.default_model
-            acct_name, acct_email = await asyncio.to_thread(_agy_current_account)
+            profile = getattr(bot, "profile", None)
+            agy_home = _agy_profile_home(profile)
+            api_key_provider = _agy_api_key_provider(profile)
+            if agy_home:
+                # 这个 bot 有自己的 Google 登录：账号和额度都只看它的 HOME
+                acct_name, acct_email = "", await asyncio.to_thread(_agy_oauth_email, agy_home)
+            else:
+                acct_name, acct_email = await asyncio.to_thread(_agy_current_account)
+                if not (acct_name or acct_email) and not api_key_provider:
+                    # Linux 没有 keychain，OAuth 登录态在 ~/.gemini 的凭证文件里
+                    acct_email = await asyncio.to_thread(_agy_oauth_email)
             title = "📈 **Antigravity CLI 用量**"
             if acct_name:
                 title += f" — 当前 `{acct_name}`"
@@ -2800,21 +2855,29 @@ async def handle_command(
             )
             if ctx_line:
                 lines.append(ctx_line)
-            bar_lines = _agy_usage_bar_lines(await asyncio.to_thread(_fetch_agy_quota))
             lines.append("")
-            if bar_lines:
-                lines.append("**订阅额度**")
-                lines.extend(bar_lines)
-            else:
+            if api_key_provider:
+                # API key 按量计费，没有订阅额度；别去查本机 OAuth 那个号的额度
                 lines.append(
-                    "订阅额度: `拿不到——agy 未 OAuth 登录，或在 API key 模式"
-                    "（AGY_MODEL_PROVIDER=gemini）下按量计费、没有额度概念`"
+                    f"订阅额度: `无——这个 bot 的 agy 走 API key（AGY_MODEL_PROVIDER={api_key_provider}），"
+                    "按量计费、没有额度概念`"
                 )
+            else:
+                bar_lines = _agy_usage_bar_lines(await asyncio.to_thread(_fetch_agy_quota, profile))
+                if bar_lines:
+                    lines.append("**订阅额度**")
+                    lines.extend(bar_lines)
+                else:
+                    lines.append("订阅额度: `拿不到——agy 没登录，或 /usage 查询失败`")
             lines.append("")
             lines.append(f"Runner: `agy`")
             lines.append(f"模型: `{model}`")
-            # 底部账号切换按钮：点击即切本机全局 agy 凭证并原地重渲染 /usage
-            buttons = _agy_switch_buttons(chat_id, for_usage=True) if chat_id else []
+            # 底部账号切换按钮：点击即切本机全局 agy 凭证并原地重渲染 /usage。
+            # bot 用自己的 agy_home 时只留刷新按钮，因为全局那份不是它在用的号。
+            buttons = (
+                _agy_switch_buttons(chat_id, for_usage=True, include_accounts=not agy_home)
+                if chat_id else []
+            )
             if any(b.get("value", {}).get("action") == "switch_usage" for b in buttons):
                 lines.append("")
                 lines.append("👇 点账号按钮切换 Antigravity 账号 · 🔄 刷新用量：")

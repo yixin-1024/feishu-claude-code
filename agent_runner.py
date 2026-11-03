@@ -193,6 +193,7 @@ async def run_agent(
             print_timeout=profile.agy_print_timeout,
             dangerously_skip_permissions=bool(profile.agy_dangerous_skip),
             idle_timeout_sec=profile.agy_idle_timeout_sec,
+            home=getattr(profile, "agy_home", "") or None,
             extra_env=agy_env,
         )
 

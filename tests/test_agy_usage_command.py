@@ -146,6 +146,8 @@ def _seed_agy_accounts(monkeypatch, tmp_path, accounts, current=None):
         if name == current:
             state["raw"] = aas.encode_raw(blob)
     monkeypatch.setattr(aas, "_read_keychain_raw", lambda: state["raw"])
+    # keychain 为空时 /usage 会去读 Linux 的凭证文件，别让它读到本机真实的 ~/.gemini
+    monkeypatch.setattr(commands, "_agy_oauth_email", lambda *a, **k: "")
     return state
 
 
@@ -153,7 +155,7 @@ def _seed_agy_accounts(monkeypatch, tmp_path, accounts, current=None):
 async def test_agy_usage_command_with_chat_id_appends_refresh_button(monkeypatch, tmp_path):
     """agy runner 执行 /usage 时，带 chat_id 应返回带刷新按钮的卡片 dict。"""
     _seed_agy_accounts(monkeypatch, tmp_path, [])
-    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda: [])
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda *a, **k: [])
     monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：1k/1M")
     store = _DummyStore(runner="agy")
     reply = await commands.handle_command("usage", "", "ou_user", "oc_test_chat", store)
@@ -175,7 +177,7 @@ async def test_agy_usage_shows_account_switch_buttons(monkeypatch, tmp_path):
         [("cactrinh383", "cactrinh383@gmail.com"), ("luyixin75", "luyixin75@gmail.com")],
         current="luyixin75",
     )
-    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda: [])
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda *a, **k: [])
     monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：1k/1M")
     store = _DummyStore(runner="agy")
 
@@ -198,7 +200,7 @@ async def test_agy_usage_single_account_has_no_switch_button(monkeypatch, tmp_pa
     """只有一个号时不给无意义的切换按钮，但标题仍标出当前号。"""
     _seed_agy_accounts(monkeypatch, tmp_path,
                        [("solo", "solo@gmail.com")], current="solo")
-    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda: [])
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda *a, **k: [])
     monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：1k/1M")
     store = _DummyStore(runner="agy")
 
@@ -213,7 +215,7 @@ async def test_agy_usage_single_account_has_no_switch_button(monkeypatch, tmp_pa
 async def test_agy_usage_command_without_chat_id_returns_string(monkeypatch, tmp_path):
     """不传 chat_id 时保持纯文本返回。"""
     _seed_agy_accounts(monkeypatch, tmp_path, [("solo", "solo@gmail.com")], current="solo")
-    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda: [])
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda *a, **k: [])
     monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：1k/1M")
     store = _DummyStore(runner="agy")
     reply = await commands.handle_command("usage", "", "ou_user", "", store)
@@ -234,3 +236,113 @@ async def test_codex_usage_command_with_chat_id_appends_refresh_button(monkeypat
         "text": "🔄 刷新",
         "value": {"action": "run_cmd", "cmd": "/usage", "cid": "oc_test_chat"},
     }]
+
+
+# ── per-profile agy HOME（2026-11-03）：/usage 要查这个 bot 自己那个号 ─────────
+from types import SimpleNamespace  # noqa: E402
+
+
+def _write_linux_token(home, email):
+    d = home / ".gemini" / "antigravity-cli"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "antigravity-oauth-token").write_text(json.dumps({
+        "token": {"access_token": "ya29.x", "refresh_token": "1//x", "expiry": "2026-11-03T19:00:00Z"},
+        "auth_method": "consumer",
+        "id_token_email": email,
+    }))
+
+
+def test_agy_oauth_email_reads_linux_token_file(tmp_path):
+    _write_linux_token(tmp_path, "bot@example.com")
+    assert commands._agy_oauth_email(str(tmp_path)) == "bot@example.com"
+    assert commands._agy_oauth_email(str(tmp_path / "nope")) == ""
+    (tmp_path / ".gemini" / "antigravity-cli" / "antigravity-oauth-token").write_text("not json")
+    assert commands._agy_oauth_email(str(tmp_path)) == ""
+
+
+def test_fetch_agy_quota_runs_with_profile_home_and_bin(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw.get("env")
+        return FakeProc(REAL_OUTPUT)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    profile = SimpleNamespace(agy_home="/x/bot-home", agy_bin="/x/agy", agy_model_provider="")
+    assert len(_fetch_agy_quota(profile)) == 4
+    assert seen["cmd"][0] == "/x/agy"
+    assert seen["env"]["HOME"] == "/x/bot-home"
+
+    # 没指定 HOME 的 profile / 老调用方：沿用 bot 进程自己的环境
+    _fetch_agy_quota(SimpleNamespace(agy_home="", agy_bin="", agy_model_provider=""))
+    assert seen["env"] is None
+    _fetch_agy_quota()
+    assert seen["env"] is None
+
+
+def _agy_bot(**profile):
+    base = {"name": "antigravity", "runner": "agy", "agy_home": "", "agy_bin": "",
+            "agy_model_provider": ""}
+    base.update(profile)
+    return SimpleNamespace(profile=SimpleNamespace(**base))
+
+
+@pytest.mark.asyncio
+async def test_agy_usage_with_profile_home_shows_that_account(monkeypatch, tmp_path):
+    """bot 用自己的 agy_home：标题是那个 HOME 的登录邮箱，额度按它查，不给全局切号按钮。"""
+    # 本机全局那份（keychain）存了两个号——不该出现在这个 bot 的 /usage 里
+    (tmp_path / "global").mkdir()
+    _seed_agy_accounts(monkeypatch, tmp_path / "global",
+                       [("cactrinh383", "cactrinh383@gmail.com"), ("luyixin75", "luyixin75@gmail.com")],
+                       current="luyixin75")
+    home = tmp_path / "bot-home"
+    _write_linux_token(home, "bot@example.com")
+    monkeypatch.setattr(commands, "_agy_oauth_email", lambda h="": "bot@example.com" if h == str(home) else "")
+    asked = []
+
+    def fake_quota(profile=None):
+        asked.append(profile)
+        return [{"group": "Gemini Models", "window": "Weekly Limit Remaining",
+                 "remaining_pct": 79.0, "resets_at": ""}]
+
+    monkeypatch.setattr(commands, "_fetch_agy_quota", fake_quota)
+    monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "")
+    bot = _agy_bot(agy_home=str(home))
+
+    reply = await commands.handle_command("usage", "", "ou_user", "oc_chat", _DummyStore(), bot=bot)
+
+    assert reply["text"].startswith("📈 **Antigravity CLI 用量** — 当前 `bot@example.com`")
+    assert "luyixin75" not in reply["text"]
+    assert "Weekly 剩余" in reply["text"]
+    assert asked == [bot.profile]
+    assert [b["value"]["action"] for b in reply["buttons"]] == ["run_cmd"]
+
+
+@pytest.mark.asyncio
+async def test_agy_usage_api_key_profile_does_not_show_oauth_quota(monkeypatch, tmp_path):
+    """API key 模式按量计费：不去查本机 OAuth 那个号的额度，也不把那个号写进标题。"""
+    _seed_agy_accounts(monkeypatch, tmp_path, [])
+    monkeypatch.setattr(commands, "_agy_oauth_email", lambda *a, **k: "luyixin75@gmail.com")
+    monkeypatch.setattr(commands, "_fetch_agy_quota",
+                        lambda *a, **k: pytest.fail("API key 模式不该查订阅额度"))
+    monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "")
+
+    reply = await commands.handle_command("usage", "", "ou_user", "oc_chat", _DummyStore(),
+                                          bot=_agy_bot(agy_model_provider="gemini"))
+
+    assert "AGY_MODEL_PROVIDER=gemini" in reply["text"]
+    assert "luyixin75" not in reply["text"]
+
+
+@pytest.mark.asyncio
+async def test_agy_usage_oauth_without_keychain_reads_linux_token(monkeypatch, tmp_path):
+    """OAuth 且没单独 HOME（共用 ~/.gemini）：Linux 没 keychain，标题从凭证文件读邮箱。"""
+    _seed_agy_accounts(monkeypatch, tmp_path, [])
+    monkeypatch.setattr(commands, "_agy_oauth_email", lambda h="": "" if h else "me@example.com")
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda *a, **k: [])
+    monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "")
+
+    reply = await commands.handle_command("usage", "", "ou_user", "oc_chat", _DummyStore(), bot=_agy_bot())
+
+    assert "— 当前 `me@example.com`" in reply["text"]
+    assert "agy 没登录，或 /usage 查询失败" in reply["text"]

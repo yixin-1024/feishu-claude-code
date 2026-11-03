@@ -1645,3 +1645,111 @@ def test_progress_only_success_resumes_through_real_stream_parser(monkeypatch):
     assert (text, sid) == ("已交付", CID)
     assert len(commands) == 2
     assert commands[1][commands[1].index("--conversation") + 1] == CID
+
+
+# ── per-profile HOME（<PREFIX>_AGY_HOME，2026-11-03）──────────────────────
+# 让某个 bot 用自己的 Google 登录：agy 进程跑在那个 HOME 下（OAuth 凭证绑 HOME），
+# 它起的 bash 由 BASH_ENV 还原成真 HOME，lark-cli / git / ssh 才找得到配置。
+
+
+def _profile_home(monkeypatch, tmp_path):
+    src = tmp_path / "claude-skills"
+    (src / "demo").mkdir(parents=True)
+    monkeypatch.setattr(agy_runner, "AGY_SKILLS_SRC", str(src))
+    monkeypatch.setattr(agy_runner, "_mcp_registered", set())
+    return tmp_path / "bot-home"
+
+
+def test_run_agy_profile_home_sets_home_and_bash_env(monkeypatch, tmp_path):
+    captured = {}
+    _patch_exec(monkeypatch, FakeProc(STREAM_LINES), captured)
+    monkeypatch.setattr(agy_runner, "AGY_BOT_HOME", "/tmp/fake-agy-home")
+    home = _profile_home(monkeypatch, tmp_path)
+
+    asyncio.run(run_agy(message="hi", cwd="/tmp", model_provider="", home=str(home)))
+
+    env = captured["env"]
+    # OAuth + 指定 HOME：用指定的那个，既不退回真 HOME，也不用 AGY_BOT_HOME
+    assert env["HOME"] == str(home)
+    script = home / ".cc-lark-restore-home.sh"
+    assert env["BASH_ENV"] == str(script)
+    assert script.is_file()
+    # 全局 skill 根要链好，否则这个 bot 一个用户 skill 都看不到
+    assert (home / ".gemini" / "config" / "skills" / "demo").is_dir()
+
+
+def test_run_agy_without_profile_home_keeps_old_behaviour(monkeypatch, tmp_path):
+    captured = {}
+    _patch_exec(monkeypatch, FakeProc(STREAM_LINES), captured)
+    monkeypatch.setattr(agy_runner, "AGY_BOT_HOME", "/tmp/fake-agy-home")
+
+    asyncio.run(run_agy(message="hi", cwd="/tmp", model_provider="gemini", home=None))
+
+    assert captured["env"]["HOME"] == "/tmp/fake-agy-home"
+    assert "BASH_ENV" not in captured["env"] or captured["env"]["BASH_ENV"] == os.environ.get("BASH_ENV")
+
+
+def test_restore_home_script_gives_commands_the_real_home(tmp_path):
+    import subprocess
+
+    home = tmp_path / "bot-home"
+    script = agy_runner.ensure_profile_home(str(home), real_home="/real/home")
+
+    def bash_home(start_home):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": start_home, "BASH_ENV": script}
+        out = subprocess.run(["bash", "-c", 'echo "$HOME|${BASH_ENV:-unset}"'],
+                             env=env, capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+
+    # agy 起的 bash：HOME 还原成真 HOME，BASH_ENV 清掉（嵌套的 bash 不再重复改）
+    assert bash_home(str(home)) == "/real/home|unset"
+    # 别人有意把 HOME 指到别处时不动它
+    assert bash_home("/somewhere/else") == "/somewhere/else|unset"
+    # 幂等：内容没变就不重写
+    mtime = os.path.getmtime(script)
+    assert agy_runner.ensure_profile_home(str(home), real_home="/real/home") == script
+    assert os.path.getmtime(script) == mtime
+
+
+def test_run_agy_profile_home_registers_cc_lark_mcp_in_that_home(monkeypatch, tmp_path):
+    real_ensure_mcp = agy_runner.ensure_cc_lark_mcp
+    captured = {}
+    _patch_exec(monkeypatch, FakeProc(STREAM_LINES), captured)
+    monkeypatch.setattr(agy_runner, "ensure_cc_lark_mcp", real_ensure_mcp)
+    home = _profile_home(monkeypatch, tmp_path)
+
+    asyncio.run(run_agy(message="hi", cwd="/tmp", model_provider="", home=str(home),
+                        extra_env={"CC_LARK_THREAD_ID": "omt_test"}))
+
+    cfg = json.loads((home / ".gemini" / "config" / "mcp_config.json").read_text())
+    assert "cc-lark" in cfg["mcpServers"]
+
+
+def test_run_agy_profile_home_with_api_key_writes_its_own_settings(monkeypatch, tmp_path):
+    real_ensure_provider = agy_runner.ensure_model_provider
+    captured = {}
+    _patch_exec(monkeypatch, FakeProc(STREAM_LINES), captured)
+    writes = []
+    monkeypatch.setattr(agy_runner, "ensure_model_provider",
+                        lambda provider, path=None: writes.append(path) or real_ensure_provider(provider, path))
+    home = _profile_home(monkeypatch, tmp_path)
+
+    asyncio.run(run_agy(message="hi", cwd="/tmp", model_provider="gemini", home=str(home)))
+
+    settings = home / ".gemini" / "antigravity-cli" / "settings.json"
+    assert writes == [str(settings)]
+    assert json.loads(settings.read_text())["modelProvider"] == "gemini"
+    assert captured["env"]["HOME"] == str(home)
+
+
+def test_load_profile_reads_agy_home(monkeypatch):
+    import bot_config
+
+    for k, v in {"AX_APP_ID": "app", "AX_APP_SECRET": "secret", "AX_PLATFORM": "lark",
+                 "AX_DEFAULT_CWD": "/tmp", "AX_RUNNER": "agy", "AX_AGY_HOME": "~/agy-ax-home"}.items():
+        monkeypatch.setenv(k, v)
+    assert bot_config._load_profile("ax").agy_home == os.path.expanduser("~/agy-ax-home")
+
+    monkeypatch.delenv("AX_AGY_HOME")
+    monkeypatch.setenv("AGY_HOME", "/must/not/leak")  # 没有全局回退
+    assert bot_config._load_profile("ax").agy_home == ""

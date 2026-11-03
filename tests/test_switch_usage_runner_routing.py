@@ -73,7 +73,7 @@ def _seed_two_agy_accounts(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_switch_usage_under_agy_runner_switches_agy_account(monkeypatch, tmp_path):
     _seed_two_agy_accounts(monkeypatch, tmp_path)
-    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda: [])
+    monkeypatch.setattr(commands, "_fetch_agy_quota", lambda *a, **k: [])
     monkeypatch.setattr(commands, "_format_context_line", lambda *a, **k: "上下文：1k/1M")
     switched = []
     monkeypatch.setattr(commands, "_switch_agy_account",
