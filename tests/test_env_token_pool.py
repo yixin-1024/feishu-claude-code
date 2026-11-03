@@ -179,8 +179,8 @@ def test_usage_card_shows_every_token_and_switch_buttons(monkeypatch):
     out = commands._get_usage("oc_chat")
 
     text = out["text"]
-    assert "当前 `a`" in text and "94.0%" in text
-    assert "**其他 token：**" in text and "`b` · 5h `10%`" in text and "7d `20%`" in text
+    assert "当前 `a`" in text and "剩余 **6%**" in text
+    assert "**其他 token**" in text and "`b` ✅ 剩 80% · 5 小时剩 90%" in text
     switch = [b for b in out["buttons"] if b["value"]["action"] == "switch_usage"]
     assert [b["text"] for b in switch] == ["● a", "b"]
     assert switch[1]["value"]["name"] == "b"
@@ -191,7 +191,7 @@ def test_usage_card_reports_dead_token(monkeypatch):
     _pool_ab()
     monkeypatch.setattr(accs, "_probe_one", _fake_probe({TOK_A: (0.03, 0.5)}))
     text = commands._get_usage("oc_chat")["text"]
-    assert "`b` — ⚠️ auth 403" in text
+    assert "`b` ⚠️ auth 403" in text
 
 
 def _drop_5h(probe, token):
@@ -213,8 +213,25 @@ def test_usage_card_handles_token_without_5h_window(monkeypatch):
     text = commands._get_usage("oc_chat")["text"]
 
     assert "用量获取失败" not in text
-    assert "当前 `a`" in text and "已取消 5 小时限额" in text and "40.0%" in text
-    assert "`b` · 5h `无` · 7d `20%`" in text and "✅" in text
+    assert "当前 `a`" in text and "剩余 **60%**" in text
+    assert "5 小时" not in text, "没有 5 小时限额的号不该再占一行"
+    assert "`b` ✅ 剩 80% · " in text
+
+
+def test_usage_card_is_one_line_per_quota_and_shows_remaining(monkeypatch):
+    """用户 2026-11-03 嫌卡片太长：5 小时窗口去掉，每个额度挤在一行，
+    只写还剩多少、不写「7天」，其他 token 也只留一行。"""
+    _pool_ab()
+    probe = _fake_probe({TOK_A: (0.03, 0.42), TOK_B: (0.1, 0.13)})
+    monkeypatch.setattr(accs, "_probe_one", _drop_5h(_drop_5h(probe, TOK_A), TOK_B))
+
+    text = commands._get_usage("oc_chat")["text"]
+
+    for noise in ("7天", "7d", "5h", "score", "状态", "█", "░"):
+        assert noise not in text, noise
+    lines = text.splitlines()
+    assert any(l.startswith("剩余 **58%** · ") and l.endswith(" 重置") for l in lines), text
+    assert any(l.startswith("`b` ✅ 剩 87% · ") and l.endswith(" 重置") for l in lines), text
 
 
 def test_emergency_switch_accepts_token_without_5h_window(monkeypatch):

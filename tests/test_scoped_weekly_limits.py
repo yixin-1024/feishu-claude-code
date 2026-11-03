@@ -10,6 +10,7 @@ import email.message
 import json
 import os
 import sys
+import time
 import urllib.error
 
 os.environ.setdefault("FEISHU_APP_ID", "test-app-id")
@@ -155,6 +156,25 @@ def test_usage_card_renders_fable_row():
         "s5h": "allowed", "s7d": "allowed",
         "scoped7d": [{"name": "Fable", "u": 0.0, "r": None, "sev": "allowed"}],
     }, account_label="env-token（钉死）")
-    text = "\n".join(lines)
-    assert "**7天窗口（Fable）**（状态：allowed）" in text
-    assert "0.0%" in text, "0% 也要显示，不能当成没数据跳过"
+    assert "Fable 剩余 **100%**" in lines, "用了 0% 也要显示，不能当成没数据跳过"
+
+
+def test_usage_card_fable_reset_only_when_different():
+    r = int(time.time()) + 86400
+    base = {"u5h": None, "u7d": 0.2, "r5h": None, "r7d": r, "s5h": "unknown", "s7d": "allowed"}
+
+    same = commands._usage_single_account_lines(
+        {**base, "scoped7d": [{"name": "Fable", "u": 0.1, "r": r, "sev": "allowed"}]})
+    assert same[-1] == "Fable 剩余 **90%**", "和周额度同一刻重置就别再写一遍"
+
+    later = commands._usage_single_account_lines(
+        {**base, "scoped7d": [{"name": "Fable", "u": 1.0, "r": r + 3 * 86400, "sev": "rejected"}]})
+    assert later[-1].startswith("Fable 剩余 **0%** · ⛔ 已撞墙 · ") and later[-1].endswith(" 重置")
+
+
+def test_other_token_line_mentions_fable_only_when_tighter():
+    acc = accs.Account(name="b", u7d=0.2, s7d="allowed", usable=True,
+                       scoped7d=[{"name": "Fable", "u": 0.0, "r": None, "sev": "allowed"}])
+    assert commands._usage_other_line(acc) == "`b` ✅ 剩 80%"
+    acc.scoped7d[0]["u"] = 0.7
+    assert commands._usage_other_line(acc) == "`b` ✅ 剩 80% · Fable 剩 30%"

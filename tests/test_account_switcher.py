@@ -677,10 +677,10 @@ def test_get_usage_multi_account(monkeypatch):
     out = commands._get_usage()
     # 当前账户标题
     assert "当前 `via`" in out
-    # 当前账户的 bar 段（5h 29%）
-    assert "29.0%" in out
-    # 其他账户的简表行
-    assert "`reg`" in out and "93%" in out
+    # 当前账户还有 5 小时限额：多一行，写剩余（已用 29% → 剩 71%）
+    assert "5 小时剩余 **71%**" in out
+    # 其他账户的简表行（5h 已用 93% → 剩 7%）
+    assert "`reg` ✅ 剩 79% · 5 小时剩 7%" in out
     # 自动切换状态
     assert "自动切换" in out and "未启用" in out
 
@@ -696,9 +696,9 @@ def test_get_usage_falls_back_when_no_accounts(monkeypatch):
                  "s5h": "allowed", "s7d": "allowed"},
     )
     out = commands._get_usage()
-    assert "Claude Max 用量" in out
+    assert "Claude 用量" in out
     assert "其他账户" not in out  # 没有多账户段
-    assert "40.0%" in out
+    assert "剩余 **80%**" in out and "5 小时剩余 **60%**" in out
 
 
 def test_get_usage_shows_recommend_switch_when_alt_clearly_better(monkeypatch):
@@ -763,7 +763,7 @@ def test_get_usage_single_account_only_refresh_button(monkeypatch):
     )
     out = commands._get_usage("oc_test_chat")
     assert isinstance(out, dict)
-    assert "点账户按钮切换" not in out["text"]
+    assert "点按钮切换" not in out["text"]
     btns = out["buttons"]
     assert len(btns) == 1
     assert btns[0] == {"text": "🔄 刷新", "value": {"action": "run_cmd", "cmd": "/usage", "cid": "oc_test_chat"}}
@@ -781,7 +781,7 @@ def test_get_usage_no_accounts_appends_refresh_button_when_chat_id(monkeypatch):
     )
     out = commands._get_usage("oc_test_chat")
     assert isinstance(out, dict)
-    assert "Claude Max 用量" in out["text"]
+    assert "Claude 用量" in out["text"]
     assert out["buttons"] == [{"text": "🔄 刷新", "value": {"action": "run_cmd", "cmd": "/usage", "cid": "oc_test_chat"}}]
 
 

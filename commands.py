@@ -668,76 +668,85 @@ def _fmt_pct_bar(val) -> str:
     return f"{bar} {pct:.1f}%"
 
 
-def _fmt_reset_short(secs) -> str:
-    """把「距离重置还有多久」渲染成短串。
+# /usage 卡片主要在手机上看，一行大约只放得下 17 个汉字：每个额度只占一行，
+# 写「剩多少」而不是「用了多少」，不再画进度条（20 格的条自己就占满一行）。
+# 周额度就叫「剩余」，不写「7天窗口」；Ultra（原 Max 20x）2026-10-31 起陆续取消
+# 5 小时限额，没有这个窗口的号就不显示那一行（还有的号才多一行「5 小时剩余」）。
 
-    ≤ 1 天 → `10h25m`；> 1 天 → `2天零3小时`（不写很多个小时），整天则 `2天`。
-    """
-    secs = max(0, int(secs))
-    if secs >= 86400:
-        days = secs // 86400
-        hours = (secs % 86400) // 3600
-        return f"{days}天零{hours}小时" if hours else f"{days}天"
-    return f"{secs // 3600}h{secs % 3600 // 60}m"
+# 只有真撞墙才标出来；allowed / allowed_warning 看剩余百分比就够了
+_QUOTA_BLOCKED_STATUSES = ("rejected", "blocked")
 
 
-def _fmt_reset_ts(ts) -> str:
-    if ts is None:
+def _usage_title(account_label: Optional[str] = None) -> str:
+    title = "📊 **Claude 用量**"
+    return f"{title} · 当前 `{account_label}`" if account_label else title
+
+
+def _fmt_left_pct(used) -> str:
+    """已用比例（0~1）→ 剩余百分比；没用完但剩不到 1% 写 `<1%`，免得看着像 0%。"""
+    if used is None:
         return "未知"
+    left = max(0.0, 1.0 - float(used)) * 100
+    if 0 < left < 1:
+        return "<1%"
+    return f"{left:.0f}%"
+
+
+def _fmt_reset_when(ts) -> str:
+    """重置时刻的口语短串：今天/明天/后天 HH:MM，再远写 MM/DD HH:MM。"""
     try:
         dt = datetime.fromtimestamp(int(ts))
-        diff = (dt - datetime.now()).total_seconds()
-        return f"{dt.strftime('%m/%d %H:%M')}（{_fmt_reset_short(diff)} 后）"
     except Exception:
         return str(ts)
+    day = {0: "今天", 1: "明天", 2: "后天"}.get((dt.date() - datetime.now().date()).days)
+    return f"{day or dt.strftime('%m/%d')} {dt.strftime('%H:%M')}"
+
+
+def _quota_line(label: str, used, status=None, reset_ts=None) -> str:
+    """一个额度一行：`剩余 **58%** · 明天 18:00 重置`，撞墙时中间多一个 ⛔。"""
+    line = f"{label} **{_fmt_left_pct(used)}**"
+    if status in _QUOTA_BLOCKED_STATUSES:
+        line += " · ⛔ 已撞墙"
+    if reset_ts:
+        line += f" · {_fmt_reset_when(reset_ts)} 重置"
+    return line
 
 
 def _usage_single_account_lines(data: dict, account_label: Optional[str] = None) -> list[str]:
-    """渲染单账户的 5h / 7d bar + reset 倒计时（共用片段）。"""
-    title = "📊 **Claude Max 用量**"
-    if account_label:
-        title += f" — 当前 `{account_label}`"
-    lines = [title, ""]
-    if data.get("u5h") is None and data.get("r5h") is None:
-        # Ultra（原 Max 20x）2026-10-31 起陆续取消 5 小时限额，响应里不再带 5h headers
-        lines.append("**5小时窗口**：无（这个号已取消 5 小时限额）")
-    else:
-        lines.append(f"**5小时窗口**（状态：{data.get('s5h', '?')}）")
-        lines.append(_fmt_pct_bar(data.get("u5h")))
-        lines.append(f"重置时间：{_fmt_reset_ts(data.get('r5h'))}")
-    lines.append("")
-    lines.append(f"**7天窗口**（状态：{data.get('s7d', '?')}）")
-    lines.append(_fmt_pct_bar(data.get("u7d")))
-    lines.append(f"重置时间：{_fmt_reset_ts(data.get('r7d'))}")
+    """当前账户的额度（共用片段）：周额度一行；还有 5 小时限额的号多一行；分模型周额度
+    （Fable）各一行，重置时刻和周额度显示出来一样就不重复写。"""
+    r7d = data.get("r7d")
+    lines = [_usage_title(account_label), "",
+             _quota_line("剩余", data.get("u7d"), data.get("s7d"), r7d)]
+    if data.get("u5h") is not None or data.get("r5h") is not None:
+        lines.append(_quota_line("5 小时剩余", data.get("u5h"), data.get("s5h"), data.get("r5h")))
     for sc in data.get("scoped7d") or []:
         if sc.get("u") is None:
             continue
-        lines.append("")
-        lines.append(f"**7天窗口（{sc.get('name', '?')}）**（状态：{sc.get('sev', '?')}）")
-        lines.append(_fmt_pct_bar(sc.get("u")))
-        lines.append(f"重置时间：{_fmt_reset_ts(sc.get('r'))}")
+        r = sc.get("r")
+        if r and r7d and _fmt_reset_when(r) == _fmt_reset_when(r7d):
+            r = None
+        lines.append(_quota_line(f"{sc.get('name') or '?'} 剩余", sc["u"], sc.get("sev"), r))
     return lines
 
 
-def _usage_other_line(a, now_ts: float, tail: str = "") -> str:
-    """/usage 里「其他账户」的一行简表（用量 / 重置 / 分模型周额度 / 可用性）。
-    tail 为空且账户不可用时补上第一条原因。"""
+def _usage_other_line(a, tail: str = "") -> str:
+    """/usage 里其他账户 / token 的一行：能不能切 + 剩余 + 周额度重置时刻。
+    还有 5 小时限额的多一段；分模型周额度只在比周额度还紧时才写。"""
     if a.probe_error:
-        return f"  `{a.name}` — ⚠️ {a.probe_error}"
-    u5 = f"{a.u5h*100:.0f}%" if a.u5h is not None else "无"
-    u7 = f"{a.u7d*100:.0f}%" if a.u7d is not None else "?"
-    mark = "✅" if a.usable else "❌"
-    r5_part = f" (重置 {_fmt_reset_short(a.r5h - now_ts)})" if a.r5h else ""
-    r7_part = f" (重置 {_fmt_reset_short(a.r7d - now_ts)})" if a.r7d else ""
-    sc_part = ""
+        return f"`{a.name}` ⚠️ {a.probe_error}"
+    parts = [f"剩 {_fmt_left_pct(a.u7d)}"]
+    if a.u5h is not None:
+        parts.append(f"5 小时剩 {_fmt_left_pct(a.u5h)}")
     for sc in getattr(a, "scoped7d", None) or []:
-        if sc.get("u") is not None:
-            sc_part += f" · {sc.get('name', '?').lower()} `{sc['u']*100:.0f}%`"
-    if not tail and not a.usable and a.reasons:
-        tail = f"（{a.reasons[0]}）"
-    return (
-        f"  `{a.name}` · 5h `{u5}`{r5_part} · 7d `{u7}`{r7_part}{sc_part} · score `{a.score:.2f}` {mark}{tail}"
-    )
+        if sc.get("u") is not None and a.u7d is not None and sc["u"] > a.u7d:
+            parts.append(f"{sc.get('name') or '?'} 剩 {_fmt_left_pct(sc['u'])}")
+    if a.s7d in _QUOTA_BLOCKED_STATUSES or a.s5h in _QUOTA_BLOCKED_STATUSES:
+        parts.append("⛔ 已撞墙")
+    if a.r7d:
+        parts.append(f"{_fmt_reset_when(a.r7d)} 重置")
+    mark = "✅" if a.usable else "❌"
+    return f"`{a.name}` {mark} " + " · ".join(parts) + tail
 
 
 def _account_usage_data(acc) -> dict:
@@ -765,34 +774,32 @@ def _get_env_token_usage(chat_id: Optional[str] = None) -> "str | dict":
         lines.extend(_usage_single_account_lines(_account_usage_data(cur), account_label=active))
     else:
         err = (cur.probe_error if cur is not None else None) or "未知"
-        lines += [f"📊 **Claude Max 用量** — 当前 `{active}`", "", f"⚠️ 用量获取失败：{err}"]
+        lines += [_usage_title(active), "", f"⚠️ 用量获取失败：{err}"]
 
     others = [a for a in accounts.values() if a.name != active]
     if others:
-        now_ts = time.time()
-        lines += ["", "**其他 token：**"]
-        lines.extend(_usage_other_line(a, now_ts) for a in others)
+        lines += ["", "**其他 token**"]
+        lines.extend(_usage_other_line(a) for a in others)
         lines.append("")
         lines.append(
-            "撞墙自动切换：✅ 当前 token 撞到用量墙时自动切到有余量的另一个并续跑"
+            "撞墙自动切换：✅ 已开"
             if switch_on_limit_enabled()
-            else "撞墙自动切换：⏸ 已关闭（`.env` 里 `ACCOUNT_SWITCH_ON_LIMIT=0`）"
+            else "撞墙自动切换：⏸ 已关（`.env` 里 `ACCOUNT_SWITCH_ON_LIMIT=0`）"
         )
 
     buttons = _account_switch_buttons(chat_id, for_usage=True) if chat_id else []
     if not buttons:
         return "\n".join(lines)
     if any(b.get("value", {}).get("action") == "switch_usage" for b in buttons):
-        lines.append("")
-        lines.append("👇 点 token 按钮切换（新任务立即用它，正在跑的不受影响）· 🔄 刷新用量：")
+        lines.append("👇 点按钮切 token（只影响新任务）")
     return {"text": "\n".join(lines), "buttons": buttons}
 
 
 def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
     """渲染 /usage 命令的完整输出。
 
-    保存了多个账户时：顶部展示当前 active 账户的详尽 bar/重置，下方列出
-    其他账户的一行简表（用量 / score / 是否可用），再显示自动切换开关，最后
+    保存了多个账户时：顶部是当前 active 账户的额度（一个额度一行，写剩余），下方
+    每个其他账户一行（能不能切 / 剩余 / 重置），再显示自动切换开关，最后
     附上账户切换按钮（与 `/switch` 同款）——传入 chat_id 时才带按钮，返回
     `{"text", "buttons"}` dict；否则（或没保存账户）返回纯文本。
 
@@ -871,13 +878,8 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
         )
         lines.append("")
     if cur and not cur.probe_error and cur.u7d is not None:
-        data = {
-            "u5h": cur.u5h, "u7d": cur.u7d, "r5h": cur.r5h, "r7d": cur.r7d,
-            "s5h": cur.s5h, "s7d": cur.s7d,
-            "scoped7d": getattr(cur, "scoped7d", None) or [],
-        }
         lines.extend(_usage_single_account_lines(
-            data, account_label=("env-token（钉死）" if pin_key else cur.name)))
+            _account_usage_data(cur), account_label=("env-token（钉死）" if pin_key else cur.name)))
     else:
         # current 探测失败 / 没识别 → 直接 fetch keychain 兜底
         data = fetch_quota_headers()
@@ -893,18 +895,17 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
         # usable 在前；usable 段内按 score 降序；unusable 在后按 name
         others.sort(key=lambda a: (0 if a.usable else 1, -a.score, a.name))
         lines.append("")
-        lines.append("**其他账户：**")
+        lines.append("**其他账户**")
         best_other = max((a for a in others if a.usable), key=lambda a: a.score, default=None)
         cur_score = cur.score if cur else 0.0
         cur_usable = bool(cur and cur.usable)
-        now_ts = time.time()
         for a in others:
             tail = ""
             if a is best_other and cur_usable and (a.score - cur_score) >= 0.15:
                 tail = "（推荐切换）"
             elif a is best_other and not cur_usable:
                 tail = "（当前不可用，候选）"
-            lines.append(_usage_other_line(a, now_ts, tail))
+            lines.append(_usage_other_line(a, tail))
 
     # 自动切换开关状态
     auto_on = os.getenv("ACCOUNT_AUTO_SWITCH", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -919,8 +920,7 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
     buttons = _account_switch_buttons(chat_id, for_usage=True) if chat_id else []
     if buttons:
         if any(b.get("value", {}).get("action") == "switch_usage" for b in buttons):
-            lines.append("")
-            lines.append("👇 点账户按钮切换 Claude Code 账户 · 🔄 刷新用量：")
+            lines.append("👇 点按钮切换 Claude Code 账户")
         return {"text": "\n".join(lines), "buttons": buttons}
     return "\n".join(lines)
 
