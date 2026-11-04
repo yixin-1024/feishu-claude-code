@@ -256,6 +256,7 @@ HELP_TEXT = """\
 `/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID；会重开 session）
 `/fable` `/opus` `/sonnet` `/haiku` `[指令]` — 快捷切模型并**直接执行后面的指令**，沿用当前 session 不丢上下文（例：`/opus 帮我查一下数据库`；仅 claude runner 可用）
 `/effort [级别]` — 设置当前对话推理强度（default / low / medium / high / xhigh / max / ultra）
+`/low` `/medium` `/high` `/xhigh` `/max` `[指令]` — 快捷切推理强度并**直接执行后面的指令**，沿用当前 session（例：`/max 帮我查一下数据库`；单发只切档）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
 `/status` — 显示当前 session 信息
 `/cd [路径]` — 切换工具执行的工作目录
@@ -315,11 +316,17 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 # 切完模型把指令当普通消息继续跑；不带指令时走 handle_command 只切模型。
 MODEL_SHORTCUTS: Tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
 
+# `/low` `/medium` `/high` `/xhigh` `/max` [指令]：同上，换的是推理强度（= `/effort X`），
+# 本来就不动 session。带指令由 dispatcher 拦截后继续跑；裸命令走 handle_command 只切档。
+# 档位是否可用按当前 runner/模型判断（和 `/effort` 同一份档位表），不支持就拒绝、不执行。
+EFFORT_SHORTCUTS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "runner", "model", "effort", "mode", "status", "cd", "ls",
     "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "switch", "stop",
     "restart", "group", "defaults", "server", "sys",
     *MODEL_SHORTCUTS,
+    *EFFORT_SHORTCUTS,
 }
 
 # ── 免排队（lock-free）命令 ───────────────────────────────────────────────
@@ -2272,6 +2279,75 @@ async def apply_model_shortcut(
     return model
 
 
+def _effort_levels_for(runner: str, model: str) -> tuple[Optional[tuple[str, ...]], str]:
+    """当前 runner/模型能用的推理强度档位。`/effort` 和 `/max` 等快捷指令共用这一份。
+
+    返回 (levels, "")；不支持调档时返回 (None, 可直接回给用户的说明)。
+    """
+    runner = (runner or "claude").lower()
+    if runner == "claude":
+        return CLAUDE_EFFORT_LEVELS, ""
+    if runner == "codex":
+        return _codex_effort_levels(model), ""
+    if runner == "grok":
+        return GROK_EFFORT_LEVELS, ""
+    if runner == "qoder":
+        return QODER_EFFORT_LEVELS, ""
+    if runner == "kiro":
+        return KIRO_EFFORT_LEVELS, ""
+    if runner == "maka":
+        # maka 的 --thinking 档位（off 对应 cc-lark 的 none，由 maka_runner 归一）
+        return ("minimal", "low", "medium", "high", "xhigh", "max"), ""
+    if runner == "agy":
+        # agy 的第三方模型（Claude/GPT-OSS）自带固定推理深度，传 --effort 会被
+        # agy 判成 invalid model selection，所以这里直接挡掉而不是静默无效。
+        from agy_runner import model_ignores_effort
+
+        if model_ignores_effort(model):
+            return None, (
+                f"ℹ️ 当前模型 `{model}` 不支持 `/effort`——它自带固定推理深度。\n"
+                f"要调档位请先切到 Gemini 系列（如 `/model agy-38`）。"
+            )
+        return AGY_EFFORT_LEVELS, ""
+    return None, (
+        f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok`、"
+        f"`maka`、`agy`、`qoder` 或 `kiro`。"
+    )
+
+
+class EffortShortcutUnavailable(RuntimeError):
+    """当前 runner/模型不支持该档位，`/max` 等快捷指令不可用。message 可直接回给用户。"""
+
+
+async def apply_effort_shortcut(
+    cmd: str, user_id: str, chat_id: str, store: SessionStore,
+) -> str:
+    """执行 `/low` … `/max` 的「切推理强度」部分（= `/effort X`），返回生效的档位。
+
+    只写 effort_override、不动 session。当前 runner/模型没有这一档（如 agy 只有
+    low/medium/high、agy 上的 Claude 模型不接受档位）时抛 EffortShortcutUnavailable，
+    调用方据此拒绝执行后面的指令，不静默按旧档位跑。
+    """
+    key = (cmd or "").strip().lower()
+    if key not in EFFORT_SHORTCUTS:
+        raise ValueError(f"not an effort shortcut: {cmd!r}")
+    cur = await store.get_current(user_id, chat_id)
+    runner = (cur.runner or "claude").lower()
+    levels, unsupported = _effort_levels_for(runner, cur.model)
+    if levels is None:
+        raise EffortShortcutUnavailable(
+            f"{unsupported.lstrip('❌ℹ️ ')}\n这条消息**没有执行**；去掉 `/{key}` 前缀重发即可。"
+        )
+    if key not in levels:
+        options = "、".join(f"`{level}`" for level in levels)
+        raise EffortShortcutUnavailable(
+            f"`{runner}`（模型 `{cur.model}`）没有 `{key}` 这一档，可选：{options}。"
+            f"这条消息**没有执行**；换个档位或去掉 `/{key}` 前缀重发。"
+        )
+    await store.set_effort(user_id, chat_id, key)
+    return key
+
+
 async def handle_command(
     cmd: str,
     args: str,
@@ -2294,6 +2370,17 @@ async def handle_command(
             return f"❌ {e}"
         return (
             f"✅ 已切换模型为 `{model}`（沿用当前 session，上下文不丢；/model default 可清除）。\n"
+            f"直接发消息即可；也可以 `/{cmd} <指令>` 一步到位。"
+        )
+
+    if cmd in EFFORT_SHORTCUTS:
+        # 同上：带指令的 `/max 帮我查一下` 由 dispatcher 拦截，这里只处理裸 `/max`。
+        try:
+            level = await apply_effort_shortcut(cmd, user_id, chat_id, store)
+        except EffortShortcutUnavailable as e:
+            return f"❌ {e}"
+        return (
+            f"✅ 当前对话推理强度已设为 `{level}`（沿用当前 session；`/effort default` 可清除）。\n"
             f"直接发消息即可；也可以 `/{cmd} <指令>` 一步到位。"
         )
 
@@ -2533,32 +2620,9 @@ async def handle_command(
     elif cmd == "effort":
         cur = await store.get_current(user_id, chat_id)
         runner = (cur.runner or "claude").lower()
-        if runner == "claude":
-            levels = CLAUDE_EFFORT_LEVELS
-        elif runner == "codex":
-            levels = _codex_effort_levels(cur.model)
-        elif runner == "grok":
-            levels = GROK_EFFORT_LEVELS
-        elif runner == "qoder":
-            levels = QODER_EFFORT_LEVELS
-        elif runner == "kiro":
-            levels = KIRO_EFFORT_LEVELS
-        elif runner == "maka":
-            # maka 的 --thinking 档位（off 对应 cc-lark 的 none，由 maka_runner 归一）
-            levels = ("minimal", "low", "medium", "high", "xhigh", "max")
-        elif runner == "agy":
-            # agy 的第三方模型（Claude/GPT-OSS）自带固定推理深度，传 --effort 会被
-            # agy 判成 invalid model selection，所以这里直接挡掉而不是静默无效。
-            from agy_runner import model_ignores_effort
-
-            if model_ignores_effort(cur.model):
-                return (
-                    f"ℹ️ 当前模型 `{cur.model}` 不支持 `/effort`——它自带固定推理深度。\n"
-                    f"要调档位请先切到 Gemini 系列（如 `/model agy-38`）。"
-                )
-            levels = AGY_EFFORT_LEVELS
-        else:
-            return f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok`、`maka`、`agy`、`qoder` 或 `kiro`。"
+        levels, unsupported = _effort_levels_for(runner, cur.model)
+        if levels is None:
+            return unsupported
 
         raw = await store.get_current_raw(user_id, chat_id)
         overridden = bool(raw.get("effort_override"))

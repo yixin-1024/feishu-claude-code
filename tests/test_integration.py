@@ -529,3 +529,60 @@ async def test_model_shortcut_refused_on_non_claude_runner(isolated_sessions):
     assert content.startswith("❌") and "codex" in content and "没有执行" in content
     cur = await bot.store.get_current("ou_user_1", "ou_user_1")
     assert cur.model == "gpt-5.1-codex"
+
+
+# ── /low … /max 快捷指令：切推理强度 + 直接执行 ────────────────────────────
+
+async def test_effort_shortcut_with_prompt_switches_and_runs(isolated_sessions):
+    """`/max 帮我查一下`：不回"已切换"卡片，切完档位把后面的指令当普通消息跑，沿用 session。"""
+    bot = _make_bot()
+    bot.feishu.send_card_to_user.return_value = "card_1"
+    await bot.store.on_claude_response("ou_user_1", "ou_user_1", "sid-keep", "earlier")
+    event = _make_event(text="/max 帮我查一下数据库 orders 表")
+
+    with patch("dispatcher._run_and_display", new_callable=AsyncMock) as run:
+        await dispatcher._process_message(
+            bot, "ou_user_1", "ou_user_1", False, "", event.event.message,
+        )
+
+    run.assert_awaited_once()
+    assert run.await_args.args[4] == "帮我查一下数据库 orders 表"
+    session = run.await_args.args[6]
+    assert session.effort == "max"
+    assert session.session_id == "sid-keep"
+    assert run.await_args.kwargs["preview_text"] == "帮我查一下数据库 orders 表"
+
+
+async def test_bare_effort_shortcut_only_switches(isolated_sessions):
+    bot = _make_bot()
+    event = _make_event(text="/low")
+
+    with patch("dispatcher._run_and_display", new_callable=AsyncMock) as run:
+        await dispatcher._process_message(
+            bot, "ou_user_1", "ou_user_1", False, "", event.event.message,
+        )
+
+    run.assert_not_awaited()
+    bot.feishu.send_card_to_user.assert_awaited_once()
+    assert "`low`" in bot.feishu.send_card_to_user.await_args.kwargs["content"]
+    cur = await bot.store.get_current("ou_user_1", "ou_user_1")
+    assert cur.effort == "low"
+
+
+async def test_effort_shortcut_refused_when_runner_lacks_level(isolated_sessions):
+    """agy 没有 max 档：`/max xxx` 明确拒绝、指令不执行、档位不变。"""
+    bot = _make_bot()
+    bot.store = SessionStore(profile="agybot", default_runner="agy", default_model="gemini-3.8-flash")
+    event = _make_event(text="/max 帮我查一下")
+
+    with patch("dispatcher._run_and_display", new_callable=AsyncMock) as run:
+        await dispatcher._process_message(
+            bot, "ou_user_1", "ou_user_1", False, "", event.event.message,
+        )
+
+    run.assert_not_awaited()
+    bot.feishu.send_card_to_user.assert_awaited_once()
+    content = bot.feishu.send_card_to_user.await_args.kwargs["content"]
+    assert content.startswith("❌") and "agy" in content and "没有执行" in content
+    cur = await bot.store.get_current("ou_user_1", "ou_user_1")
+    assert cur.effort is None

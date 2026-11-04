@@ -45,6 +45,7 @@ from feishu_client import _err_desc
 from display_pages import publish_full_display
 from commands import (
     MODEL_SHORTCUTS, ModelShortcutUnavailable, apply_model_shortcut,
+    EFFORT_SHORTCUTS, EffortShortcutUnavailable, apply_effort_shortcut,
     is_lock_free_command, parse_command, handle_command,
 )
 from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
@@ -2664,16 +2665,22 @@ async def _process_message(
     parsed = parse_command(text)
 
     # `/fable xxx` `/opus xxx` `/sonnet xxx` `/haiku xxx`：一条消息完成「切模型 +
-    # 执行」。切完模型不回"已切换"卡片，把后面的指令当普通消息落到下面的 agent
-    # 分支去跑（沿用当前 session，上下文不丢）。裸 `/opus` 不在这里处理，仍走
-    # handle_command 只切模型。非 claude runner 用不了（runner 由 profile 钉死），
-    # 明确告知且不执行，绝不静默用错模型跑。
-    if parsed and parsed[0] in MODEL_SHORTCUTS and parsed[1]:
+    # 执行」；`/low` … `/max xxx` 同理，换的是推理强度。切完不回"已切换"卡片，把
+    # 后面的指令当普通消息落到下面的 agent 分支去跑（沿用当前 session，上下文不丢）。
+    # 裸 `/opus` `/max` 不在这里处理，仍走 handle_command 只切换。当前 runner/模型
+    # 用不了（模型快捷只给 claude；档位要当前 runner 有这一档），明确告知且不执行，
+    # 绝不静默按错的模型 / 档位跑。
+    if parsed and parsed[1] and (parsed[0] in MODEL_SHORTCUTS or parsed[0] in EFFORT_SHORTCUTS):
         cmd, args = parsed
+        is_effort = cmd in EFFORT_SHORTCUTS
+        what = "推理强度" if is_effort else "模型"
         try:
-            model = await apply_model_shortcut(cmd, user_id, chat_id, bot.store)
-        except ModelShortcutUnavailable as e:
-            log(tag, "cmd", "warn", f"/{cmd} 快捷切模型不可用: {e}")
+            if is_effort:
+                applied = await apply_effort_shortcut(cmd, user_id, chat_id, bot.store)
+            else:
+                applied = await apply_model_shortcut(cmd, user_id, chat_id, bot.store)
+        except (ModelShortcutUnavailable, EffortShortcutUnavailable) as e:
+            log(tag, "cmd", "warn", f"/{cmd} 快捷切{what}不可用: {e}")
             err = f"❌ {e}"
             if is_group:
                 try:
@@ -2684,8 +2691,8 @@ async def _process_message(
                 await bot.feishu.send_card_to_user(user_id, content=err, loading=False)
             return
         except Exception as e:
-            log(tag, "cmd", "error", f"/{cmd} 快捷切模型失败: {e}")
-            err = f"❌ 切换模型失败：{e}（这条指令没有执行）"
+            log(tag, "cmd", "error", f"/{cmd} 快捷切{what}失败: {e}")
+            err = f"❌ 切换{what}失败：{e}（这条指令没有执行）"
             if is_group:
                 try:
                     await bot.feishu.reply_card(msg.message_id, content=err, loading=False)
@@ -2694,7 +2701,7 @@ async def _process_message(
             else:
                 await bot.feishu.send_card_to_user(user_id, content=err, loading=False)
             return
-        log(tag, "cmd", "info", f"/{cmd} 快捷切模型 → {model}（沿用当前 session），直接执行后续指令")
+        log(tag, "cmd", "info", f"/{cmd} 快捷切{what} → {applied}（沿用当前 session），直接执行后续指令")
         text = args
         preview_text = args
         parsed = None  # 命令部分已消费，剩下的按普通消息处理
