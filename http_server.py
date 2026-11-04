@@ -1081,7 +1081,8 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
             cmd_text = value.get("cmd", "")
             if cmd_text:
                 _submit(_handlers.handle_menu_command(bot, user_id, chat_id, cmd_text, clicked_msg_id))
-            toast_content = "正在刷新用量…" if cmd_text == "/usage" else cmd_text
+            from commands import run_cmd_toast
+            toast_content = run_cmd_toast(cmd_text)
             self._respond(200, {"toast": {"type": "info", "content": toast_content}})
         elif action_type == "switch_usage":
             name = value.get("name", "")

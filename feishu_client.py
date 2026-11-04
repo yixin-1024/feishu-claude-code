@@ -249,6 +249,22 @@ def _card_dict(content: str, loading: bool = False) -> dict:
     return {"schema": "2.0", "body": {"elements": elements}}
 
 
+def _corner_title_row(title: str, corner: str) -> dict:
+    """卡片第一行：左边标题，右上角一行灰色小字（/all 的刷新时间）。"""
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "horizontal_spacing": "8px",
+        "columns": [
+            {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "center",
+             "elements": [{"tag": "markdown", "content": normalize_lark_md(title)}]},
+            {"tag": "column", "width": "auto", "vertical_align": "center",
+             "elements": [{"tag": "markdown", "text_align": "right", "text_size": "notation",
+                           "content": normalize_lark_md(f"<font color='grey'>{corner}</font>")}]},
+        ],
+    }
+
+
 def _card_json(content: str, loading: bool = False) -> str:
     """生成卡片 JSON 字符串（默认 Card JSON 2.0；LARK_CARD_MODE=v1 时降级 v1）"""
     return _serialize_card(_card_dict(content, loading=loading))
@@ -1097,19 +1113,32 @@ class FeishuClient:
         return result
 
     async def update_card_with_buttons(self, message_id: str, content: str, buttons: list[dict],
-                                      flow: bool = False):
+                                      flow: bool = False, corner: str = "", after: str = ""):
         """更新卡片内容并附加操作按钮。flow=True 时横排自动换行，False 时竖排。
 
+        corner：非空时把 content 第一行当标题，标题右边放这行灰色小字（/all 的刷新时间）。
+        after：按钮**下面**再放一段正文（/all 的服务器状态）。
+
         流式卡：先推最终全量文本，再关流式 + 用 CardKit 追加按钮（按钮必须等
-        streaming_mode 关掉后才能交互），最后注销登记。
+        streaming_mode 关掉后才能交互），最后注销登记。流式卡不支持这两样排版，
+        after 直接拼到正文后面。
         """
+        full_text = f"{content}\n\n{after}" if after else content
         if message_id in self._streaming_cards:
-            await self._stream_update_text(message_id, content)
-            self._remember_card_text(message_id, content)
+            await self._stream_update_text(message_id, full_text)
+            self._remember_card_text(message_id, full_text)
             await self.finalize_streaming_card(message_id, buttons=buttons, flow=flow)
             return
 
-        base = _card_dict(content)
+        title_row = None
+        if corner:
+            title, _, content = content.partition("\n")
+            title_row = _corner_title_row(title, corner)
+            content = content.lstrip("\n")
+        base = _card_dict(content) if (content.strip() or not title_row) else {
+            "schema": "2.0", "body": {"elements": []}}
+        if title_row:
+            base["body"]["elements"].insert(0, title_row)
         btn_elements = []
         for i, btn in enumerate(buttons):
             signed_value = self._signed_action_value(btn["value"], message_id)
@@ -1129,6 +1158,8 @@ class FeishuClient:
         else:
             # 竖排: 每个按钮独占一行
             base["body"]["elements"].extend(btn_elements)
+        if after:
+            base["body"]["elements"].extend(_card_dict(after)["body"]["elements"])
         card_content = _serialize_card(base)
 
         async def _update():
@@ -1147,7 +1178,7 @@ class FeishuClient:
                 raise FeishuApiError("patch 卡片失败", resp.code, resp.msg)
 
         await self._retry_with_backoff(_update, max_retries=3)
-        self._remember_card_text(message_id, content)
+        self._remember_card_text(message_id, full_text)
         # 收尾确认写：这也是一条终态 patch（内容 + 按钮），同样可能被飞书排到最后
         # 一条流式 patch 之前 / 合并丢掉，导致卡片停在流式快照、按钮不出现。补一次。
         # 见 update_card_final 的说明。

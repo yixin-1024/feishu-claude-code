@@ -271,6 +271,7 @@ HELP_TEXT = """\
 `/accounts` — 账户全景（Claude runner：Max 用量 + 智能切换状态；agy runner：Antigravity 账号）
 `/switch <账户>` — 切换本机全局账户（Claude Code；agy runner 下切 Antigravity 账号，`/switch save [名字]` 存当前号）
 `/server` 或 `/sys` — 本机 CPU / 负载 / 内存 / 磁盘 / 进程一屏看
+`/all` — 用量 + 服务器状态一张卡（刷新按钮两块一起刷）
 
 **审计：**
 `/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
@@ -324,7 +325,7 @@ EFFORT_SHORTCUTS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "runner", "model", "effort", "mode", "status", "cd", "ls",
     "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "switch", "stop",
-    "restart", "group", "defaults", "server", "sys",
+    "restart", "group", "defaults", "server", "sys", "all",
     *MODEL_SHORTCUTS,
     *EFFORT_SHORTCUTS,
 }
@@ -344,7 +345,20 @@ READONLY_COMMANDS = frozenset({
 # 按钮点出去走的是 handle_menu_command，本来就在锁外，行为一致。
 READONLY_WHEN_BARE = frozenset({
     "resume", "workspace", "ws", "model", "runner", "effort", "mode",
+    # `/all switch <token>` 是卡片上的切号按钮，会改本机全局凭证
+    "all",
 })
+
+
+def run_cmd_toast(cmd_text: str) -> str:
+    """点 run_cmd 按钮后弹的 toast。"""
+    if cmd_text == "/usage":
+        return "正在刷新用量…"
+    if cmd_text == "/all":
+        return "正在刷新…"
+    if cmd_text.startswith(ALL_SWITCH_PREFIX):
+        return f"正在切换到 {cmd_text[len(ALL_SWITCH_PREFIX):].strip()}…"
+    return cmd_text
 
 
 def is_lock_free_command(cmd: str, args: str = "") -> bool:
@@ -709,35 +723,62 @@ def _fmt_reset_when(ts) -> str:
     return f"{day or dt.strftime('%m/%d')} {dt.strftime('%H:%M')}"
 
 
-def _quota_line(label: str, used, status=None, reset_ts=None) -> str:
+def _fmt_reset_in(ts) -> str:
+    """距重置还有多久：`1天5小时后` / `6小时59分后` / `12分钟后`；已过 / 读不出来返回空串。"""
+    try:
+        secs = int(ts) - int(time.time())
+    except Exception:
+        return ""
+    if secs <= 0:
+        return ""
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    if days:
+        return f"{days}天{hours}小时后"
+    if hours:
+        return f"{hours}小时{mins}分后"
+    return f"{max(mins, 1)}分钟后"
+
+
+def _fmt_reset(ts, countdown: bool = False) -> str:
+    """`明天 18:00 重置`；countdown=True 时后面再跟 ` (1天5小时后)`（/all 用）。"""
+    text = f"{_fmt_reset_when(ts)} 重置"
+    left = _fmt_reset_in(ts) if countdown else ""
+    return f"{text} ({left})" if left else text
+
+
+def _quota_line(label: str, used, status=None, reset_ts=None, countdown: bool = False) -> str:
     """一个额度一行：`剩余 **58%** · 明天 18:00 重置`，撞墙时中间多一个 ⛔。"""
     line = f"{label} **{_fmt_left_pct(used)}**"
     if status in _QUOTA_BLOCKED_STATUSES:
         line += " · ⛔ 已撞墙"
     if reset_ts:
-        line += f" · {_fmt_reset_when(reset_ts)} 重置"
+        line += f" · {_fmt_reset(reset_ts, countdown)}"
     return line
 
 
-def _usage_single_account_lines(data: dict, account_label: Optional[str] = None) -> list[str]:
+def _usage_single_account_lines(data: dict, account_label: Optional[str] = None,
+                                countdown: bool = False) -> list[str]:
     """当前账户的额度（共用片段）：周额度一行；还有 5 小时限额的号多一行；分模型周额度
     （Fable）各一行，重置时刻和周额度显示出来一样就不重复写。"""
     r7d = data.get("r7d")
     lines = [_usage_title(account_label), "",
-             _quota_line("剩余", data.get("u7d"), data.get("s7d"), r7d)]
+             _quota_line("剩余", data.get("u7d"), data.get("s7d"), r7d, countdown)]
     if data.get("u5h") is not None or data.get("r5h") is not None:
-        lines.append(_quota_line("5 小时剩余", data.get("u5h"), data.get("s5h"), data.get("r5h")))
+        lines.append(_quota_line("5 小时剩余", data.get("u5h"), data.get("s5h"),
+                                 data.get("r5h"), countdown))
     for sc in data.get("scoped7d") or []:
         if sc.get("u") is None:
             continue
         r = sc.get("r")
         if r and r7d and _fmt_reset_when(r) == _fmt_reset_when(r7d):
             r = None
-        lines.append(_quota_line(f"{sc.get('name') or '?'} 剩余", sc["u"], sc.get("sev"), r))
+        lines.append(_quota_line(f"{sc.get('name') or '?'} 剩余", sc["u"], sc.get("sev"), r, countdown))
     return lines
 
 
-def _usage_other_line(a, tail: str = "") -> str:
+def _usage_other_line(a, tail: str = "", countdown: bool = False) -> str:
     """/usage 里其他账户 / token 的一行：能不能切 + 剩余 + 周额度重置时刻。
     还有 5 小时限额的多一段；分模型周额度只在比周额度还紧时才写。"""
     if a.probe_error:
@@ -751,7 +792,7 @@ def _usage_other_line(a, tail: str = "") -> str:
     if a.s7d in _QUOTA_BLOCKED_STATUSES or a.s5h in _QUOTA_BLOCKED_STATUSES:
         parts.append("⛔ 已撞墙")
     if a.r7d:
-        parts.append(f"{_fmt_reset_when(a.r7d)} 重置")
+        parts.append(_fmt_reset(a.r7d, countdown))
     mark = "✅" if a.usable else "❌"
     return f"`{a.name}` {mark} " + " · ".join(parts) + tail
 
@@ -765,9 +806,12 @@ def _account_usage_data(acc) -> dict:
     }
 
 
-def _get_env_token_usage(chat_id: Optional[str] = None) -> "str | dict":
+def _get_env_token_usage(chat_id: Optional[str] = None, compact: bool = False) -> "str | dict":
     """登记了 env token 池时的 /usage：顶部是正在用的 token，下面每个其他 token 一行，
-    底部一个 token 一个切换按钮。"""
+    底部一个 token 一个切换按钮。
+
+    compact=True 是 /all 用的精简版（用户 2026-11-04 定的样式）：标题不带 token 名
+    （按钮上有 ●），重置时刻后面跟倒计时，不写「其他 token」小标题和自动切换那行。"""
     from account_switcher import (
         active_env_token_name, evaluate, probe_env_tokens, switch_on_limit_enabled,
     )
@@ -777,32 +821,37 @@ def _get_env_token_usage(chat_id: Optional[str] = None) -> "str | dict":
         evaluate(a, active)
     cur = accounts.get(active)
     lines: list[str] = []
+    label = None if compact else active
     if cur is not None and not cur.probe_error and cur.u7d is not None:
-        lines.extend(_usage_single_account_lines(_account_usage_data(cur), account_label=active))
+        lines.extend(_usage_single_account_lines(
+            _account_usage_data(cur), account_label=label, countdown=compact))
     else:
         err = (cur.probe_error if cur is not None else None) or "未知"
-        lines += [_usage_title(active), "", f"⚠️ 用量获取失败：{err}"]
+        lines += [_usage_title(label), "", f"⚠️ 用量获取失败：{err}"]
 
     others = [a for a in accounts.values() if a.name != active]
     if others:
-        lines += ["", "**其他 token**"]
-        lines.extend(_usage_other_line(a) for a in others)
         lines.append("")
-        lines.append(
-            "撞墙自动切换：✅ 已开"
-            if switch_on_limit_enabled()
-            else "撞墙自动切换：⏸ 已关（`.env` 里 `ACCOUNT_SWITCH_ON_LIMIT=0`）"
-        )
+        if not compact:
+            lines.append("**其他 token**")
+        lines.extend(_usage_other_line(a, countdown=compact) for a in others)
+        lines.append("")
+        if not compact:
+            lines.append(
+                "撞墙自动切换：✅ 已开"
+                if switch_on_limit_enabled()
+                else "撞墙自动切换：⏸ 已关（`.env` 里 `ACCOUNT_SWITCH_ON_LIMIT=0`）"
+            )
 
     buttons = _account_switch_buttons(chat_id, for_usage=True) if chat_id else []
     if not buttons:
-        return "\n".join(lines)
+        return "\n".join(lines).rstrip()
     if any(b.get("value", {}).get("action") == "switch_usage" for b in buttons):
-        lines.append("👇 点按钮切 token（只影响新任务）")
+        lines.append("👇 点按钮切 token" if compact else "👇 点按钮切 token（只影响新任务）")
     return {"text": "\n".join(lines), "buttons": buttons}
 
 
-def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
+def _get_usage(chat_id: Optional[str] = None, compact: bool = False) -> "str | dict":
     """渲染 /usage 命令的完整输出。
 
     保存了多个账户时：顶部是当前 active 账户的额度（一个额度一行，写剩余），下方
@@ -815,7 +864,7 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
     try:
         from account_switcher import env_token_names
         if env_token_names():
-            return _get_env_token_usage(chat_id)
+            return _get_env_token_usage(chat_id, compact=compact)
     except Exception:
         pass
     accounts: dict = {}
@@ -931,6 +980,74 @@ def _get_usage(chat_id: Optional[str] = None) -> "str | dict":
         return {"text": "\n".join(lines), "buttons": buttons}
     return "\n".join(lines)
 
+
+
+# /all 卡片上切号按钮发的命令：`/all switch <名字>`，切完原地重出整张 /all
+ALL_SWITCH_PREFIX = "/all switch "
+
+
+def _all_buttons(buttons: list[dict], chat_id: str) -> list[dict]:
+    """把 /usage 的按钮改成 /all 用的：刷新 → 重跑 /all，切号 → `/all switch <名字>`
+    （切完还是这张 /all 卡，不会被换成 /usage）。没有刷新按钮就补一个。"""
+    out: list[dict] = []
+    for b in buttons or []:
+        val = dict(b.get("value") or {})
+        if val.get("action") == "switch_usage" and val.get("name"):
+            val = {"action": "run_cmd", "cmd": ALL_SWITCH_PREFIX + val["name"], "cid": chat_id}
+        elif val.get("action") == "run_cmd" and val.get("cmd") == "/usage":
+            val = {**val, "cmd": "/all"}
+        out.append({**b, "value": val})
+    if not any((b["value"] or {}).get("cmd") == "/all" for b in out):
+        out.append({"text": "🔄 刷新", "value": {"action": "run_cmd", "cmd": "/all", "cid": chat_id}})
+    return out
+
+
+async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, bot=None) -> "str | dict":
+    """/all：用量 + 服务器状态一张卡，刷新按钮两块一起刷，右上角是刷新时间。
+
+    样式按用户 2026-11-04 给的样板：用量用精简版（见 _get_env_token_usage compact），
+    服务器用 server_stats 的精简版；切号按钮紧跟在用量下面，服务器状态在按钮下面。
+    返回 dict 多两个键给卡片排版：`corner`（右上角小字）、`after`（按钮下面的正文）。
+    """
+    import server_stats
+
+    cur = await store.get_current_raw(user_id, chat_id)
+    runner = str(cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
+
+    headline = ""
+    sub = (args or "").split(None, 1)
+    if len(sub) == 2 and sub[0].lower() == "switch":
+        switch = _switch_agy_account if runner == "agy" else _switch_claude_account
+        result = await asyncio.to_thread(switch, sub[1].strip())
+        first = (result or "").split("\n", 1)[0].strip()
+        if first and not first.startswith("✅"):
+            headline = first  # 切成功了卡上自然能看出来（● 换了），只有失败才写一行
+
+    async def _usage():
+        if runner == "claude":
+            # 走线程：会给每个 token 发一次真实 API 探测（见 /usage 的说明）
+            return await asyncio.to_thread(_get_usage, chat_id, True)
+        return await handle_command("usage", "", user_id, chat_id, store, bot=bot)
+
+    usage, server = await asyncio.gather(
+        _usage(), asyncio.to_thread(server_stats.get_report, True))
+    if isinstance(usage, dict):
+        usage_text, buttons = usage.get("text") or "", usage.get("buttons") or []
+    else:
+        usage_text, buttons = usage or "", []
+    if headline:
+        title, _, rest = usage_text.partition("\n")
+        usage_text = f"{title}\n\n{headline}\n{rest}"
+
+    if not chat_id:
+        return f"{usage_text}\n\n{server}"
+    now = datetime.now(server_stats._TZ)
+    return {
+        "text": usage_text,
+        "buttons": _all_buttons(buttons, chat_id),
+        "after": server,
+        "corner": now.strftime("%m-%d %H:%M:%S 刷新"),
+    }
 
 
 def _list_mcp() -> str:
@@ -2978,6 +3095,9 @@ async def handle_command(
         # （单次就有 10s 超时）。留在事件循环里跑 = 这段时间全 profile 的卡片推送、
         # 流式刷新、WS 回调集体冻住，正是「/usage 一点整个 bot 就卡住」的根因。
         return await asyncio.to_thread(_get_usage, chat_id)
+
+    elif cmd == "all":
+        return await _get_all(args, user_id, chat_id, store, bot)
 
     elif cmd in ("server", "sys"):
         import server_stats

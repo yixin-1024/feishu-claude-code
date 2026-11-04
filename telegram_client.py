@@ -806,8 +806,16 @@ class TelegramClient:
             print(f"[tg] finalize 失败（忽略） key={message_id}: {e}", flush=True)
 
     async def update_card_with_buttons(self, message_id: str, content: str,
-                                       buttons: list[dict], flow: bool = False):
+                                       buttons: list[dict], flow: bool = False,
+                                       corner: str = "", after: str = ""):
+        # corner / after 是飞书卡片的排版（右上角小字、按钮下面的正文）；Telegram
+        # 按钮只能挂在消息底部，所以 corner 接在标题行后面、after 拼到正文末尾。
         text = content or ""
+        if corner:
+            title, sep, rest = text.partition("\n")
+            text = f"{title} · {corner}{sep}{rest}"
+        if after:
+            text = f"{text}\n\n{after}"
         chunks = split_md(text) or [text]
         keyboard = self._keyboard(buttons, message_id, flow)
         seq = self._issue(message_id)
@@ -993,6 +1001,7 @@ class TelegramClient:
         ("status", "当前会话状态"),
         ("usage", "Claude 用量"),
         ("server", "服务器 CPU / 内存 / 磁盘"),
+        ("all", "用量 + 服务器一屏看"),
         ("skills", "可用 skills"),
         ("mcp", "MCP 服务器"),
         ("ls", "列出工作目录"),

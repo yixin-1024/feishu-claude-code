@@ -1042,18 +1042,35 @@ async def _show_command_menu(bot: BotInstance, user_id: str, chat_id: str, is_gr
         log(bot.profile.name, "menu", "error", f"命令菜单发送失败: {e}")
 
 
+def _command_card_layout(reply) -> dict:
+    """命令回复里的额外排版（目前只有 /all 用）：`corner` 标题右边的灰色小字、
+    `after` 按钮下面的正文。原样转给 update_card_with_buttons；没有就是空 dict，
+    老的调用（和测试里的假客户端）完全不受影响。"""
+    if not isinstance(reply, dict):
+        return {}
+    return {k: reply[k] for k in ("corner", "after") if reply.get(k)}
+
+
+def _command_plain_text(text: str, layout: dict) -> str:
+    """不带按钮排版时的全文（先发出去的占位卡 / 没按钮时直接 update_card）。"""
+    after = layout.get("after")
+    return f"{text}\n\n{after}" if after else text
+
+
 async def _send_command_reply(
     bot: BotInstance, user_id: str, is_group: bool, msg_id: str, reply,
 ) -> None:
     """把 handle_command 的返回值渲染成一张卡片发出去。
 
     reply 可以是纯文本，也可以是 {"text", "buttons"}（/model、/usage 这类带
-    切换按钮的卡）。群里回原消息、私聊直发给用户。
+    切换按钮的卡），/all 还多 `corner` / `after` 两个排版键。群里回原消息、
+    私聊直发给用户。
     """
     if isinstance(reply, dict):
         reply_text, reply_buttons = reply["text"], reply.get("buttons", [])
     else:
         reply_text, reply_buttons = reply, []
+    layout = _command_card_layout(reply)
 
     for btn in reply_buttons:
         val = btn.get("value")
@@ -1061,16 +1078,17 @@ async def _send_command_reply(
             val.setdefault("profile", bot.profile.name)
             val["_cc_uid"] = user_id
 
+    first_text = _command_plain_text(reply_text, layout)
     if is_group:
-        card_id = await bot.feishu.reply_card(msg_id, content=reply_text, loading=False)
+        card_id = await bot.feishu.reply_card(msg_id, content=first_text, loading=False)
     else:
-        card_id = await bot.feishu.send_card_to_user(user_id, content=reply_text, loading=False)
+        card_id = await bot.feishu.send_card_to_user(user_id, content=first_text, loading=False)
 
     if reply_buttons:
         try:
             short = all(len(b["text"]) <= 12 for b in reply_buttons)
             await bot.feishu.update_card_with_buttons(
-                card_id, reply_text, reply_buttons, flow=short,
+                card_id, reply_text, reply_buttons, flow=short, **layout,
             )
         except Exception as btn_err:
             log(bot.profile.name, "btn", "warn", f"按钮渲染失败: {btn_err}")
@@ -3478,7 +3496,8 @@ def on_card_action(bot: BotInstance, data: P2CardActionTrigger) -> P2CardActionT
         resp = P2CardActionTriggerResponse()
         toast = CallBackToast()
         toast.type = "info"
-        toast.content = "正在刷新用量…" if cmd_text == "/usage" else cmd_text
+        from commands import run_cmd_toast
+        toast.content = run_cmd_toast(cmd_text)
         resp.toast = toast
         return resp
 
@@ -3549,6 +3568,7 @@ async def handle_menu_command(bot: BotInstance, user_id: str, chat_id: str, cmd_
         reply_text, reply_buttons = reply["text"], reply.get("buttons", [])
     else:
         reply_text, reply_buttons = reply, []
+    layout = _command_card_layout(reply)
 
     for btn in reply_buttons:
         val = btn.get("value")
@@ -3560,9 +3580,10 @@ async def handle_menu_command(bot: BotInstance, user_id: str, chat_id: str, cmd_
         try:
             if reply_buttons:
                 short = all(len(b["text"]) <= 12 for b in reply_buttons)
-                await bot.feishu.update_card_with_buttons(card_msg_id, reply_text, reply_buttons, flow=short)
+                await bot.feishu.update_card_with_buttons(
+                    card_msg_id, reply_text, reply_buttons, flow=short, **layout)
             else:
-                await bot.feishu.update_card(card_msg_id, reply_text)
+                await bot.feishu.update_card(card_msg_id, _command_plain_text(reply_text, layout))
         except Exception as e:
             log(bot.profile.name, "menu", "error", f"菜单命令卡片更新失败: {e}")
 
