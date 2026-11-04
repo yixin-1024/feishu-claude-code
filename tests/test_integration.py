@@ -586,3 +586,77 @@ async def test_effort_shortcut_refused_when_runner_lacks_level(isolated_sessions
     assert content.startswith("❌") and "agy" in content and "没有执行" in content
     cur = await bot.store.get_current("ou_user_1", "ou_user_1")
     assert cur.effort is None
+
+
+# ── 带图富文本 / 带说明的文件里的快捷指令 ─────────────────────────────────
+
+def _make_post_event(lines: list, *, image_key: str = "img_k1"):
+    """一条 Lark post：每个元素是一行，str=文字，None=图片。"""
+    content = []
+    for ln in lines:
+        if ln is None:
+            content.append([{"tag": "img", "image_key": image_key}])
+        else:
+            content.append([{"tag": "text", "text": ln}])
+    ev = _make_event(message_type="post")
+    ev.event.message.content = json.dumps({"title": "", "content": content})
+    return ev
+
+
+async def test_effort_shortcut_in_post_with_image(isolated_sessions):
+    """`/low` + 截图 + 一句话（11-05 实测）：要切到 low 再跑，不能被图片包装吞掉命令。"""
+    bot = _make_bot()
+    bot.feishu.download_image.return_value = "/tmp/feishu-image-x.jpg"
+    event = _make_post_event(["/low", None, "给我本地 macbook ip加白"])
+
+    with patch("dispatcher._run_and_display", new_callable=AsyncMock) as run:
+        await dispatcher._process_message(
+            bot, "ou_user_1", "ou_user_1", False, "", event.event.message,
+        )
+
+    run.assert_awaited_once()
+    prompt = run.await_args.args[4]
+    assert prompt.startswith("[用户发送了富文本消息，含 1 张图片]")
+    assert "/low" not in prompt
+    assert "给我本地 macbook ip加白" in prompt and "/tmp/feishu-image-x.jpg" in prompt
+    assert run.await_args.args[6].effort == "low"
+    assert run.await_args.kwargs["preview_text"] == "[图片]\n给我本地 macbook ip加白"
+
+
+async def test_bare_shortcut_with_only_image_runs_image(isolated_sessions):
+    """只有 `/opus` + 一张图：切模型并分析这张图（不是只切不跑）。"""
+    bot = _make_bot()
+    bot.feishu.download_image.return_value = "/tmp/feishu-image-y.jpg"
+    event = _make_post_event(["/opus", None])
+
+    with patch("dispatcher._run_and_display", new_callable=AsyncMock) as run:
+        await dispatcher._process_message(
+            bot, "ou_user_1", "ou_user_1", False, "", event.event.message,
+        )
+
+    run.assert_awaited_once()
+    assert "/tmp/feishu-image-y.jpg" in run.await_args.args[4]
+    assert run.await_args.args[6].model.startswith("opus")
+
+
+async def test_post_with_image_without_shortcut_unchanged(isolated_sessions):
+    bot = _make_bot()
+    bot.feishu.download_image.return_value = "/tmp/feishu-image-z.jpg"
+    event = _make_post_event(["这个不会是 /low 吗", None])
+
+    with patch("dispatcher._run_and_display", new_callable=AsyncMock) as run:
+        await dispatcher._process_message(
+            bot, "ou_user_1", "ou_user_1", False, "", event.event.message,
+        )
+
+    run.assert_awaited_once()
+    assert "文字内容：这个不会是 /low 吗" in run.await_args.args[4]
+    assert run.await_args.args[6].effort is None
+
+
+def test_split_run_shortcut():
+    assert dispatcher._split_run_shortcut("/max 查一下") == ("/max ", "查一下")
+    assert dispatcher._split_run_shortcut("/LOW\n[图片]\n看看") == ("/low ", "[图片]\n看看")
+    assert dispatcher._split_run_shortcut("/effort low") == ("", "/effort low")
+    assert dispatcher._split_run_shortcut("普通的话") == ("", "普通的话")
+    assert dispatcher._split_run_shortcut("") == ("", "")

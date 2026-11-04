@@ -2721,7 +2721,9 @@ async def _process_message(
             return
         log(tag, "cmd", "info", f"/{cmd} 快捷切{what} → {applied}（沿用当前 session），直接执行后续指令")
         text = args
-        preview_text = args
+        # 带图富文本时 args 是整段「[用户发送了富文本消息…]」包装，预览只要用户那句话
+        _pp = parse_command(preview_text or "")
+        preview_text = _pp[1] if _pp and _pp[0] == cmd and _pp[1] else args
         parsed = None  # 命令部分已消费，剩下的按普通消息处理
 
     if parsed:
@@ -2765,6 +2767,19 @@ async def _process_message(
         bot, user_id, chat_id, is_group, thread_id, msg, text, preview_text,
         session=session, trinity_ctx=trinity_ctx,
     )
+
+
+def _split_run_shortcut(user_text: str) -> tuple[str, str]:
+    """用户文字以 `/low` `/opus` 这类「切换 + 执行」快捷命令开头时，拆成 ("/low ", 剩下的话)。
+
+    带图富文本、带说明的文件会被包成「[用户发送了…] 文字内容：…」再交给 parse_command，
+    命令就不在开头了、认不出来，结果按默认档位/模型跑（11-05 `/low` + 截图实测踩到）。
+    把命令前缀留在包装外面，后面照常走快捷命令分支。不是快捷命令就返回 ("", 原文)。
+    """
+    parsed = parse_command(user_text or "")
+    if parsed and (parsed[0] in MODEL_SHORTCUTS or parsed[0] in EFFORT_SHORTCUTS):
+        return f"/{parsed[0]} ", parsed[1]
+    return "", user_text
 
 
 async def _extract_message_text(
@@ -2860,9 +2875,13 @@ async def _extract_message_text(
             # Telegram 的文件/视频可以带一句说明（caption），Lark 的 file 消息没有
             # 这个字段，所以这里读到就带上、读不到就照旧。
             caption = (content_obj.get("caption") or "").strip()
+            prefix, caption = _split_run_shortcut(caption)
             if caption:
                 text += f"\n用户对这个文件的说明：{caption}"
             preview_text = f"[文件 {file_name}]"
+            if prefix:
+                text = prefix + text
+                preview_text = prefix + preview_text
         except Exception as e:
             log(tag, "file", "error", f"下载文件失败: {e}")
             if is_group:
@@ -2895,14 +2914,17 @@ async def _extract_message_text(
 
         if img_paths:
             paths_list = "\n".join(f"  - {p}" for p in img_paths)
-            caption = post_text or "（无文字说明）"
-            text = (
+            prefix, user_words = _split_run_shortcut(post_text)
+            caption = user_words or "（无文字说明）"
+            text = prefix + (
                 f"[用户发送了富文本消息，含 {len(img_paths)} 张图片]\n"
                 f"文字内容：{caption}\n"
                 f"图片路径：\n{paths_list}\n"
                 f"请读取并分析这些图片，结合文字回复（中文）。"
             )
-            preview_text = post_text[:40] if post_text else f"[富文本 + {len(img_paths)} 图]"
+            preview_text = prefix + (
+                user_words[:40] if user_words else f"[富文本 + {len(img_paths)} 图]"
+            )
         else:
             text = post_text
             preview_text = post_text
