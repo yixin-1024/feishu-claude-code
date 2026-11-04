@@ -261,19 +261,13 @@ def _dur(secs: float) -> str:
     return f"{d}天{h}小时" if d else f"{h}小时{m}分"
 
 
-def render(snap: dict, compact: bool = False) -> str:
-    """compact=True 是 /all 卡里的精简版（用户 2026-11-04 定的样式）：只留 CPU、负载、
-    内存、数据盘、进程这几行——不写主机名 / 时间（卡片右上角有刷新时间）、系统版本、
-    IO / 内存压力、Swap、服务 cgroup、/boot 分区。"""
+def render(snap: dict) -> str:
     cores = snap["cores"]
-    if compact:
-        lines = ["🖥️ **服务器状态**", ""]
-    else:
-        head = f"🖥️ **服务器状态** · `{snap['host']}` · {snap['now'].strftime('%m-%d %H:%M:%S')}（+08）"
-        sub = [snap["os"], f"{cores} 核"]
-        if snap.get("uptime"):
-            sub.append(f"已运行 {_dur(snap['uptime'])}")
-        lines = [head, " · ".join(sub), ""]
+    head = f"🖥️ **服务器状态** · `{snap['host']}` · {snap['now'].strftime('%m-%d %H:%M:%S')}（+08）"
+    sub = [snap["os"], f"{cores} 核"]
+    if snap.get("uptime"):
+        sub.append(f"已运行 {_dur(snap['uptime'])}")
+    lines = [head, " · ".join(sub), ""]
 
     lines.append("**CPU / 负载**")
     if snap.get("cpu") is not None:
@@ -281,9 +275,9 @@ def render(snap: dict, compact: bool = False) -> str:
         lines.append(f"{_lvl(cpu, 70, 90)} CPU {_bar(cpu)} {cpu:.0f}%")
     if snap.get("load"):
         l1, l5, l15 = snap["load"]
-        load = f"{_lvl(l1 / cores * 100, 80, 150)} 负载 {l1:.2f} / {l5:.2f} / {l15:.2f}"
-        lines.append(load if compact else f"{load}（1/5/15 分钟，满载≈{cores}）")
-    if snap.get("psi_io") and not compact:
+        lines.append(f"{_lvl(l1 / cores * 100, 80, 150)} 负载 {l1:.2f} / {l5:.2f} / {l15:.2f}"
+                     f"（1/5/15 分钟，满载≈{cores}）")
+    if snap.get("psi_io"):
         io = snap["psi_io"].get("some", 0.0)
         lines.append(f"{_lvl(io, 10, 30)} IO 等待压力 {io:.1f}%（近 10 秒）")
     lines.append("")
@@ -296,21 +290,19 @@ def render(snap: dict, compact: bool = False) -> str:
         lines.append(f"{_lvl(used_pct, 80, 90)} 内存 {_bar(used_pct)} {used_pct:.0f}%"
                      f" · 已用 {_size(total - avail)} / {_size(total)}，可用 {_size(avail)}")
         swap_total = mem.get("SwapTotal", 0)
-        if compact:
-            pass
-        elif swap_total:
+        if swap_total:
             swap_used = swap_total - mem.get("SwapFree", 0)
             sp = swap_used / swap_total * 100
             lines.append(f"{_lvl(sp, 50, 80)} Swap {_bar(sp)} {sp:.0f}%"
                          f" · {_size(swap_used)} / {_size(swap_total)}")
         else:
             lines.append("⚪ Swap 未开启")
-        if snap.get("psi_mem") and not compact:
+        if snap.get("psi_mem"):
             some = snap["psi_mem"].get("some", 0.0)
             full = snap["psi_mem"].get("full", 0.0)
             lines.append(f"{_lvl(some, 5, 20)} 内存压力 {some:.1f}%（近 10 秒，完全卡住 {full:.1f}%）"
                          "——持续上涨＝开始抖，先于内存条变红")
-        cg = None if compact else snap.get("cgroup")
+        cg = snap.get("cgroup")
         if cg:
             cap = cg["max"]
             if cap:
@@ -329,8 +321,6 @@ def render(snap: dict, compact: bool = False) -> str:
     if snap.get("disks"):
         lines.append("**磁盘**")
         for d in snap["disks"]:
-            if compact and d["mount"].startswith("/boot"):
-                continue
             # 跟 df 的 Use% 同口径：分母不含 root 保留块
             denom = d["used"] + d["free"]
             pct = d["used"] / denom * 100 if denom else 0.0
@@ -357,8 +347,60 @@ def render(snap: dict, compact: bool = False) -> str:
     return "\n".join(lines)
 
 
+_LVL_ORDER = {"⚪": 0, "🟢": 1, "🟡": 2, "🔴": 3}
+
+
+def render_compact(snap: dict) -> str:
+    """/all 卡里的精简版（用户 2026-11-04 定的样式）：CPU 和负载一行（灯取两者里更差的）、
+    内存只写占比和可用、磁盘去掉 /boot、进程只写总数。不写主机名 / 时间（卡片右上角
+    有刷新时间）、系统版本、IO / 内存压力、Swap、服务 cgroup、进程排行。"""
+    cores = snap["cores"]
+    lines = ["🖥️ **服务器状态**", ""]
+
+    lamps, parts = [], []
+    if snap.get("cpu") is not None:
+        cpu = snap["cpu"]
+        lamps.append(_lvl(cpu, 70, 90))
+        parts.append(f"CPU {_bar(cpu)} {cpu:.0f}%")
+    if snap.get("load"):
+        l1, l5, l15 = snap["load"]
+        lamps.append(_lvl(l1 / cores * 100, 80, 150))
+        parts.append(f"负载 {l1:.2f} / {l5:.2f} / {l15:.2f}")
+    if parts:
+        lamp = max(lamps, key=lambda x: _LVL_ORDER.get(x, 0))
+        lines += ["**CPU / 负载**", f"{lamp} " + " ".join(parts), ""]
+
+    mem = snap.get("mem") or {}
+    if mem.get("MemTotal"):
+        total, avail = mem["MemTotal"], mem.get("MemAvailable", mem.get("MemFree", 0))
+        used_pct = (total - avail) / total * 100
+        lines += ["**内存**",
+                  f"{_lvl(used_pct, 80, 90)} 内存 {_bar(used_pct)} {used_pct:.0f}% · 可用 {_size(avail)}",
+                  ""]
+
+    disks = [d for d in snap.get("disks") or [] if not d["mount"].startswith("/boot")]
+    if disks:
+        lines.append("**磁盘**")
+        for d in disks:
+            denom = d["used"] + d["free"]  # 跟 df 的 Use% 同口径
+            pct = d["used"] / denom * 100 if denom else 0.0
+            lines.append(f"{_lvl(pct, 80, 90)} `{d['mount']}` {_bar(pct)} {pct:.0f}%"
+                         f" · {_size(d['used'])} / {_size(d['total'])}，剩 {_size(d['free'])}")
+        lines.append("")
+
+    procs = snap.get("procs")
+    if procs:
+        n_claude = sum(1 for p in procs if p["comm"] == "claude")
+        lines.append(f"**进程**（共 {len(procs)} 个，其中 claude {n_claude} 个）")
+
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
 def get_report(compact: bool = False) -> str:
     try:
-        return render(collect(), compact=compact)
+        snap = collect()
+        return render_compact(snap) if compact else render(snap)
     except Exception as e:  # noqa: BLE001 —— 看板命令本身不能把 bot 带崩
         return f"❌ 读取服务器指标失败：{type(e).__name__}: {e}"

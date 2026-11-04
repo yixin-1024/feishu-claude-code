@@ -1,8 +1,8 @@
 """/all：用量 + 服务器状态一张卡（2026-11-04 用户要的）。
 
 - 样式按用户给的样板：用量是精简版（标题不带 token 名、重置后面带倒计时、
-  没有「其他 token」小标题和自动切换那行），服务器是精简版（没有主机名/系统/IO/Swap/
-  cgroup//boot）。
+  没有「其他 token」小标题和自动切换那行），服务器是精简版（CPU 和负载一行、内存只写
+  占比和可用、没有 /boot、进程只写总数；没有主机名/系统/IO/Swap/cgroup）。
 - 刷新按钮重跑 /all（两块一起刷），切号按钮切完还是 /all 卡。
 - 右上角是刷新时间（corner），服务器状态放在按钮下面（after）。
 """
@@ -125,18 +125,40 @@ def _snap():
 
 
 def test_server_compact_only_keeps_template_lines():
-    text = server_stats.render(_snap(), compact=True)
-    lines = text.split("\n")
-    assert lines[0] == "🖥️ **服务器状态**"
-    assert "spxpay-staging" not in text and "Ubuntu" not in text
-    assert any(l.endswith("负载 18.81 / 9.45 / 5.69") for l in lines)
-    for gone in ("IO 等待", "Swap", "内存压力", "cc-lark.service", "/boot"):
-        assert gone not in text, gone
-    assert "`/`" in text and "`/mnt/data`" in text and "**进程**" in text
+    text = server_stats.render_compact(_snap())
+    assert text.split("\n") == [
+        "🖥️ **服务器状态**",
+        "",
+        "**CPU / 负载**",
+        "🔴 CPU █████████░ 87% 负载 18.81 / 9.45 / 5.69",  # 灯取两者更差的（负载 18.8/8 核 → 红）
+        "",
+        "**内存**",
+        "🟢 内存 ███░░░░░░░ 28% · 可用 23.0 GB",
+        "",
+        "**磁盘**",
+        "🟡 `/` ████████░░ 81% · 38.0 GB / 47.0 GB，剩 9.0 GB",
+        "🟡 `/mnt/data` █████████░ 86% · 84.0 GB / 98.0 GB，剩 14.0 GB",
+        "",
+        "**进程**（共 1 个，其中 claude 1 个）",
+    ]
 
     full = server_stats.render(_snap())
-    for kept in ("spxpay-staging", "IO 等待", "Swap", "内存压力", "cc-lark.service", "/boot"):
+    for kept in ("spxpay-staging", "IO 等待", "Swap", "内存压力", "cc-lark.service", "/boot",
+                 "已用", "内存前 5", "CPU 前 5", "满载≈8"):
         assert kept in full, kept
+
+
+def test_server_compact_lamp_is_worse_of_cpu_and_load():
+    snap = {**_snap(), "cpu": 95.0, "load": (1.0, 1.0, 1.0)}
+    assert "🔴 CPU" in server_stats.render_compact(snap)
+    snap = {**_snap(), "cpu": 10.0, "load": (1.0, 1.0, 1.0)}
+    assert "🟢 CPU" in server_stats.render_compact(snap)
+
+
+def test_get_report_compact_switch(monkeypatch):
+    monkeypatch.setattr(server_stats, "collect", _snap)
+    assert server_stats.get_report(True) == server_stats.render_compact(_snap())
+    assert server_stats.get_report() == server_stats.render(_snap())
 
 
 # ── /all 命令 ────────────────────────────────────────────────
