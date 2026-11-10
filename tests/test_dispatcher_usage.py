@@ -28,3 +28,26 @@ def test_dispatch_body_includes_full_prompt():
     assert "cc-lark 子任务已派发" in body
     assert "【完整任务提示词】" in body
     assert prompt in body
+
+
+def test_strip_fake_usage_footer_removes_model_imitated_line():
+    from dispatcher import _strip_fake_usage_footer
+
+    # 11-10 prod 告警分诊：模型照抄历史卡片尾巴编了一行假的，bot 再追加真的 → 两行
+    text = "结论已经回在原告警下面。\n\n这类告警一周只出了两次。\n\n— 📊 上下文 48k / 1M (4.8%)"
+    assert _strip_fake_usage_footer(text) == "结论已经回在原告警下面。\n\n这类告警一周只出了两次。"
+
+    # 中间位置、qoder 占比样式、短横线写法也认
+    mid = "第一段\n\n— 📊 上下文 12.3%\n\n第二段\n- 📊 上下文 1k / 200k (0.5%) · 本轮消耗 3k"
+    assert _strip_fake_usage_footer(mid) == "第一段\n\n第二段"
+
+
+def test_strip_fake_usage_footer_keeps_quoted_or_unrelated_text():
+    from dispatcher import _strip_fake_usage_footer
+
+    quoted = "卡片尾巴长这样：`— 📊 上下文 48k / 1M (4.8%)`"
+    assert _strip_fake_usage_footer(quoted) == quoted
+    other = "📊 状态\n- 列表项\n— 普通破折号"
+    assert _strip_fake_usage_footer(other) == other
+    assert _strip_fake_usage_footer("") == ""
+    assert _strip_fake_usage_footer(None) is None

@@ -2528,6 +2528,8 @@ async def _execute_run(
             full_text = result_text
         else:
             process_text, result_text = _split_process_and_result(accumulated, full_text)
+        process_text = _strip_fake_usage_footer(process_text)
+        result_text = _strip_fake_usage_footer(result_text)
         final = result_text or "（无输出）"
         # 选项只从最终产出里认，别被过程叙述里的候选文本污染。
         options = _extract_options(result_text) or ask_options
@@ -2657,7 +2659,7 @@ async def _execute_run(
         # 把本轮最终响应文本作为返回值交回（成功路径）。dispatch_task 的子会话靠它把结果
         # **内联**进给主 agent 的唤醒消息——不必再 read_thread（而 read_thread 受 Lark
         # interactive 卡"初始快照"限制，本来也拿不到子的最终答案文本）。错误路径上面已 return（→None）。
-        return full_text
+        return _strip_fake_usage_footer(full_text)
     finally:
         active_run.input = None
         active_run.on_inject = None
@@ -3115,6 +3117,23 @@ def build_lark_system_prompt(
         runner=runner,
         bot_username=bot_username,
     )
+
+
+# 模型会照抄它在话题历史里看到的旧卡片尾巴（lark-cli 读回来的卡片正文带着
+# 「— 📊 上下文 56.4k / 1M (5.6%)」），自己在回答末尾编一行假的；bot 再追加真的，
+# 卡片底部就出现两行、数字还对不上（11-10 prod 告警分诊：假 48k + 真 59.1k）。
+# 只认整行就是 footer 的写法（行首是破折号），反引号里引用的不算。
+_FAKE_FOOTER_LINE_RE = re.compile(r"^[ \t]*[—–-]+[ \t]*📊[ \t]*上下文[^\n]*$", re.M)
+
+
+def _strip_fake_usage_footer(text: str) -> str:
+    """去掉模型仿写的「— 📊 上下文 …」行（真 footer 由 _format_usage_footer 统一追加）。"""
+    if not text or "📊" not in text:
+        return text
+    cleaned = _FAKE_FOOTER_LINE_RE.sub("", text)
+    if cleaned == text:
+        return text
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
 
 
 def _format_usage_footer(usage: dict, model: str) -> str:
