@@ -19,6 +19,10 @@
     WORK_CHAT_CWD_oc_aaa=/Users/me/spx
     WORK_CHAT_CWD_oc_bbb=/Users/me/tools/feishu-claude-code
 
+    # 可选：按 chat_id 钉默认模型（这个群和它的所有话题没有 /model 覆盖时用它，
+    # 不跟 WORK_DEFAULT_MODEL 走；实时生效到老话题，不落进 sessions.json）
+    WORK_CHAT_MODEL_oc_aaa=opus[1m]
+
     PERSONAL_APP_ID=cli_yyy
     PERSONAL_APP_SECRET=yyy
     PERSONAL_PLATFORM=feishu
@@ -283,6 +287,11 @@ class Profile:
     # 可选：chat_id -> cwd 映射。新群初次进入时按此初始化 cwd（缺省回退到 default_cwd）。
     # 不影响 sessions.json 已记录的群——那些走持久化值，可被 /ws set / /ws use 继续覆盖。
     chat_default_cwd: dict[str, str] = field(default_factory=dict)
+    # 可选：chat_id -> 模型。这个群（含它的所有话题、派进来的子会话）没有 /model
+    # 覆盖时用它，而不是 profile 的 default_model。来自 <PREFIX>_CHAT_MODEL_<chat_id>。
+    # 和 chat_default_cwd 不同，它不落进 sessions.json，每次取模型时实时查，
+    # 所以对老话题也生效。值保留原样（别名在取用时解析）。
+    chat_default_model: dict[str, str] = field(default_factory=dict)
     allowed_open_ids: set[str] = field(default_factory=set)
     allowed_group_chat_ids: set[str] = field(default_factory=set)
     # Webhook callback source verification. Long-connection callbacks are already
@@ -495,6 +504,15 @@ def _load_profile(name: str) -> Profile:
             if chat_id:
                 chat_default_cwd[chat_id] = os.path.expanduser(env_val)
 
+    # 扫描 <PREFIX>_CHAT_MODEL_<chat_id>：给个别群钉一个不同于 profile 默认的模型。
+    chat_model_prefix = f"{prefix}_CHAT_MODEL_"
+    chat_default_model: dict[str, str] = {}
+    for env_key, env_val in os.environ.items():
+        if env_key.startswith(chat_model_prefix) and env_val.strip():
+            chat_id = env_key[len(chat_model_prefix):]
+            if chat_id:
+                chat_default_model[chat_id] = env_val.strip()
+
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
     if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
@@ -591,6 +609,7 @@ def _load_profile(name: str) -> Profile:
         default_model=env("DEFAULT_MODEL", os.getenv("DEFAULT_MODEL", "")),
         dispatch_model=env("DISPATCH_MODEL", os.getenv("DISPATCH_MODEL", "")).strip(),
         chat_default_cwd=chat_default_cwd,
+        chat_default_model=chat_default_model,
         # 白名单 = .env 里配的 ∪ 自助授权落盘的（见 tg_allowlist）
         allowed_open_ids=(
             _split_csv(env("ALLOWED_OPEN_IDS"))

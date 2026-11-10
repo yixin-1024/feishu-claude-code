@@ -376,6 +376,7 @@ class SessionStore:
         default_runner: Optional[str] = None,
         default_model: Optional[str] = None,
         shared_thread_sessions: Optional[bool] = None,
+        chat_default_model: Optional[dict[str, str]] = None,
     ):
         """
         每个 profile 独占一个 SessionStore 实例和一份 json 文件。
@@ -399,6 +400,8 @@ class SessionStore:
         # /group add 和外部 API 的 /api/v1/chats 都是实时往 profile.chat_default_cwd 里加映射，
         # 换了对象这里就永远看不到，新群的话题会落回 default_cwd。
         self._chat_default_cwd = chat_default_cwd if chat_default_cwd is not None else {}
+        # 群级默认模型（<PREFIX>_CHAT_MODEL_<chat_id>），同样持有 profile 的那个 dict。
+        self._chat_default_model = chat_default_model if chat_default_model is not None else {}
         self._sessions_file = _sessions_file_for(profile)
         self._save_lock = asyncio.Lock()  # 保护 _save() 的全局锁
         self._data: dict = self._load()
@@ -690,6 +693,27 @@ class SessionStore:
         """profile 当前默认模型（来自 config，重启即生效的唯一真相源）"""
         return self._default_model
 
+    def default_model_for(self, chat_id: Optional[str] = None, runner: Optional[str] = None) -> str:
+        """这个会话没有 /model 覆盖时该用的模型：群级默认优先，否则 profile 默认。
+
+        chat_id 在话题群里是 "oc_xxx:omt_yyy" 复合形式，配置里写的是裸 chat_id，
+        所以先按完整 key 查，未命中再剥掉话题后缀查（同 _default_current 的 cwd）。
+        群级默认只在它属于该会话的 runner 时才用——话题被 /runner 切到别的后端后，
+        不能把 opus 塞给 codex。
+        """
+        if chat_id:
+            model = self._chat_default_model.get(chat_id)
+            if model is None and ":" in chat_id:
+                model = self._chat_default_model.get(chat_id.split(":", 1)[0])
+            if model:
+                try:
+                    from bot_config import is_model_compatible_with_runner, normalize_model
+                    if is_model_compatible_with_runner(model, runner or self._default_runner):
+                        return normalize_model(model) or self._default_model
+                except Exception:
+                    pass
+        return self._default_model
+
     async def get_current(self, user_id: str, chat_id: str) -> Session:
         """Get current session config for a specific chat"""
         cur = await self.get_current_raw(user_id, chat_id)
@@ -713,8 +737,10 @@ class SessionStore:
                 pass
         return Session(
             session_id=cur.get("session_id"),
-            # 没有显式 override 就用 profile 默认（实时取，配置变了即生效）
-            model=cur.get("model_override") or self._default_model,
+            # 没有显式 override 就用群级默认 / profile 默认（实时取，配置变了即生效）
+            model=cur.get("model_override") or self.default_model_for(
+                chat_id, cur.get("runner", self._default_runner)
+            ),
             cwd=cur.get("cwd", self._default_cwd),
             permission_mode=cur.get("permission_mode", PERMISSION_MODE),
             workspace=cur.get("workspace", ""),

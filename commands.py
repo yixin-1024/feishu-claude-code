@@ -1545,6 +1545,17 @@ def _kiro_plan_lines(profile) -> list[str]:
     return lines
 
 
+def _session_model(store, cur: dict, chat_id: str, runner: str = "") -> str:
+    """会话实际用的模型：/model 覆盖 > 群级默认（<PREFIX>_CHAT_MODEL_<chat_id>）> profile 默认。"""
+    override = cur.get("model_override")
+    if override:
+        return override
+    resolver = getattr(store, "default_model_for", None)
+    if resolver is None:
+        return store.default_model
+    return resolver(chat_id, runner or cur.get("runner"))
+
+
 def _runner_default_model(bot, runner: str) -> str:
     profile = getattr(bot, "profile", None)
     if profile and getattr(profile, "runner", "") == runner and getattr(profile, "default_model", ""):
@@ -2711,18 +2722,27 @@ async def handle_command(
             if overridden:
                 buttons.append({"text": "↩️ 跟随默认", "value": {"action": "run_cmd", "cmd": "/model default", "cid": chat_id}})
             status = "（本 session 覆盖）" if overridden else "（跟随默认）"
+            followed = _session_model(store, {}, chat_id, runner)
+            default_line = (
+                f"profile 默认：**{store.default_model}**"
+                if followed == store.default_model
+                else f"本群默认：**{followed}**（profile 默认 {store.default_model}）"
+            )
             return {
                 "text": (
                     f"当前 runner：**{runner}**\n"
                     f"当前模型：**{cur.model}** {status}\n"
-                    f"profile 默认：**{store.default_model}**"
+                    f"{default_line}"
                 ),
                 "buttons": buttons,
             }
         # /model default|reset|clear|默认 → 清除 override，回落 profile 默认
         if args.strip().lower() in {"default", "reset", "clear", "默认", "跟随默认"}:
             await store.set_model(user_id, chat_id, "")
-            return f"✅ 已清除模型覆盖，跟随 profile 默认 `{store.default_model}`。已开始新 session。"
+            raw = await store.get_current_raw(user_id, chat_id)
+            followed = _session_model(store, {}, chat_id, raw.get("runner") or "")
+            scope = "profile 默认" if followed == store.default_model else "本群默认"
+            return f"✅ 已清除模型覆盖，跟随{scope} `{followed}`。已开始新 session。"
         model = MODEL_ALIASES.get(args.lower(), args)
         cur = await store.get_current(user_id, chat_id)
         from bot_config import is_model_compatible_with_runner
@@ -2794,7 +2814,7 @@ async def handle_command(
         cur = await store.get_current_raw(user_id, chat_id)
         sid = cur.get("session_id") or "（新 session）"
         runner = cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")
-        model = cur.get("model_override") or store.default_model
+        model = _session_model(store, cur, chat_id, runner)
         cwd = cur.get("cwd", "~")
         workspace = cur.get("workspace") or "（未绑定）"
         started = cur.get("started_at", "")[:16].replace("T", " ")
@@ -2919,7 +2939,7 @@ async def handle_command(
             lines.append("额度：算在 ChatGPT 账号上，cc-lark 这边查不到。")
             return "\n".join(lines)
         if runner == "codex":
-            model = cur.get("model_override") or store.default_model
+            model = _session_model(store, cur, chat_id, runner)
             lines = ["📊 **Codex 用量**", ""]
             lines.append(_format_context_line(
                 cur.get("session_id"),
@@ -2941,7 +2961,7 @@ async def handle_command(
             lines.append(f"模型: `{model}`")
             return _wrap_usage_output(lines)
         if runner == "opencode":
-            model = cur.get("model_override") or store.default_model
+            model = _session_model(store, cur, chat_id, runner)
             lines = ["📈 **opencode 用量**"]
             ctx_line = _format_context_line(
                 cur.get("session_id"),
@@ -2955,7 +2975,7 @@ async def handle_command(
             lines.append(f"模型: `{model}`")
             return _wrap_usage_output(lines)
         if runner == "qoder":
-            model = cur.get("model_override") or store.default_model
+            model = _session_model(store, cur, chat_id, runner)
             lines = ["📈 **Qoder CLI 用量**"]
             last_usage = cur.get("last_usage") or None
             ctx_line = _format_context_line(
@@ -2976,7 +2996,7 @@ async def handle_command(
             lines.extend(await asyncio.to_thread(_qoder_plan_lines, getattr(bot, "profile", None)))
             return _wrap_usage_output(lines)
         if runner == "kiro":
-            model = cur.get("model_override") or store.default_model
+            model = _session_model(store, cur, chat_id, runner)
             lines = ["📈 **Kiro CLI 用量**"]
             last_usage = cur.get("last_usage") or None
             ctx_line = _format_context_line(
@@ -2996,7 +3016,7 @@ async def handle_command(
             lines.extend(await asyncio.to_thread(_kiro_plan_lines, getattr(bot, "profile", None)))
             return _wrap_usage_output(lines)
         if runner == "grok":
-            model = cur.get("model_override") or store.default_model
+            model = _session_model(store, cur, chat_id, runner)
             lines = ["📈 **Grok CLI 用量**"]
             ctx_line = _format_context_line(
                 cur.get("session_id"),
@@ -3010,7 +3030,7 @@ async def handle_command(
             lines.append(f"模型: `{model}`")
             return _wrap_usage_output(lines)
         if runner == "agy":
-            model = cur.get("model_override") or store.default_model
+            model = _session_model(store, cur, chat_id, runner)
             profile = getattr(bot, "profile", None)
             agy_home = _agy_profile_home(profile)
             api_key_provider = _agy_api_key_provider(profile)
@@ -3064,7 +3084,7 @@ async def handle_command(
                 lines.append("👇 点账号按钮切换 Antigravity 账号 · 🔄 刷新用量：")
             return _wrap_usage_output(lines, buttons)
         if runner == "mimo":
-            model = cur.get("model_override") or store.default_model
+            model = _session_model(store, cur, chat_id, runner)
             lines = ["📈 **MiMo Code 用量**"]
             ctx_line = _format_context_line(
                 cur.get("session_id"),
@@ -3078,7 +3098,7 @@ async def handle_command(
             lines.append(f"模型: `{model}`")
             return _wrap_usage_output(lines)
         if runner == "maka":
-            model = cur.get("model_override") or store.default_model
+            model = _session_model(store, cur, chat_id, runner)
             lines = ["📈 **Apache Maka 用量**"]
             ctx_line = _format_context_line(
                 cur.get("session_id"),
