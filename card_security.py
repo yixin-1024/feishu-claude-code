@@ -17,6 +17,8 @@ import threading
 import time
 from typing import Any
 
+import user_acl
+
 
 _VERSION = 1
 _SIGNATURE_FIELD = "_cc_sig"
@@ -127,16 +129,14 @@ def card_action_allowed(profile, user_id: str, chat_id: str) -> bool:
     """Apply the profile's normal user/group allowlists to a button click."""
     if not user_id or not chat_id:
         return False
-    allowed_users = set(getattr(profile, "allowed_open_ids", set()) or set())
-    if allowed_users and user_id not in allowed_users:
-        return False
-
     raw_chat_id = chat_id.split(":", 1)[0]
-    if raw_chat_id.startswith("oc_"):
+    is_group = raw_chat_id.startswith("oc_")
+    if is_group:
         allowed_groups = set(getattr(profile, "allowed_group_chat_ids", set()) or set())
         if "*" not in allowed_groups and raw_chat_id not in allowed_groups:
             return False
-    return True
+    # 和发消息同一套人员名单（管理员 / 本群名单 / 私聊开关 / 全局名单）
+    return user_acl.user_allowed(profile, user_id, is_group=is_group, raw_chat_id=raw_chat_id)
 
 
 def card_context_matches(user_id: str, chat_id: str, open_chat_id: str) -> bool:

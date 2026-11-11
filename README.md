@@ -116,6 +116,7 @@ cc-lark 自研的 `cc_mcp_server.py` 把 13 个运行时工具注入进去，**�
 - 每个群/话题独立 session、模型、推理强度、工作目录（同用户跨 chat 互不阻塞）
 - `/ws` 为不同群绑定不同项目
 - **访问控制**：`ALLOWED_OPEN_IDS` 用户白名单、`ALLOWED_GROUP_CHAT_IDS` 群聊白名单，未授权者静默忽略
+- **按群配人 / 私聊开关**：`<PROFILE>_CHAT_USERS_<chat_id>` 给单个群单独配谁能 @（替代全局名单）、`<PROFILE>_ALLOW_P2P` 开关私聊、`<PROFILE>_ADMIN_OPEN_IDS` 管理员永远放行；管理员在群里发 `/acl add @某人` / `/acl remove @某人` / `/acl clear` / `/acl dm on|off` 实时改（见 `user_acl.py`）
 
 **Telegram 渠道（和 Lark 共用一套底座）**
 
@@ -379,6 +380,10 @@ python3 main.py
 | `PERMISSION_MODE` | 否 | `bypassPermissions` | 工具权限模式 |
 | `ALLOWED_OPEN_IDS` | 推荐 | 空=允许所有 | 用户 open_id 白名单，逗号分隔 |
 | `ALLOWED_GROUP_CHAT_IDS` | 推荐 | 空=禁用所有群 | 群聊 chat_id 白名单 (oc_*)，逗号分隔 |
+| `ADMIN_OPEN_IDS` | 推荐 | 空=过了白名单的人都算 | 管理员：永远放行，只有他们能用 `/acl` `/group` `/restart` |
+| `CHAT_USERS_<chat_id>` | 否 | 没配=沿用全局 | 本群能 @ bot 的人，**替代** `ALLOWED_OPEN_IDS`；空值=只有管理员，`*`=不单独限制。一般用 `/acl` 改 |
+| `ALLOW_P2P` | 否 | `1` | 是否允许私聊；`0`=只有管理员能私聊 |
+| `P2P_USERS` | 否 | 空=沿用全局 | 私聊名单，非空时只有这些人（+管理员）能私聊 |
 | `DISPATCH_CHAT_ID` | 否 | 空=禁用派单 | 会话群 chat_id；bot 在其它群被 @ 时把任务派到这里的新话题 |
 | `CALLBACK_PORT` | 否 | `9981` | 卡片按钮回调 HTTP 端口 |
 | `CONTROL_PORT` | 否 | `CALLBACK_PORT + 1` | 本机控制面端口，仅绑定 `127.0.0.1`，禁止转发到公网 |

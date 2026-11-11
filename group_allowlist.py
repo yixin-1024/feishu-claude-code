@@ -1,4 +1,5 @@
-"""群白名单 + 群 workspace 映射的唯一写入口（`/group add` 和外部 API 的 `/api/v1/chats` 共用）。
+"""群白名单 + 群 workspace 映射的唯一写入口（`/group add` 和外部 API 的 `/api/v1/chats` 共用）；
+`/acl` 的单键开关也走这里的 `set_env_line`，共用同一把锁和原子落盘。
 
 两件事必须一起做才算「加群」：
   · 内存：`profile.allowed_group_chat_ids` / `profile.chat_default_cwd` —— 实时生效，不用重启；
@@ -84,23 +85,67 @@ def persist_chat_to_env(
             changed = True
 
         if changed:
-            real = os.path.realpath(env_path)
-            mode = os.stat(real).st_mode & 0o777
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real) or ".", prefix=".env.tmp.")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write("\n".join(out) + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.chmod(tmp, mode)
-                os.replace(tmp, real)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
+            _write_lines_atomic(env_path, out)
 
+    return changed, env_path
+
+
+def _write_lines_atomic(env_path: str, out: list[str]) -> None:
+    """tmp + fsync + replace，保留原文件权限。调用方持有 _ENV_LOCK。"""
+    real = os.path.realpath(env_path)
+    mode = os.stat(real).st_mode & 0o777
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real) or ".", prefix=".env.tmp.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, real)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,200}$")
+
+
+def set_env_line(key: str, value: str, env_path: str = "") -> Tuple[bool, str]:
+    """把 .env 里 `key=...` 那一行改成 `key=value`（没有就追加；重复的只留第一行）。
+    返回 (是否改动, .env 路径 或 ❌ 开头的错误说明)。给 /acl 这类单键开关用。"""
+    if not _ENV_KEY_RE.match(key or ""):
+        return False, f"❌ 变量名非法: {key!r}"
+    if "\n" in value or "\r" in value:
+        return False, "❌ 值不能含换行"
+    env_path = env_path or default_env_path()
+    if not os.path.isfile(env_path):
+        return False, f"❌ .env 不存在: {env_path}"
+    new_ln = f"{key}={value}"
+    with _ENV_LOCK:
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        out: list[str] = []
+        seen = False
+        changed = False
+        for ln in lines:
+            if ln.lstrip().startswith(f"{key}="):
+                if seen:
+                    changed = True  # 重复行：以第一行为准，其余删掉
+                    continue
+                seen = True
+                if ln != new_ln:
+                    changed = True
+                out.append(new_ln)
+                continue
+            out.append(ln)
+        if not seen:
+            out.append(new_ln)
+            changed = True
+        if changed:
+            _write_lines_atomic(env_path, out)
     return changed, env_path
 
 

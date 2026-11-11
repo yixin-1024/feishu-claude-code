@@ -44,6 +44,8 @@ from typing import Optional
 
 from dotenv import dotenv_values, load_dotenv
 
+import user_acl
+
 # override=True：让 .env 文件成为唯一事实源。
 # 必须 override —— /restart 是以"当前运行进程"为父进程跑 `open .app` 拉起新实例，
 # 新进程会继承老进程的环境变量；而老进程启动时 load_dotenv 已把 .env 的值灌进了
@@ -294,6 +296,16 @@ class Profile:
     chat_default_model: dict[str, str] = field(default_factory=dict)
     allowed_open_ids: set[str] = field(default_factory=set)
     allowed_group_chat_ids: set[str] = field(default_factory=set)
+    # ── 操作者白名单（判定和 /acl 命令都在 user_acl.py）──────────
+    # 管理员：永远放行，只有他们能用 /acl /group /restart。空 = 老行为（过了白名单都算）。
+    admin_open_ids: set[str] = field(default_factory=set)
+    # chat_id -> 本群能 @ bot 的人（<PREFIX>_CHAT_USERS_<chat_id>）。有 key 就替代全局
+    # allowed_open_ids（空集 = 只有管理员）；没有 key / 值为 * = 沿用全局。
+    chat_allowed_open_ids: dict[str, set[str]] = field(default_factory=dict)
+    # 私聊开关（<PREFIX>_ALLOW_P2P，默认开）；关了只有管理员能私聊。
+    allow_p2p: bool = True
+    # 私聊名单（<PREFIX>_P2P_USERS）：非空时只有这些人能私聊；空 = 沿用全局。
+    p2p_allowed_open_ids: set[str] = field(default_factory=set)
     # Webhook callback source verification. Long-connection callbacks are already
     # authenticated by the SDK; HTTP callbacks should also set this per profile.
     verification_token: str = ""
@@ -513,6 +525,16 @@ def _load_profile(name: str) -> Profile:
             if chat_id:
                 chat_default_model[chat_id] = env_val.strip()
 
+    # 扫描 <PREFIX>_CHAT_USERS_<chat_id>：本群操作者名单（值为空 = 只有管理员，* = 不单独限制）。
+    chat_users_prefix = f"{prefix}_CHAT_USERS_"
+    chat_allowed_open_ids: dict[str, set[str]] = {}
+    for env_key, env_val in os.environ.items():
+        if env_key.startswith(chat_users_prefix):
+            chat_id = env_key[len(chat_users_prefix):]
+            users = user_acl.parse_chat_users(env_val)
+            if chat_id and users is not None:
+                chat_allowed_open_ids[chat_id] = users
+
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
     if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
@@ -616,6 +638,10 @@ def _load_profile(name: str) -> Profile:
             | (_load_tg_allowlist(name) if platform == "telegram" else set())
         ),
         allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
+        admin_open_ids=_split_csv(env("ADMIN_OPEN_IDS")),
+        chat_allowed_open_ids=chat_allowed_open_ids,
+        allow_p2p=_env_flag(env("ALLOW_P2P"), True),
+        p2p_allowed_open_ids=_split_csv(env("P2P_USERS")),
         verification_token=env("VERIFICATION_TOKEN").strip(),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),
         bot_token=bot_token,

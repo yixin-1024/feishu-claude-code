@@ -31,6 +31,7 @@ from qoder_runner import QODER_EFFORT_LEVELS
 from kiro_runner import KIRO_EFFORT_LEVELS
 from run_control import RUN_GATE
 import group_allowlist
+import user_acl
 from session_store import SessionStore, scan_cli_sessions, generate_summary, _get_api_token, _write_custom_title, _find_session_file
 
 PLUGINS_DIR = os.path.expanduser("~/.claude/plugins")
@@ -279,6 +280,7 @@ HELP_TEXT = """\
 **服务管理：**
 `/restart` — 立即提醒、打断未完成任务并重启服务（群聊需 @ 当前 bot）
 `/group add <chat_id> [cwd]` — 把群加白名单并设默认 cwd（实时生效 + 持久化到 .env）
+`/acl` — 操作者名单：`/acl add @某人`、`/acl remove @某人`、`/acl clear`、`/acl dm on|off`（只有管理员能用）
 
 
 **Runner Skills / Slash 透传：**
@@ -325,7 +327,7 @@ EFFORT_SHORTCUTS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 BOT_COMMANDS = {
     "help", "h", "new", "clear", "resume", "runner", "model", "effort", "mode", "status", "cd", "ls",
     "exec", "workspace", "ws", "skills", "mcp", "usage", "accounts", "switch", "stop",
-    "restart", "group", "defaults", "server", "sys", "all",
+    "restart", "group", "acl", "defaults", "server", "sys", "all",
     *MODEL_SHORTCUTS,
     *EFFORT_SHORTCUTS,
 }
@@ -3170,7 +3172,16 @@ async def handle_command(
         return "⚠️ 请单独发送 `/restart`；重启将由消息分发器安全执行。"
 
     elif cmd == "group":
+        if bot is not None and not user_acl.is_admin(bot.profile, user_id):
+            return "⛔ 只有管理员能用 `/group`。"
         return await _handle_group_command(args, bot)
+
+    elif cmd == "acl":
+        # 纯文本的 /acl 在 dispatcher 锁外处理（能拿到 @ 的人）；走到这里的是富文本 /
+        # 卡片按钮，没有 @ 目标，只能看名单、开关私聊、或写 ou_ id。
+        if bot is None:
+            return "❌ 内部错误：handler 缺少 bot 上下文"
+        return await user_acl.handle_acl_command(bot, user_id, chat_id, args)
 
     else:
         return None  # fallback: 转发给 Claude

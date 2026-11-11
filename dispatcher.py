@@ -32,6 +32,7 @@ from bot_config import (
     normalize_model_for_runner,
 )
 from bot_instance import BotInstance
+import user_acl
 from card_security import (
     card_action_allowed,
     card_context_matches,
@@ -370,6 +371,15 @@ async def _handle_restart_request(
     """统一编排 /restart：先通知，再立即中断任务，最后触发 supervisor 重拉。"""
     global _restart_in_progress, _restart_committed
     from commands import _trigger_restart, restart_strategy
+
+    if not user_acl.is_admin(bot.profile, user_id):
+        log(bot.profile.name, "restart", "info", f"拒绝非管理员重启 user={user_id[:12]}")
+        await _send_restart_notice(
+            bot, user_id, is_group, message_id,
+            "⛔ 只有管理员能重启服务。",
+            card_msg_id=card_msg_id,
+        )
+        return True
 
     # 同一 event loop 内无 await 地 check-and-set，避免两个 /restart 重复 kickstart；
     # 同时阻止“active run 快照之后、进程真正退出之前”再启动新 runner。
@@ -1274,8 +1284,12 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
         ):
             _log_acl_group_skip(tag, raw_chat_id)
             return
-        if bot.profile.allowed_open_ids and user_id not in bot.profile.allowed_open_ids:
-            log(tag, "acl", "info", f"user={user_id} 不在 allowlist")
+        # 人员名单：管理员 > 本群名单 / 私聊开关+名单 > 全局名单（见 user_acl）
+        if not user_acl.user_allowed(
+            bot.profile, user_id, is_group=is_group, raw_chat_id=raw_chat_id,
+        ):
+            log(tag, "acl", "info",
+                f"user={user_id} 不在{'本群' if is_group else '私聊'}名单 chat={raw_chat_id[:14]}")
             return
 
     # 锁外快路径：/stop、/restart、/ 命令菜单，以及所有只读命令（不排队）
@@ -1309,6 +1323,22 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
             if is_group and not await _is_current_bot_mentioned(bot, msg):
                 return
             await _handle_restart_request(bot, user_id, is_group, msg.message_id)
+            return
+
+        # /acl 要读消息里 @ 到的人（_text 里的 @ 占位已被剥掉），所以在这里直接处理；
+        # 不碰 session，不用排队。富文本里的 /acl 走 handle_command（没有 @ 目标）。
+        if _parsed_lock_free and _parsed_lock_free[0] == "acl":
+            if is_group and not await _is_current_bot_mentioned(bot, msg):
+                return
+            bot_open_id = await bot.feishu.get_bot_open_id() if is_group else ""
+            reply = await user_acl.handle_acl_command(
+                bot, user_id, chat_id, _parsed_lock_free[1],
+                user_acl.mention_targets(getattr(msg, "mentions", None), bot_open_id),
+            )
+            if is_group:
+                await bot.feishu.reply_card(msg.message_id, content=reply, loading=False)
+            else:
+                await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
 
         # 只读命令（/usage /status /help /skills …）不进队列：它们跟前面那条消息
