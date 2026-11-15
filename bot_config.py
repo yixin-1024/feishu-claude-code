@@ -22,6 +22,9 @@
     # 可选：按 chat_id 钉默认模型（这个群和它的所有话题没有 /model 覆盖时用它，
     # 不跟 WORK_DEFAULT_MODEL 走；实时生效到老话题，不落进 sessions.json）
     WORK_CHAT_MODEL_oc_aaa=opus[1m]
+    # 同理按 chat_id 钉默认推理强度（只对 claude runner 生效；话题里 /effort 覆盖仍优先）。
+    # 这两行都可以在群里用 /all 卡上的「本群默认」按钮改，实时生效 + 自动写回 .env
+    WORK_CHAT_EFFORT_oc_aaa=high
 
     PERSONAL_APP_ID=cli_yyy
     PERSONAL_APP_SECRET=yyy
@@ -294,6 +297,9 @@ class Profile:
     # 和 chat_default_cwd 不同，它不落进 sessions.json，每次取模型时实时查，
     # 所以对老话题也生效。值保留原样（别名在取用时解析）。
     chat_default_model: dict[str, str] = field(default_factory=dict)
+    # 可选：chat_id -> 推理强度。同上，来自 <PREFIX>_CHAT_EFFORT_<chat_id>，取用时实时查；
+    # 只对 claude runner 生效（档位是 Claude 的 low~max）。
+    chat_default_effort: dict[str, str] = field(default_factory=dict)
     allowed_open_ids: set[str] = field(default_factory=set)
     allowed_group_chat_ids: set[str] = field(default_factory=set)
     # ── 操作者白名单（判定和 /acl 命令都在 user_acl.py）──────────
@@ -525,6 +531,15 @@ def _load_profile(name: str) -> Profile:
             if chat_id:
                 chat_default_model[chat_id] = env_val.strip()
 
+    # 扫描 <PREFIX>_CHAT_EFFORT_<chat_id>：给个别群钉一个默认推理强度。
+    chat_effort_prefix = f"{prefix}_CHAT_EFFORT_"
+    chat_default_effort: dict[str, str] = {}
+    for env_key, env_val in os.environ.items():
+        if env_key.startswith(chat_effort_prefix) and env_val.strip():
+            chat_id = env_key[len(chat_effort_prefix):]
+            if chat_id:
+                chat_default_effort[chat_id] = env_val.strip().lower()
+
     # 扫描 <PREFIX>_CHAT_USERS_<chat_id>：本群操作者名单（值为空 = 只有管理员，* = 不单独限制）。
     chat_users_prefix = f"{prefix}_CHAT_USERS_"
     chat_allowed_open_ids: dict[str, set[str]] = {}
@@ -632,6 +647,7 @@ def _load_profile(name: str) -> Profile:
         dispatch_model=env("DISPATCH_MODEL", os.getenv("DISPATCH_MODEL", "")).strip(),
         chat_default_cwd=chat_default_cwd,
         chat_default_model=chat_default_model,
+        chat_default_effort=chat_default_effort,
         # 白名单 = .env 里配的 ∪ 自助授权落盘的（见 tg_allowlist）
         allowed_open_ids=(
             _split_csv(env("ALLOWED_OPEN_IDS"))

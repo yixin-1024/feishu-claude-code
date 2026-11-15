@@ -223,8 +223,20 @@ def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[s
     return None
 
 
-def _effective_effort_label(store: SessionStore, bot, runner: str, override: Optional[str]) -> str:
-    return override or _profile_default_effort(store, bot, runner) or "CLI 默认"
+def _default_effort_for(store: SessionStore, bot, runner: str, chat_id: str = "") -> Tuple[Optional[str], bool]:
+    """没有 /effort 覆盖时实际用的默认强度：群级默认（<PREFIX>_CHAT_EFFORT_<chat_id>）> profile/全局。
+    返回 (档位或 None=CLI 默认, 是不是群级的)。"""
+    resolver = getattr(store, "default_effort_for", None)
+    if resolver is not None and chat_id:
+        value = resolver(chat_id, runner)
+        if value:
+            return value, True
+    return _profile_default_effort(store, bot, runner), False
+
+
+def _effective_effort_label(store: SessionStore, bot, runner: str, override: Optional[str],
+                            chat_id: str = "") -> str:
+    return override or _default_effort_for(store, bot, runner, chat_id)[0] or "CLI 默认"
 
 
 def _codex_effort_levels(model: str) -> tuple[str, ...]:
@@ -278,7 +290,7 @@ HELP_TEXT = """\
 `/accounts` — 账户全景（Claude runner：Max 用量 + 智能切换状态；agy runner：Antigravity 账号）
 `/switch <账户>` — 切换本机全局账户（Claude Code；agy runner 下切 Antigravity 账号，`/switch save [名字]` 存当前号）
 `/server` 或 `/sys` — 本机 CPU / 负载 / 内存 / 磁盘 / 进程一屏看
-`/all` — 用量 + 服务器状态一张卡（刷新按钮两块一起刷）；管理员还能在卡上一键换全局默认模型（Fable / Opus / Sonnet / Haiku）和默认推理强度（Low ~ Max），所有 Claude bot 的新话题都用它（也可发 `/all model fable`、`/all effort high`）
+`/all` — 用量 + 服务器状态一张卡（刷新按钮两块一起刷）；管理员还能在卡上一键换默认模型（Fable / Opus / Sonnet / Haiku）和默认推理强度（Low ~ Max）：**私聊里改全局**（所有 Claude bot），**群里改只对本群生效**（有「跟随全局」按钮）；也可发 `/all model fable`、`/all effort high`、`/all model global`
 
 **审计：**
 `/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
@@ -366,10 +378,13 @@ def run_cmd_toast(cmd_text: str) -> str:
         return "正在刷新…"
     if cmd_text.startswith(ALL_SWITCH_PREFIX):
         return f"正在切换到 {cmd_text[len(ALL_SWITCH_PREFIX):].strip()}…"
-    if cmd_text.startswith(ALL_MODEL_PREFIX):
-        return f"正在把默认模型改成 {cmd_text[len(ALL_MODEL_PREFIX):].strip().capitalize()}…"
-    if cmd_text.startswith(ALL_EFFORT_PREFIX):
-        return f"正在把默认推理强度改成 {_effort_name(cmd_text[len(ALL_EFFORT_PREFIX):].strip().lower())}…"
+    for prefix, what in ((ALL_MODEL_PREFIX, "模型"), (ALL_EFFORT_PREFIX, "推理强度")):
+        if cmd_text.startswith(prefix):
+            value = cmd_text[len(prefix):].strip().lower()
+            if value in _FOLLOW_GLOBAL_WORDS:
+                return f"正在把默认{what}改成跟随全局…"
+            name = _effort_name(value) if prefix == ALL_EFFORT_PREFIX else value.capitalize()
+            return f"正在把默认{what}改成 {name}…"
     return cmd_text
 
 
@@ -1155,6 +1170,94 @@ def _all_effort_buttons(chat_id: str) -> list[dict]:
     ]
 
 
+# ── 本群默认模型 / 推理强度（用户 2026-11-15 要的）─────────────────────────
+# 同一张 /all 卡、同一组按钮，**在哪儿按决定改哪儿**：私聊里改的是全局（上面两个函数），
+# 群里改的只是这个群（含它所有话题），落在 <PREFIX>_CHAT_MODEL_<chat_id> /
+# <PREFIX>_CHAT_EFFORT_<chat_id>（bot_config 启动时扫、SessionStore 取用时实时查）。
+# 「跟随全局」= 删掉本群那行，回到全局默认。优先级：话题里 /model、/effort 覆盖 > 本群 > 全局。
+FOLLOW_GLOBAL = "global"
+_FOLLOW_GLOBAL_WORDS = {"global", "reset", "default", "全局", "跟随全局"}
+
+
+def _is_group_chat(chat_id: str, user_id: str) -> bool:
+    """和 dispatcher 同一个判定：私聊的会话键就是 user_id。"""
+    return bool(chat_id) and chat_id.split(":", 1)[0] != user_id
+
+
+def _set_chat_default(bot, chat_id: str, kind: str, value: str) -> str:
+    """改本群的默认模型（kind="model"）或推理强度（kind="effort"）：内存实时改 + 写 .env。
+    返回要写在卡片标题下面的一行；完全成功返回空串。"""
+    raw_chat = (chat_id or "").split(":", 1)[0]
+    profile = bot.profile
+    if kind == "model":
+        mapping, choices, suffix, what = profile.chat_default_model, GLOBAL_MODEL_CHOICES, "MODEL", "模型"
+    else:
+        mapping, choices, suffix, what = profile.chat_default_effort, GLOBAL_EFFORT_CHOICES, "EFFORT", "强度"
+    key = f"{profile.name.upper()}_CHAT_{suffix}_{raw_chat}"
+
+    value = (value or "").strip().lower()
+    if not value:
+        return f"用法：`/all {kind} {'|'.join(choices)}|{FOLLOW_GLOBAL}`"
+    if value in _FOLLOW_GLOBAL_WORDS:
+        mapping.pop(raw_chat, None)
+        os.environ.pop(key, None)
+        _, info = group_allowlist.remove_env_line(key)
+    elif value in choices:
+        stored = MODEL_ALIASES[value] if kind == "model" else value
+        mapping[raw_chat] = stored
+        os.environ[key] = stored
+        _, info = group_allowlist.set_env_line(key, stored)
+    else:
+        return f"❌ 不认识的{what} `{value}`，可选 {' / '.join(choices)} / {FOLLOW_GLOBAL}"
+    if info.startswith("❌"):
+        return f"⚠️ 已生效，但没写进 .env（重启会丢）：{info}"
+    return ""
+
+
+def _global_model_name(bot) -> str:
+    current = getattr(bot.profile, "default_model", "") or bot.store.default_model
+    alias = _global_model_alias(current)
+    return alias.capitalize() if alias else current
+
+
+def _chat_model_buttons(bot, chat_id: str) -> list[dict]:
+    """群里的「本群默认模型」那排：跟随全局 + 四个模型，当前的前面带 ●。"""
+    own = (getattr(bot.profile, "chat_default_model", {}) or {}).get(chat_id.split(":", 1)[0])
+    on = (_global_model_alias(own) if own else FOLLOW_GLOBAL)
+    label = f"**本群默认模型**（全局 {_global_model_name(bot)}）"
+    if own and not on:
+        label += f"：`{own}`"
+    options = [(FOLLOW_GLOBAL, "跟随全局")] + [(a, a.capitalize()) for a in GLOBAL_MODEL_CHOICES]
+    return [
+        {
+            "text": ("● " if key == on else "") + text,
+            "group": label,
+            "value": {"action": "run_cmd", "cmd": ALL_MODEL_PREFIX + key, "cid": chat_id},
+        }
+        for key, text in options
+    ]
+
+
+def _chat_effort_buttons(bot, chat_id: str) -> list[dict]:
+    """群里的「本群默认推理强度」那排：跟随全局 + low~max，当前的前面带 ●。"""
+    own = (getattr(bot.profile, "chat_default_effort", {}) or {}).get(chat_id.split(":", 1)[0])
+    own = (own or "").strip().lower()
+    on = own if own in GLOBAL_EFFORT_CHOICES else ("" if own else FOLLOW_GLOBAL)
+    glob = _profile_default_effort(bot.store, bot, "claude")
+    label = f"**本群默认推理强度**（全局 {_effort_name(glob) if glob else 'CLI 默认'}）"
+    if own and not on:
+        label += f"：`{own}`"
+    options = [(FOLLOW_GLOBAL, "跟随全局")] + [(lv, _effort_name(lv)) for lv in GLOBAL_EFFORT_CHOICES]
+    return [
+        {
+            "text": ("● " if key == on else "") + text,
+            "group": label,
+            "value": {"action": "run_cmd", "cmd": ALL_EFFORT_PREFIX + key, "cid": chat_id},
+        }
+        for key, text in options
+    ]
+
+
 async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, bot=None) -> "str | dict":
     """/all：用量 + 服务器状态一张卡，刷新按钮两块一起刷，右上角是刷新时间。
 
@@ -1168,6 +1271,7 @@ async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, b
     runner = str(cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
 
     is_admin = bot is not None and user_acl.is_admin(bot.profile, user_id)
+    in_group = _is_group_chat(chat_id, user_id)
     headline = ""
     sub = (args or "").split(None, 1)
     if len(sub) == 2 and sub[0].lower() == "switch":
@@ -1177,15 +1281,20 @@ async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, b
         if first and not first.startswith("✅"):
             headline = first  # 切成功了卡上自然能看出来（● 换了），只有失败才写一行
     elif sub and sub[0].lower() in ("model", "effort"):
-        # 改的是所有 Claude bot、所有群，比 /restart 还大，只给管理员
-        what = "模型" if sub[0].lower() == "model" else "推理强度"
-        setter = _set_global_default_model if sub[0].lower() == "model" else _set_global_default_effort
+        # 私聊里改全局（所有 Claude bot、所有群），群里只改本群。都只给管理员。
+        kind = sub[0].lower()
+        value = sub[1] if len(sub) == 2 else ""
+        what = "模型" if kind == "model" else "推理强度"
+        scope = "本群" if in_group else "全局"
         if bot is None:
             headline = "❌ 内部错误：缺少 bot 上下文"
         elif not is_admin:
-            headline = f"⛔ 只有管理员能改全局默认{what}"
+            headline = f"⛔ 只有管理员能改{scope}默认{what}"
+        elif in_group:
+            headline = await asyncio.to_thread(_set_chat_default, bot, chat_id, kind, value)
         else:
-            headline = await asyncio.to_thread(setter, bot, sub[1] if len(sub) == 2 else "")
+            setter = _set_global_default_model if kind == "model" else _set_global_default_effort
+            headline = await asyncio.to_thread(setter, bot, value)
 
     async def _usage():
         if runner == "claude":
@@ -1207,7 +1316,10 @@ async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, b
         return f"{usage_text}\n\n{server}"
     all_buttons = _all_buttons(buttons, chat_id)
     if is_admin and str(getattr(bot.profile, "runner", "")).lower() == "claude":
-        all_buttons += _all_model_buttons(bot, chat_id) + _all_effort_buttons(chat_id)
+        if in_group:
+            all_buttons += _chat_model_buttons(bot, chat_id) + _chat_effort_buttons(bot, chat_id)
+        else:
+            all_buttons += _all_model_buttons(bot, chat_id) + _all_effort_buttons(chat_id)
     now = datetime.now(server_stats._TZ)
     return {
         "text": usage_text,
@@ -2935,7 +3047,8 @@ async def handle_command(
 
         raw = await store.get_current_raw(user_id, chat_id)
         overridden = bool(raw.get("effort_override"))
-        configured_default = _profile_default_effort(store, bot, runner)
+        configured_default, from_chat = _default_effort_for(store, bot, runner, chat_id)
+        default_scope = "本群默认" if from_chat else "profile 默认"
         effective = raw.get("effort_override") or configured_default or "CLI 默认"
 
         if not args:
@@ -2965,7 +3078,7 @@ async def handle_command(
                     f"当前 runner：**{runner}**\n"
                     f"当前模型：**{cur.model}**\n"
                     f"当前推理强度：**{effective}**（{status}）\n"
-                    f"profile 默认：**{configured_default or 'CLI 默认'}**\n"
+                    f"{default_scope}：**{configured_default or 'CLI 默认'}**\n"
                     "可用档位受当前模型能力限制。"
                 ),
                 "buttons": buttons,
@@ -2975,7 +3088,7 @@ async def handle_command(
         if requested in {"default", "reset", "clear", "默认", "跟随默认"}:
             await store.set_effort(user_id, chat_id, "")
             default_label = configured_default or "CLI 默认"
-            return f"✅ 已清除推理强度覆盖，当前对话跟随 profile 默认 `{default_label}`；下一轮调用生效。"
+            return f"✅ 已清除推理强度覆盖，当前对话跟随 {default_scope} `{default_label}`；下一轮调用生效。"
         if requested not in levels:
             options = "、".join(f"`{level}`" for level in levels)
             return f"❌ `{runner}` 不支持推理强度 `{args}`。可选：{options}、`default`。"
@@ -3013,8 +3126,13 @@ async def handle_command(
         ]
         if runner in {"claude", "codex", "grok", "maka", "agy", "qoder", "kiro"}:
             effort_override = cur.get("effort_override")
-            effort = _effective_effort_label(store, bot, runner, effort_override)
-            effort_status = "当前对话覆盖" if effort_override else "跟随默认"
+            effort = _effective_effort_label(store, bot, runner, effort_override, chat_id)
+            if effort_override:
+                effort_status = "当前对话覆盖"
+            elif _default_effort_for(store, bot, runner, chat_id)[1]:
+                effort_status = "跟随本群默认"
+            else:
+                effort_status = "跟随默认"
             lines.append(f"推理强度: `{effort}`（{effort_status}）")
         lines.extend([
             f"权限模式: `{mode}`",

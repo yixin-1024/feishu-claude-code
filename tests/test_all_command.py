@@ -296,7 +296,7 @@ def test_card_layout_unchanged_without_extras(monkeypatch):
     assert len(els) == 2
 
 
-# ── 全局默认模型（2026-11-15 用户要的）─────────────────────────────
+# ── 全局默认模型（2026-11-15 用户要的；私聊里改的是全局）──────────────
 
 class _ModelStore(_Store):
     def __init__(self, model, runner="claude"):
@@ -313,7 +313,8 @@ class _ModelStore(_Store):
 
 def _bot(name, runner="claude", model="opus[1m]", admins=("ou_admin",)):
     profile = SimpleNamespace(name=name, runner=runner, default_model=model,
-                              admin_open_ids=set(admins))
+                              admin_open_ids=set(admins),
+                              chat_default_model={}, chat_default_effort={})
     return SimpleNamespace(profile=profile, store=_ModelStore(model, runner))
 
 
@@ -337,7 +338,7 @@ def _model_buttons(out):
 def test_all_shows_global_model_row_for_admin(monkeypatch, tmp_path):
     main = _bot("main")
     _model_env(monkeypatch, tmp_path, [main])
-    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "ou_admin", main.store, bot=main))
     row = _model_buttons(out)
     assert [b["text"] for b in row] == ["Fable", "● Opus", "Sonnet", "Haiku"]
     assert {b["group"] for b in row} == {commands.GLOBAL_MODEL_LABEL}
@@ -348,7 +349,7 @@ def test_all_shows_global_model_row_for_admin(monkeypatch, tmp_path):
 def test_all_hides_model_row_for_non_admin_and_non_claude(monkeypatch, tmp_path):
     main = _bot("main")
     _model_env(monkeypatch, tmp_path, [main])
-    out = asyncio.run(commands.handle_command("all", "", "ou_someone", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "", "ou_someone", "ou_someone", main.store, bot=main))
     assert _model_buttons(out) == []
 
 
@@ -357,7 +358,7 @@ def test_all_model_switches_every_claude_bot_and_persists(monkeypatch, tmp_path)
     grok = _bot("grok", runner="agy", model="gemini-4-argon")
     env = _model_env(monkeypatch, tmp_path, [main, grok, research])
 
-    out = asyncio.run(commands.handle_command("all", "model fable", "ou_admin", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "model fable", "ou_admin", "ou_admin", main.store, bot=main))
 
     for b in (main, research):
         assert b.profile.default_model == "fable[1m]"
@@ -376,7 +377,7 @@ def test_all_model_switches_every_claude_bot_and_persists(monkeypatch, tmp_path)
     assert out["text"].split("\n")[2].startswith("剩余")
     assert [b["text"] for b in _model_buttons(out)] == ["● Fable", "Opus", "Sonnet", "Haiku"]
 
-    asyncio.run(commands.handle_command("all", "model haiku", "ou_admin", "oc_chat", main.store, bot=main))
+    asyncio.run(commands.handle_command("all", "model haiku", "ou_admin", "ou_admin", main.store, bot=main))
     assert main.store.default_model == "haiku" and research.profile.default_model == "haiku"
     assert "MAIN_DEFAULT_MODEL=haiku" in env.read_text().splitlines()
 
@@ -385,7 +386,7 @@ def test_all_model_refused_for_non_admin(monkeypatch, tmp_path):
     main = _bot("main")
     env = _model_env(monkeypatch, tmp_path, [main])
     before = env.read_text()
-    out = asyncio.run(commands.handle_command("all", "model haiku", "ou_someone", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "model haiku", "ou_someone", "ou_someone", main.store, bot=main))
     assert out["text"].split("\n")[2] == "⛔ 只有管理员能改全局默认模型"
     assert main.store.default_model == "opus[1m]"
     assert env.read_text() == before
@@ -395,7 +396,7 @@ def test_all_model_unknown_name(monkeypatch, tmp_path):
     main = _bot("main")
     env = _model_env(monkeypatch, tmp_path, [main])
     before = env.read_text()
-    out = asyncio.run(commands.handle_command("all", "model gpt5", "ou_admin", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "model gpt5", "ou_admin", "ou_admin", main.store, bot=main))
     assert out["text"].split("\n")[2].startswith("❌ 不认识的模型 `gpt5`")
     assert main.store.default_model == "opus[1m]" and env.read_text() == before
 
@@ -403,7 +404,7 @@ def test_all_model_unknown_name(monkeypatch, tmp_path):
 def test_all_model_row_shows_unlisted_current_model(monkeypatch, tmp_path):
     main = _bot("main", model="claude-opus-5[1m]")
     _model_env(monkeypatch, tmp_path, [main])
-    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "ou_admin", main.store, bot=main))
     row = _model_buttons(out)
     assert [b["text"] for b in row] == ["Fable", "Opus", "Sonnet", "Haiku"]
     assert row[0]["group"].endswith("`claude-opus-5[1m]`")
@@ -457,7 +458,7 @@ def test_all_shows_effort_row_after_model_row(monkeypatch, tmp_path):
     main = _bot("main")
     _model_env(monkeypatch, tmp_path, [main])
     monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
-    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "ou_admin", main.store, bot=main))
     row = _effort_buttons(out)
     assert [b["text"] for b in row] == ["Low", "Medium", "High", "● XHigh", "Max"]
     assert {b["group"] for b in row} == {commands.GLOBAL_EFFORT_LABEL}
@@ -469,7 +470,7 @@ def test_all_effort_row_without_config_says_cli_default(monkeypatch, tmp_path):
     main = _bot("main")
     _model_env(monkeypatch, tmp_path, [main])
     monkeypatch.delenv("CLAUDE_EFFORT", raising=False)
-    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "ou_admin", main.store, bot=main))
     row = _effort_buttons(out)
     assert not any(b["text"].startswith("● ") for b in row)
     assert row[0]["group"].endswith("CLI 默认")
@@ -478,7 +479,7 @@ def test_all_effort_row_without_config_says_cli_default(monkeypatch, tmp_path):
 def test_all_effort_hidden_for_non_admin(monkeypatch, tmp_path):
     main = _bot("main")
     _model_env(monkeypatch, tmp_path, [main])
-    out = asyncio.run(commands.handle_command("all", "", "ou_someone", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "", "ou_someone", "ou_someone", main.store, bot=main))
     assert _effort_buttons(out) == []
 
 
@@ -489,7 +490,7 @@ def test_all_effort_sets_env_and_persists(monkeypatch, tmp_path):
     env.write_text(env.read_text() + "CLAUDE_EFFORT=xhigh\n")
     monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
 
-    out = asyncio.run(commands.handle_command("all", "effort high", "ou_admin", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "effort high", "ou_admin", "ou_admin", main.store, bot=main))
 
     assert os.environ["CLAUDE_EFFORT"] == "high"
     lines = env.read_text().splitlines()
@@ -508,9 +509,9 @@ def test_all_effort_refused_and_unknown(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
     before = env.read_text()
 
-    out = asyncio.run(commands.handle_command("all", "effort low", "ou_someone", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "effort low", "ou_someone", "ou_someone", main.store, bot=main))
     assert out["text"].split("\n")[2] == "⛔ 只有管理员能改全局默认推理强度"
-    out = asyncio.run(commands.handle_command("all", "effort ultra", "ou_admin", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "effort ultra", "ou_admin", "ou_admin", main.store, bot=main))
     assert out["text"].split("\n")[2].startswith("❌ 不认识的强度 `ultra`")
     assert os.environ["CLAUDE_EFFORT"] == "xhigh" and env.read_text() == before
 
@@ -522,7 +523,7 @@ def test_all_effort_warns_bot_with_own_env_file(monkeypatch, tmp_path):
     own.write_text("CLAUDE_EFFORT=max\n")
     research.profile.claude_env_file = str(own)
     monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
-    out = asyncio.run(commands.handle_command("all", "effort low", "ou_admin", "oc_chat", main.store, bot=main))
+    out = asyncio.run(commands.handle_command("all", "effort low", "ou_admin", "ou_admin", main.store, bot=main))
     assert out["text"].split("\n")[2] == "⚠️ 这些 bot 自己的 env 文件钉了强度，不跟：research=max"
 
 

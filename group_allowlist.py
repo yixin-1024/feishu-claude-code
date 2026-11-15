@@ -149,6 +149,25 @@ def set_env_line(key: str, value: str, env_path: str = "") -> Tuple[bool, str]:
     return changed, env_path
 
 
+def remove_env_line(key: str, env_path: str = "") -> Tuple[bool, str]:
+    """删掉 .env 里所有 `key=...` 行（/all「本群默认」改回跟随全局时用）。
+    返回 (是否改动, .env 路径 或 ❌ 开头的错误说明)。调用方要同时把 os.environ 里的
+    这个键也删掉，否则靠 exec 重启的进程会把它继承回来。"""
+    if not _ENV_KEY_RE.match(key or ""):
+        return False, f"❌ 变量名非法: {key!r}"
+    env_path = env_path or default_env_path()
+    if not os.path.isfile(env_path):
+        return False, f"❌ .env 不存在: {env_path}"
+    with _ENV_LOCK:
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        out = [ln for ln in lines if not ln.lstrip().startswith(f"{key}=")]
+        changed = len(out) != len(lines)
+        if changed:
+            _write_lines_atomic(env_path, out)
+    return changed, env_path
+
+
 def add_chat_to_profile(
     profile, chat_id: str, cwd: Optional[str], env_path: str = "",
 ) -> Tuple[bool, str]:

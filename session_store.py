@@ -377,6 +377,7 @@ class SessionStore:
         default_model: Optional[str] = None,
         shared_thread_sessions: Optional[bool] = None,
         chat_default_model: Optional[dict[str, str]] = None,
+        chat_default_effort: Optional[dict[str, str]] = None,
     ):
         """
         每个 profile 独占一个 SessionStore 实例和一份 json 文件。
@@ -402,6 +403,8 @@ class SessionStore:
         self._chat_default_cwd = chat_default_cwd if chat_default_cwd is not None else {}
         # 群级默认模型（<PREFIX>_CHAT_MODEL_<chat_id>），同样持有 profile 的那个 dict。
         self._chat_default_model = chat_default_model if chat_default_model is not None else {}
+        # 群级默认推理强度（<PREFIX>_CHAT_EFFORT_<chat_id>），同上持有 profile 的 dict。
+        self._chat_default_effort = chat_default_effort if chat_default_effort is not None else {}
         self._sessions_file = _sessions_file_for(profile)
         self._save_lock = asyncio.Lock()  # 保护 _save() 的全局锁
         self._data: dict = self._load()
@@ -712,9 +715,7 @@ class SessionStore:
         不能把 opus 塞给 codex。
         """
         if chat_id:
-            model = self._chat_default_model.get(chat_id)
-            if model is None and ":" in chat_id:
-                model = self._chat_default_model.get(chat_id.split(":", 1)[0])
+            model = self._chat_value(self._chat_default_model, chat_id)
             if model:
                 try:
                     from bot_config import is_model_compatible_with_runner, normalize_model
@@ -723,6 +724,29 @@ class SessionStore:
                 except Exception:
                     pass
         return self._default_model
+
+    @staticmethod
+    def _chat_value(mapping: dict, chat_id: Optional[str]) -> Optional[str]:
+        """群级配置按完整 key 查，未命中再剥掉话题后缀（oc_xxx:omt_yyy → oc_xxx）查。"""
+        if not chat_id:
+            return None
+        value = mapping.get(chat_id)
+        if value is None and ":" in chat_id:
+            value = mapping.get(chat_id.split(":", 1)[0])
+        return value
+
+    def default_effort_for(self, chat_id: Optional[str] = None, runner: Optional[str] = None) -> Optional[str]:
+        """这个会话没有 /effort 覆盖时的群级默认推理强度；没配 / 不适用返回 None
+        （由 runner 再落到 profile env 文件 / 全局 CLAUDE_EFFORT / CLI 默认）。
+
+        档位是 Claude 的 low~max，所以只对 claude runner 生效——话题被 /runner 切到
+        别的后端后不能把 max 塞给它。
+        """
+        if (runner or self._default_runner).lower() != "claude":
+            return None
+        value = (self._chat_value(self._chat_default_effort, chat_id) or "").strip().lower()
+        from bot_config import CLAUDE_EFFORT_LEVELS
+        return value if value in CLAUDE_EFFORT_LEVELS else None
 
     async def get_current(self, user_id: str, chat_id: str) -> Session:
         """Get current session config for a specific chat"""
@@ -755,7 +779,10 @@ class SessionStore:
             permission_mode=cur.get("permission_mode", PERMISSION_MODE),
             workspace=cur.get("workspace", ""),
             runner=cur.get("runner", self._default_runner),
-            effort=cur.get("effort_override"),
+            # 没有 /effort 覆盖就用群级默认（实时取）；都没有是 None，runner 再落到全局
+            effort=cur.get("effort_override") or self.default_effort_for(
+                chat_id, cur.get("runner", self._default_runner)
+            ),
         )
 
     async def on_claude_response(
