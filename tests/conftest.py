@@ -60,6 +60,11 @@ def _isolate_sessions(tmp_path, monkeypatch):
     # 在那台机器上集体变红。测试要验 pinned 行为的自己 monkeypatch.setenv 打开。
     for _pin_key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(_pin_key, raising=False)
+    # 运行中插话开关同理：财务机 .env 开着 CLAUDE_PRINT_STREAM_INPUT=1，漏进测试后
+    # print 后端改走 --input-format stream-json、stdin 不再写完就关，测「默认关」行为的
+    # 用例（test_run_claude_prefers_final_result_over_partial_deltas）在那台机器上
+    # 一直红。默认关才是代码的默认值；要测打开的用例自己 monkeypatch.setenv。
+    monkeypatch.delenv("CLAUDE_PRINT_STREAM_INPUT", raising=False)
     # env token 池（~/.claude/env_tokens.json）同理：里面是真 token，读到了会把
     # 上面删掉的 CLAUDE_CODE_OAUTH_TOKEN 又同步回 os.environ。
     import account_switcher as _acs
