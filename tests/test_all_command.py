@@ -294,3 +294,154 @@ def test_card_layout_unchanged_without_extras(monkeypatch):
     els = sent[-1]["body"]["elements"]
     assert els[0] == {"tag": "markdown", "content": "line1\nline2"}
     assert len(els) == 2
+
+
+# ── 全局默认模型（2026-11-15 用户要的）─────────────────────────────
+
+class _ModelStore(_Store):
+    def __init__(self, model, runner="claude"):
+        super().__init__(runner)
+        self._default_model = model
+
+    @property
+    def default_model(self):
+        return self._default_model
+
+    def set_default_model(self, model):
+        self._default_model = model
+
+
+def _bot(name, runner="claude", model="opus[1m]", admins=("ou_admin",)):
+    profile = SimpleNamespace(name=name, runner=runner, default_model=model,
+                              admin_open_ids=set(admins))
+    return SimpleNamespace(profile=profile, store=_ModelStore(model, runner))
+
+
+def _model_env(monkeypatch, tmp_path, bots):
+    env = tmp_path / ".env"
+    env.write_text("MAIN_DEFAULT_MODEL=opus[1m]\nDEFAULT_MODEL=opus[1m]\nGROK_DEFAULT_MODEL=gemini-4-argon\n")
+    monkeypatch.setenv("CC_LARK_ENV_FILE", str(env))
+    monkeypatch.setenv("PROFILES", ",".join(b.profile.name for b in bots))
+    for key in ("MAIN_DEFAULT_MODEL", "RESEARCH_DEFAULT_MODEL", "DEFAULT_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(commands, "_registered_bots", lambda bot: bots)
+    monkeypatch.setattr(commands, "_get_usage", lambda chat_id, compact=False: _usage_reply(chat_id))
+    monkeypatch.setattr(server_stats, "get_report", lambda compact=False: "server")
+    return env
+
+
+def _model_buttons(out):
+    return [b for b in out["buttons"] if b["value"]["cmd"].startswith(commands.ALL_MODEL_PREFIX)]
+
+
+def test_all_shows_global_model_row_for_admin(monkeypatch, tmp_path):
+    main = _bot("main")
+    _model_env(monkeypatch, tmp_path, [main])
+    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "oc_chat", main.store, bot=main))
+    row = _model_buttons(out)
+    assert [b["text"] for b in row] == ["Fable", "● Opus", "Sonnet", "Haiku"]
+    assert {b["group"] for b in row} == {commands.GLOBAL_MODEL_LABEL}
+    # 用量那排还在前面，不受影响
+    assert [b["value"]["cmd"] for b in out["buttons"][:3]] == ["/all switch token1", "/all switch token2", "/all"]
+
+
+def test_all_hides_model_row_for_non_admin_and_non_claude(monkeypatch, tmp_path):
+    main = _bot("main")
+    _model_env(monkeypatch, tmp_path, [main])
+    out = asyncio.run(commands.handle_command("all", "", "ou_someone", "oc_chat", main.store, bot=main))
+    assert _model_buttons(out) == []
+
+
+def test_all_model_switches_every_claude_bot_and_persists(monkeypatch, tmp_path):
+    main, research = _bot("main"), _bot("research")
+    grok = _bot("grok", runner="agy", model="gemini-4-argon")
+    env = _model_env(monkeypatch, tmp_path, [main, grok, research])
+
+    out = asyncio.run(commands.handle_command("all", "model fable", "ou_admin", "oc_chat", main.store, bot=main))
+
+    for b in (main, research):
+        assert b.profile.default_model == "fable[1m]"
+        assert b.store.default_model == "fable[1m]"
+    assert grok.profile.default_model == "gemini-4-argon"  # 非 Claude bot 不动
+    assert grok.store.default_model == "gemini-4-argon"
+    lines = env.read_text().splitlines()
+    assert "MAIN_DEFAULT_MODEL=fable[1m]" in lines
+    assert "RESEARCH_DEFAULT_MODEL=fable[1m]" in lines  # 原来没有这行 → 追加
+    assert "DEFAULT_MODEL=fable[1m]" in lines
+    assert "GROK_DEFAULT_MODEL=gemini-4-argon" in lines
+    assert "GROK_DEFAULT_MODEL=fable[1m]" not in lines
+    import os
+    assert os.environ["MAIN_DEFAULT_MODEL"] == "fable[1m]"
+    # 成功不写，● 跟着换
+    assert out["text"].split("\n")[2].startswith("剩余")
+    assert [b["text"] for b in _model_buttons(out)] == ["● Fable", "Opus", "Sonnet", "Haiku"]
+
+    asyncio.run(commands.handle_command("all", "model haiku", "ou_admin", "oc_chat", main.store, bot=main))
+    assert main.store.default_model == "haiku" and research.profile.default_model == "haiku"
+    assert "MAIN_DEFAULT_MODEL=haiku" in env.read_text().splitlines()
+
+
+def test_all_model_refused_for_non_admin(monkeypatch, tmp_path):
+    main = _bot("main")
+    env = _model_env(monkeypatch, tmp_path, [main])
+    before = env.read_text()
+    out = asyncio.run(commands.handle_command("all", "model haiku", "ou_someone", "oc_chat", main.store, bot=main))
+    assert out["text"].split("\n")[2] == "⛔ 只有管理员能改全局默认模型"
+    assert main.store.default_model == "opus[1m]"
+    assert env.read_text() == before
+
+
+def test_all_model_unknown_name(monkeypatch, tmp_path):
+    main = _bot("main")
+    env = _model_env(monkeypatch, tmp_path, [main])
+    before = env.read_text()
+    out = asyncio.run(commands.handle_command("all", "model gpt5", "ou_admin", "oc_chat", main.store, bot=main))
+    assert out["text"].split("\n")[2].startswith("❌ 不认识的模型 `gpt5`")
+    assert main.store.default_model == "opus[1m]" and env.read_text() == before
+
+
+def test_all_model_row_shows_unlisted_current_model(monkeypatch, tmp_path):
+    main = _bot("main", model="claude-opus-5[1m]")
+    _model_env(monkeypatch, tmp_path, [main])
+    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "oc_chat", main.store, bot=main))
+    row = _model_buttons(out)
+    assert [b["text"] for b in row] == ["Fable", "Opus", "Sonnet", "Haiku"]
+    assert row[0]["group"].endswith("`claude-opus-5[1m]`")
+
+
+def test_all_model_toast():
+    assert commands.run_cmd_toast("/all model fable") == "正在把默认模型改成 Fable…"
+
+
+def test_session_store_set_default_model_applies_to_sessions_without_override(tmp_path, monkeypatch):
+    import session_store
+    monkeypatch.setattr(session_store, "SESSIONS_DIR", str(tmp_path))
+    monkeypatch.setattr(session_store, "_sessions_file_for", lambda p: str(tmp_path / f"s-{p}.json"))
+    store = session_store.SessionStore(profile="t", default_model="opus[1m]", default_runner="claude")
+    store.set_default_model("fable[1m]")
+    assert store.default_model == "fable[1m]"
+    s = asyncio.run(store.get_current("ou_u", "oc_x:omt_new"))
+    assert s.model == "fable[1m]"
+    store.set_default_model("")  # 空串不清掉
+    assert store.default_model == "fable[1m]"
+
+
+def test_card_groups_buttons_under_label(monkeypatch):
+    client, sent = _client_capturing_patches(monkeypatch)
+    buttons = [
+        {"text": "● token1", "value": {"action": "run_cmd", "cmd": "/all switch token1", "_cc_uid": "ou_user"}},
+        {"text": "🔄 刷新", "value": {"action": "run_cmd", "cmd": "/all", "_cc_uid": "ou_user"}},
+        {"text": "Fable", "group": "**全局默认模型**", "value": {"action": "run_cmd", "cmd": "/all model fable", "_cc_uid": "ou_user"}},
+        {"text": "● Opus", "group": "**全局默认模型**", "value": {"action": "run_cmd", "cmd": "/all model opus", "_cc_uid": "ou_user"}},
+    ]
+    asyncio.run(client.update_card_with_buttons(
+        "om_card", "📊 **Claude 用量**\n\n剩余", buttons, flow=True,
+        corner="11-15 22:30:00 刷新", after="🖥️ **服务器状态**"))
+    els = sent[-1]["body"]["elements"]
+    tags = [e["tag"] for e in els]
+    assert tags == ["column_set", "markdown", "column_set", "markdown", "column_set", "markdown"]
+    assert len(els[2]["columns"]) == 2
+    assert els[3] == {"tag": "markdown", "content": "**全局默认模型**"}
+    assert [c["elements"][0]["text"]["content"] for c in els[4]["columns"]] == ["Fable", "● Opus"]
+    assert els[5]["content"] == "🖥️ **服务器状态**"
+    assert all("group" not in c["elements"][0]["value"] for c in els[4]["columns"])

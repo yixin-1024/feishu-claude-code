@@ -1151,13 +1151,24 @@ class FeishuClient:
                 "value": signed_value,
                 "behaviors": [{"type": "callback", "value": signed_value}],
             })
-        if flow and btn_elements:
-            # 横排: column_set + flex_mode flow
-            columns = [{"tag": "column", "width": "auto", "elements": [b]} for b in btn_elements]
-            base["body"]["elements"].append({"tag": "column_set", "flex_mode": "flow", "columns": columns})
-        else:
-            # 竖排: 每个按钮独占一行
-            base["body"]["elements"].extend(btn_elements)
+        # 按钮可带 `group`（一行 markdown 小标题）：相邻同组的排在一起，换组时另起一段、
+        # 先写小标题（/all 的「全局默认模型」那排）。不带 group 的就是老样子。
+        groups: list[tuple[str, list[dict]]] = []
+        for btn, el in zip(buttons, btn_elements):
+            label = btn.get("group") or ""
+            if not groups or groups[-1][0] != label:
+                groups.append((label, []))
+            groups[-1][1].append(el)
+        for label, els in groups:
+            if label:
+                base["body"]["elements"].extend(_card_dict(label)["body"]["elements"])
+            if flow:
+                # 横排: column_set + flex_mode flow
+                columns = [{"tag": "column", "width": "auto", "elements": [b]} for b in els]
+                base["body"]["elements"].append({"tag": "column_set", "flex_mode": "flow", "columns": columns})
+            else:
+                # 竖排: 每个按钮独占一行
+                base["body"]["elements"].extend(els)
         if after:
             base["body"]["elements"].extend(_card_dict(after)["body"]["elements"])
         card_content = _serialize_card(base)

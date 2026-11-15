@@ -278,7 +278,7 @@ HELP_TEXT = """\
 `/accounts` — 账户全景（Claude runner：Max 用量 + 智能切换状态；agy runner：Antigravity 账号）
 `/switch <账户>` — 切换本机全局账户（Claude Code；agy runner 下切 Antigravity 账号，`/switch save [名字]` 存当前号）
 `/server` 或 `/sys` — 本机 CPU / 负载 / 内存 / 磁盘 / 进程一屏看
-`/all` — 用量 + 服务器状态一张卡（刷新按钮两块一起刷）
+`/all` — 用量 + 服务器状态一张卡（刷新按钮两块一起刷）；管理员还能在卡上一键换全局默认模型（Fable / Opus / Sonnet / Haiku，所有 Claude bot 的新话题都用它，也可发 `/all model fable`）
 
 **审计：**
 `/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
@@ -366,6 +366,8 @@ def run_cmd_toast(cmd_text: str) -> str:
         return "正在刷新…"
     if cmd_text.startswith(ALL_SWITCH_PREFIX):
         return f"正在切换到 {cmd_text[len(ALL_SWITCH_PREFIX):].strip()}…"
+    if cmd_text.startswith(ALL_MODEL_PREFIX):
+        return f"正在把默认模型改成 {cmd_text[len(ALL_MODEL_PREFIX):].strip().capitalize()}…"
     return cmd_text
 
 
@@ -1010,6 +1012,88 @@ def _all_buttons(buttons: list[dict], chat_id: str) -> list[dict]:
     return out
 
 
+# /all 卡片上「全局默认模型」那排按钮：`/all model <别名>`（用户 2026-11-15 要的）。
+# 改的是本进程里**所有 Claude bot** 的 profile 默认模型：实时生效 + 写进 .env（重启后仍在）。
+# 优先级不变：话题里 /model、/opus 钉的覆盖 > 群级默认（<PREFIX>_CHAT_MODEL_<chat_id>）> 这里。
+ALL_MODEL_PREFIX = "/all model "
+GLOBAL_MODEL_CHOICES: Tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
+GLOBAL_MODEL_LABEL = "**全局默认模型**"
+
+
+def _registered_bots(bot) -> list:
+    """本进程所有 bot（dispatcher 启动时注入的注册表）；拿不到就只有当前这个。"""
+    try:
+        import dispatcher
+        bots = list(getattr(dispatcher, "_bots", {}).values())
+    except Exception:
+        bots = []
+    if not bots and bot is not None:
+        bots = [bot]
+    return bots
+
+
+def _claude_bots(bot) -> list:
+    return [b for b in _registered_bots(bot)
+            if str(getattr(b.profile, "runner", "")).lower() == "claude"]
+
+
+def _global_model_alias(model: str) -> str:
+    """模型串 → 按钮上的别名（fable / opus / sonnet / haiku），不是这四个就返回空串。"""
+    value = (model or "").strip()
+    resolved = MODEL_ALIASES.get(value.lower(), value)
+    for alias in GLOBAL_MODEL_CHOICES:
+        if MODEL_ALIASES[alias] == resolved:
+            return alias
+    return ""
+
+
+def _set_global_default_model(bot, alias: str) -> str:
+    """把所有 Claude bot 的默认模型改成 alias：内存里实时改 + 写 .env。
+    返回要写在卡片标题下面的一行；完全成功返回空串（按钮上的 ● 自己会换）。"""
+    alias = (alias or "").strip().lower()
+    if not alias:
+        return f"用法：`/all model {'|'.join(GLOBAL_MODEL_CHOICES)}`"
+    if alias not in GLOBAL_MODEL_CHOICES:
+        return f"❌ 不认识的模型 `{alias}`，可选 {' / '.join(GLOBAL_MODEL_CHOICES)}"
+    targets = _claude_bots(bot)
+    if not targets:
+        return "❌ 本机没有 Claude bot，没改"
+    model = MODEL_ALIASES[alias]
+
+    for b in targets:
+        b.profile.default_model = model
+        b.store.set_default_model(model)
+
+    # 多 profile 模式读 <PREFIX>_DEFAULT_MODEL，老的单 profile 模式读 DEFAULT_MODEL；
+    # DEFAULT_MODEL 也是没写自己那行的 profile 的兜底，一起改才算「全局」。
+    keys = [f"{b.profile.name.upper()}_DEFAULT_MODEL" for b in targets] if os.getenv("PROFILES") else []
+    keys.append("DEFAULT_MODEL")
+    errors: list[str] = []
+    for key in dict.fromkeys(keys):
+        os.environ[key] = model
+        _, info = group_allowlist.set_env_line(key, model)
+        if info.startswith("❌"):
+            errors.append(info)
+    if errors:
+        return f"⚠️ 已生效，但没写进 .env（重启会丢）：{errors[0]}"
+    return ""
+
+
+def _all_model_buttons(bot, chat_id: str) -> list[dict]:
+    """「全局默认模型」那排按钮，当前的前面带 ●。`group` 让卡片把它们单独排一行、上面写标题。"""
+    current = getattr(bot.profile, "default_model", "") or bot.store.default_model
+    on = _global_model_alias(current)
+    label = GLOBAL_MODEL_LABEL if on else f"{GLOBAL_MODEL_LABEL}：`{current}`"
+    return [
+        {
+            "text": ("● " if alias == on else "") + alias.capitalize(),
+            "group": label,
+            "value": {"action": "run_cmd", "cmd": ALL_MODEL_PREFIX + alias, "cid": chat_id},
+        }
+        for alias in GLOBAL_MODEL_CHOICES
+    ]
+
+
 async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, bot=None) -> "str | dict":
     """/all：用量 + 服务器状态一张卡，刷新按钮两块一起刷，右上角是刷新时间。
 
@@ -1022,6 +1106,7 @@ async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, b
     cur = await store.get_current_raw(user_id, chat_id)
     runner = str(cur.get("runner") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
 
+    is_admin = bot is not None and user_acl.is_admin(bot.profile, user_id)
     headline = ""
     sub = (args or "").split(None, 1)
     if len(sub) == 2 and sub[0].lower() == "switch":
@@ -1030,6 +1115,15 @@ async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, b
         first = (result or "").split("\n", 1)[0].strip()
         if first and not first.startswith("✅"):
             headline = first  # 切成功了卡上自然能看出来（● 换了），只有失败才写一行
+    elif sub and sub[0].lower() == "model":
+        # 改的是所有 Claude bot、所有群，比 /restart 还大，只给管理员
+        if bot is None:
+            headline = "❌ 内部错误：缺少 bot 上下文"
+        elif not is_admin:
+            headline = "⛔ 只有管理员能改全局默认模型"
+        else:
+            headline = await asyncio.to_thread(
+                _set_global_default_model, bot, sub[1] if len(sub) == 2 else "")
 
     async def _usage():
         if runner == "claude":
@@ -1049,10 +1143,13 @@ async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, b
 
     if not chat_id:
         return f"{usage_text}\n\n{server}"
+    all_buttons = _all_buttons(buttons, chat_id)
+    if is_admin and str(getattr(bot.profile, "runner", "")).lower() == "claude":
+        all_buttons += _all_model_buttons(bot, chat_id)
     now = datetime.now(server_stats._TZ)
     return {
         "text": usage_text,
-        "buttons": _all_buttons(buttons, chat_id),
+        "buttons": all_buttons,
         "after": server,
         "corner": now.strftime("%m-%d %H:%M:%S 刷新"),
     }

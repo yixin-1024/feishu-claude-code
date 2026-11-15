@@ -690,8 +690,18 @@ class SessionStore:
 
     @property
     def default_model(self) -> str:
-        """profile 当前默认模型（来自 config，重启即生效的唯一真相源）"""
+        """profile 当前默认模型（启动时来自 config；/all 改全局默认时运行时更新）"""
         return self._default_model
+
+    def set_default_model(self, model: str) -> None:
+        """运行时换 profile 默认模型（/all 卡上的「全局默认模型」按钮）。
+
+        和群级默认一样不落进 sessions.json：没有 /model 覆盖的会话（新话题、老话题、
+        派进来的子会话、cron）下一条消息起就用它。持久化靠调用方写 .env。
+        """
+        model = (model or "").strip()
+        if model:
+            self._default_model = model
 
     def default_model_for(self, chat_id: Optional[str] = None, runner: Optional[str] = None) -> str:
         """这个会话没有 /model 覆盖时该用的模型：群级默认优先，否则 profile 默认。
