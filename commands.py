@@ -128,6 +128,12 @@ MODEL_ALIASES = {
     # 免得裸名 + /effort medium 被 agy 判成 invalid model selection
     "agy-pro": "gemini-3.1-pro-high",
     "agy-pro-low": "gemini-3.1-pro-low",
+    # Gemini 4（agy 1.5.8 起内置）。只在 API key 通道可用——订阅 OAuth 的
+    # `agy models` 里没有它们；Argon / Carbon 还要求 key 所在项目开了计费
+    # （免费档配额是 0，直接 429），Hydrogen 免费档能跑。Hydrogen 多一档 xhigh。
+    "agy-hydrogen": "gemini-4-hydrogen",
+    "agy-carbon": "gemini-4-carbon",
+    "agy-argon": "gemini-4-argon",
     # agy 内置的第三方模型：走 "Claude and GPT models" 配额池（与 Gemini 池
     # 独立计量），且**都不接受 /effort**——见 agy_runner._MODELS_WITHOUT_EFFORT。
     # 必须用 agy- 前缀的别名，不能复用 opus/sonnet：那两个是 Claude Code 的模型，
@@ -2438,7 +2444,9 @@ def _effort_levels_for(runner: str, model: str) -> tuple[Optional[tuple[str, ...
                 f"ℹ️ 当前模型 `{model}` 不支持 `/effort`——它自带固定推理深度。\n"
                 f"要调档位请先切到 Gemini 系列（如 `/model agy-38`）。"
             )
-        return AGY_EFFORT_LEVELS, ""
+        from agy_runner import effort_levels_for_model
+
+        return effort_levels_for_model(model), ""
     return None, (
         f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok`、"
         f"`maka`、`agy`、`qoder` 或 `kiro`。"
@@ -2675,6 +2683,9 @@ async def handle_command(
                 ]
             elif runner == "agy":
                 buttons = [
+                    {"text": "💧 Gemini 4 Hydrogen", "value": {"action": "run_cmd", "cmd": "/model agy-hydrogen", "cid": chat_id}},
+                    {"text": "🪨 Gemini 4 Carbon", "value": {"action": "run_cmd", "cmd": "/model agy-carbon", "cid": chat_id}},
+                    {"text": "🔆 Gemini 4 Argon", "value": {"action": "run_cmd", "cmd": "/model agy-argon", "cid": chat_id}},
                     {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-38", "cid": chat_id}},
                     {"text": "Gemini 3.7 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-37", "cid": chat_id}},
                     {"text": "Gemini 3.6 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-36", "cid": chat_id}},

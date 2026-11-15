@@ -221,6 +221,8 @@ def test_run_agy_raises_on_error_result(monkeypatch):
 
 def test_resolve_model_effort(monkeypatch):
     monkeypatch.delenv("AGY_EFFORT", raising=False)
+    # bot_config 一 import 就 load_dotenv，本机 .env 的 AGY_DEFAULT_MODEL 会漏进来
+    monkeypatch.delenv("AGY_DEFAULT_MODEL", raising=False)
     # 带档位后缀的 id 原样传，不再给 --effort
     assert _resolve_model_effort("gemini-3.1-pro-high", "low") == ("gemini-3.1-pro-high", None)
     # 裸名必须配 effort，没给就 high
@@ -1753,3 +1755,41 @@ def test_load_profile_reads_agy_home(monkeypatch):
     monkeypatch.delenv("AX_AGY_HOME")
     monkeypatch.setenv("AGY_HOME", "/must/not/leak")  # 没有全局回退
     assert bot_config._load_profile("ax").agy_home == ""
+
+
+def test_gemini4_aliases_and_hydrogen_xhigh(monkeypatch):
+    """Gemini 4（agy 1.5.8 内置）：别名可用；只有 Hydrogen 多一档 xhigh。"""
+    monkeypatch.delenv("AGY_EFFORT", raising=False)
+    from bot_config import is_model_compatible_with_runner
+
+    for alias, model in (
+        ("agy-hydrogen", "gemini-4-hydrogen"),
+        ("agy-carbon", "gemini-4-carbon"),
+        ("agy-argon", "gemini-4-argon"),
+    ):
+        assert is_model_compatible_with_runner(alias, "agy")
+        assert not is_model_compatible_with_runner(alias, "claude")
+        assert _resolve_model_effort(alias, "high") == (model, "high")
+
+    # Hydrogen：xhigh 原样，max → xhigh
+    assert _resolve_model_effort("agy-hydrogen", "xhigh") == ("gemini-4-hydrogen", "xhigh")
+    assert _resolve_model_effort("gemini-4-hydrogen", "max") == ("gemini-4-hydrogen", "xhigh")
+    # 已带档位后缀（含 -xhigh）原样传，不再给 --effort
+    assert _resolve_model_effort("gemini-4-hydrogen-xhigh", "low") == ("gemini-4-hydrogen-xhigh", None)
+    # Argon / Carbon / Flash 只有三档：xhigh、max 收敛到 high
+    assert _resolve_model_effort("agy-carbon", "xhigh") == ("gemini-4-carbon", "high")
+    assert _resolve_model_effort("gemini-4-argon", "max") == ("gemini-4-argon", "high")
+    assert _resolve_model_effort("gemini-3.8-flash", "xhigh") == ("gemini-3.8-flash", "high")
+
+    assert agy_runner.effort_levels_for_model("agy-hydrogen") == ("low", "medium", "high", "xhigh")
+    assert agy_runner.effort_levels_for_model("google/gemini-4-hydrogen") == ("low", "medium", "high", "xhigh")
+    assert agy_runner.effort_levels_for_model("gemini-4-carbon") == ("low", "medium", "high")
+    with pytest.raises(ValueError):
+        _normalize_effort("xhigh-plus", "gemini-4-hydrogen")
+
+
+def test_effort_levels_for_agy_hydrogen():
+    from commands import _effort_levels_for
+
+    assert _effort_levels_for("agy", "gemini-4-hydrogen")[0] == ("low", "medium", "high", "xhigh")
+    assert _effort_levels_for("agy", "agy-argon")[0] == ("low", "medium", "high")

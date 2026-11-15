@@ -87,6 +87,13 @@ _EFFORT_FALLBACK = {
 }
 DEFAULT_EFFORT = "high"
 
+# 少数模型比上面三档多一档 xhigh（agy 1.5.8 `agy models` 实测：只有
+# gemini-4-hydrogen 有 -xhigh 变体；Argon / Carbon 仍是三档）。键是裸模型名。
+# 这些模型上 cc-lark 的 xhigh / max 收敛到 xhigh，其余模型照旧收敛到 high。
+_MODEL_EXTRA_EFFORTS: dict[str, tuple[str, ...]] = {
+    "gemini-4-hydrogen": ("xhigh",),
+}
+
 # agy 里**不接受 `--effort`** 的模型（`agy models` 显示它们没有 -high/-medium/-low
 # 档位变体）。给它们传 --effort 会直接报
 #   `invalid model selection (... --effort "high"): --effort is not supported for model ...`
@@ -338,15 +345,43 @@ def ensure_cc_lark_mcp(path: str = AGY_MCP_CONFIG_PATH) -> bool:
     return True
 
 
-def _normalize_effort(effort: Optional[str]) -> Optional[str]:
-    """把 cc-lark 的七档 effort 收敛到 agy 的三档；空值返回 None。"""
+def _bare_model(model: Optional[str]) -> str:
+    """去掉 google/ 前缀、解析 cc-lark 别名后的小写模型名（不去档位后缀）。"""
+    m = (model or "").strip().lower()
+    if m.startswith("google/"):
+        m = m[len("google/"):]
+    try:
+        from commands import MODEL_ALIASES
+        m = MODEL_ALIASES.get(m, m).lower()
+    except Exception:
+        pass
+    if m.startswith("google/"):
+        m = m[len("google/"):]
+    return m
+
+
+def effort_levels_for_model(model: Optional[str]) -> tuple[str, ...]:
+    """该 agy 模型可用的 `--effort` 档位（Hydrogen 多一档 xhigh）。"""
+    return AGY_EFFORT_LEVELS + _MODEL_EXTRA_EFFORTS.get(_bare_model(model), ())
+
+
+def _normalize_effort(effort: Optional[str], model: Optional[str] = None) -> Optional[str]:
+    """把 cc-lark 的七档 effort 收敛到该模型支持的档位；空值返回 None。
+
+    一般模型只有 low/medium/high（xhigh/max → high）；有 xhigh 的模型
+    （gemini-4-hydrogen）xhigh 原样、max → xhigh。
+    """
     e = (effort or "").strip().lower()
     if not e:
         return None
-    e = _EFFORT_FALLBACK.get(e, e)
-    if e not in AGY_EFFORT_LEVELS:
+    levels = effort_levels_for_model(model)
+    if e == "max" and "xhigh" in levels:
+        e = "xhigh"
+    elif e not in levels:
+        e = _EFFORT_FALLBACK.get(e, e)
+    if e not in levels:
         raise ValueError(
-            f"invalid agy effort {effort!r}; expected one of {list(AGY_EFFORT_LEVELS)}"
+            f"invalid agy effort {effort!r}; expected one of {list(levels)}"
         )
     return e
 
@@ -363,9 +398,8 @@ def _resolve_model_effort(
       AGY_DEFAULT_MODEL 或 gemini-3.8-flash，绝不往 agy CLI 传非法模型。
     """
     m = (model or "").strip()
-    e = _normalize_effort(effort)
     if not m:
-        return None, e
+        return None, _normalize_effort(effort)
 
     # 别名与格式归一：如 google/gemini-3.8-flash → gemini-3.8-flash
     if m.lower().startswith("google/"):
@@ -394,11 +428,16 @@ def _resolve_model_effort(
     if model_ignores_effort(m):
         return m, None
 
-    for level in AGY_EFFORT_LEVELS:
+    # 已带档位后缀（gemini-3.8-flash-high / gemini-4-hydrogen-xhigh）：原样传。
+    # 注意 "-xhigh" 不以 "-high" 结尾，所以 xhigh 要单独列出来。
+    for level in AGY_EFFORT_LEVELS + ("xhigh",):
         if m.endswith(f"-{level}"):
             return m, None
+    e = _normalize_effort(effort, m)
     default = (os.getenv("AGY_EFFORT") or DEFAULT_EFFORT).strip().lower()
-    if default not in AGY_EFFORT_LEVELS:
+    try:
+        default = _normalize_effort(default, m) or DEFAULT_EFFORT
+    except ValueError:
         default = DEFAULT_EFFORT
     return m, e or default
 
