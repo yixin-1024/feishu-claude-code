@@ -445,3 +445,86 @@ def test_card_groups_buttons_under_label(monkeypatch):
     assert [c["elements"][0]["text"]["content"] for c in els[4]["columns"]] == ["Fable", "● Opus"]
     assert els[5]["content"] == "🖥️ **服务器状态**"
     assert all("group" not in c["elements"][0]["value"] for c in els[4]["columns"])
+
+
+# ── 全局默认推理强度（2026-11-15 用户要的）──────────────────────────
+
+def _effort_buttons(out):
+    return [b for b in out["buttons"] if b["value"]["cmd"].startswith(commands.ALL_EFFORT_PREFIX)]
+
+
+def test_all_shows_effort_row_after_model_row(monkeypatch, tmp_path):
+    main = _bot("main")
+    _model_env(monkeypatch, tmp_path, [main])
+    monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
+    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "oc_chat", main.store, bot=main))
+    row = _effort_buttons(out)
+    assert [b["text"] for b in row] == ["Low", "Medium", "High", "● XHigh", "Max"]
+    assert {b["group"] for b in row} == {commands.GLOBAL_EFFORT_LABEL}
+    cmds = [b["value"]["cmd"] for b in out["buttons"]]
+    assert cmds.index("/all effort low") > cmds.index("/all model haiku")
+
+
+def test_all_effort_row_without_config_says_cli_default(monkeypatch, tmp_path):
+    main = _bot("main")
+    _model_env(monkeypatch, tmp_path, [main])
+    monkeypatch.delenv("CLAUDE_EFFORT", raising=False)
+    out = asyncio.run(commands.handle_command("all", "", "ou_admin", "oc_chat", main.store, bot=main))
+    row = _effort_buttons(out)
+    assert not any(b["text"].startswith("● ") for b in row)
+    assert row[0]["group"].endswith("CLI 默认")
+
+
+def test_all_effort_hidden_for_non_admin(monkeypatch, tmp_path):
+    main = _bot("main")
+    _model_env(monkeypatch, tmp_path, [main])
+    out = asyncio.run(commands.handle_command("all", "", "ou_someone", "oc_chat", main.store, bot=main))
+    assert _effort_buttons(out) == []
+
+
+def test_all_effort_sets_env_and_persists(monkeypatch, tmp_path):
+    import os
+    main = _bot("main")
+    env = _model_env(monkeypatch, tmp_path, [main])
+    env.write_text(env.read_text() + "CLAUDE_EFFORT=xhigh\n")
+    monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
+
+    out = asyncio.run(commands.handle_command("all", "effort high", "ou_admin", "oc_chat", main.store, bot=main))
+
+    assert os.environ["CLAUDE_EFFORT"] == "high"
+    lines = env.read_text().splitlines()
+    assert "CLAUDE_EFFORT=high" in lines and "CLAUDE_EFFORT=xhigh" not in lines
+    assert out["text"].split("\n")[2].startswith("剩余")  # 成功不写
+    assert [b["text"] for b in _effort_buttons(out)] == ["Low", "Medium", "● High", "XHigh", "Max"]
+    # 卡上 /effort 显示的「跟随默认」也跟着变（runner 每次 spawn 读的就是这个）
+    assert commands._profile_default_effort(main.store, main, "claude") == "high"
+    assert main.store.default_model == "opus[1m]"  # 模型不动
+
+
+def test_all_effort_refused_and_unknown(monkeypatch, tmp_path):
+    import os
+    main = _bot("main")
+    env = _model_env(monkeypatch, tmp_path, [main])
+    monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
+    before = env.read_text()
+
+    out = asyncio.run(commands.handle_command("all", "effort low", "ou_someone", "oc_chat", main.store, bot=main))
+    assert out["text"].split("\n")[2] == "⛔ 只有管理员能改全局默认推理强度"
+    out = asyncio.run(commands.handle_command("all", "effort ultra", "ou_admin", "oc_chat", main.store, bot=main))
+    assert out["text"].split("\n")[2].startswith("❌ 不认识的强度 `ultra`")
+    assert os.environ["CLAUDE_EFFORT"] == "xhigh" and env.read_text() == before
+
+
+def test_all_effort_warns_bot_with_own_env_file(monkeypatch, tmp_path):
+    main, research = _bot("main"), _bot("research")
+    _model_env(monkeypatch, tmp_path, [main, research])
+    own = tmp_path / ".env.research"
+    own.write_text("CLAUDE_EFFORT=max\n")
+    research.profile.claude_env_file = str(own)
+    monkeypatch.setenv("CLAUDE_EFFORT", "xhigh")
+    out = asyncio.run(commands.handle_command("all", "effort low", "ou_admin", "oc_chat", main.store, bot=main))
+    assert out["text"].split("\n")[2] == "⚠️ 这些 bot 自己的 env 文件钉了强度，不跟：research=max"
+
+
+def test_all_effort_toast():
+    assert commands.run_cmd_toast("/all effort xhigh") == "正在把默认推理强度改成 XHigh…"

@@ -278,7 +278,7 @@ HELP_TEXT = """\
 `/accounts` — 账户全景（Claude runner：Max 用量 + 智能切换状态；agy runner：Antigravity 账号）
 `/switch <账户>` — 切换本机全局账户（Claude Code；agy runner 下切 Antigravity 账号，`/switch save [名字]` 存当前号）
 `/server` 或 `/sys` — 本机 CPU / 负载 / 内存 / 磁盘 / 进程一屏看
-`/all` — 用量 + 服务器状态一张卡（刷新按钮两块一起刷）；管理员还能在卡上一键换全局默认模型（Fable / Opus / Sonnet / Haiku，所有 Claude bot 的新话题都用它，也可发 `/all model fable`）
+`/all` — 用量 + 服务器状态一张卡（刷新按钮两块一起刷）；管理员还能在卡上一键换全局默认模型（Fable / Opus / Sonnet / Haiku）和默认推理强度（Low ~ Max），所有 Claude bot 的新话题都用它（也可发 `/all model fable`、`/all effort high`）
 
 **审计：**
 `/verify [关注点]` — 在话题群里开新 session，审上方整段对话（既审 bot 的回答也审代码改动）
@@ -368,6 +368,8 @@ def run_cmd_toast(cmd_text: str) -> str:
         return f"正在切换到 {cmd_text[len(ALL_SWITCH_PREFIX):].strip()}…"
     if cmd_text.startswith(ALL_MODEL_PREFIX):
         return f"正在把默认模型改成 {cmd_text[len(ALL_MODEL_PREFIX):].strip().capitalize()}…"
+    if cmd_text.startswith(ALL_EFFORT_PREFIX):
+        return f"正在把默认推理强度改成 {_effort_name(cmd_text[len(ALL_EFFORT_PREFIX):].strip().lower())}…"
     return cmd_text
 
 
@@ -1094,6 +1096,65 @@ def _all_model_buttons(bot, chat_id: str) -> list[dict]:
     ]
 
 
+# /all 卡片上「全局默认推理强度」那排按钮：`/all effort <档位>`（用户 2026-11-15 要的）。
+# Claude bot 的默认强度只有一个来源：进程环境 CLAUDE_EFFORT（runner 每次 spawn 时实时读），
+# 所以改它就是改所有 Claude bot。实时改 os.environ + 写 .env（重启后仍在）。
+# 话题里 /effort、/max 这类钉的覆盖仍然优先；profile 的 claude env 文件里单独写了
+# CLAUDE_EFFORT 的 bot 也不跟（runner 里那个优先级更高），会在卡上提示。
+ALL_EFFORT_PREFIX = "/all effort "
+GLOBAL_EFFORT_CHOICES: Tuple[str, ...] = CLAUDE_EFFORT_LEVELS
+GLOBAL_EFFORT_LABEL = "**全局默认推理强度**"
+_EFFORT_NAMES = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "XHigh", "max": "Max"}
+
+
+def _effort_name(level: str) -> str:
+    return _EFFORT_NAMES.get(level, level.capitalize())
+
+
+def _set_global_default_effort(bot, level: str) -> str:
+    """把 Claude bot 的默认推理强度改成 level：内存（os.environ）实时改 + 写 .env。
+    返回要写在卡片标题下面的一行；完全成功返回空串（按钮上的 ● 自己会换）。"""
+    level = (level or "").strip().lower()
+    if not level:
+        return f"用法：`/all effort {'|'.join(GLOBAL_EFFORT_CHOICES)}`"
+    if level not in GLOBAL_EFFORT_CHOICES:
+        return f"❌ 不认识的强度 `{level}`，可选 {' / '.join(GLOBAL_EFFORT_CHOICES)}"
+
+    os.environ["CLAUDE_EFFORT"] = level
+    _, info = group_allowlist.set_env_line("CLAUDE_EFFORT", level)
+    if info.startswith("❌"):
+        return f"⚠️ 已生效，但没写进 .env（重启会丢）：{info}"
+
+    pinned = []
+    for b in _claude_bots(bot):
+        own = (load_claude_extra_env(b.profile).get("CLAUDE_EFFORT") or "").strip().lower()
+        if own and own != level:
+            pinned.append(f"{b.profile.name}={own}")
+    if pinned:
+        return f"⚠️ 这些 bot 自己的 env 文件钉了强度，不跟：{'、'.join(pinned)}"
+    return ""
+
+
+def _all_effort_buttons(chat_id: str) -> list[dict]:
+    """「全局默认推理强度」那排按钮，当前的前面带 ●；没配就是 CLI 默认，写在小标题里。"""
+    current = (os.getenv("CLAUDE_EFFORT") or "").strip().lower()
+    on = current if current in GLOBAL_EFFORT_CHOICES else ""
+    if on:
+        label = GLOBAL_EFFORT_LABEL
+    elif current:
+        label = f"{GLOBAL_EFFORT_LABEL}：`{current}`"
+    else:
+        label = f"{GLOBAL_EFFORT_LABEL}：CLI 默认"
+    return [
+        {
+            "text": ("● " if level == on else "") + _effort_name(level),
+            "group": label,
+            "value": {"action": "run_cmd", "cmd": ALL_EFFORT_PREFIX + level, "cid": chat_id},
+        }
+        for level in GLOBAL_EFFORT_CHOICES
+    ]
+
+
 async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, bot=None) -> "str | dict":
     """/all：用量 + 服务器状态一张卡，刷新按钮两块一起刷，右上角是刷新时间。
 
@@ -1115,15 +1176,16 @@ async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, b
         first = (result or "").split("\n", 1)[0].strip()
         if first and not first.startswith("✅"):
             headline = first  # 切成功了卡上自然能看出来（● 换了），只有失败才写一行
-    elif sub and sub[0].lower() == "model":
+    elif sub and sub[0].lower() in ("model", "effort"):
         # 改的是所有 Claude bot、所有群，比 /restart 还大，只给管理员
+        what = "模型" if sub[0].lower() == "model" else "推理强度"
+        setter = _set_global_default_model if sub[0].lower() == "model" else _set_global_default_effort
         if bot is None:
             headline = "❌ 内部错误：缺少 bot 上下文"
         elif not is_admin:
-            headline = "⛔ 只有管理员能改全局默认模型"
+            headline = f"⛔ 只有管理员能改全局默认{what}"
         else:
-            headline = await asyncio.to_thread(
-                _set_global_default_model, bot, sub[1] if len(sub) == 2 else "")
+            headline = await asyncio.to_thread(setter, bot, sub[1] if len(sub) == 2 else "")
 
     async def _usage():
         if runner == "claude":
@@ -1145,7 +1207,7 @@ async def _get_all(args: str, user_id: str, chat_id: str, store: SessionStore, b
         return f"{usage_text}\n\n{server}"
     all_buttons = _all_buttons(buttons, chat_id)
     if is_admin and str(getattr(bot.profile, "runner", "")).lower() == "claude":
-        all_buttons += _all_model_buttons(bot, chat_id)
+        all_buttons += _all_model_buttons(bot, chat_id) + _all_effort_buttons(chat_id)
     now = datetime.now(server_stats._TZ)
     return {
         "text": usage_text,
