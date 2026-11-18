@@ -2953,17 +2953,30 @@ async def handle_command(
                     {"text": "🆓 Nemotron 3 Ultra", "value": {"action": "run_cmd", "cmd": "/model maka-free", "cid": chat_id}},
                 ]
             elif runner == "agy":
-                buttons = [
-                    {"text": "💧 Gemini 4 Hydrogen", "value": {"action": "run_cmd", "cmd": "/model agy-hydrogen", "cid": chat_id}},
-                    {"text": "🪨 Gemini 4 Carbon", "value": {"action": "run_cmd", "cmd": "/model agy-carbon", "cid": chat_id}},
-                    {"text": "🔆 Gemini 4 Argon", "value": {"action": "run_cmd", "cmd": "/model agy-argon", "cid": chat_id}},
-                    {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-38", "cid": chat_id}},
-                    {"text": "Gemini 3.7 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-37", "cid": chat_id}},
-                    {"text": "Gemini 3.6 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-36", "cid": chat_id}},
-                    {"text": "💎 Gemini 3.1 Pro", "value": {"action": "run_cmd", "cmd": "/model agy-pro", "cid": chat_id}},
-                    {"text": "🧠 Claude Opus 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-opus", "cid": chat_id}},
-                    {"text": "⚡ Claude Sonnet 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-sonnet", "cid": chat_id}},
-                ]
+                # 两条鉴权通道的模型表不重叠（agy 1.5.9 `agy models` 实测）：
+                #   API key：Gemini 4 三款 + 3.8/3.7/3.6 Flash + 3.1 Pro，没有 Claude/GPT；
+                #   OAuth 订阅：只有 3.8 Flash + Claude 4.6 两款 + GPT-OSS，没有 Gemini 4。
+                # 点了另一边的模型 agy 会直接报 not recognized，所以只列本 bot 那条通道的。
+                # 拿不到 profile 时按 bot_config 的默认（agy_model_provider="gemini"）算 API key。
+                agy_profile = getattr(bot, "profile", None)
+                agy_api_key_mode = bool(_agy_api_key_provider(agy_profile)) if agy_profile is not None else True
+                if agy_api_key_mode:
+                    buttons = [
+                        {"text": "💧 Gemini 4 Hydrogen", "value": {"action": "run_cmd", "cmd": "/model agy-hydrogen", "cid": chat_id}},
+                        {"text": "🪨 Gemini 4 Carbon", "value": {"action": "run_cmd", "cmd": "/model agy-carbon", "cid": chat_id}},
+                        {"text": "🔆 Gemini 4 Argon", "value": {"action": "run_cmd", "cmd": "/model agy-argon", "cid": chat_id}},
+                        {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-38", "cid": chat_id}},
+                        {"text": "Gemini 3.7 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-37", "cid": chat_id}},
+                        {"text": "Gemini 3.6 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-36", "cid": chat_id}},
+                        {"text": "💎 Gemini 3.1 Pro", "value": {"action": "run_cmd", "cmd": "/model agy-pro", "cid": chat_id}},
+                    ]
+                else:
+                    buttons = [
+                        {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-38", "cid": chat_id}},
+                        {"text": "🧠 Claude Opus 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-opus", "cid": chat_id}},
+                        {"text": "⚡ Claude Sonnet 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-sonnet", "cid": chat_id}},
+                        {"text": "GPT-OSS 120B", "value": {"action": "run_cmd", "cmd": "/model agy-gpt", "cid": chat_id}},
+                    ]
             elif runner == "qoder":
                 buttons = [
                     {"text": "🆓 Qwen3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model qoder-qwen-flash", "cid": chat_id}},
