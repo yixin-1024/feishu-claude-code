@@ -116,16 +116,28 @@ def cli_args(session_id: str, opt: Optional[dict]) -> list[str]:
 # ── 从会话记录里找回退点 ────────────────────────────────────────────────
 
 
+# /context /recap /goal 这类在 CLI 本地跑的斜杠命令，会留一条 type=user 的记录
+# （<command-name>/context</command-name>…），不算用户说的一轮（11-19 实测）
+_LOCAL_COMMAND_PREFIXES = ("<command-name>", "<local-command-", "<command-message>")
+
+
 def _is_real_user_turn(rec: dict) -> bool:
     if rec.get("type") != "user" or rec.get("isMeta") or rec.get("isCompactSummary"):
         return False
     content = (rec.get("message") or {}).get("content")
     if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
+        text = content.strip()
+    elif isinstance(content, list):
         kinds = {c.get("type") for c in content if isinstance(c, dict)}
-        return "tool_result" not in kinds and bool(kinds & {"text", "image", "document"})
-    return False
+        if "tool_result" in kinds or not (kinds & {"text", "image", "document"}):
+            return False
+        text = " ".join(c.get("text", "") for c in content
+                        if isinstance(c, dict) and c.get("type") == "text").strip()
+        if not text:
+            return True  # 只有图片 / 文件也是用户发的一轮
+    else:
+        return False
+    return bool(text) and not text.startswith(_LOCAL_COMMAND_PREFIXES)
 
 
 def _preview(rec: dict, limit: int = 40) -> str:

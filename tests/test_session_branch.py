@@ -84,6 +84,27 @@ def test_rewind_target_walks_active_branch(tmp_path):
         session_branch.rewind_target(str(f), 3)
 
 
+def test_rewind_skips_local_slash_command_records(tmp_path):
+    f = tmp_path / "s.jsonl"
+    _write_session(f, [
+        _u("u1", None, "跑 ping"), _a("a1", "u1"),
+        _u("u2", "a1", "跑 python"), _a("a2", "u2"),
+        {"type": "user", "uuid": "m1", "parentUuid": "a2", "isMeta": True,
+         "message": {"role": "user", "content": "<local-command-caveat>…</local-command-caveat>"}},
+        _u("c1", "m1", "<command-name>/context</command-name>\n<command-message>context</command-message>"),
+        {"type": "system", "subtype": "local_command", "uuid": "s1", "parentUuid": "c1",
+         "content": "<local-command-stdout>## Context Usage</local-command-stdout>"},
+        {"type": "user", "uuid": "img", "parentUuid": "s1",
+         "message": {"role": "user", "content": [{"type": "image", "source": {}}]}},
+        _a("a3", "img"),
+    ])
+    # 最后一轮是那张图；/context 不算一轮，再往前一轮是「跑 python」
+    target, undone = session_branch.rewind_target(str(f), 1)
+    assert target == "a2" and undone == [""]  # 只有图片：预览为空，回复里显示成「附件 / 空消息」
+    target, undone = session_branch.rewind_target(str(f), 2)
+    assert target == "a1" and undone[0] == "跑 python"
+
+
 async def test_runner_passes_and_consumes_branch_args(monkeypatch):
     import claude_runner
     from tests.test_claude_runner_stream_input import FakeProc, _result
