@@ -128,9 +128,11 @@ MODEL_ALIASES = {
     # 免得裸名 + /effort medium 被 agy 判成 invalid model selection
     "agy-pro": "gemini-3.1-pro-high",
     "agy-pro-low": "gemini-3.1-pro-low",
-    # Gemini 4（agy 1.5.8 起内置）。只在 API key 通道可用——订阅 OAuth 的
-    # `agy models` 里没有它们；Argon / Carbon 还要求 key 所在项目开了计费
-    # （免费档配额是 0，直接 429），Hydrogen 免费档能跑。Hydrogen 多一档 xhigh。
+    # Gemini 4（agy 1.5.8 起内置，Neon 1.5.12 起）。只在 API key 通道可用——
+    # 订阅 OAuth 的 `agy models` 里没有它们；Argon / Carbon 还要求 key 所在项目
+    # 开了计费（免费档配额是 0，直接 429），Hydrogen 免费档能跑。
+    # Hydrogen / Neon 多一档 xhigh。
+    "agy-neon": "gemini-4-neon",
     "agy-hydrogen": "gemini-4-hydrogen",
     "agy-carbon": "gemini-4-carbon",
     "agy-argon": "gemini-4-argon",
@@ -2954,7 +2956,7 @@ async def handle_command(
                 ]
             elif runner == "agy":
                 # 两条鉴权通道的模型表不重叠（agy 1.5.9 `agy models` 实测）：
-                #   API key：Gemini 4 三款 + 3.8/3.7/3.6 Flash + 3.1 Pro，没有 Claude/GPT；
+                #   API key：Gemini 4 四款 + 3.8/3.7/3.6 Flash + 3.1 Pro，没有 Claude/GPT；
                 #   OAuth 订阅：只有 3.8 Flash + Claude 4.6 两款 + GPT-OSS，没有 Gemini 4。
                 # 点了另一边的模型 agy 会直接报 not recognized，所以只列本 bot 那条通道的。
                 # 拿不到 profile 时按 bot_config 的默认（agy_model_provider="gemini"）算 API key。
@@ -2962,6 +2964,7 @@ async def handle_command(
                 agy_api_key_mode = bool(_agy_api_key_provider(agy_profile)) if agy_profile is not None else True
                 if agy_api_key_mode:
                     buttons = [
+                        {"text": "✴️ Gemini 4 Neon", "value": {"action": "run_cmd", "cmd": "/model agy-neon", "cid": chat_id}},
                         {"text": "💧 Gemini 4 Hydrogen", "value": {"action": "run_cmd", "cmd": "/model agy-hydrogen", "cid": chat_id}},
                         {"text": "🪨 Gemini 4 Carbon", "value": {"action": "run_cmd", "cmd": "/model agy-carbon", "cid": chat_id}},
                         {"text": "🔆 Gemini 4 Argon", "value": {"action": "run_cmd", "cmd": "/model agy-argon", "cid": chat_id}},

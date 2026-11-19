@@ -87,11 +87,12 @@ _EFFORT_FALLBACK = {
 }
 DEFAULT_EFFORT = "high"
 
-# 少数模型比上面三档多一档 xhigh（agy 1.5.8 `agy models` 实测：只有
-# gemini-4-hydrogen 有 -xhigh 变体；Argon / Carbon 仍是三档）。键是裸模型名。
+# 少数模型比上面三档多一档 xhigh（`agy models` 实测：1.5.8 的 gemini-4-hydrogen、
+# 1.5.12 的 gemini-4-neon 有 -xhigh 变体；Argon / Carbon 仍是三档）。键是裸模型名。
 # 这些模型上 cc-lark 的 xhigh / max 收敛到 xhigh，其余模型照旧收敛到 high。
 _MODEL_EXTRA_EFFORTS: dict[str, tuple[str, ...]] = {
     "gemini-4-hydrogen": ("xhigh",),
+    "gemini-4-neon": ("xhigh",),
 }
 
 # agy 里**不接受 `--effort`** 的模型（`agy models` 显示它们没有 -high/-medium/-low
@@ -361,7 +362,7 @@ def _bare_model(model: Optional[str]) -> str:
 
 
 def effort_levels_for_model(model: Optional[str]) -> tuple[str, ...]:
-    """该 agy 模型可用的 `--effort` 档位（Hydrogen 多一档 xhigh）。"""
+    """该 agy 模型可用的 `--effort` 档位（Hydrogen / Neon 多一档 xhigh）。"""
     return AGY_EFFORT_LEVELS + _MODEL_EXTRA_EFFORTS.get(_bare_model(model), ())
 
 
@@ -369,7 +370,7 @@ def _normalize_effort(effort: Optional[str], model: Optional[str] = None) -> Opt
     """把 cc-lark 的七档 effort 收敛到该模型支持的档位；空值返回 None。
 
     一般模型只有 low/medium/high（xhigh/max → high）；有 xhigh 的模型
-    （gemini-4-hydrogen）xhigh 原样、max → xhigh。
+    （gemini-4-hydrogen / gemini-4-neon）xhigh 原样、max → xhigh。
     """
     e = (effort or "").strip().lower()
     if not e:

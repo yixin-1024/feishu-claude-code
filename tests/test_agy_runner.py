@@ -1758,11 +1758,12 @@ def test_load_profile_reads_agy_home(monkeypatch):
 
 
 def test_gemini4_aliases_and_hydrogen_xhigh(monkeypatch):
-    """Gemini 4（agy 1.5.8 内置）：别名可用；只有 Hydrogen 多一档 xhigh。"""
+    """Gemini 4（agy 1.5.8 内置，Neon 1.5.12）：别名可用；Hydrogen / Neon 多一档 xhigh。"""
     monkeypatch.delenv("AGY_EFFORT", raising=False)
     from bot_config import is_model_compatible_with_runner
 
     for alias, model in (
+        ("agy-neon", "gemini-4-neon"),
         ("agy-hydrogen", "gemini-4-hydrogen"),
         ("agy-carbon", "gemini-4-carbon"),
         ("agy-argon", "gemini-4-argon"),
@@ -1774,6 +1775,10 @@ def test_gemini4_aliases_and_hydrogen_xhigh(monkeypatch):
     # Hydrogen：xhigh 原样，max → xhigh
     assert _resolve_model_effort("agy-hydrogen", "xhigh") == ("gemini-4-hydrogen", "xhigh")
     assert _resolve_model_effort("gemini-4-hydrogen", "max") == ("gemini-4-hydrogen", "xhigh")
+    # Neon（agy 1.5.12）同样有 xhigh
+    assert _resolve_model_effort("agy-neon", "xhigh") == ("gemini-4-neon", "xhigh")
+    assert _resolve_model_effort("gemini-4-neon", "max") == ("gemini-4-neon", "xhigh")
+    assert agy_runner.effort_levels_for_model("agy-neon") == ("low", "medium", "high", "xhigh")
     # 已带档位后缀（含 -xhigh）原样传，不再给 --effort
     assert _resolve_model_effort("gemini-4-hydrogen-xhigh", "low") == ("gemini-4-hydrogen-xhigh", None)
     # Argon / Carbon / Flash 只有三档：xhigh、max 收敛到 high

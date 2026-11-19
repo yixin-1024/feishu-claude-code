@@ -48,7 +48,7 @@ async def _picker_models(store, bot):
 @pytest.mark.asyncio
 async def test_api_key_bot_lists_gemini4_and_no_claude(agy_store):
     models = await _picker_models(agy_store, _bot("gemini"))
-    assert {"gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen"} <= models
+    assert {"gemini-4-neon", "gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen"} <= models
     assert not any(m.startswith(("claude-", "gpt-")) for m in models)
 
 
