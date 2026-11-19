@@ -245,6 +245,13 @@ def resolve_target_agent(
     if want:
         cands = [b for b in bots.values() if b.profile.runner == want]
         if chat_id:
+            # 一个群只属于一个租户，调用方一定在这个群里：同族里先留和调用方同渠道
+            # （lark / feishu）的。群白名单写 "*" 的 bot 在 _bot_serves_chat 眼里哪个群
+            # 都能进，光靠它分不出飞书群里该派飞书的 codex 还是 Lark 的 GPT。
+            caller = bots.get(exclude) if exclude else None
+            plat = getattr(getattr(caller, "profile", None), "platform", "") if caller else ""
+            if plat:
+                cands = [b for b in cands if getattr(b.profile, "platform", "") == plat] or cands
             cands = [b for b in cands if _bot_serves_chat(b, chat_id)] or cands
             mine = [b for b in cands if b.profile.name == exclude]
             if mine:

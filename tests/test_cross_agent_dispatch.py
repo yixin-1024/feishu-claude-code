@@ -144,3 +144,47 @@ def test_explicit_profile_name_still_wins_over_chat_filter():
     b, err = resolve_target_agent(_chat_bots(), "seesaw", exclude="spx", chat_id=CHAT)
     assert err == ""
     assert b.profile.name == "seesaw"
+
+
+# ── 两个租户各有同族 bot、白名单都写 "*" 时，按调用方渠道挑 ─────────────
+#
+# 服务器上 Lark 的 GPT(codex) 和飞书的 codex 都是 "*"：飞书群里 research(claude)
+# 派 agent="gpt"，必须拿到飞书那个，不能拿到进不了飞书群的 Lark GPT。
+
+def _two_tenant_bots():
+    def mk(name, runner, platform):
+        b = _B(name, runner, {"*"})
+        b.profile.platform = platform
+        return b
+    return {
+        "main": mk("main", "claude", "lark"),
+        "larkgpt": mk("larkgpt", "codex", "lark"),
+        "antigravity": mk("antigravity", "agy", "lark"),
+        "research": mk("research", "claude", "feishu"),
+        "fscodex": mk("fscodex", "codex", "feishu"),
+        "fsgemini": mk("fsgemini", "agy", "feishu"),
+    }
+
+
+def test_alias_picks_same_platform_as_caller_in_feishu_chat():
+    b, err = resolve_target_agent(_two_tenant_bots(), "gpt", exclude="research", chat_id=CHAT)
+    assert err == ""
+    assert b.profile.name == "fscodex"
+    b, err = resolve_target_agent(_two_tenant_bots(), "agy", exclude="research", chat_id=CHAT)
+    assert b.profile.name == "fsgemini"
+
+
+def test_alias_picks_same_platform_as_caller_in_lark_chat():
+    b, err = resolve_target_agent(_two_tenant_bots(), "gpt", exclude="main", chat_id=CHAT)
+    assert err == ""
+    assert b.profile.name == "larkgpt"
+    b, err = resolve_target_agent(_two_tenant_bots(), "claude", exclude="fscodex", chat_id=CHAT)
+    assert b.profile.name == "research"
+
+
+def test_platform_filter_falls_back_when_no_same_platform_candidate():
+    bots = _two_tenant_bots()
+    del bots["fscodex"]
+    b, err = resolve_target_agent(bots, "gpt", exclude="research", chat_id=CHAT)
+    assert err == ""
+    assert b.profile.name == "larkgpt"
