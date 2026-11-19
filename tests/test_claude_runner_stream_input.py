@@ -308,3 +308,122 @@ async def test_soft_stop_never_respawns(monkeypatch):
     text, sid, fresh = await asyncio.wait_for(task, 2)
     assert len(spawned) == 1, "软停后又拉了新进程"
     assert fresh is False
+
+
+# ── 控制请求：/btw（side_question）与撤回排队插话（cancel_async_message）──────────
+# 形状照 CLI 2.1.327 实测：control_response.response = {subtype, request_id, response|error}
+
+
+def _ctrl_ok(rid, response):
+    return {"type": "control_response",
+            "response": {"subtype": "success", "request_id": rid, "response": response}}
+
+
+def _last_ctrl(proc, subtype):
+    reqs = [l for l in proc.stdin.lines
+            if l.get("type") == "control_request" and l["request"]["subtype"] == subtype]
+    return reqs[-1] if reqs else None
+
+
+async def test_side_question_answers_without_touching_the_turn(fake_proc):
+    got = {}
+
+    async def on_ready(run_input):
+        got["input"] = run_input
+
+    task = asyncio.create_task(run_claude("跑个长命令", on_input_ready=on_ready))
+    await _wait_for(lambda: "input" in got)
+    ri = got["input"]
+    first_uid = fake_proc.stdin.lines[0]["uuid"]
+    fake_proc.stdout.feed(_life(first_uid, "started"))
+
+    q = asyncio.create_task(ri.side_question("你在干嘛"))
+    await _wait_for(lambda: _last_ctrl(fake_proc, "side_question"))
+    req = _last_ctrl(fake_proc, "side_question")
+    assert req["request"]["question"] == "你在干嘛"
+    fake_proc.stdout.feed({"type": "system", "subtype": "control_request_progress",
+                           "request_id": req["request_id"], "status": "started"})
+    fake_proc.stdout.feed(_ctrl_ok(req["request_id"], {"response": "在跑 sleep", "synthetic": False}))
+    assert await asyncio.wait_for(q, 2) == "在跑 sleep"
+    # 旁路提问不算一条用户消息，主轮照常收尾
+    assert [l for l in fake_proc.stdin.lines if l.get("type") == "user"] == [fake_proc.stdin.lines[0]]
+    fake_proc.stdout.feed(_result("完成", [first_uid]))
+    text, sid, _ = await asyncio.wait_for(task, 2)
+    assert text == "完成" and fake_proc.stdin.closed
+
+
+async def test_side_question_keeps_stdin_open_until_answered(fake_proc):
+    got = {}
+
+    async def on_ready(run_input):
+        got["input"] = run_input
+
+    task = asyncio.create_task(run_claude("hi", on_input_ready=on_ready))
+    await _wait_for(lambda: "input" in got)
+    ri = got["input"]
+    first_uid = fake_proc.stdin.lines[0]["uuid"]
+    q = asyncio.create_task(ri.side_question("顺便问"))
+    await _wait_for(lambda: _last_ctrl(fake_proc, "side_question"))
+    req = _last_ctrl(fake_proc, "side_question")
+    # 主轮先结束：回答还没来，stdin 不能关（关了 CLI 会拒答）
+    fake_proc.stdout.feed(_result("done", [first_uid]))
+    await asyncio.sleep(0.05)
+    assert not fake_proc.stdin.closed
+    fake_proc.stdout.feed(_ctrl_ok(req["request_id"], {"response": "答案", "synthetic": False}))
+    assert await asyncio.wait_for(q, 2) == "答案"
+    await asyncio.wait_for(task, 2)
+    assert fake_proc.stdin.closed
+
+
+async def test_side_question_synthetic_error_raises(fake_proc):
+    got = {}
+
+    async def on_ready(run_input):
+        got["input"] = run_input
+
+    task = asyncio.create_task(run_claude("hi", on_input_ready=on_ready))
+    await _wait_for(lambda: "input" in got)
+    q = asyncio.create_task(got["input"].side_question("x"))
+    await _wait_for(lambda: _last_ctrl(fake_proc, "side_question"))
+    req = _last_ctrl(fake_proc, "side_question")
+    fake_proc.stdout.feed(_ctrl_ok(req["request_id"], {"response": "(API error: auth)", "synthetic": True}))
+    with pytest.raises(RuntimeError, match="API error"):
+        await asyncio.wait_for(q, 2)
+    fake_proc.stdout.feed(_result("ok", [fake_proc.stdin.lines[0]["uuid"]]))
+    await asyncio.wait_for(task, 2)
+
+
+async def test_cancel_queued_injection(fake_proc):
+    got = {}
+
+    async def on_ready(run_input):
+        got["input"] = run_input
+
+    task = asyncio.create_task(run_claude("主任务", on_input_ready=on_ready))
+    await _wait_for(lambda: "input" in got)
+    ri = got["input"]
+    first_uid = fake_proc.stdin.lines[0]["uuid"]
+    fake_proc.stdout.feed(_life(first_uid, "started"))
+    uid = await ri.send("插一句", "next")
+    assert ri.is_pending(uid)
+    c = asyncio.create_task(ri.cancel_queued(uid))
+    await _wait_for(lambda: _last_ctrl(fake_proc, "cancel_async_message"))
+    req = _last_ctrl(fake_proc, "cancel_async_message")
+    assert req["request"]["message_uuid"] == uid
+    fake_proc.stdout.feed(_life(uid, "cancelled"))
+    fake_proc.stdout.feed(_ctrl_ok(req["request_id"], {"cancelled": True, "message_uuid": uid}))
+    assert await asyncio.wait_for(c, 2) is True
+    assert not ri.is_pending(uid) and ri.undelivered() == []
+    # 已开始处理的不发控制请求，直接撤不回
+    assert await ri.cancel_queued(first_uid) is False
+    fake_proc.stdout.feed(_result("完成", [first_uid]))
+    await asyncio.wait_for(task, 2)
+    assert fake_proc.stdin.closed
+
+
+async def test_control_after_close_raises():
+    proc = FakeProc()
+    ri = RunInput(proc)
+    ri.close()
+    with pytest.raises(RuntimeError):
+        await ri.side_question("x")

@@ -11,7 +11,9 @@
 # 白名单：真正想透传给 claude 内置 slash 的命令。其他 `/` 开头的会被
 # claude_pty._escape_for_pty 前置一个空格降级成普通文本（用户的 "/pwd" 通常是
 # 想让模型执行 pwd，不是触发 claude 内置）。
-CLAUDE_BUILTIN_PASSTHROUGH = ("/compact",)
+# /goal /context /recap /skill-doctor：2.1.327 起 -p 下都能当提示词用（supportsNonInteractive），
+# 2026-11-19 实测 /goal /context /recap 生效。
+CLAUDE_BUILTIN_PASSTHROUGH = ("/compact", "/goal", "/context", "/recap", "/skill-doctor")
 
 
 def is_builtin_passthrough(message: str) -> bool:

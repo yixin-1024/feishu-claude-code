@@ -317,6 +317,9 @@ class RunInput:
         # /stop 走的软停：进程会以退出码 1 退出，runner 不能把它当「resume 失败」再拉新进程
         self.stopped = False
         self._turn_ended = asyncio.Event()  # 每收到一个 result 置位
+        # 发出去、还没收到 control_response 的控制请求（side_question / cancel_async_message）。
+        # 有在等的就不关 stdin：关了 CLI 会按「正在退出」回绝，/btw 的回答就丢了。
+        self._ctrl_waiters: dict[str, asyncio.Future] = {}
         # dispatcher 挂的回调：某条插话开始被处理 / 每轮结束（参数是这一轮的最终文本）
         self.on_started: Optional[Callable[[str], Any]] = None
         self.on_turn_result: Optional[Callable[[str], Any]] = None
@@ -336,6 +339,10 @@ class RunInput:
             self._proc.stdin.close()
         except Exception:
             pass
+        for fut in self._ctrl_waiters.values():
+            if not fut.done():
+                fut.set_exception(RuntimeError("进程已收尾，控制请求没有拿到回应"))
+        self._ctrl_waiters.clear()
 
     def _write(self, obj: dict) -> bool:
         if not self.open:
@@ -434,6 +441,65 @@ class RunInput:
                 pass
         self.close()
 
+    async def control(self, request: dict, timeout: float = 60.0) -> dict:
+        """发一个 control_request，等同 request_id 的 control_response。
+
+        成功返回 response 里的 response 字段（dict）；CLI 回 error、超时、进程收尾都抛
+        RuntimeError。CLI 支持的 subtype 见二进制里的 `request.subtype===`（2.1.327）。
+        """
+        rid = f"cc-lark-{uuid.uuid4().hex[:12]}"
+        fut = asyncio.get_running_loop().create_future()
+        self._ctrl_waiters[rid] = fut
+        if not self._write({"type": "control_request", "request_id": rid, "request": request}):
+            self._ctrl_waiters.pop(rid, None)
+            raise RuntimeError("进程已收尾，写不进控制请求")
+        await self._drain()
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"{timeout:.0f} 秒内没等到回应")
+        finally:
+            self._ctrl_waiters.pop(rid, None)
+            self._maybe_close()
+
+    async def side_question(self, question: str, timeout: float = 180.0) -> str:
+        """/btw：基于当前对话旁路回答一个问题，不打断正在跑的这一轮，也不写进主对话。
+
+        实测（2.1.327）主轮在跑前台长命令时问，约 1.5s 回答，主轮照常跑完。
+        """
+        resp = await self.control({"subtype": "side_question", "question": question}, timeout)
+        answer = str((resp or {}).get("response") or "").strip()
+        if (resp or {}).get("synthetic"):
+            # synthetic = CLI 自己拼的错误文本（如鉴权失败），不是模型的回答
+            raise RuntimeError(answer or "旁路提问失败")
+        return answer
+
+    def is_pending(self, uid: str) -> bool:
+        """这条插话写进去了、模型还没开始处理。"""
+        return uid in self._outstanding and uid not in self._started and uid != self._first_uid
+
+    async def cancel_queued(self, uid: str) -> bool:
+        """撤回一条还在排队的插话（cancel_async_message）。已开始处理的撤不回，返回 False。"""
+        if not self.is_pending(uid):
+            return False
+        resp = await self.control({"subtype": "cancel_async_message", "message_uuid": uid}, 15.0)
+        if (resp or {}).get("cancelled"):
+            self._outstanding.pop(uid, None)
+            self._maybe_close()
+            return True
+        return False
+
+    def _on_control_response(self, data: dict) -> None:
+        resp = data.get("response") or {}
+        rid = str(resp.get("request_id") or "")
+        fut = self._ctrl_waiters.get(rid)
+        if fut is None or fut.done():
+            return
+        if resp.get("subtype") == "success":
+            fut.set_result(resp.get("response") or {})
+        else:
+            fut.set_exception(RuntimeError(str(resp.get("error") or "控制请求失败")))
+
     def undelivered(self) -> list[str]:
         """写进去了但模型还没开始处理的插话（进程意外退出时由调用方补发）。"""
         return [
@@ -442,7 +508,7 @@ class RunInput:
         ]
 
     def _maybe_close(self) -> None:
-        if self._idle and self._queued <= 0 and not self._outstanding:
+        if self._idle and self._queued <= 0 and not self._outstanding and not self._ctrl_waiters:
             self.close()
 
     async def _on_lifecycle(self, data: dict) -> None:
@@ -690,7 +756,10 @@ async def _run_claude_print(
                     idle_seconds = 0  # 收到输出，重置计时
                 except asyncio.TimeoutError:
                     idle_seconds += _CHECK_INTERVAL
-                    if run_input is not None and run_input.open and run_input._idle:
+                    if (
+                        run_input is not None and run_input.open and run_input._idle
+                        and not run_input._ctrl_waiters
+                    ):
                         # 上一轮已结束、却没等到「全部处理完」的信号（CLI 版本变了、事件
                         # 缺字段）：静默 30s 就关 stdin。关不会丢已写进去的消息。
                         run_input.close()
@@ -736,6 +805,10 @@ async def _run_claude_print(
                                 max(wall_deadline, loop.time() + wall_clock_limit),
                             )
                         await run_input._on_lifecycle(data)
+
+                elif event_type == "control_response":
+                    if run_input is not None:
+                        run_input._on_control_response(data)
 
                 elif event_type == "system":
                     sid = data.get("session_id")

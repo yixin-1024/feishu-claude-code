@@ -191,6 +191,7 @@ def main():
             on_lark_message=dispatcher.handle_message_async,
             on_card_action=dispatcher.on_card_action,
             spawn_fn=dispatcher.handle_spawn,
+            on_lark_recall=dispatcher.handle_recall_async,
         ),
     )
 

@@ -206,3 +206,85 @@ async def test_stop_run_soft_interrupts_stream_input(monkeypatch):
     assert calls == ["stop", "reap", ("term", [111, 222])]
     assert killed == []  # 软停成功就不用 SIGTERM
     assert run.stop_requested
+
+
+# ── /btw 旁路提问 · 撤回排队插话 · 内置命令透传 ──────────────────────────────
+
+
+class SideInput(FakeInput):
+    def __init__(self, answer="在跑测试", fail=None):
+        super().__init__()
+        self.answer, self.fail = answer, fail
+        self.questions: list[str] = []
+        self.cancelled: list[str] = []
+
+    async def side_question(self, q):
+        self.questions.append(q)
+        if self.fail:
+            raise RuntimeError(self.fail)
+        return self.answer
+
+    async def cancel_queued(self, uid):
+        self.cancelled.append(uid)
+        return True
+
+
+@pytest.fixture
+def replies(monkeypatch):
+    sent = []
+
+    async def fake_reply(bot, user_id, is_group, msg_id, reply):
+        sent.append((msg_id, reply))
+    monkeypatch.setattr(dispatcher, "_send_command_reply", fake_reply)
+    return sent
+
+
+async def test_btw_answers_from_running_process(replies):
+    bot = _bot()
+    inp = SideInput()
+    _running(bot, inp)
+    handled = await dispatcher._handle_btw(bot, "ou_user", CHAT, True, _msg("/btw 进度?"), "进度?")
+    assert handled is True
+    assert inp.questions == ["进度?"] and inp.sent == []  # 不进主对话
+    assert replies and "在跑测试" in replies[0][1] and "顺便问" in replies[0][1]
+
+
+async def test_btw_without_running_process_falls_through(replies):
+    bot = _bot()
+    assert await dispatcher._handle_btw(bot, "ou_user", CHAT, True, _msg("/btw x"), "x") is False
+    _running(bot, FakeInput())  # 没有 side_question 的后端（如 codex）
+    assert await dispatcher._handle_btw(bot, "ou_user", CHAT, True, _msg("/btw x"), "x") is False
+    assert replies == []
+
+
+async def test_btw_empty_question_shows_usage_and_errors_are_reported(replies):
+    bot = _bot()
+    assert await dispatcher._handle_btw(bot, "ou_user", CHAT, True, _msg("/btw"), "") is True
+    assert "用法" in replies[-1][1]
+    _running(bot, SideInput(fail="超时"))
+    assert await dispatcher._handle_btw(bot, "ou_user", CHAT, True, _msg("/btw q"), "q") is True
+    assert "超时" in replies[-1][1]
+
+
+async def test_recall_cancels_pending_injection(no_ctx):
+    bot = _bot()
+    inp = SideInput()
+    run = _running(bot, inp)
+    run.on_note = mock.AsyncMock()
+    assert await _call(bot, _msg("补充一句", mid="om_recall")) is True
+    event = mock.Mock(event=mock.Mock(message_id="om_recall"))
+    await dispatcher.handle_recall_async(bot, event)
+    assert inp.cancelled == ["uid-1"]
+    run.on_note.assert_awaited_once()
+    # 同一条再撤一次 / 不认识的消息：什么都不做
+    await dispatcher.handle_recall_async(bot, event)
+    await dispatcher.handle_recall_async(bot, mock.Mock(event=mock.Mock(message_id="om_other")))
+    assert inp.cancelled == ["uid-1"]
+
+
+def test_passthrough_covers_print_mode_builtins():
+    from passthrough import is_builtin_passthrough
+    for t in ("/compact", "/goal 测试全过", "/goal clear", "/context", "/recap", "/skill-doctor"):
+        assert is_builtin_passthrough(t), t
+    for t in ("/goals", "看下 /context", "/btw 你好", "/contextual"):
+        assert not is_builtin_passthrough(t), t

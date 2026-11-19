@@ -51,6 +51,8 @@ class RuntimeBindings:
     on_card_action: Callable
     # /spawn 派单 handler（给 scheduler 用）
     spawn_fn: Callable[..., Awaitable[None]]
+    # 用户撤回了一条消息（im.message.recalled_v1），签名 (bot, event) -> Awaitable[None]
+    on_lark_recall: Optional[Callable[..., Awaitable[None]]] = None
 
 
 _bindings: Optional[RuntimeBindings] = None
@@ -530,6 +532,15 @@ def start_profile_ws(bot: BotInstance) -> None:
             _bot_loop,
         )
 
+    def _on_recall(data) -> None:
+        touch_event()
+        _touch_profile_event(name)
+        if _bindings.on_lark_recall is not None:
+            asyncio.run_coroutine_threadsafe(
+                _bindings.on_lark_recall(bot, data),
+                _bot_loop,
+            )
+
     def _on_card(data):
         touch_event()
         _touch_profile_event(name)
@@ -541,6 +552,8 @@ def start_profile_ws(bot: BotInstance) -> None:
         handler = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(_on_message)
+            # 撤回：还在排队没送进模型的插话跟着取消（应用要订阅 im.message.recalled_v1）
+            .register_p2_im_message_recalled_v1(_on_recall)
             .register_p2_card_action_trigger(_on_card)
             .register_p2_im_message_message_read_v1(lambda _e: None)
             # 表情回应事件没人消费，但应用订阅了它 → SDK 每条都刷一行 ERROR "processor not found"

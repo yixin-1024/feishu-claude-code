@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+from collections import OrderedDict
 import traceback
 from typing import Optional
 
@@ -1341,6 +1342,14 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
                 await bot.feishu.send_card_to_user(user_id, content=reply, loading=False)
             return
 
+        # /btw：任务在跑时旁路问一句，不排队、不打断、不进主对话。没有能接的进程时
+        # 落到下面的普通流程（_process_message 会去掉 /btw 前缀当普通消息跑）。
+        if _parsed_lock_free and _parsed_lock_free[0] == "btw":
+            if is_group and not await _is_current_bot_mentioned(bot, msg):
+                return
+            if await _handle_btw(bot, user_id, chat_id, is_group, msg, _parsed_lock_free[1]):
+                return
+
         # 只读命令（/usage /status /help /skills …）不进队列：它们跟前面那条消息
         # 毫无关系，也不会动 session，没理由陪着一个跑 20 分钟的任务一起等。
         # 每条消息本来就是 loop 上独立的 task，这里 await 掉即是真并行。
@@ -1459,6 +1468,87 @@ def _strip_steer_mark(text: str) -> str:
     return re.sub(r"(文字内容：)\s*[!！]\s*", r"\1", text or "", count=1)
 
 
+# 插进运行中进程、还可能撤回的插话：飞书 message_id → (user_id, chat_id, 插话 uuid)。
+# 用户在飞书里撤回这条消息时，据此把还在排队的那条从 CLI 队列里拿掉（cancel_async_message）。
+_INJECTED_BY_MSG: "OrderedDict[str, tuple[str, str, str]]" = OrderedDict()
+_INJECTED_KEEP = 500
+
+
+def _remember_injection(message_id: str, user_id: str, chat_id: str, uid: str) -> None:
+    if not message_id or not uid:
+        return
+    _INJECTED_BY_MSG[message_id] = (user_id, chat_id, uid)
+    while len(_INJECTED_BY_MSG) > _INJECTED_KEEP:
+        _INJECTED_BY_MSG.popitem(last=False)
+
+
+async def handle_recall_async(bot: BotInstance, data) -> None:
+    """飞书 im.message.recalled_v1：撤回的是一条还没送进模型的插话，就从队列里取消。"""
+    tag = bot.profile.name
+    try:
+        message_id = str(getattr(data.event, "message_id", "") or "")
+    except Exception:
+        return
+    hit = _INJECTED_BY_MSG.pop(message_id, None)
+    if not hit:
+        return
+    user_id, chat_id, uid = hit
+    run = bot.active_runs.get_run(user_id, chat_id)
+    run_input = getattr(run, "input", None) if run is not None else None
+    if run_input is None or not getattr(run_input, "open", False) or not hasattr(run_input, "cancel_queued"):
+        log(tag, "inject", "info", f"撤回的插话 {message_id[:16]} 所在进程已收尾，不用取消")
+        return
+    try:
+        cancelled = await run_input.cancel_queued(uid)
+    except Exception as e:
+        log(tag, "inject", "warn", f"取消撤回的插话失败 uid={uid[:8]}: {_err_desc(e)}")
+        return
+    log(tag, "inject", "info",
+        f"撤回插话 uid={uid[:8]} → {'已从队列取消' if cancelled else '模型已经开始处理，撤不回'}")
+    if cancelled and getattr(run, "on_note", None) is not None:
+        try:
+            await run.on_note("↩️ **撤回了一条插话**（还没送进任务，已取消）")
+        except Exception as e:
+            log(tag, "inject", "warn", f"卡片标记撤回失败: {_err_desc(e)}")
+
+
+_BTW_USAGE = (
+    "用法：`/btw 你的问题`\n\n任务在跑时，它会根据当前对话直接回答，"
+    "**不打断任务、不写进主对话**。没有任务在跑时就当普通消息处理。"
+)
+
+
+async def _handle_btw(
+    bot: BotInstance, user_id: str, chat_id: str, is_group: bool, msg, question: str,
+) -> bool:
+    """/btw 旁路提问。返回 True = 已处理；False = 没有能接的进程，交给普通流程。"""
+    tag = bot.profile.name
+    question = (question or "").strip()
+    if not question:
+        await _send_command_reply(bot, user_id, is_group, msg.message_id, _BTW_USAGE)
+        return True
+    run = bot.active_runs.get_run(user_id, chat_id)
+    run_input = getattr(run, "input", None) if run is not None and not run.stop_requested else None
+    if (
+        run_input is None
+        or not getattr(run_input, "open", False)
+        or not hasattr(run_input, "side_question")
+    ):
+        return False
+    log(tag, "btw", "info", f"旁路提问 len={len(question)} chat={chat_id[:24]}")
+    t0 = time.time()
+    try:
+        answer = await run_input.side_question(question)
+    except Exception as e:
+        log(tag, "btw", "warn", f"旁路提问失败: {_err_desc(e)}")
+        reply = f"⚠️ 顺便问没拿到回答：{_err_desc(e)}\n\n任务还在照常跑，可以等它做完再问。"
+    else:
+        log(tag, "btw", "info", f"旁路提问已回答 {time.time() - t0:.1f}s len={len(answer)}")
+        reply = f"💬 **顺便问**：{_short_arg(question, 60)}\n\n{answer or '（没有回答内容）'}"
+    await _send_command_reply(bot, user_id, is_group, msg.message_id, reply)
+    return True
+
+
 async def _inject_or_steer(
     bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, msg,
     lock: asyncio.Lock,
@@ -1515,6 +1605,8 @@ async def _inject_or_steer(
             + text
         )
         uid = await (run_input.steer(body) if steer else run_input.send(body, "next"))
+        if uid and not steer:
+            _remember_injection(msg.message_id, user_id, chat_id, uid)
         if uid:
             log(tag, "inject", "info",
                 f"{'打断改道' if steer else '插话'}已写进运行中的进程 "
@@ -2046,8 +2138,21 @@ async def _execute_run(
 
     active_run.on_inject = _mark_injection
 
+    async def _mark_note(note: str):
+        nonlocal accumulated, last_push_time
+        if _stopping():
+            return
+        accumulated += f"\n\n{note}\n\n"
+        await push(_build_display())
+        last_push_time = time.time()
+
+    active_run.on_note = _mark_note
+
     # 本轮消息 id / 提问者写在用户消息最前面（system prompt 里不放每轮都变的字段）
-    claude_msg = _turn_header(notify_msg_id, user_id, thread_id=thread_id) + text
+    # 透传给 CLI 的内置命令（/compact /goal …）必须在消息最开头，否则 -p 当普通文字
+    claude_msg = text if is_builtin_passthrough(text) else (
+        _turn_header(notify_msg_id, user_id, thread_id=thread_id) + text
+    )
     # 外层 try/finally 让 active_run 的生命周期对齐 lock —— 后处理（卡片 patch、发✅、
     # 写 session）期间 lock 仍然 held，active_run 也必须仍可被 /stop 找到，否则会出现
     # "队列说在跑、/stop 说没在跑" 的死区。
@@ -2693,6 +2798,7 @@ async def _execute_run(
     finally:
         active_run.input = None
         active_run.on_inject = None
+        active_run.on_note = None
         _drop_resume(bot, active_run)
         bot.active_runs.clear_run(user_id, chat_id, active_run)
 
@@ -2713,6 +2819,13 @@ async def _process_message(
 
     # ── 斜杠命令 ──────────────────────────────────────────────
     parsed = parse_command(text)
+
+    # /btw 没赶上运行中的进程（任务已结束 / 后端不支持旁路提问）：当普通消息跑
+    if parsed and parsed[0] == "btw" and parsed[1].strip():
+        text = parsed[1].strip()
+        _pp = parse_command(preview_text or "")
+        preview_text = _pp[1] if _pp and _pp[0] == "btw" and _pp[1] else text
+        parsed = None
 
     # `/fable xxx` `/opus xxx` `/sonnet xxx` `/haiku xxx`：一条消息完成「切模型 +
     # 执行」；`/low` … `/max xxx` 同理，换的是推理强度。切完不回"已切换"卡片，把
@@ -2786,8 +2899,8 @@ async def _process_message(
     # 消息不再以 /compact 开头，_escape_for_pty 不透传、claude 当普通文本，内置命令
     # 不触发 = 没效果。同时跳过 set_last_seen——这条命令并没有真正"读"话题内容，
     # 把未读上下文留给下一条真实消息。
-    if thread_id and is_builtin_passthrough(text):
-        log(tag, "thread", "info", "透传内置命令，跳过话题上下文注入")
+    if is_builtin_passthrough(text):
+        log(tag, "thread", "info", "透传内置命令，跳过话题/群聊上下文注入")
     elif thread_id:
         text = await _attach_thread_context(bot, user_id, chat_id, thread_id, msg, text)
         if text is None:

@@ -108,6 +108,8 @@ class ActiveRun:
     # on_inject(preview, steer)：_execute_run 挂的回调，在卡片上标出插话位置。
     input: object | None = None
     on_inject: Callable[[str, bool], Awaitable[None]] | None = field(default=None, repr=False)
+    # on_note(text)：在卡片上补一行说明（如「撤回了一条插话」）。
+    on_note: Callable[[str], Awaitable[None]] | None = field(default=None, repr=False)
 
 
 def _key(user_id: str, chat_id: str) -> str:
