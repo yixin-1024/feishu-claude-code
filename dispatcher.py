@@ -15,8 +15,9 @@ import os
 import re
 import sys
 import time
-from collections import OrderedDict
 import traceback
+import uuid
+from collections import OrderedDict
 from typing import Optional
 
 import lark_oapi as lark
@@ -53,9 +54,11 @@ from commands import (
 from feishu_post import parse_post_content, extract_post_image_keys, strip_lark_mentions
 from lark_prompts import render_lark_prompt
 from passthrough import is_builtin_passthrough
+from session_store import _find_session_file
 from log_util import log
 import handover_store
 import resume_store
+import session_branch
 import task_routes
 from run_control import RUN_GATE, ActiveRun, stop_run
 from thread_context import build_chat_context, build_quoted_context, build_thread_context
@@ -1549,6 +1552,82 @@ async def _handle_btw(
     return True
 
 
+# ── /rewind 回退 · /fork 分叉（改下一次 resume 的参数，见 session_branch）────────
+
+
+async def _claude_session_or_reason(bot: BotInstance, user_id: str, chat_id: str):
+    """当前话题的 Claude 会话 + 记录文件；不行就返回 (None, None, 原因)。"""
+    session = await bot.store.get_current(user_id, chat_id)
+    if session.runner != "claude" or not session.session_id:
+        return None, None, "ℹ️ 这个话题还没有 Claude 会话（或者用的不是 Claude），没有可操作的对话。"
+    fpath = _find_session_file(session.session_id)
+    if not fpath:
+        return None, None, "⚠️ 找不到当前会话的记录文件，没法操作。"
+    return session, fpath, ""
+
+
+async def _handle_rewind(bot: BotInstance, user_id: str, chat_id: str, args: str) -> str:
+    raw = (args or "").strip()
+    if raw and not raw.isdigit():
+        return "用法：`/rewind` 退回一轮，`/rewind 3` 退回三轮。"
+    turns = max(1, min(int(raw or 1), 50))
+    session, fpath, reason = await _claude_session_or_reason(bot, user_id, chat_id)
+    if session is None:
+        return reason
+    sid = session.session_id
+    pending = session_branch.get_option(sid) or {}
+    try:
+        target, undone = await asyncio.to_thread(
+            session_branch.rewind_target, fpath, turns, pending.get("resume_at", ""))
+    except ValueError as e:
+        return f"ℹ️ 退不了：{e}"
+    session_branch.set_option(sid, resume_at=target, fork_from=pending.get("fork_from", ""))
+    log(bot.profile.name, "rewind", "info", f"会话 {sid[:8]} 退回 {turns} 轮 → {target[:8]}")
+    lines = "\n".join(f"· {u or '（附件 / 空消息）'}" for u in undone)
+    return (
+        f"⏪ 已退回 {turns} 轮，下一条消息从这之前接着聊。撤掉的是：\n{lines}\n\n"
+        "⚠️ 只退对话，这期间改过的文件、跑过的命令不会撤销。连着发 /rewind 可以继续往前退。"
+    )
+
+
+async def _handle_fork(
+    bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, args: str,
+) -> str:
+    if not (is_group and thread_id and ":" in chat_id):
+        return "ℹ️ /fork 只能在话题群的话题里用：它会在群里新开一个话题，带着当前对话接着聊。"
+    session, fpath, reason = await _claude_session_or_reason(bot, user_id, chat_id)
+    if session is None:
+        return reason
+    group_chat_id = chat_id.split(":", 1)[0]
+    title = (args or "").strip().splitlines()[0][:60] if (args or "").strip() else "分叉出来的话题"
+    try:
+        root_mid = await bot.feishu.send_post_to_chat(
+            group_chat_id, title=f"🔀 {title}",
+            body_text=("从另一个话题分叉出来，带着分叉那一刻的全部对话。在这个话题里 @我 接着聊，"
+                       "原话题不受影响。"),
+            mention_open_id=user_id,
+        )
+        new_thread = ""
+        for _ in range(3):
+            new_thread = await bot.feishu.get_message_thread_id(root_mid)
+            if new_thread.startswith("omt_"):
+                break
+            await asyncio.sleep(1)
+    except Exception as e:
+        return f"⚠️ 新话题没建成：{_err_desc(e)}"
+    if not new_thread.startswith("omt_"):
+        return "⚠️ 新话题发出去了，但拿不到它的话题 id，分叉没绑上。"
+    new_sid = str(uuid.uuid4())
+    pending = session_branch.get_option(session.session_id) or {}
+    session_branch.set_option(
+        new_sid, fork_from=session.session_id, resume_at=pending.get("resume_at", ""))
+    new_key = f"{group_chat_id}:{new_thread}"
+    await bot.store.handover_session(user_id, new_key, new_sid, cwd=session.cwd)
+    log(bot.profile.name, "fork", "info",
+        f"会话 {session.session_id[:8]} 分叉 → {new_sid[:8]} thread={new_thread}")
+    return f"🔀 已分叉到新话题「{title}」：去那边 @我 接着聊，上下文是到现在为止的；这个话题照旧。"
+
+
 async def _inject_or_steer(
     bot: BotInstance, user_id: str, chat_id: str, is_group: bool, thread_id: str, msg,
     lock: asyncio.Lock,
@@ -2819,6 +2898,21 @@ async def _process_message(
 
     # ── 斜杠命令 ──────────────────────────────────────────────
     parsed = parse_command(text)
+
+    # /rewind /fork：在锁里做（这个话题没有任务在跑），改的是下一次 resume 的参数
+    if parsed and parsed[0] in ("rewind", "fork"):
+        cmd, args = parsed
+        log(tag, "cmd", "info", f"执行 {cmd} args={args!r}")
+        try:
+            if cmd == "rewind":
+                reply = await _handle_rewind(bot, user_id, chat_id, args)
+            else:
+                reply = await _handle_fork(bot, user_id, chat_id, is_group, thread_id, args)
+        except Exception as e:
+            log(tag, "cmd", "error", f"/{cmd} 失败: {_err_desc(e)}")
+            reply = f"❌ /{cmd} 失败：{_err_desc(e)}"
+        await _send_command_reply(bot, user_id, is_group, msg.message_id, reply)
+        return
 
     # /btw 没赶上运行中的进程（任务已结束 / 后端不支持旁路提问）：当普通消息跑
     if parsed and parsed[0] == "btw" and parsed[1].strip():

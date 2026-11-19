@@ -26,6 +26,8 @@ import sys
 import uuid
 from typing import Any, Callable, Optional
 
+import session_branch
+
 from bot_config import (
     CLAUDE_CLI,
     CLAUDE_EFFORT_LEVELS,
@@ -666,8 +668,10 @@ async def _run_claude_print(
         ]
         if stream_input:
             cmd += ["--input-format", "stream-json"]
-        if active_session_id:
-            cmd += ["--resume", active_session_id]
+        # /rewind、/fork 记下的「下次启动要带的参数」（见 session_branch），等第一个 system
+        # 事件证明 CLI 接受了才删
+        branch_opt = session_branch.get_option(active_session_id) if active_session_id else None
+        cmd += session_branch.cli_args(active_session_id or "", branch_opt)
         if effective_model:
             cmd += ["--model", effective_model]
         _cc_effort = (
@@ -728,6 +732,7 @@ async def _run_claude_print(
 
         full_text = ""
         new_session_id = None
+        branch_started = False
         pending_tool_name = ""
         pending_tool_input_json = ""
 
@@ -814,6 +819,9 @@ async def _run_claude_print(
                     sid = data.get("session_id")
                     if sid:
                         new_session_id = sid
+                    if branch_opt is not None and not branch_started:
+                        branch_started = True
+                        session_branch.consume(active_session_id)
 
                 elif event_type == "stream_event":
                     evt = data.get("event", {})
@@ -918,6 +926,8 @@ async def _run_claude_print(
             # 会一直等下一条消息，不关就成了孤儿进程。
             if run_input is not None:
                 run_input.close()
+            if branch_opt is not None and not branch_started:
+                session_branch.note_failed_start(active_session_id)
 
         stderr_output = await proc.stderr.read()
         await proc.wait()
