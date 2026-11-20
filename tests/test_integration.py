@@ -531,6 +531,40 @@ async def test_model_shortcut_refused_on_non_claude_runner(isolated_sessions):
     assert cur.model == "gpt-5.1-codex"
 
 
+async def test_flash_shortcut_on_agy_with_prompt_switches_and_runs(isolated_sessions):
+    """agy bot 上 `/flash 帮我查一下`：切到 3.8 Flash、沿用当前会话、把指令当普通消息跑。"""
+    bot = _make_bot()
+    bot.store = SessionStore(profile="agybot", default_runner="agy", default_model="gemini-4-neon")
+    bot.feishu.send_card_to_user.return_value = "card_1"
+    await bot.store.on_claude_response("ou_user_1", "ou_user_1", "agy-conv-keep", "earlier")
+    event = _make_event(text="/flash 帮我查一下数据库 orders 表")
+
+    with patch("dispatcher._run_and_display", new_callable=AsyncMock) as run:
+        await dispatcher._process_message(
+            bot, "ou_user_1", "ou_user_1", False, "", event.event.message,
+        )
+
+    run.assert_awaited_once()
+    assert run.await_args.args[4] == "帮我查一下数据库 orders 表"
+    session = run.await_args.args[6]
+    assert session.model == "gemini-3.8-flash"
+    assert session.session_id == "agy-conv-keep"
+
+
+async def test_flash_shortcut_refused_on_claude_runner(isolated_sessions):
+    bot = _make_bot()
+    event = _make_event(text="/flash 帮我查一下")
+
+    with patch("dispatcher._run_and_display", new_callable=AsyncMock) as run:
+        await dispatcher._process_message(
+            bot, "ou_user_1", "ou_user_1", False, "", event.event.message,
+        )
+
+    run.assert_not_awaited()
+    content = bot.feishu.send_card_to_user.await_args.kwargs["content"]
+    assert content.startswith("❌") and "agy runner" in content and "没有执行" in content
+
+
 # ── /low … /max 快捷指令：切推理强度 + 直接执行 ────────────────────────────
 
 async def test_effort_shortcut_with_prompt_switches_and_runs(isolated_sessions):
@@ -656,6 +690,7 @@ async def test_post_with_image_without_shortcut_unchanged(isolated_sessions):
 
 def test_split_run_shortcut():
     assert dispatcher._split_run_shortcut("/max 查一下") == ("/max ", "查一下")
+    assert dispatcher._split_run_shortcut("/flash\n[图片]\n看看") == ("/flash ", "[图片]\n看看")
     assert dispatcher._split_run_shortcut("/LOW\n[图片]\n看看") == ("/low ", "[图片]\n看看")
     assert dispatcher._split_run_shortcut("/effort low") == ("", "/effort low")
     assert dispatcher._split_run_shortcut("普通的话") == ("", "普通的话")

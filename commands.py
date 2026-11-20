@@ -289,6 +289,7 @@ HELP_TEXT = """\
 `/runner [codex|claude|opencode|mimo|grok|maka|agy|qoder|kiro|pi]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka / Antigravity / Qoder CLI / Kiro CLI / pi
 `/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID；会重开 session）
 `/fable` `/opus` `/sonnet` `/haiku` `[指令]` — 快捷切模型并**直接执行后面的指令**，沿用当前 session 不丢上下文（例：`/opus 帮我查一下数据库`；仅 claude runner 可用）
+`/flash` `[指令]` — 同上，快捷切到 Gemini 3.8 Flash（仅 agy runner 可用；例：`/flash 帮我查一下数据库`）
 `/effort [级别]` — 设置当前对话推理强度（default / low / medium / high / xhigh / max / ultra）
 `/low` `/medium` `/high` `/xhigh` `/max` `[指令]` — 快捷切推理强度并**直接执行后面的指令**，沿用当前 session（例：`/max 帮我查一下数据库`；单发只切档）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
@@ -358,7 +359,17 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 # 与 `/model X` 的区别：不重开 session（Claude CLI 支持 --resume 时换 --model），
 # 用户在一个会话里临时换个模型接着问、上下文不丢。带指令时由 dispatcher 拦截、
 # 切完模型把指令当普通消息继续跑；不带指令时走 handle_command 只切模型。
-MODEL_SHORTCUTS: Tuple[str, ...] = ("fable", "opus", "sonnet", "haiku")
+# `/flash` 是 agy 的同款：切到 Gemini 3.8 Flash。agy `--conversation <id>` 续轮时可以换
+# `--model`，上下文照样在（2026-11-20 实测 Neon → 3.8 Flash 续轮记得前文）；API key 和
+# OAuth 订阅两条通道都有 3.8 Flash。
+#
+# 快捷指令 → {能用它的 runner: 切到的模型}。runner 由 profile 钉死、快捷指令切不了，
+# 当前 runner 不在表里就拒绝执行（别把 Claude 模型塞给 agy，或反过来）。
+MODEL_SHORTCUT_TARGETS: dict[str, dict[str, str]] = {
+    **{k: {"claude": MODEL_ALIASES[k]} for k in ("fable", "opus", "sonnet", "haiku")},
+    "flash": {"agy": MODEL_ALIASES["agy-38"]},
+}
+MODEL_SHORTCUTS: Tuple[str, ...] = tuple(MODEL_SHORTCUT_TARGETS)
 
 # `/low` `/medium` `/high` `/xhigh` `/max` [指令]：同上，换的是推理强度（= `/effort X`），
 # 本来就不动 session。带指令由 dispatcher 拦截后继续跑；裸命令走 handle_command 只切档。
@@ -2681,33 +2692,37 @@ def _trigger_restart() -> None:
 
 
 class ModelShortcutUnavailable(RuntimeError):
-    """当前 runner 不是 claude，`/fable` 等 Claude 系快捷指令不可用。message 可直接回给用户。"""
+    """当前 runner 用不了这个模型快捷指令（如 codex 上发 `/opus`、claude 上发 `/flash`）。
+    message 可直接回给用户。"""
 
 
 async def apply_model_shortcut(
     cmd: str, user_id: str, chat_id: str, store: SessionStore,
 ) -> str:
-    """执行 `/fable` `/opus` `/sonnet` `/haiku` 的「切模型」部分，返回生效的模型串。
+    """执行 `/fable` `/opus` `/sonnet` `/haiku` `/flash` 的「切模型」部分，返回生效的模型串。
 
-    只改 model_override、**不动 session**——Claude CLI `--resume` 时可以换
-    `--model`，同一会话接着聊，上下文不丢（这正是它和 `/model X` 的区别）。
+    只改 model_override、**不动 session**——Claude CLI `--resume`、agy
+    `--conversation` 续轮时都可以换 `--model`，同一会话接着聊，上下文不丢
+    （这正是它和 `/model X` 的区别）。
 
-    这四个都是 Claude 系模型，硬塞给 codex / opencode / mimo / grok / maka 只会
-    报错；而 runner 由 profile 钉死（SessionStore._ensure_current_defaults 每次都
-    把 runner 拉回 profile 默认），这里切不了 runner，所以非 claude runner 直接抛
-    ModelShortcutUnavailable，让调用方把话说清楚、别静默跑错模型。
+    每个快捷指令只对应特定 runner 的模型（见 MODEL_SHORTCUT_TARGETS），硬塞给别的
+    后端只会报错或被静默回退；而 runner 由 profile 钉死（SessionStore._ensure_current_defaults
+    每次都把 runner 拉回 profile 默认），这里切不了 runner，所以当前 runner 不在表里
+    直接抛 ModelShortcutUnavailable，让调用方把话说清楚、别静默跑错模型。
     """
     key = (cmd or "").strip().lower()
-    if key not in MODEL_SHORTCUTS:
+    targets = MODEL_SHORTCUT_TARGETS.get(key)
+    if targets is None:
         raise ValueError(f"not a model shortcut: {cmd!r}")
     cur = await store.get_current(user_id, chat_id)
     runner = (cur.runner or "claude").lower()
-    if runner != "claude":
+    model = targets.get(runner)
+    if model is None:
+        where = " / ".join(targets)
         raise ModelShortcutUnavailable(
-            f"`/{key}` 这类快捷指令只在 claude runner 下可用（当前 runner：`{runner}`）。"
+            f"`/{key}` 这个快捷指令只在 {where} runner 下可用（当前 runner：`{runner}`）。"
             f"这条消息**没有执行**；去掉 `/{key}` 前缀重发，或换用 `/model` 选本 runner 支持的模型。"
         )
-    model = MODEL_ALIASES[key]
     await store.set_model_override(user_id, chat_id, model)
     return model
 

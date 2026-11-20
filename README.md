@@ -249,6 +249,7 @@ python3 main.py
 | `/model haiku` | 切换到 Haiku |
 | `/fable 帮我查一下数据库` | 快捷指令：切到 Fable 并**直接执行后面的指令**，沿用当前 session（上下文不丢） |
 | `/opus …` `/sonnet …` `/haiku …` | 同上，分别切到 Opus / Sonnet / Haiku；不带指令时只切模型（仅 claude runner 可用） |
+| `/flash …` | 同上，切到 Gemini 3.8 Flash（仅 agy runner 可用） |
 | `/effort` | 查看当前推理强度并用按钮选择档位 |
 | `/effort high` | 当前对话改用 high（不重开 session） |
 | `/effort default` | 清除当前对话覆盖，跟随 profile/CLI 默认 |

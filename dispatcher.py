@@ -2921,11 +2921,11 @@ async def _process_message(
         preview_text = _pp[1] if _pp and _pp[0] == "btw" and _pp[1] else text
         parsed = None
 
-    # `/fable xxx` `/opus xxx` `/sonnet xxx` `/haiku xxx`：一条消息完成「切模型 +
-    # 执行」；`/low` … `/max xxx` 同理，换的是推理强度。切完不回"已切换"卡片，把
+    # `/fable xxx` `/opus xxx` `/sonnet xxx` `/haiku xxx`（agy 上是 `/flash xxx`）：一条
+    # 消息完成「切模型 + 执行」；`/low` … `/max xxx` 同理，换的是推理强度。切完不回"已切换"卡片，把
     # 后面的指令当普通消息落到下面的 agent 分支去跑（沿用当前 session，上下文不丢）。
     # 裸 `/opus` `/max` 不在这里处理，仍走 handle_command 只切换。当前 runner/模型
-    # 用不了（模型快捷只给 claude；档位要当前 runner 有这一档），明确告知且不执行，
+    # 用不了（Claude 四个只给 claude、`/flash` 只给 agy；档位要当前 runner 有这一档），明确告知且不执行，
     # 绝不静默按错的模型 / 档位跑。
     if parsed and parsed[1] and (parsed[0] in MODEL_SHORTCUTS or parsed[0] in EFFORT_SHORTCUTS):
         cmd, args = parsed
