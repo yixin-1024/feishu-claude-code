@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import session_store as session_store_module
-from commands import MODEL_ALIASES, handle_command
+from commands import handle_command, resolve_model_alias
 from session_store import SessionStore
 
 
@@ -42,7 +42,8 @@ async def _picker_models(store, bot):
     reply = await handle_command("model", "", "user_1", "oc_agy", store, bot=bot)
     cmds = [b["value"]["cmd"] for b in reply["buttons"]]
     assert all(c.startswith("/model ") for c in cmds)
-    return {MODEL_ALIASES[c.split(" ", 1)[1]] for c in cmds}
+    # 按钮上是本后端的短名（/model carbon），按 /model 同一套解析还原成模型 id
+    return {resolve_model_alias(c.split(" ", 1)[1], "agy") for c in cmds}
 
 
 @pytest.mark.asyncio

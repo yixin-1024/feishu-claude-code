@@ -244,11 +244,12 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
 def normalize_model_for_runner(model: str, runner: str, fallback: str = "") -> str:
     """把 model 字段归一化为适合该 runner 的串；若不兼容则回落至 fallback。"""
     runner = (runner or "").strip().lower()
-    from commands import MODEL_ALIASES
+    # 和 `/model` 同一套解析：后端专属名不带前缀也认（agy 上 carbon → gemini-4-carbon）
+    from commands import resolve_model_alias
 
     target = (model or "").strip()
     if target:
-        resolved = MODEL_ALIASES.get(target.lower(), target)
+        resolved = resolve_model_alias(target, runner)
         if runner == "agy" and resolved.lower().startswith("google/"):
             resolved = resolved[len("google/"):]
         if runner == "pi":
@@ -259,7 +260,7 @@ def normalize_model_for_runner(model: str, runner: str, fallback: str = "") -> s
     fb = (fallback or "").strip()
     if not fb:
         return ""
-    resolved_fb = MODEL_ALIASES.get(fb.lower(), fb)
+    resolved_fb = resolve_model_alias(fb, runner)
     if runner == "agy" and resolved_fb.lower().startswith("google/"):
         resolved_fb = resolved_fb[len("google/"):]
     if runner == "pi":

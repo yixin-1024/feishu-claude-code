@@ -33,25 +33,37 @@ def _store(tmp_path, runner: str = "claude") -> SessionStore:
     )
 
 
+AGY_SHORTCUTS = {
+    "flash": "gemini-3.8-flash",
+    "neon": "gemini-4-neon",
+    "hydrogen": "gemini-4-hydrogen",
+    "carbon": "gemini-4-carbon",
+    "argon": "gemini-4-argon",
+}
+
+
 def test_shortcuts_registered_aliased_and_documented():
-    assert MODEL_SHORTCUTS == ("fable", "opus", "sonnet", "haiku", "flash")
+    assert MODEL_SHORTCUTS == ("fable", "opus", "sonnet", "haiku", *AGY_SHORTCUTS)
     for cmd in MODEL_SHORTCUTS:
         assert cmd in commands.BOT_COMMANDS, cmd
-        assert cmd in MODEL_ALIASES, cmd
         # 切模型要写 session，不能被当成免排队的只读命令
         assert not commands.is_lock_free_command(cmd, ""), cmd
     assert "`/fable` `/opus` `/sonnet` `/haiku`" in commands.HELP_TEXT
     assert "直接执行后面的指令" in commands.HELP_TEXT
-    assert "`/flash`" in commands.HELP_TEXT and "仅 agy runner 可用" in commands.HELP_TEXT
+    assert "`/flash` `/neon` `/hydrogen` `/carbon` `/argon`" in commands.HELP_TEXT
+    assert "仅 agy runner 可用" in commands.HELP_TEXT
 
 
-def test_shortcut_targets_are_valid_models_for_their_runner():
+def test_shortcut_targets_match_model_command_on_their_runner():
+    """`/carbon` 和 `/model carbon` 在同一个 runner 上必须落到同一个模型。"""
     from bot_config import is_model_compatible_with_runner
 
-    assert MODEL_SHORTCUT_TARGETS["flash"] == {"agy": "gemini-3.8-flash"}
+    for cmd, model in AGY_SHORTCUTS.items():
+        assert MODEL_SHORTCUT_TARGETS[cmd] == {"agy": model}, cmd
     for cmd, targets in MODEL_SHORTCUT_TARGETS.items():
         for runner, model in targets.items():
             assert is_model_compatible_with_runner(model, runner), (cmd, runner, model)
+            assert commands.resolve_model_alias(cmd, runner) == model, (cmd, runner)
 
 
 def test_parse_shortcut_keeps_trailing_prompt_intact():
@@ -203,3 +215,99 @@ async def test_bare_flash_via_handle_command(tmp_path):
     cur = await store.get_current("ou_u", "oc_c")
     assert cur.model == "gemini-3.8-flash"
     assert cur.session_id == "agy-conv-1"
+
+
+@pytest.mark.parametrize("cmd,model", list(AGY_SHORTCUTS.items()))
+async def test_agy_shortcuts_switch_model_and_keep_session(tmp_path, cmd, model):
+    store = _store(tmp_path, runner="agy")
+    await store.on_claude_response("ou_u", "oc_c", "agy-conv-1", "hello")
+
+    assert await apply_model_shortcut(cmd, "ou_u", "oc_c", store) == model
+
+    cur = await store.get_current("ou_u", "oc_c")
+    assert cur.model == model
+    assert cur.session_id == "agy-conv-1"
+
+
+@pytest.mark.parametrize("cmd", ["neon", "hydrogen", "carbon", "argon"])
+async def test_gemini4_shortcuts_refused_on_claude(tmp_path, cmd):
+    store = _store(tmp_path, runner="claude")
+
+    reply = await commands.handle_command(cmd, "", "ou_u", "oc_c", store, bot=None)
+
+    assert reply.startswith("❌") and "agy runner" in reply and "没有执行" in reply
+    assert (await store.get_current_raw("ou_u", "oc_c"))["model_override"] is None
+
+
+# ── `/model xxx`：后端专属名不用带前缀 ────────────────────────────────────
+
+@pytest.mark.parametrize("name,model", [
+    ("carbon", "gemini-4-carbon"),
+    ("Neon", "gemini-4-neon"),
+    ("hydrogen", "gemini-4-hydrogen"),
+    ("argon", "gemini-4-argon"),
+    ("flash", "gemini-3.8-flash"),
+    ("37", "gemini-3.7-flash"),
+    ("pro", "gemini-3.1-pro-high"),
+    ("agy-carbon", "gemini-4-carbon"),          # 带前缀的老写法照样认
+    ("gemini-4-argon", "gemini-4-argon"),       # 完整 id 原样
+])
+async def test_model_command_accepts_unprefixed_agy_names(tmp_path, name, model):
+    store = _store(tmp_path, runner="agy")
+
+    reply = await commands.handle_command("model", name, "ou_u", "oc_c", store, bot=None)
+
+    assert reply.startswith("✅") and f"`{model}`" in reply, reply
+    assert (await store.get_current("ou_u", "oc_c")).model == model
+
+
+async def test_unprefixed_name_resolves_per_runner(tmp_path):
+    from commands import resolve_model_alias
+
+    # 同一个名字，在不同后端落到各自的模型
+    assert resolve_model_alias("neon", "pi") == "google/gemini-4-neon"
+    assert resolve_model_alias("neon", "agy") == "gemini-4-neon"
+    # agy 的模型名不带 google/
+    assert resolve_model_alias("flash", "agy") == "gemini-3.8-flash"
+    assert resolve_model_alias("gemini38", "agy") == "gemini-3.8-flash"
+    assert resolve_model_alias("flash", "pi") == "google/gemini-3.8-flash"
+    # 通用表里已有的名字不被前缀版顶掉：agy 上 opus 仍是 Claude 的 opus（→ /model 拒绝）
+    assert resolve_model_alias("opus", "agy") == "opus[1m]"
+    assert resolve_model_alias("opus", "claude") == "opus[1m]"
+    # 哪儿都没有：原样
+    assert resolve_model_alias("gpt-5.5", "codex") == "gpt-5.5"
+    assert resolve_model_alias("carbon", "") == "carbon"
+    # Claude 系名字在 claude 上还是不兼容 agy 的（/model 会报不兼容，不会悄悄换模型）
+    store = _store(tmp_path, runner="claude")
+    reply = await commands.handle_command("model", "carbon", "ou_u", "oc_c", store, bot=None)
+    assert reply.startswith("❌")
+
+
+async def test_agy_model_card_buttons_use_unprefixed_names(tmp_path):
+    store = _store(tmp_path, runner="agy")
+
+    card = await commands.handle_command("model", "", "ou_u", "oc_c", store, bot=None)
+
+    cmds = [b["value"]["cmd"] for b in card["buttons"]]
+    assert cmds[:5] == ["/model neon", "/model hydrogen", "/model carbon", "/model argon", "/model flash"]
+    assert not any("agy-" in c for c in cmds)
+    # 每个按钮点出去都要真能切成功
+    for c in cmds:
+        reply = await commands.handle_command("model", c.split(" ", 1)[1], "ou_u", "oc_c", store, bot=None)
+        assert reply.startswith("✅"), (c, reply)
+
+
+async def test_agy_oauth_model_card_buttons_all_switch(tmp_path):
+    """OAuth 订阅通道：3.8 Flash 不带前缀；第三方模型保留 agy- 前缀（裸 opus 是 Claude 的）。"""
+    from types import SimpleNamespace
+
+    store = _store(tmp_path, runner="agy")
+    bot = SimpleNamespace(profile=SimpleNamespace(agy_model_provider="", runner="agy", name="agybot"))
+
+    card = await commands.handle_command("model", "", "ou_u", "oc_c", store, bot=bot)
+
+    cmds = [b["value"]["cmd"] for b in card["buttons"]]
+    assert cmds == ["/model flash", "/model agy-opus", "/model agy-sonnet", "/model agy-gpt"]
+    for c in cmds:
+        reply = await commands.handle_command("model", c.split(" ", 1)[1], "ou_u", "oc_c", store, bot=None)
+        assert reply.startswith("✅"), (c, reply)

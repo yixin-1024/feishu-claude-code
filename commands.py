@@ -183,6 +183,28 @@ MODEL_ALIASES = {
 }
 
 
+def resolve_model_alias(name: str, runner: str = "") -> str:
+    """`/model` 的名字 → 模型串：通用别名优先，没有再找本 runner 带前缀的别名。
+
+    后端专属的别名都带 runner 前缀（agy-carbon / pi-neon …），用户在本后端里不用再敲
+    前缀：agy 上 `/model carbon` = `/model agy-carbon`。通用表里已有的名字（opus /
+    sonnet / flash …）**不**被前缀版顶掉——agy 上 `/model opus` 仍按 Claude 的 opus
+    解析、被判不兼容而拒绝，不会悄悄换成 agy 的 claude-opus-4-6-thinking（API key
+    通道根本没有它）。agy 的模型名不带 `google/`，这里顺手去掉（flash → gemini-3.8-flash）。
+    """
+    raw = (name or "").strip()
+    key = raw.lower()
+    runner = (runner or "").strip().lower()
+    resolved = MODEL_ALIASES.get(key)
+    if resolved is None and key and runner:
+        resolved = MODEL_ALIASES.get(f"{runner}-{key}")
+    if resolved is None:
+        resolved = raw
+    if runner == "agy" and resolved.lower().startswith("google/"):
+        resolved = resolved[len("google/"):]
+    return resolved
+
+
 def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[str]:
     """Return the configured runner default for display; None means CLI default."""
     runner = (runner or "").strip().lower()
@@ -287,9 +309,9 @@ HELP_TEXT = """\
 `/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
 `/runner [codex|claude|opencode|mimo|grok|maka|agy|qoder|kiro|pi]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka / Antigravity / Qoder CLI / Kiro CLI / pi
-`/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID；会重开 session）
+`/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID；会重开 session；后端专属名不用带前缀，如 agy 上 `/model carbon`）
 `/fable` `/opus` `/sonnet` `/haiku` `[指令]` — 快捷切模型并**直接执行后面的指令**，沿用当前 session 不丢上下文（例：`/opus 帮我查一下数据库`；仅 claude runner 可用）
-`/flash` `[指令]` — 同上，快捷切到 Gemini 3.8 Flash（仅 agy runner 可用；例：`/flash 帮我查一下数据库`）
+`/flash` `/neon` `/hydrogen` `/carbon` `/argon` `[指令]` — 同上，快捷切到 Gemini 3.8 Flash / Gemini 4 Neon / Hydrogen / Carbon / Argon（仅 agy runner 可用；例：`/carbon 帮我查一下数据库`）
 `/effort [级别]` — 设置当前对话推理强度（default / low / medium / high / xhigh / max / ultra）
 `/low` `/medium` `/high` `/xhigh` `/max` `[指令]` — 快捷切推理强度并**直接执行后面的指令**，沿用当前 session（例：`/max 帮我查一下数据库`；单发只切档）
 `/mode [模式]` — 切换权限模式（default / plan / acceptEdits / bypassPermissions）
@@ -359,15 +381,18 @@ def parse_command(text: str) -> Optional[Tuple[str, str]]:
 # 与 `/model X` 的区别：不重开 session（Claude CLI 支持 --resume 时换 --model），
 # 用户在一个会话里临时换个模型接着问、上下文不丢。带指令时由 dispatcher 拦截、
 # 切完模型把指令当普通消息继续跑；不带指令时走 handle_command 只切模型。
-# `/flash` 是 agy 的同款：切到 Gemini 3.8 Flash。agy `--conversation <id>` 续轮时可以换
-# `--model`，上下文照样在（2026-11-20 实测 Neon → 3.8 Flash 续轮记得前文）；API key 和
-# OAuth 订阅两条通道都有 3.8 Flash。
+# `/flash` `/neon` `/hydrogen` `/carbon` `/argon` 是 agy 的同款：切到 Gemini 3.8 Flash /
+# Gemini 4 四款。agy `--conversation <id>` 续轮时可以换 `--model`，上下文照样在
+# （2026-11-20 实测 Neon → 3.8 Flash，以及 Flash → Carbon → Argon → Hydrogen → Neon
+# 轮流续轮都记得前文）。3.8 Flash 两条鉴权通道都有；Gemini 4 只有 API key 通道有，
+# 本机三个 agy bot 都走 API key。
 #
-# 快捷指令 → {能用它的 runner: 切到的模型}。runner 由 profile 钉死、快捷指令切不了，
-# 当前 runner 不在表里就拒绝执行（别把 Claude 模型塞给 agy，或反过来）。
+# 快捷指令 → {能用它的 runner: 切到的模型}，模型和 `/model <同名>` 在该 runner 上解析出来的
+# 一致。runner 由 profile 钉死、快捷指令切不了，当前 runner 不在表里就拒绝执行
+# （别把 Claude 模型塞给 agy，或反过来）。
 MODEL_SHORTCUT_TARGETS: dict[str, dict[str, str]] = {
     **{k: {"claude": MODEL_ALIASES[k]} for k in ("fable", "opus", "sonnet", "haiku")},
-    "flash": {"agy": MODEL_ALIASES["agy-38"]},
+    **{k: {"agy": MODEL_ALIASES[f"agy-{k}"]} for k in ("flash", "neon", "hydrogen", "carbon", "argon")},
 }
 MODEL_SHORTCUTS: Tuple[str, ...] = tuple(MODEL_SHORTCUT_TARGETS)
 
@@ -2699,7 +2724,7 @@ class ModelShortcutUnavailable(RuntimeError):
 async def apply_model_shortcut(
     cmd: str, user_id: str, chat_id: str, store: SessionStore,
 ) -> str:
-    """执行 `/fable` `/opus` `/sonnet` `/haiku` `/flash` 的「切模型」部分，返回生效的模型串。
+    """执行 `/opus` `/flash` `/carbon` 等模型快捷指令的「切模型」部分，返回生效的模型串。
 
     只改 model_override、**不动 session**——Claude CLI `--resume`、agy
     `--conversation` 续轮时都可以换 `--model`，同一会话接着聊，上下文不丢
@@ -2759,7 +2784,7 @@ def _effort_levels_for(runner: str, model: str) -> tuple[Optional[tuple[str, ...
         if model_ignores_effort(model):
             return None, (
                 f"ℹ️ 当前模型 `{model}` 不支持 `/effort`——它自带固定推理深度。\n"
-                f"要调档位请先切到 Gemini 系列（如 `/model agy-38`）。"
+                f"要调档位请先切到 Gemini 系列（如 `/flash`）。"
             )
         from agy_runner import effort_levels_for_model
 
@@ -3012,18 +3037,19 @@ async def handle_command(
                 agy_api_key_mode = bool(_agy_api_key_provider(agy_profile)) if agy_profile is not None else True
                 if agy_api_key_mode:
                     buttons = [
-                        {"text": "✴️ Gemini 4 Neon", "value": {"action": "run_cmd", "cmd": "/model agy-neon", "cid": chat_id}},
-                        {"text": "💧 Gemini 4 Hydrogen", "value": {"action": "run_cmd", "cmd": "/model agy-hydrogen", "cid": chat_id}},
-                        {"text": "🪨 Gemini 4 Carbon", "value": {"action": "run_cmd", "cmd": "/model agy-carbon", "cid": chat_id}},
-                        {"text": "🔆 Gemini 4 Argon", "value": {"action": "run_cmd", "cmd": "/model agy-argon", "cid": chat_id}},
-                        {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-38", "cid": chat_id}},
-                        {"text": "Gemini 3.7 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-37", "cid": chat_id}},
-                        {"text": "Gemini 3.6 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-36", "cid": chat_id}},
-                        {"text": "💎 Gemini 3.1 Pro", "value": {"action": "run_cmd", "cmd": "/model agy-pro", "cid": chat_id}},
+                        {"text": "✴️ Gemini 4 Neon", "value": {"action": "run_cmd", "cmd": "/model neon", "cid": chat_id}},
+                        {"text": "💧 Gemini 4 Hydrogen", "value": {"action": "run_cmd", "cmd": "/model hydrogen", "cid": chat_id}},
+                        {"text": "🪨 Gemini 4 Carbon", "value": {"action": "run_cmd", "cmd": "/model carbon", "cid": chat_id}},
+                        {"text": "🔆 Gemini 4 Argon", "value": {"action": "run_cmd", "cmd": "/model argon", "cid": chat_id}},
+                        {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model flash", "cid": chat_id}},
+                        {"text": "Gemini 3.7 Flash", "value": {"action": "run_cmd", "cmd": "/model 37", "cid": chat_id}},
+                        {"text": "Gemini 3.6 Flash", "value": {"action": "run_cmd", "cmd": "/model 36", "cid": chat_id}},
+                        {"text": "💎 Gemini 3.1 Pro", "value": {"action": "run_cmd", "cmd": "/model pro", "cid": chat_id}},
                     ]
                 else:
+                    # 第三方模型保留 agy- 前缀：裸 opus / sonnet 是 Claude 的通用别名
                     buttons = [
-                        {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model agy-38", "cid": chat_id}},
+                        {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model flash", "cid": chat_id}},
                         {"text": "🧠 Claude Opus 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-opus", "cid": chat_id}},
                         {"text": "⚡ Claude Sonnet 4.6", "value": {"action": "run_cmd", "cmd": "/model agy-sonnet", "cid": chat_id}},
                         {"text": "GPT-OSS 120B", "value": {"action": "run_cmd", "cmd": "/model agy-gpt", "cid": chat_id}},
@@ -3096,8 +3122,8 @@ async def handle_command(
             followed = _session_model(store, {}, chat_id, raw.get("runner") or "")
             scope = "profile 默认" if followed == store.default_model else "本群默认"
             return f"✅ 已清除模型覆盖，跟随{scope} `{followed}`。已开始新 session。"
-        model = MODEL_ALIASES.get(args.lower(), args)
         cur = await store.get_current(user_id, chat_id)
+        model = resolve_model_alias(args, cur.runner)
         from bot_config import is_model_compatible_with_runner
         if not is_model_compatible_with_runner(model, cur.runner):
             return (

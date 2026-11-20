@@ -43,6 +43,9 @@ def test_normalize_model_for_runner():
     # Normal cases
     assert normalize_model_for_runner("opus", "claude") == "opus[1m]"
     assert normalize_model_for_runner("agy-38", "agy") == "gemini-3.8-flash"
+    # dispatch_task / 定时任务的 model 参数和 /model 同一套解析：后端专属名不用带前缀
+    assert normalize_model_for_runner("carbon", "agy") == "gemini-4-carbon"
+    assert normalize_model_for_runner("neon", "pi") == "google/gemini-4-neon"
     assert normalize_model_for_runner("google/gemini-3.8-flash", "agy") == "gemini-3.8-flash"
 
     # Incompatible model fallback
