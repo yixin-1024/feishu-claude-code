@@ -37,6 +37,7 @@ from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse, parse_qs
 
 import external_api
+from bot_config import SWITCHABLE_RUNNERS
 from bot_instance import BotInstance
 from card_security import (
     card_action_allowed,
@@ -262,6 +263,22 @@ def resolve_target_agent(
             return chosen[0], ""
     avail = ", ".join(f"{n}({b.profile.runner})" for n, b in bots.items()) or "（无）"
     return None, f"未找到 agent {spec!r}。已加载可选：{avail}"
+
+
+# 不需要专门 bot 的后端（bot_config.SWITCHABLE_RUNNERS，目前只有 pi）：agent 点名了它、
+# 而本机又没有 profile runner 就是它的 bot 时，由派发方自己的 bot 换后端开子话题。
+# 只放已经在本机实测过的后端——其它点名不到的 agent 仍旧明确报错，别静默派给一个装都没装的 CLI。
+SAME_BOT_RUNNERS = SWITCHABLE_RUNNERS
+
+
+def runner_fallback_for(bots: dict[str, BotInstance], spec: str) -> str:
+    """agent=spec 没有对应的 bot 时，能不能让派发方的 bot 换后端代跑；能就返回 runner 名。"""
+    want = _AGENT_RUNNER_ALIASES.get((spec or "").strip().lower())
+    if want not in SAME_BOT_RUNNERS:
+        return ""
+    if any(b.profile.runner == want for b in bots.values()):
+        return ""  # 有专门的 bot，就该派给它（resolve_target_agent 已经处理）
+    return want
 
 
 def _resolve_spawn_request(
@@ -726,14 +743,18 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
         # 跨 agent：agent 参数指定异后端目标 bot（如 "gpt"→codex）。缺省=同 bot。
         _agent = (p.get("agent") or "").strip()
         target_bot = None
+        p["_runner"] = ""
         if _agent:
             # 带上派发目标群：同家族候选里必须先排掉"不在本群"的 bot（否则建话题 230002）
             target_bot, err = resolve_target_agent(
                 _bots, _agent, exclude=bot.profile.name, chat_id=ws_chat,
             )
             if target_bot is None:
-                self._mcp_respond(endpoint, _prof, {"ok": False, "error": err})
-                return None, None, None
+                # 没有专门的 bot、但派发方自己就能换后端跑（pi）：同一个 bot 开子话题
+                p["_runner"] = runner_fallback_for(_bots, _agent)
+                if not p["_runner"]:
+                    self._mcp_respond(endpoint, _prof, {"ok": False, "error": err})
+                    return None, None, None
         # 跨群派发（workspace 路由过）才校验"这个 bot 在不在目标群"。同群派发不查是
         # 有意的：会话本来就跑在那个群里，白名单为空只代表该 profile 的群入站被关掉，
         # 不代表 bot 不在群里——在这里改判成硬拒会掐掉一批本来能跑的派发。
@@ -784,6 +805,7 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                     # 只能显式带上（别名解析 + 校验在 dispatcher 侧统一做）。
                     model=(p.get("model") or "").strip(),
                     effort=(p.get("effort") or "").strip(),
+                    runner=p.get("_runner") or "",
                 ),
                 timeout=30,
             )
@@ -830,6 +852,7 @@ class _CardCallbackHandler(BaseHTTPRequestHandler):
                     effort=(p.get("effort") or "").strip(),
                     from_thread=(p.get("from_thread") or "").strip(),
                     from_anchor=(p.get("from_anchor") or "").strip(),
+                    runner=p.get("_runner") or "",
                 ),
                 timeout=30,
             )

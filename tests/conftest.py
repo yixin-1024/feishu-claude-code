@@ -43,6 +43,9 @@ def _isolate_sessions(tmp_path, monkeypatch):
     # 要测这条路的用例自己打开并把目录指到 tmp（见 test_claude_context.py）。
     monkeypatch.setenv("CC_LARK_QODER_CLAUDE_CONTEXT", "0")
     monkeypatch.setenv("CC_LARK_KIRO_CLAUDE_CONTEXT", "0")
+    monkeypatch.setenv("CC_LARK_PI_CLAUDE_CONTEXT", "0")
+    # pi 的会话文件别落到真 ~/.feishu-claude/pi-sessions
+    monkeypatch.setenv("PI_SESSION_DIR", str(tmp_path / "pi-sessions"))
     # agy 账号快照 / keychain 同理，而且更凶：~/.gemini/accounts 里是**真凭证**，
     # keychain 那条 gemini/antigravity 就是本机 agy 的登录态。测试一律读不到真号、
     # 也写不动 keychain（要验证写入路径的用例自己 monkeypatch 回去）。

@@ -11,7 +11,7 @@ from typing import Optional
 
 from bot_config import (
     SESSIONS_DIR, DEFAULT_MODEL, DEFAULT_CWD, PERMISSION_MODE, DEFAULT_RUNNER,
-    THREAD_SHARED_SESSION,
+    THREAD_SHARED_SESSION, RUNNERS, SWITCHABLE_RUNNERS,
 )
 
 # 话题群共享 session 的哨兵用户桶：thread 复合 chat_id（"oc_xxx:omt_yyy"）
@@ -394,7 +394,7 @@ class SessionStore:
         )
         self._default_cwd = default_cwd or DEFAULT_CWD
         self._default_runner = (default_runner or DEFAULT_RUNNER or "claude").strip().lower()
-        if self._default_runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
+        if self._default_runner not in RUNNERS:
             self._default_runner = "claude"
         self._default_model = default_model or DEFAULT_MODEL
         # 必须持有 profile 的同一个 dict（空 dict 也一样，不能 `or {}` 换成新对象）：
@@ -553,10 +553,14 @@ class SessionStore:
         changed = False
         defaults = self._default_current(chat_key=chat_key)
         stored_runner = current.get("runner")
-        if stored_runner != self._default_runner:
+        # /runner 显式切过的话题（runner_pinned）不动：那是用户选的，不是配置漂移。
+        # 以前没有这个标记，/runner 切完下一条消息就被这里打回 profile runner，等于没切。
+        pinned = bool(current.get("runner_pinned")) and stored_runner in SWITCHABLE_RUNNERS
+        if stored_runner != self._default_runner and not pinned:
             # runner 跟 profile 配置不一致（多为改了配置）：回到 profile 默认 runner，
             # 并清掉为旧 runner 选的模型 override，让模型回落到 profile 默认。
             current["runner"] = self._default_runner
+            current.pop("runner_pinned", None)
             current["model_override"] = None
             current["effort_override"] = None
             current["session_id"] = None
@@ -862,6 +866,8 @@ class SessionStore:
         chat_data["current"] = {
             "session_id": None,
             "runner": cur.get("runner", self._default_runner),
+            # /runner 显式切过的后端，/new 之后继续用
+            "runner_pinned": bool(cur.get("runner_pinned")),
             # 沿用显式 override（若有）；没有就继续跟随 profile 默认
             "model_override": cur.get("model_override"),
             # effort 是话题配置，/new 只换 CLI session，继续沿用当前覆盖。
@@ -969,9 +975,11 @@ class SessionStore:
             normalized = "qoder"
         if normalized in {"kiro-cli", "kirocli"}:
             normalized = "kiro"
-        if normalized not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
+        if normalized in {"pi-agent", "pi-coding-agent", "pi-mono"}:
+            normalized = "pi"
+        if normalized not in RUNNERS:
             raise ValueError(
-                "runner must be 'claude', 'codex', 'opencode', 'mimo', 'grok', 'maka', 'agy', 'qoder', 'kiro' or 'dots'"
+                "runner must be 'claude', 'codex', 'opencode', 'mimo', 'grok', 'maka', 'agy', 'qoder', 'kiro', 'pi' or 'dots'"
             )
         chat_data = await self._ensure_chat_data(user_id, chat_id)
         cur = chat_data["current"]
@@ -988,6 +996,11 @@ class SessionStore:
             })
             chat_data["history"] = chat_data["history"][-20:]
         cur["runner"] = normalized
+        # 切到 profile 默认之外、且不用专门 bot 的后端（pi）才钉住；切回默认就恢复「跟随配置」
+        if normalized != self._default_runner and normalized in SWITCHABLE_RUNNERS:
+            cur["runner_pinned"] = True
+        else:
+            cur.pop("runner_pinned", None)
         if runner_changed:
             # 不同 runner 支持的 effort 档位不同（如 Codex 的 ultra），不可沿用。
             cur["effort_override"] = None

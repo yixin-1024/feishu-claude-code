@@ -3412,6 +3412,10 @@ def _format_usage_footer(usage: dict, model: str) -> str:
     credits = _credits_suffix(usage)
     if credits:
         line += f" · {credits}"
+    # 按 token 计价、runner 自己算了钱的后端（pi）：本轮花了多少
+    cost = usage.get("_turn_cost_usd")
+    if isinstance(cost, (int, float)) and cost > 0:
+        line += f" · 本轮 ${cost:.4f}" if cost < 0.01 else f" · 本轮 ${cost:.2f}"
     return line
 
 
@@ -4043,8 +4047,12 @@ async def handle_spawn(
     effort: str = "",
     cwd: str = "",
     workspace: str = "",
+    runner: str = "",
 ) -> tuple[bool, str]:
     """在 (user, chat_id_raw:thread_id) 这一格强制开新 session 跑 prompt。
+
+    runner：这条话题换个后端跑（不传 = bot 的 profile runner）。派活点名了某个后端、
+    但本机没有专门跑它的 bot 时用（目前只有 pi，见 http_server.runner_fallback_for）。
 
     设计场景：大群里的"调度 session"读完上下文后，用 lark-cli 在会话群创建新话题，
     再 curl 这个端点把后续工作派给独立 session。和 WS 路径不冲突——这是绕过 WS 的
@@ -4115,11 +4123,16 @@ async def handle_spawn(
     async with lock:
         try:
             await bot.store.new_session(user_id, chat_id)
+            if runner:
+                await bot.store.set_runner(user_id, chat_id, runner)
             if model:
-                child_runner = bot.profile.runner
+                child_runner = runner or bot.profile.runner
                 if not is_model_compatible_with_runner(model, child_runner):
+                    # profile 的默认模型属于 profile 的 runner；换了后端就让那个后端用它自己的默认
+                    profile_fallback = "" if runner else (
+                        bot.profile.dispatch_model or bot.profile.default_model or "")
                     corrected = normalize_model_for_runner(
-                        "", child_runner, fallback=bot.profile.dispatch_model or bot.profile.default_model or ""
+                        "", child_runner, fallback=profile_fallback
                     )
                     log(tag, "spawn", "warn",
                         f"spawn model={model!r} 不兼容 runner={child_runner}，已自动修正为 {corrected!r}")
@@ -4492,6 +4505,7 @@ async def dispatch_task(
     target_bot: "BotInstance | None" = None,
     model: str = "", effort: str = "",
     cwd: str = "", workspace: str = "", body_header: str = "",
+    runner: str = "",
 ) -> dict:
     """在 group_chat_id 新开一条 thread 派一个独立 cc-lark 子会话跑 prompt。
 
@@ -4554,10 +4568,11 @@ async def dispatch_task(
     if not child_user:
         return {"ok": False, "error": "无法确定目标 bot 侧的 user_id，不能复用调用方 open_id"}
 
-    child_runner = child_bot.profile.runner
+    # runner：子话题换个后端跑（agent 点名的后端本机没有专门的 bot，由同一个 bot 代跑）
+    child_runner = runner or child_bot.profile.runner
     if model:
         if not is_model_compatible_with_runner(model, child_runner):
-            fallback_target = (
+            fallback_target = "" if runner else (
                 child_bot.profile.dispatch_model
                 or child_bot.profile.default_model
                 or ""
@@ -4579,13 +4594,13 @@ async def dispatch_task(
     # 没显式指定就用**子 bot** profile 的 dispatch 默认模型（DISPATCH_MODEL）——
     # 让"主对话用便宜模型聊天、派出去的活用最强模型"成为配置保证，而不是靠派发方
     # 每次记得传 model。取 child_bot 的：model 属于跑它的那个后端。
-    if not model:
+    if not model and not runner:
         model = normalize_model(child_bot.profile.dispatch_model)
 
     topic_title = (title.strip() if (title and title.strip())
                    else prompt.strip().splitlines()[0])[:60]
-    if cross:
-        topic_title = f"[{child_bot.profile.runner}] {topic_title}"[:60]
+    if cross or runner:
+        topic_title = f"[{child_runner}] {topic_title}"[:60]
     try:
         anchor = await child_bot.feishu.send_post_to_chat(
             chat_id=group_chat_id,
@@ -4644,7 +4659,7 @@ async def dispatch_task(
     t = asyncio.create_task(handle_spawn(
         child_bot, user_id=(child_user or user), chat_id_raw=group_chat_id,
         thread_id=thread_id, anchor_message_id=anchor, prompt=prompt,
-        model=model, effort=effort, cwd=cwd, workspace=workspace,
+        model=model, effort=effort, cwd=cwd, workspace=workspace, runner=runner,
     ))
     _DISPATCH_CHILDREN.setdefault(group_chat_id, set()).add(t)
 
@@ -4857,6 +4872,7 @@ async def handover_task(
     model: str = "", effort: str = "",
     from_thread: str = "", from_anchor: str = "",
     cwd: str = "", workspace: str = "",
+    runner: str = "",
 ) -> dict:
     """把整项任务的所有权移交给一个全新会话（可跨 agent），移交方随后即可收工。
 
@@ -4889,7 +4905,7 @@ async def handover_task(
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
         "from": f"{bot.profile.name}[{bot.profile.runner}]",
         "from_thread": from_thread,
-        "to": f"{child_bot.profile.name}[{child_bot.profile.runner}]",
+        "to": f"{child_bot.profile.name}[{runner or child_bot.profile.runner}]",
         "chat_id": group_chat_id,
     }
     rendered = handover_store.render(normalized, meta)
@@ -4919,7 +4935,7 @@ async def handover_task(
         bot, user_id=user_id, group_chat_id=group_chat_id,
         title=f"[移交] {topic_title}", prompt=prompt, cap=cap,
         target_bot=target_bot, model=model, effort=effort,
-        cwd=cwd, workspace=workspace,
+        cwd=cwd, workspace=workspace, runner=runner,
         body_header=(f"（🔀 会话移交：本话题由 {meta['to']} 独立负责到底，"
                      f"移交自 {meta['from']} 的话题 {from_thread or '（未知）'}）"),
     )

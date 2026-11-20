@@ -18,6 +18,7 @@ AGENT_RUNNER_ALIASES: dict[str, str] = {
     "agy": "agy", "antigravity": "agy",
     "qoder": "qoder", "qodercli": "qoder",
     "kiro": "kiro", "kiro-cli": "kiro",
+    "pi": "pi", "pi-agent": "pi",
     "dots": "dots", "dot": "dots",
 }
 
@@ -30,6 +31,7 @@ RUNNER_HINTS: list[tuple[str, str, str]] = [
     ("grok",     '"grok"/"xai"',            "Grok"),
     ("qoder",    '"qoder"',                 "Qoder CLI（Qwen / Kimi / GLM / DeepSeek 等，按 Qoder 账号 credits 计费）"),
     ("kiro",     '"kiro"',                  "Kiro CLI（AWS Kiro：Claude Opus/Sonnet 5.5、GPT-5.6 等，按 Kiro Pro 的 credits 计费）"),
+    ("pi",       '"pi"',                    "pi（earendil-works/pi 编程 agent，模型写 provider/id：Gemini / ChatGPT 订阅等，按所选 provider 计费；本机没有专门的 pi bot 时由当前 bot 用 pi 后端开子话题）"),
     ("mimo",     '"mimo"',                  "MiMo Code"),
     ("maka",     '"maka"',                  "Apache Maka"),
     ("dots",     '"dots"/"dot"',            "OpenAI Dots（网页里的 Dot，只收发消息，不执行本机命令）"),

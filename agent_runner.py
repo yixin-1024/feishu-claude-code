@@ -1,4 +1,4 @@
-"""Claude / Codex / OpenCode / MiMo / Grok / Maka / agy / Qoder / Kiro / Dots 后端分发入口。"""
+"""Claude / Codex / OpenCode / MiMo / Grok / Maka / agy / Qoder / Kiro / pi / Dots 后端分发入口。"""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from maka_runner import run_maka
 from agy_runner import run_agy
 from qoder_runner import run_qoder
 from kiro_runner import run_kiro
+from pi_runner import run_pi
 from dots_runner import run_dots
 
 
@@ -245,6 +246,31 @@ async def run_agent(
             dangerously_skip_permissions=bool(profile.kiro_dangerous_skip),
             idle_timeout_sec=profile.kiro_idle_timeout_sec,
             extra_env=kiro_env,
+        )
+
+    if backend == "pi":
+        # pi 没有 --mcp-config：pi_runner 把 cc-lark MCP 配置（CC_LARK_* 显式写进 server env）
+        # 塞进环境变量，由 pi_extensions/cc_lark_mcp.ts 在会话里注册。
+        pi_env = dict(wake_context or {})
+        pi_env["CC_LARK_PROFILE"] = profile.name
+        return await run_pi(
+            message=message,
+            session_id=session_id,
+            model=model,
+            effort=effort,
+            cwd=cwd,
+            permission_mode=permission_mode,
+            on_text_chunk=on_text_chunk,
+            on_tool_use=on_tool_use,
+            on_process_start=on_process_start,
+            on_usage=on_usage,
+            on_status=on_status,
+            append_system_prompt=append_system_prompt,
+            pi_bin=getattr(profile, "pi_bin", "") or None,
+            agent_dir=getattr(profile, "pi_agent_dir", "") or None,
+            dangerously_skip_permissions=bool(getattr(profile, "pi_dangerous_skip", 1)),
+            idle_timeout_sec=int(getattr(profile, "pi_idle_timeout_sec", 600) or 600),
+            extra_env=pi_env,
         )
 
     if backend == "codex":

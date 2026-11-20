@@ -185,6 +185,16 @@ _KIRO_MCP_ADAPTER = (
     "并行子任务照样用 `dispatch_task`。\n\n"
 )
 
+# pi(earendil-works/pi) 把 MCP server 名里的 `-` 换成 `_`：cc-lark 的工具在它那里叫
+# `mcp__cc_lark__<tool>`，已经直接声明好（exposure=direct），不用 tool_search。
+_PI_MCP_ADAPTER = (
+    "【本后端（pi）怎么调下面这些工具】\n"
+    "下文按 Claude 的命名写作 `mcp__cc-lark__<tool>`；pi 会把 server 名里的 `-` 换成 `_`，"
+    "所以你工具列表里它们叫 `mcp__cc_lark__wake_me_in`、`mcp__cc_lark__dispatch_task` 这类，"
+    "已经直接加载好，**不需要** ToolSearch / tool_search，按这个名字直接调用、参数原样传。"
+    "**它们是真能用的**，别因为名字对不上就当成不存在。\n\n"
+)
+
 _AGY_SYSTEM_NOTIFICATION_GUARD = (
     "【后台任务与系统通知处理规范】\n"
     "- 当收到后台异步任务（run_command 等 background task）或系统消息完成的回执通知时（如包含 `Command execution finished`、"
@@ -227,6 +237,8 @@ def _build_timeout_ctx(profile: Profile, runner: str) -> dict:
                 _idle = int(getattr(profile, "qoder_idle_timeout_sec", 600) or 600)
             elif backend == "kiro":
                 _idle = int(getattr(profile, "kiro_idle_timeout_sec", 600) or 600)
+            elif backend == "pi":
+                _idle = int(getattr(profile, "pi_idle_timeout_sec", 600) or 600)
             rules = [
                 f"{_fmt_minutes(_idle)}内完全无输出且无子进程 → 强杀",
                 f"有子进程但你 {_fmt_minutes(_stuck)}没新输出 → 强杀",
@@ -379,10 +391,12 @@ def render_lark_prompt(
         ),
     }
     # qoder 的 MCP 工具名与 Claude 完全一致（mcp__cc-lark__*），直接用 Claude 那份
-    if backend in {"claude", "codex", "agy", "qoder", "kiro"}:
+    if backend in {"claude", "codex", "agy", "qoder", "kiro", "pi"}:
         runtime_mcp_section = render("_runtime_mcp_claude", shared_ctx)
         if backend == "kiro":
             runtime_mcp_section = _KIRO_MCP_ADAPTER + runtime_mcp_section
+        if backend == "pi":
+            runtime_mcp_section = _PI_MCP_ADAPTER + runtime_mcp_section
         if backend == "agy":
             # agy 不把 MCP 工具铺平成 mcp__<server>__<tool>，而是统一走 call_mcp_tool，
             # 并前置后台任务回执防复读规范

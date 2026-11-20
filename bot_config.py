@@ -127,6 +127,20 @@ AGY_ONLY_MODELS = frozenset({
 QODER_TIER_MODELS = frozenset({"auto", "ultimate", "performance", "efficient", "sonus", "cantus"})
 QODER_MODEL_PREFIXES = ("qwen", "kimi-", "glm-", "deepseek-v", "deepseek-flash", "minimax-", "qoder")
 
+# 所有 runner 名（profile 的 RUNNER、会话的 runner 都只能是这几个）。新后端加这里，
+# session_store / commands 的校验都引用它，别再各写一份集合。
+RUNNERS = frozenset({"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "pi", "dots"})
+
+# 不用专门开 bot、任何 bot 的话题里都能换成它跑的后端（本机实测过的才放进来）：
+#   · 话题里 /runner 切过去会钉住（session_store 的 runner_pinned），不会被打回 profile runner；
+#   · dispatch_task(agent=…) 点名它而本机没有 RUNNER=它 的 bot 时，派发方自己的 bot 换后端开子话题。
+# 别的后端各自一个 bot（profile 的 RUNNER），话题里 /runner 切过去下一条就回到 profile runner（老行为）。
+SWITCHABLE_RUNNERS = frozenset({"pi"})
+
+# pi 的模型一律写成 provider/id（google/gemini-3.8-flash、openai-codex/gpt-5.5 …），
+# 可带 :<thinking> 后缀。按「有 provider 前缀」放行，provider 名只认字母数字和 - _。
+_PI_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*/[^\s/][^\s]*$")
+
 # kiro 的模型名（kiro-cli chat --list-models，2.28.0）：auto + Claude / GPT-5.6 / 开源权重。
 # Claude 那批写法是 claude-opus-5.5（点号），和 Claude Code 的 claude-opus-5-5 不是一回事。
 KIRO_MODEL_PREFIXES = ("gpt-5", "glm-", "deepseek-", "minimax-", "qwen3-", "kiro")
@@ -201,6 +215,10 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
             or low.startswith(KIRO_MODEL_PREFIXES)
             or bool(_KIRO_CLAUDE_MODEL_RE.match(low))
         )
+
+    if runner == "pi":
+        # pi: provider/id（pi 自己按 provider 找凭据），或 pi-* 别名（已在上面解析成 provider/id）
+        return bool(_PI_MODEL_RE.match(low))
 
     if runner == "dots":
         # dots: 模型是 Dot 自己的（服务端决定），这里只认占位名
@@ -423,6 +441,12 @@ class Profile:
     kiro_bin: str = ""
     kiro_dangerous_skip: int = 1
     kiro_idle_timeout_sec: int = 600
+    # pi runner 配置（earendil-works/pi，CLI 名 pi）。凭据走 pi 自己的 auth.json + 环境变量
+    # 里的各家 API key；pi_agent_dir 对应 PI_CODING_AGENT_DIR（默认 ~/.pi/agent）。
+    pi_bin: str = ""
+    pi_agent_dir: str = ""
+    pi_dangerous_skip: int = 1
+    pi_idle_timeout_sec: int = 600
     # "会话群" chat_id：bot 在其它群被 @ 时（=调度 session），会被指引把任务派单到
     # 这个群的新话题里，由独立 session 承接处理。空字符串=禁用派单。
     dispatch_chat_id: str = ""
@@ -552,9 +576,9 @@ def _load_profile(name: str) -> Profile:
 
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
-    if runner not in {"claude", "codex", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
+    if runner not in RUNNERS:
         raise ValueError(
-            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka / agy / qoder / kiro / dots，"
+            f"profile {name!r} 的 {prefix}_RUNNER 必须是 claude / codex / opencode / mimo / grok / maka / agy / qoder / kiro / pi / dots，"
             f"当前: {runner}"
         )
     claude_runner = env("CLAUDE_RUNNER").strip().lower()
@@ -635,6 +659,14 @@ def _load_profile(name: str) -> Profile:
         kiro_idle = int(env("KIRO_IDLE_TIMEOUT_SEC", os.getenv("KIRO_IDLE_TIMEOUT_SEC", "600")) or "600")
     except ValueError:
         kiro_idle = 600
+    try:
+        pi_skip = int(env("PI_DANGEROUS_SKIP", os.getenv("PI_DANGEROUS_SKIP", "1")) or "1")
+    except ValueError:
+        pi_skip = 1
+    try:
+        pi_idle = int(env("PI_IDLE_TIMEOUT_SEC", os.getenv("PI_IDLE_TIMEOUT_SEC", "600")) or "600")
+    except ValueError:
+        pi_idle = 600
     return Profile(
         name=name,
         app_id=app_id,
@@ -720,6 +752,10 @@ def _load_profile(name: str) -> Profile:
         kiro_bin=env("KIRO_BIN", os.getenv("KIRO_BIN", "")).strip(),
         kiro_dangerous_skip=max(0, min(1, kiro_skip)),
         kiro_idle_timeout_sec=max(0, kiro_idle),
+        pi_bin=env("PI_BIN", os.getenv("PI_BIN", "")).strip(),
+        pi_agent_dir=env("PI_AGENT_DIR", os.getenv("PI_AGENT_DIR", "")).strip(),
+        pi_dangerous_skip=max(0, min(1, pi_skip)),
+        pi_idle_timeout_sec=max(0, pi_idle),
         dispatch_chat_id=env("DISPATCH_CHAT_ID").strip(),
         role=role,
         court_chat_id=env("COURT_CHAT_ID").strip(),
@@ -817,6 +853,14 @@ def _load_legacy_profile() -> Optional[Profile]:
         kiro_idle = int(os.getenv("KIRO_IDLE_TIMEOUT_SEC", "600") or "600")
     except ValueError:
         kiro_idle = 600
+    try:
+        pi_skip = int(os.getenv("PI_DANGEROUS_SKIP", "1") or "1")
+    except ValueError:
+        pi_skip = 1
+    try:
+        pi_idle = int(os.getenv("PI_IDLE_TIMEOUT_SEC", "600") or "600")
+    except ValueError:
+        pi_idle = 600
     return Profile(
         name=legacy_name,
         app_id=app_id,
@@ -884,6 +928,10 @@ def _load_legacy_profile() -> Optional[Profile]:
         kiro_bin=os.getenv("KIRO_BIN", "").strip(),
         kiro_dangerous_skip=max(0, min(1, kiro_skip)),
         kiro_idle_timeout_sec=max(0, kiro_idle),
+        pi_bin=os.getenv("PI_BIN", "").strip(),
+        pi_agent_dir=os.getenv("PI_AGENT_DIR", "").strip(),
+        pi_dangerous_skip=max(0, min(1, pi_skip)),
+        pi_idle_timeout_sec=max(0, pi_idle),
     )
 
 

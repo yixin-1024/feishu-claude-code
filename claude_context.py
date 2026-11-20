@@ -1,4 +1,4 @@
-"""把本机 Claude Code 的规则 / 记忆 / skill 接给非 Claude 后端（qoder、kiro）。
+"""把本机 Claude Code 的规则 / 记忆 / skill 接给非 Claude 后端（qoder、kiro、pi）。
 
 用户的长期规则和记忆都记在 Claude Code 那边，换个后端就全丢了：
   - 全局规则 ~/.claude/CLAUDE.md、项目规则 <dir>/CLAUDE.md —— qoder 只认 AGENTS.md
@@ -144,9 +144,13 @@ def _memory_index(cwd: str) -> tuple[str, str]:
     return mem_dir, raw
 
 
-def build_claude_context_brief(cwd: Optional[str], skills_note: str = "") -> str:
+def build_claude_context_brief(
+    cwd: Optional[str], skills_note: str = "", include_project_rules: bool = True,
+) -> str:
     """给非 Claude 后端的提示词段落：Claude Code 的规则 / 记忆 / skill 在哪、怎么读。
 
+    include_project_rules=False：后端自己会沿目录往上加载 CLAUDE.md（pi），就别再列
+    「项目规则你不会自动加载」那段，免得说错、也免得它把同一份文件再读一遍。
     什么都没有（干净机器）时返回空串，不往提示词里塞空壳。
     """
     cwd = cwd or os.path.expanduser("~")
@@ -159,7 +163,7 @@ def build_claude_context_brief(cwd: Optional[str], skills_note: str = "") -> str
             + global_rules
         )
 
-    project_mds = _project_claude_mds(cwd)
+    project_mds = _project_claude_mds(cwd) if include_project_rules else []
     if project_mds:
         parts.append(
             "■ 项目规则：下面这些 CLAUDE.md 你不会自动加载，**动手前先读完**，里面是这个项目的约定、"

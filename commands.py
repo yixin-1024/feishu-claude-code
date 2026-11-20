@@ -29,6 +29,7 @@ from grok_runner import GROK_EFFORT_LEVELS
 from agy_runner import AGY_EFFORT_LEVELS, resolve_agy_bin
 from qoder_runner import QODER_EFFORT_LEVELS
 from kiro_runner import KIRO_EFFORT_LEVELS
+from pi_runner import PI_EFFORT_LEVELS, PI_MODEL_BUTTONS
 from run_control import RUN_GATE
 import group_allowlist
 import user_acl
@@ -168,6 +169,15 @@ MODEL_ALIASES = {
     "kiro-glm": "glm-5",
     "kiro-minimax": "minimax-m2.5",
     "kiro-qwen": "qwen3-coder-next",
+    # pi（earendil-works/pi）：模型写 provider/id，凭据走 pi 自己的 auth.json + 各家 API key。
+    # Gemini 那几个用本机的 Gemini API key（AGY_API_KEY）；Neon 不在 pi 的模型表里，
+    # pi 会当自定义 id 用（stderr 警告一句）。GPT 要先 `pi auth login openai-codex`。
+    "pi": "google/gemini-3.8-flash",
+    "pi-flash": "google/gemini-3.8-flash",
+    "pi-neon": "google/gemini-4-neon",
+    "pi-argon": "google/gemini-4-argon",
+    "pi-gemini-pro": "google/gemini-3.1-pro-preview",
+    "pi-gpt": "openai-codex/gpt-5.5",
     # OpenAI Dots（网页里的 Dot）：模型由 Dot 自己决定，只有一个占位名
     "dots": "dots",
     "dot": "dots",
@@ -222,6 +232,11 @@ def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[s
         from kiro_runner import default_effort
         return default_effort(profile_name)
 
+    if runner == "pi":
+        from pi_runner import default_effort as pi_default_effort
+        level = pi_default_effort(profile_name)
+        return "none" if level == "off" else level
+
     return None
 
 
@@ -273,7 +288,7 @@ HELP_TEXT = """\
 `/new` 或 `/clear` — 开始新 session
 `/defaults` — 新开 session，并把当前 chat 参数重置为配置默认值
 `/resume` — 查看历史 sessions / `/resume [序号]` 恢复
-`/runner [codex|claude|opencode|mimo|grok|maka|agy|qoder|kiro]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka / Antigravity / Qoder CLI / Kiro CLI
+`/runner [codex|claude|opencode|mimo|grok|maka|agy|qoder|kiro|pi]` — 切换当前 chat 使用 Codex / Claude Code / opencode / MiMo Code / Grok CLI / Apache Maka / Antigravity / Qoder CLI / Kiro CLI / pi
 `/model [名称]` — 切换当前 bot 后端支持的模型（也可填完整 ID；会重开 session）
 `/fable` `/opus` `/sonnet` `/haiku` `[指令]` — 快捷切模型并**直接执行后面的指令**，沿用当前 session 不丢上下文（例：`/opus 帮我查一下数据库`；仅 claude runner 可用）
 `/effort [级别]` — 设置当前对话推理强度（default / low / medium / high / xhigh / max / ultra）
@@ -1866,6 +1881,9 @@ def _runner_default_model(bot, runner: str) -> str:
         return "Qwen3.8-Flash"
     if runner == "kiro":
         return "auto"
+    if runner == "pi":
+        from pi_runner import default_model as pi_default_model
+        return pi_default_model(getattr(profile, "name", "") if profile else "")
     if runner == "dots":
         return "dots"
     return "sonnet[1m]"
@@ -2712,6 +2730,9 @@ def _effort_levels_for(runner: str, model: str) -> tuple[Optional[tuple[str, ...
         return QODER_EFFORT_LEVELS, ""
     if runner == "kiro":
         return KIRO_EFFORT_LEVELS, ""
+    if runner == "pi":
+        # pi 的 --thinking 档位（off 对应 cc-lark 的 none，由 pi_runner 归一）
+        return PI_EFFORT_LEVELS, ""
     if runner == "maka":
         # maka 的 --thinking 档位（off 对应 cc-lark 的 none，由 maka_runner 归一）
         return ("minimal", "low", "medium", "high", "xhigh", "max"), ""
@@ -2730,7 +2751,7 @@ def _effort_levels_for(runner: str, model: str) -> tuple[Optional[tuple[str, ...
         return effort_levels_for_model(model), ""
     return None, (
         f"❌ 当前 runner `{runner}` 暂不支持 `/effort`；请先切换到 `claude`、`codex`、`grok`、"
-        f"`maka`、`agy`、`qoder` 或 `kiro`。"
+        f"`maka`、`agy`、`qoder`、`kiro` 或 `pi`。"
     )
 
 
@@ -2903,6 +2924,7 @@ async def handle_command(
                     {"text": "Antigravity", "value": {"action": "run_cmd", "cmd": "/runner agy", "cid": chat_id}},
                     {"text": "Qoder", "value": {"action": "run_cmd", "cmd": "/runner qoder", "cid": chat_id}},
                     {"text": "Kiro", "value": {"action": "run_cmd", "cmd": "/runner kiro", "cid": chat_id}},
+                    {"text": "pi", "value": {"action": "run_cmd", "cmd": "/runner pi", "cid": chat_id}},
                     {"text": "OpenAI Dots", "value": {"action": "run_cmd", "cmd": "/runner dots", "cid": chat_id}},
                 ],
             }
@@ -2923,8 +2945,11 @@ async def handle_command(
             requested = "qoder"
         if requested in {"kiro-cli", "kirocli"}:
             requested = "kiro"
-        if requested not in {"codex", "claude", "opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}:
-            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）、`agy`（Antigravity CLI）、`qoder`（Qoder CLI）、`kiro`（Kiro CLI）、`dots`（网页版 OpenAI Dots）".format(args)
+        if requested in {"pi-agent", "pi-coding-agent", "pi-mono"}:
+            requested = "pi"
+        from bot_config import RUNNERS
+        if requested not in RUNNERS:
+            return "❌ 未知 runner：`{}`\n可选：`codex`、`claude`（Claude Code）、`opencode`、`mimo`（MiMo Code）、`grok`（Grok CLI）、`maka`（Apache Maka）、`agy`（Antigravity CLI）、`qoder`（Qoder CLI）、`kiro`（Kiro CLI）、`pi`（earendil-works/pi）、`dots`（网页版 OpenAI Dots）".format(args)
         model = _runner_default_model(bot, requested)
         await store.set_runner(user_id, chat_id, requested, model=model)
         return f"✅ 已切换 runner 为 `{requested}`，模型 `{model}`。已开始新 session。"
@@ -3011,6 +3036,11 @@ async def handle_command(
                     {"text": "🌙 GPT-5.6 Luna 0.6x", "value": {"action": "run_cmd", "cmd": "/model kiro-gpt-luna", "cid": chat_id}},
                     {"text": "🐋 DeepSeek 3.2 0.25x", "value": {"action": "run_cmd", "cmd": "/model kiro-deepseek", "cid": chat_id}},
                     {"text": "🇨🇳 Qwen3 Coder 0.05x", "value": {"action": "run_cmd", "cmd": "/model kiro-qwen", "cid": chat_id}},
+                ]
+            elif runner == "pi":
+                buttons = [
+                    {"text": label, "value": {"action": "run_cmd", "cmd": f"/model {alias}", "cid": chat_id}}
+                    for alias, label in PI_MODEL_BUTTONS
                 ]
             elif runner == "grok":
                 buttons = [
@@ -3138,7 +3168,7 @@ async def handle_command(
         quota_line = (
             await asyncio.to_thread(_format_codex_rate_line, cur.get("session_id"))
             if runner == "codex"
-            else "" if runner in {"opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "dots"}
+            else "" if runner in {"opencode", "mimo", "grok", "maka", "agy", "qoder", "kiro", "pi", "dots"}
             else await asyncio.to_thread(_get_quota_compact)
         )
 
@@ -3148,7 +3178,7 @@ async def handle_command(
             f"Runner: `{runner}`",
             f"模型: `{model}`",
         ]
-        if runner in {"claude", "codex", "grok", "maka", "agy", "qoder", "kiro"}:
+        if runner in {"claude", "codex", "grok", "maka", "agy", "qoder", "kiro", "pi"}:
             effort_override = cur.get("effort_override")
             effort = _effective_effort_label(store, bot, runner, effort_override, chat_id)
             if effort_override:
@@ -3328,6 +3358,30 @@ async def handle_command(
             lines.append(f"模型: `{model}`")
             lines.append("")
             lines.extend(await asyncio.to_thread(_kiro_plan_lines, getattr(bot, "profile", None)))
+            return _wrap_usage_output(lines)
+        if runner == "pi":
+            from pi_runner import format_cost, resolve_model, session_cost
+            profile_name = getattr(getattr(bot, "profile", None), "name", "") or ""
+            model = resolve_model(_session_model(store, cur, chat_id, runner), profile_name)
+            lines = ["📈 **pi 用量**"]
+            last_usage = cur.get("last_usage") or None
+            ctx_line = _format_context_line(
+                cur.get("session_id"),
+                model,
+                runner="pi",
+                current_usage=last_usage,
+            )
+            if ctx_line:
+                lines.append(ctx_line)
+            turn = format_cost((last_usage or {}).get("_turn_cost_usd"))
+            if turn:
+                lines.append(f"上一轮花费：{turn}（pi 按模型价目表估算）")
+            total = format_cost(await asyncio.to_thread(session_cost, cur.get("session_id")))
+            if total:
+                lines.append(f"本会话累计：{total}")
+            lines.append("Runner: `pi`")
+            lines.append(f"模型: `{model}`")
+            lines.append("按所选 provider 计费（Gemini 走本机的 Gemini API key）。")
             return _wrap_usage_output(lines)
         if runner == "grok":
             model = _session_model(store, cur, chat_id, runner)
