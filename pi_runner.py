@@ -1,8 +1,8 @@
 """本地调用 pi（earendil-works/pi 的编程 agent，CLI 叫 `pi`）的统一入口。
 
     pi --mode json --session-dir <PI_SESSION_DIR> [--session <会话文件>]
-       [--model <provider/id>] [--thinking <level>] [--tools read,grep,find,ls]
-       [--append-system-prompt <临时文件>] [-e pi_extensions/cc_lark_mcp.ts]
+       --model google/<id> [--thinking <level>] [--tools read,grep,find,ls]
+       [--append-system-prompt <临时文件>] -e pi_extensions/cc_lark.ts
        [--skill ~/.claude/skills] [--skill <cwd>/.claude/skills]
     （prompt 从 stdin 进：管道进来的 stdin 会拼在首条 prompt 前，没有 argv 长度上限）
 
@@ -22,19 +22,24 @@ stdin 不是终端就当 N 直接退出。所以这里用 `--session-dir` 钉一
 id 找到文件、用 `--session <文件路径>` 打开（跨 cwd 也直接续上，实测）。文件不在了
 （换机器 / 被清）就退回新会话。
 
-模型：`provider/id`，如 google/gemini-3.8-flash、openai-codex/gpt-5.5、
-anthropic/claude-…。凭据走 pi 自己的（~/.pi/agent/auth.json，`pi auth login <provider>`），
-加上环境变量里的各家 API key。本机没单独配 GEMINI_API_KEY 时，借 agy 那把 Gemini
-API key（AGY_API_KEY，PI_GEMINI_KEY_FROM 可改来源）。不在 pi 模型表里的 id（如
-gemini-4-neon）pi 会在 stderr 警告一句然后照样当自定义 id 用。
+模型：**只接 Gemini**（用户 11-20 定：Gemini 4 全家 Neon / Hydrogen / Carbon / Argon +
+3.8 Flash，见 PI_GEMINI_MODELS）。pi 自带的 Google 模型表里只有 Argon 和 3.8 Flash，
+Neon / Hydrogen / Carbon 会被当「自定义 id」照抄 Argon 的元数据（价格、档位都不对），
+所以扩展每轮用 registerProvider("google", {models}) 把 Google 的模型表整张换成这 5 款。
+凭据：GEMINI_API_KEY；本机没单独配时借 agy 那把（AGY_API_KEY，PI_GEMINI_KEY_FROM 可改）。
 
-推理强度：`--thinking off|minimal|low|medium|high|xhigh|max`；cc-lark 的 none = off。
+推理强度：`--thinking`。Gemini 只有 low / medium / high，Neon / Hydrogen 多一档 xhigh
+（11-20 直接打 Gemini API 实测：这两款收 thinkingLevel=xhigh，Carbon 回 400）。
+none / minimal 落到 low，max 落到该模型的最高档。⚠️ pi 1.5.2 的 Google 适配层把档位写死成
+minimal/low/medium/high，配 xhigh 会直接报 Unsupported Google thinking level mapping；所以
+模型表里 xhigh 先映射成 high 让 pi 放行，扩展在 before_provider_request 里再把这两款的
+thinkingLevel 改写成 XHIGH。
 
 MCP：pi 没有 --mcp-config，全局 ~/.pi/agent/mcp.json 又是所有会话共用的（并发话题
 的 CC_LARK_* 会串）。所以每轮把 cc-lark 运行时 MCP 配置（Claude 同款 JSON）放进
-环境变量 CC_LARK_PI_MCP_CONFIG，用 `-e pi_extensions/cc_lark_mcp.ts` 这个扩展在
-会话里 registerMcpServer（exposure=direct）。pi 会把 server 名里的 `-` 换成 `_`，
-工具名是 `mcp__cc_lark__<tool>`，提示词里有一段转译。
+环境变量 CC_LARK_PI_MCP_CONFIG，同一个扩展在会话里 registerMcpServer
+（exposure=direct）。pi 会把 server 名里的 `-` 换成 `_`，工具名是
+`mcp__cc_lark__<tool>`，提示词里有一段转译。
 
 权限：pi 没有审批机制，工具默认全开。profile 关了 PI_DANGEROUS_SKIP 且本轮不是
 bypassPermissions 时只给只读工具（read,grep,find,ls），MCP 工具不受影响。
@@ -44,8 +49,9 @@ Claude Code 的规则 / 记忆 / skill：pi 自己会沿 cwd 往上加载 AGENTS
 ~/.claude/CLAUDE.md 和记忆索引拼进系统提示（见 claude_context.py）。
 CC_LARK_PI_CLAUDE_CONTEXT=0 关掉。
 
-计费：按所选 provider 计。每条 assistant 消息自带 usage + cost（美元，pi 按模型表
-估算），footer 显示上下文占用 + 本轮花费。
+计费：走 Gemini API key。每条 assistant 消息自带 usage + cost（美元，pi 按
+PI_GEMINI_MODELS 里的价目表算，Gemini 4 的价格没有官方页可查，是估算），footer 显示
+上下文占用 + 本轮花费。
 """
 
 from __future__ import annotations
@@ -72,27 +78,38 @@ IDLE_TIMEOUT = 600  # 无输出且无子进程 → 视为挂死
 STUCK_CHILD_TIMEOUT = int(os.getenv("STUCK_CHILD_TIMEOUT_SEC", "3600"))
 _CHECK_INTERVAL = 30
 
-PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
-# /effort 面板用的档位（cc-lark 习惯写 none，runner 里换成 off）
-PI_EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# 基础三档；Neon / Hydrogen 多一档 xhigh（见 PI_GEMINI_MODELS）
+PI_EFFORT_LEVELS = ("low", "medium", "high")
 
 DEFAULT_MODEL = "google/gemini-3.8-flash"
 DEFAULT_SESSION_DIR = os.path.expanduser("~/.feishu-claude/pi-sessions")
-EXTENSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pi_extensions", "cc_lark_mcp.ts")
+EXTENSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pi_extensions", "cc_lark.ts")
 READ_ONLY_TOOLS = "read,grep,find,ls"
+
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+_CONTEXT_WINDOW = 1_048_576
+
+# pi 能用的全部模型（id → 显示名, (输入, 输出, 缓存命中) 美元/百万 token, 最大输出, 有没有 xhigh）。
+# 3.8 Flash / Argon 的价格和输出上限照抄 pi 1.5.2 自带的表；Neon / Hydrogen / Carbon 没有官方
+# 价目页，按 11-20 网上报道估（Neon $3/$15、Hydrogen $1.5/$7.5、Carbon 同 Argon 的首发价 $2/$10，
+# 12-01 起 Carbon / Argon 据称涨到 $4/$20），输出上限按 Argon 的 32k 保守给。
+# ⚠️ 名单和 bot_config.PI_MODELS 必须一致（tests/test_pi_runner.py 有断言）。
+PI_GEMINI_MODELS: dict[str, tuple[str, tuple[float, float, float], int, bool]] = {
+    "gemini-3.8-flash": ("Gemini 3.8 Flash", (0.75, 3.75, 0.075), 65_536, False),
+    "gemini-4-neon": ("Gemini 4 Neon", (3.0, 15.0, 0.15), 32_768, True),
+    "gemini-4-hydrogen": ("Gemini 4 Hydrogen", (1.5, 7.5, 0.15), 32_768, True),
+    "gemini-4-carbon": ("Gemini 4 Carbon", (2.0, 10.0, 0.1), 32_768, False),
+    "gemini-4-argon": ("Gemini 4 Argon", (2.0, 10.0, 0.1), 32_768, False),
+}
 
 # 给 /model 用的静态清单（别名, 显示名）；别名在 commands.MODEL_ALIASES 里解析
 PI_MODEL_BUTTONS: list[tuple[str, str]] = [
-    ("pi-flash", "🚀 Gemini 3.8 Flash"),
     ("pi-neon", "✴️ Gemini 4 Neon"),
+    ("pi-hydrogen", "💧 Gemini 4 Hydrogen"),
+    ("pi-carbon", "🪨 Gemini 4 Carbon"),
     ("pi-argon", "🔆 Gemini 4 Argon"),
-    ("pi-gemini-pro", "💎 Gemini 3.1 Pro"),
-    ("pi-gpt", "🤖 GPT-5.5（ChatGPT 订阅，要先 pi auth login openai-codex）"),
+    ("pi-flash", "🚀 Gemini 3.8 Flash"),
 ]
-
-# 上下文窗口：先问 `pi --list-models`（准），拿不到按家族猜；PI_CONTEXT_WINDOW 可覆盖
-_DEFAULT_CONTEXT_WINDOW = 200_000
-_window_cache: dict[str, int] = {}
 
 # pi 工具名 → 卡片认识的名字（dispatcher._format_tool 按名字挑图标和主参数）
 _TOOL_DISPLAY = {"find": "glob", "ls": "list_dir"}
@@ -111,24 +128,76 @@ def resolve_pi_bin(configured: Optional[str] = None) -> str:
     return "pi"
 
 
-def normalize_thinking(effort: Optional[str]) -> Optional[str]:
-    """cc-lark 的 effort → pi 的 --thinking；空 / auto / default = 不传（跟 pi 自己的默认）。"""
+def _bare_model(model: Optional[str]) -> str:
+    low = (model or "").strip().lower()
+    return low[len("google/"):] if low.startswith("google/") else low
+
+
+def effort_levels_for_model(model: Optional[str]) -> tuple[str, ...]:
+    """该模型能用的推理档位：low / medium / high，Neon / Hydrogen 多一档 xhigh。"""
+    meta = PI_GEMINI_MODELS.get(_bare_model(model))
+    return PI_EFFORT_LEVELS + (("xhigh",) if meta and meta[3] else ())
+
+
+def normalize_thinking(effort: Optional[str], model: Optional[str] = None) -> Optional[str]:
+    """cc-lark 的 effort → pi 的 --thinking；空 / auto / default = 不传（跟 pi 自己的默认）。
+
+    收敛到该模型真有的档位：none / off / minimal → low（Gemini 关不掉思考，pi 也会这么抬）；
+    xhigh / max → 有 xhigh 的模型给 xhigh，其余给 high。不知道模型时 xhigh / max 原样留 xhigh。
+    """
     e = (effort or "").strip().lower()
     if not e or e in ("auto", "default"):
         return None
-    if e == "none":
-        return "off"
-    if e not in PI_THINKING_LEVELS:
-        raise ValueError(f"invalid pi thinking level {e!r}; expected one of {list(PI_THINKING_LEVELS)}")
-    return e
+    if e in ("none", "off", "minimal"):
+        return "low"
+    if e in PI_EFFORT_LEVELS:
+        return e
+    if e in ("xhigh", "max"):
+        if model is None or "xhigh" in effort_levels_for_model(model):
+            return "xhigh"
+        return "high"
+    raise ValueError(f"invalid pi thinking level {e!r}; expected one of low/medium/high/xhigh/max")
 
 
-def default_effort(profile_name: Optional[str] = None) -> Optional[str]:
+def provider_config(api_key_env: str = "GEMINI_API_KEY") -> dict:
+    """扩展拿去 registerProvider("google", …) 的配置：Google 的模型表整张换成 PI_GEMINI_MODELS。"""
+    models = []
+    for mid, (name, (cin, cout, cread), max_out, xhigh) in PI_GEMINI_MODELS.items():
+        models.append({
+            "id": mid,
+            "name": name,
+            "api": "google-generative-ai",
+            "baseUrl": GEMINI_BASE_URL,
+            "reasoning": True,
+            "input": ["text", "image"],
+            "cost": {"input": cin, "output": cout, "cacheRead": cread, "cacheWrite": 0},
+            "contextWindow": _CONTEXT_WINDOW,
+            "maxTokens": max_out,
+            # xhigh 先映射成 high（pi 只放行四个 Google 值），扩展发请求前改写成 XHIGH
+            "thinkingLevelMap": {
+                "off": None, "minimal": None, "low": "low", "medium": "medium", "high": "high",
+                "xhigh": "high" if xhigh else None, "max": None,
+            },
+        })
+    return {
+        "provider": "google",
+        "xhighModels": [mid for mid, meta in PI_GEMINI_MODELS.items() if meta[3]],
+        "config": {
+            "name": "Google",
+            "baseUrl": GEMINI_BASE_URL,
+            "api": "google-generative-ai",
+            "apiKey": f"${api_key_env}",
+            "models": models,
+        },
+    }
+
+
+def default_effort(profile_name: Optional[str] = None, model: Optional[str] = None) -> Optional[str]:
     """profile 级默认强度：<PROFILE>_PI_EFFORT 优先，再退到 PI_EFFORT；非法值当没配。"""
     prof = (profile_name or "").strip().upper()
     raw = (os.getenv(f"{prof}_PI_EFFORT") if prof else None) or os.getenv("PI_EFFORT") or ""
     try:
-        return normalize_thinking(raw)
+        return normalize_thinking(raw, model)
     except ValueError:
         return None
 
@@ -137,7 +206,8 @@ def default_model(profile_name: Optional[str] = None) -> str:
     """没 /model 覆盖时用的模型：<PROFILE>_PI_MODEL > PI_MODEL > google/gemini-3.8-flash。"""
     prof = (profile_name or "").strip().upper()
     raw = (os.getenv(f"{prof}_PI_MODEL") if prof else None) or os.getenv("PI_MODEL") or ""
-    return raw.strip() or DEFAULT_MODEL
+    bare = _bare_model(raw)
+    return f"google/{bare}" if bare in PI_GEMINI_MODELS else DEFAULT_MODEL
 
 
 def resolve_model(model: Optional[str], profile_name: Optional[str] = None) -> str:
@@ -191,63 +261,12 @@ def session_cost(session_id: Optional[str], sessions: Optional[str] = None) -> O
     return total
 
 
-def _parse_window(text: str) -> Optional[int]:
-    m = re.fullmatch(r"([\d.]+)\s*([KkMm]?)", (text or "").strip())
-    if not m:
-        return None
-    n = float(m.group(1))
-    unit = m.group(2).lower()
-    return int(round(n * (1_000_000 if unit == "m" else 1000 if unit == "k" else 1)))
-
-
-def parse_list_models(text: str) -> dict[str, int]:
-    """`pi --list-models` 的表格 → {"provider/model": 上下文窗口}。"""
-    out: dict[str, int] = {}
-    for line in (text or "").splitlines():
-        cols = line.split()
-        if len(cols) < 3 or cols[0] == "provider":
-            continue
-        window = _parse_window(cols[2])
-        if window:
-            out[f"{cols[0]}/{cols[1]}".lower()] = window
-    return out
-
-
-def _guess_window(model: str) -> int:
-    low = (model or "").lower()
-    if "gemini" in low or "[1m]" in low:
-        return 1_000_000
-    return _DEFAULT_CONTEXT_WINDOW
-
-
-async def context_window_for(model: Optional[str], pi_bin: Optional[str] = None, env: Optional[dict] = None) -> int:
+def context_window_for(model: Optional[str] = None) -> int:
+    """这几款 Gemini 都是 1M 窗口；PI_CONTEXT_WINDOW 可覆盖。"""
     override = (os.getenv("PI_CONTEXT_WINDOW") or "").strip()
     if override.isdigit() and int(override) > 0:
         return int(override)
-    key = (model or "").strip().lower().split(":", 1)[0]
-    if not key:
-        return _DEFAULT_CONTEXT_WINDOW
-    if key in _window_cache:
-        return _window_cache[key]
-    window = 0
-    try:
-        search = key.split("/", 1)[-1]
-        proc = await asyncio.create_subprocess_exec(
-            resolve_pi_bin(pi_bin), "--list-models", search,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=env or None,
-            start_new_session=True,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
-        table = parse_list_models(out.decode("utf-8", errors="replace"))
-        window = table.get(key) or (table.get(f"google/{key}") if "/" not in key else 0) or 0
-    except Exception:  # noqa: BLE001 — 查不到就按家族猜
-        window = 0
-    window = window or _guess_window(key)
-    _window_cache[key] = window
-    return window
+    return _CONTEXT_WINDOW
 
 
 def _with_claude_context(append_system_prompt: Optional[str], cwd: Optional[str]) -> str:
@@ -348,14 +367,14 @@ async def run_pi(
     """返回 (full_text, session_id, used_fresh_session_fallback)。"""
     del on_status  # 那是 PTY 限流告警通道，pi 的重试只记日志
     profile_name = (extra_env or {}).get("CC_LARK_PROFILE")
+    resolved_model = resolve_model(model, profile_name)
     try:
-        thinking = normalize_thinking(effort)
+        thinking = normalize_thinking(effort, resolved_model)
     except ValueError:
         # 派活 / 定时任务可能带别家后端才有的档位（codex 的 ultra）：别为这个整轮失败
         print(f"[run_pi] 忽略 pi 不认识的推理强度 {effort!r}", flush=True)
         thinking = None
-    thinking = thinking or default_effort(profile_name)
-    resolved_model = resolve_model(model, profile_name)
+    thinking = thinking or default_effort(profile_name, resolved_model)
     trust_all = bool(dangerously_skip_permissions) or (permission_mode or "").lower() in (
         "bypasspermissions", "bypass_permissions",
     )
@@ -375,6 +394,8 @@ async def run_pi(
         src = os.getenv("PI_GEMINI_KEY_FROM", "AGY_API_KEY")
         if src and env.get(src):
             env["GEMINI_API_KEY"] = env[src]
+    # 扩展把 Google 的模型表换成 PI_GEMINI_MODELS（只接这几款 Gemini、价格和档位对得上）
+    env["CC_LARK_PI_PROVIDER"] = json.dumps(provider_config(), ensure_ascii=False)
     mcp_cfg = cc_lark_mcp_config(extra_env, log_tag="run_pi")
     if mcp_cfg:
         env["CC_LARK_PI_MCP_CONFIG"] = json.dumps(mcp_cfg, ensure_ascii=False)
@@ -402,7 +423,7 @@ async def run_pi(
             cmd += ["--tools", READ_ONLY_TOOLS]
         if prompt_file:
             cmd += ["--append-system-prompt", prompt_file]
-        if mcp_cfg and os.path.isfile(EXTENSION_PATH):
+        if os.path.isfile(EXTENSION_PATH):
             cmd += ["-e", EXTENSION_PATH]
         cmd += _skill_args(cwd)
 
@@ -563,7 +584,7 @@ async def run_pi(
 
         if last_usage:
             usage_out = dict(last_usage)
-            usage_out["_context_window"] = await context_window_for(resolved_model, pi_bin, env)
+            usage_out["_context_window"] = context_window_for(resolved_model)
             if turn_tokens:
                 usage_out["_turn_tokens"] = turn_tokens
             if turn_cost:

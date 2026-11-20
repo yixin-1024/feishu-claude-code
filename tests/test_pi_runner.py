@@ -173,7 +173,7 @@ def test_builds_expected_argv_and_env(monkeypatch, sessions):
     monkeypatch.setenv("AGY_API_KEY", "gem-key")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     _run(
-        sessions, model="pi-neon", effort="none", pi_bin="/opt/pi", append_system_prompt="SYS",
+        sessions, model="pi-neon", effort="max", pi_bin="/opt/pi", append_system_prompt="SYS",
         extra_env={"CC_LARK_THREAD_ID": "omt_p", "CC_LARK_PROFILE": "main", "CC_LARK_CONTROL_TOKEN": "x"},
     )
     call = captured["calls"][0]
@@ -182,7 +182,7 @@ def test_builds_expected_argv_and_env(monkeypatch, sessions):
     assert cmd[cmd.index("--session-dir") + 1] == sessions
     assert "--session" not in cmd  # 新会话
     assert cmd[cmd.index("--model") + 1] == "google/gemini-4-neon"  # 别名已解析
-    assert cmd[cmd.index("--thinking") + 1] == "off"  # cc-lark 的 none = pi 的 off
+    assert cmd[cmd.index("--thinking") + 1] == "xhigh"  # Neon 最高档是 xhigh，max 落到它
     assert "--tools" not in cmd  # 默认工具全开
     assert cmd[cmd.index("-e") + 1] == pi_runner.EXTENSION_PATH
     # 系统提示走临时文件（跑完删掉）
@@ -194,16 +194,24 @@ def test_builds_expected_argv_and_env(monkeypatch, sessions):
     assert "CC_LARK_CONTROL_TOKEN" not in server_env
     assert env["GEMINI_API_KEY"] == "gem-key"  # 借 agy 的 Gemini key
     assert env["PI_SKIP_VERSION_CHECK"] == "1"
+    # 模型表：Google 只留那 5 款，Neon / Hydrogen 标成要改写 xhigh
+    provider = json.loads(env["CC_LARK_PI_PROVIDER"])
+    assert provider["provider"] == "google"
+    assert provider["config"]["apiKey"] == "$GEMINI_API_KEY"
+    assert sorted(m["id"] for m in provider["config"]["models"]) == sorted(pi_runner.PI_GEMINI_MODELS)
+    assert sorted(provider["xhighModels"]) == ["gemini-4-hydrogen", "gemini-4-neon"]
 
 
-def test_no_thread_context_means_no_mcp_extension(monkeypatch, sessions):
+def test_no_thread_context_means_no_mcp_but_still_model_table(monkeypatch, sessions):
     captured = {}
     _patch_exec(monkeypatch, [FakeProc(STREAM)], captured)
     monkeypatch.setenv("CC_LARK_PI_MCP_CONFIG", "stale")
     _run(sessions, extra_env={"CC_LARK_PROFILE": "main"})
     call = captured["calls"][0]
-    assert "-e" not in call["cmd"]
+    # 私聊没有话题上下文：不挂 cc-lark MCP，但扩展照样加载（模型表要换）
+    assert call["cmd"][call["cmd"].index("-e") + 1] == pi_runner.EXTENSION_PATH
     assert "CC_LARK_PI_MCP_CONFIG" not in call["env"]
+    assert "CC_LARK_PI_PROVIDER" in call["env"]
 
 
 def test_resumes_by_session_file(monkeypatch, sessions):
@@ -324,27 +332,47 @@ def test_session_cost_sums_assistant_messages(sessions):
     assert pi_runner.session_cost("missing-session-id", sessions) is None
 
 
-def test_parse_list_models_table():
-    table = pi_runner.parse_list_models(
-        "provider  model             context  max-out  thinking  images\n"
-        "google    gemini-3.8-flash  1.0M     65.5K    yes       yes\n"
-        "google    gemini-2.5-computer-use-preview-10-2025  128K  64K  yes  yes\n"
-    )
-    assert table == {"google/gemini-3.8-flash": 1_000_000,
-                     "google/gemini-2.5-computer-use-preview-10-2025": 128_000}
+def test_model_list_matches_bot_config():
+    import bot_config
+    assert set(pi_runner.PI_GEMINI_MODELS) == set(bot_config.PI_MODELS)
+    assert pi_runner.DEFAULT_MODEL == "google/gemini-3.8-flash"
 
 
-def test_normalize_thinking():
-    assert pi_runner.normalize_thinking("") is None
-    assert pi_runner.normalize_thinking("auto") is None
-    assert pi_runner.normalize_thinking("none") == "off"
-    assert pi_runner.normalize_thinking("MAX") == "max"
+def test_provider_config_maps_xhigh_to_high_for_pi_validation():
+    models = {m["id"]: m for m in pi_runner.provider_config()["config"]["models"]}
+    assert models["gemini-4-neon"]["thinkingLevelMap"]["xhigh"] == "high"  # 扩展再改写成 XHIGH
+    assert models["gemini-4-carbon"]["thinkingLevelMap"]["xhigh"] is None
+    assert all(m["contextWindow"] == 1_048_576 for m in models.values())
+    assert models["gemini-4-neon"]["cost"]["input"] == 3.0
+
+
+def test_normalize_thinking_per_model():
+    nt = pi_runner.normalize_thinking
+    assert nt("") is None and nt("auto") is None
+    assert nt("none", "google/gemini-4-neon") == "low"
+    assert nt("minimal", "google/gemini-3.8-flash") == "low"
+    assert nt("MEDIUM", "google/gemini-4-carbon") == "medium"
+    assert nt("max", "google/gemini-4-neon") == "xhigh"
+    assert nt("xhigh", "gemini-4-hydrogen") == "xhigh"
+    assert nt("xhigh", "google/gemini-4-carbon") == "high"
+    assert nt("max", "google/gemini-3.8-flash") == "high"
     with pytest.raises(ValueError):
-        pi_runner.normalize_thinking("ultra")
+        nt("ultra", "google/gemini-4-neon")
+    assert pi_runner.effort_levels_for_model("google/gemini-4-neon") == ("low", "medium", "high", "xhigh")
+    assert pi_runner.effort_levels_for_model("google/gemini-4-argon") == ("low", "medium", "high")
 
 
-def test_extension_file_registers_servers():
+def test_default_model_ignores_non_gemini(monkeypatch):
+    monkeypatch.setenv("PI_MODEL", "openai-codex/gpt-5.5")
+    assert pi_runner.default_model("main") == "google/gemini-3.8-flash"
+    monkeypatch.setenv("MAIN_PI_MODEL", "gemini-4-neon")
+    assert pi_runner.default_model("main") == "google/gemini-4-neon"
+
+
+def test_extension_file_registers_models_and_servers():
     src = open(pi_runner.EXTENSION_PATH, encoding="utf-8").read()
+    assert "CC_LARK_PI_PROVIDER" in src and "registerProvider" in src
+    assert "before_provider_request" in src and '"XHIGH"' in src
     assert "CC_LARK_PI_MCP_CONFIG" in src
     assert "registerMcpServer" in src
     assert 'exposure: "direct"' in src

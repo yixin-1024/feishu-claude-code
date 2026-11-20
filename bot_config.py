@@ -137,9 +137,18 @@ RUNNERS = frozenset({"claude", "codex", "opencode", "mimo", "grok", "maka", "agy
 # 别的后端各自一个 bot（profile 的 RUNNER），话题里 /runner 切过去下一条就回到 profile runner（老行为）。
 SWITCHABLE_RUNNERS = frozenset({"pi"})
 
-# pi 的模型一律写成 provider/id（google/gemini-3.8-flash、openai-codex/gpt-5.5 …），
-# 可带 :<thinking> 后缀。按「有 provider 前缀」放行，provider 名只认字母数字和 - _。
-_PI_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*/[^\s/][^\s]*$")
+# pi 只接这几款 Gemini（用户 11-20 定：Gemini 4 全家 + 3.8 Flash），传给 pi 时写成 google/<id>。
+# ⚠️ 必须和 pi_runner.PI_GEMINI_MODELS 的键一致（那边有价格 / 档位，tests 里有断言）。
+PI_MODELS = frozenset({
+    "gemini-3.8-flash", "gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon",
+})
+
+
+def _pi_model_id(model: str) -> str:
+    """pi 的模型统一成 google/<id>：裸 id（agy 的写法）补上前缀，不认识的原样返回。"""
+    low = (model or "").strip().lower()
+    bare = low[len("google/"):] if low.startswith("google/") else low
+    return f"google/{bare}" if bare in PI_MODELS else model
 
 # kiro 的模型名（kiro-cli chat --list-models，2.28.0）：auto + Claude / GPT-5.6 / 开源权重。
 # Claude 那批写法是 claude-opus-5.5（点号），和 Claude Code 的 claude-opus-5-5 不是一回事。
@@ -217,8 +226,9 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
         )
 
     if runner == "pi":
-        # pi: provider/id（pi 自己按 provider 找凭据），或 pi-* 别名（已在上面解析成 provider/id）
-        return bool(_PI_MODEL_RE.match(low))
+        # pi: 只接 PI_MODELS 那几款 Gemini（google/<id> 或裸 id，pi-* 别名已在上面解析）
+        bare = low[len("google/"):] if low.startswith("google/") else low
+        return bare in PI_MODELS
 
     if runner == "dots":
         # dots: 模型是 Dot 自己的（服务端决定），这里只认占位名
@@ -241,6 +251,8 @@ def normalize_model_for_runner(model: str, runner: str, fallback: str = "") -> s
         resolved = MODEL_ALIASES.get(target.lower(), target)
         if runner == "agy" and resolved.lower().startswith("google/"):
             resolved = resolved[len("google/"):]
+        if runner == "pi":
+            resolved = _pi_model_id(resolved)
         if is_model_compatible_with_runner(resolved, runner):
             return resolved
 
@@ -250,6 +262,8 @@ def normalize_model_for_runner(model: str, runner: str, fallback: str = "") -> s
     resolved_fb = MODEL_ALIASES.get(fb.lower(), fb)
     if runner == "agy" and resolved_fb.lower().startswith("google/"):
         resolved_fb = resolved_fb[len("google/"):]
+    if runner == "pi":
+        resolved_fb = _pi_model_id(resolved_fb)
     return resolved_fb
 
 

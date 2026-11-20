@@ -29,7 +29,7 @@ from grok_runner import GROK_EFFORT_LEVELS
 from agy_runner import AGY_EFFORT_LEVELS, resolve_agy_bin
 from qoder_runner import QODER_EFFORT_LEVELS
 from kiro_runner import KIRO_EFFORT_LEVELS
-from pi_runner import PI_EFFORT_LEVELS, PI_MODEL_BUTTONS
+from pi_runner import PI_MODEL_BUTTONS
 from run_control import RUN_GATE
 import group_allowlist
 import user_acl
@@ -169,15 +169,14 @@ MODEL_ALIASES = {
     "kiro-glm": "glm-5",
     "kiro-minimax": "minimax-m2.5",
     "kiro-qwen": "qwen3-coder-next",
-    # pi（earendil-works/pi）：模型写 provider/id，凭据走 pi 自己的 auth.json + 各家 API key。
-    # Gemini 那几个用本机的 Gemini API key（AGY_API_KEY）；Neon 不在 pi 的模型表里，
-    # pi 会当自定义 id 用（stderr 警告一句）。GPT 要先 `pi auth login openai-codex`。
+    # pi（earendil-works/pi）：只接 Gemini 4 全家 + 3.8 Flash（用户 11-20 定），走本机的
+    # Gemini API key（AGY_API_KEY）。Neon / Hydrogen 多一档 xhigh。
     "pi": "google/gemini-3.8-flash",
     "pi-flash": "google/gemini-3.8-flash",
     "pi-neon": "google/gemini-4-neon",
+    "pi-hydrogen": "google/gemini-4-hydrogen",
+    "pi-carbon": "google/gemini-4-carbon",
     "pi-argon": "google/gemini-4-argon",
-    "pi-gemini-pro": "google/gemini-3.1-pro-preview",
-    "pi-gpt": "openai-codex/gpt-5.5",
     # OpenAI Dots（网页里的 Dot）：模型由 Dot 自己决定，只有一个占位名
     "dots": "dots",
     "dot": "dots",
@@ -234,8 +233,7 @@ def _profile_default_effort(store: SessionStore, bot, runner: str) -> Optional[s
 
     if runner == "pi":
         from pi_runner import default_effort as pi_default_effort
-        level = pi_default_effort(profile_name)
-        return "none" if level == "off" else level
+        return pi_default_effort(profile_name)
 
     return None
 
@@ -2731,8 +2729,10 @@ def _effort_levels_for(runner: str, model: str) -> tuple[Optional[tuple[str, ...
     if runner == "kiro":
         return KIRO_EFFORT_LEVELS, ""
     if runner == "pi":
-        # pi 的 --thinking 档位（off 对应 cc-lark 的 none，由 pi_runner 归一）
-        return PI_EFFORT_LEVELS, ""
+        # Gemini 只有 low/medium/high，Neon / Hydrogen 多一档 xhigh。会话里没 /model 覆盖时
+        # 记的是 profile 默认（如 opus[1m]），先换成 pi 实际会跑的模型再看档位。
+        from pi_runner import effort_levels_for_model, resolve_model
+        return effort_levels_for_model(resolve_model(model)), ""
     if runner == "maka":
         # maka 的 --thinking 档位（off 对应 cc-lark 的 none，由 maka_runner 归一）
         return ("minimal", "low", "medium", "high", "xhigh", "max"), ""
@@ -3381,7 +3381,7 @@ async def handle_command(
                 lines.append(f"本会话累计：{total}")
             lines.append("Runner: `pi`")
             lines.append(f"模型: `{model}`")
-            lines.append("按所选 provider 计费（Gemini 走本机的 Gemini API key）。")
+            lines.append("走本机的 Gemini API key 计费；Gemini 4 价格是估算。")
             return _wrap_usage_output(lines)
         if runner == "grok":
             model = _session_model(store, cur, chat_id, runner)

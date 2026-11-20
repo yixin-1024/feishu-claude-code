@@ -78,10 +78,14 @@ def test_load_profile_accepts_pi_runner(monkeypatch):
 
 
 @pytest.mark.parametrize("model,ok", [
-    ("google/gemini-3.8-flash", True), ("openai-codex/gpt-5.5", True), ("pi-neon", True),
-    ("openrouter/anthropic/claude-x", True), ("google/gemini-4-neon:high", True),
+    ("google/gemini-3.8-flash", True), ("google/gemini-4-neon", True), ("pi-hydrogen", True),
+    ("pi-carbon", True), ("google/gemini-4-argon", True),
+    ("gemini-4-carbon", True), ("agy-neon", True),  # 裸 id / agy 的别名也认，传给 pi 时补 google/
+    ("gemini-3.8-flash", True),  # opencode 的别名，解析成 google/gemini-3.8-flash
+    # 只接 Gemini 4 全家 + 3.8 Flash（用户 11-20 定）
+    ("openai-codex/gpt-5.5", False), ("google/gemini-3.1-pro-preview", False), ("gemini-3.7-flash", False),
+    ("google/gemini-4-neon:high", False), ("anthropic/claude-x", False),
     ("opus", False), ("opus[1m]", False), ("claude-opus-5-5", False), ("auto", False),
-    ("gemini-3.8-flash", True),  # opencode 的别名，解析成 google/gemini-3.8-flash，pi 也认
 ])
 def test_model_compat_for_pi(model, ok):
     assert is_model_compatible_with_runner(model, "pi") is ok
@@ -91,6 +95,8 @@ def test_pi_models_do_not_leak_into_claude():
     assert is_model_compatible_with_runner("pi-flash", "claude") is False
     assert normalize_model_for_runner("opus", "pi", "google/gemini-3.8-flash") == "google/gemini-3.8-flash"
     assert normalize_model_for_runner("pi-argon", "pi", "") == "google/gemini-4-argon"
+    assert normalize_model_for_runner("agy-neon", "pi", "") == "google/gemini-4-neon"
+    assert normalize_model_for_runner("gemini-4-hydrogen", "pi", "") == "google/gemini-4-hydrogen"
 
 
 def test_agent_alias_knows_pi():
@@ -135,7 +141,9 @@ async def test_model_picker_alias_and_effort_for_pi(tmp_path, monkeypatch):
 
     picker = await handle_command("model", "", "u", "oc_1", s, bot=_bot())
     labels = [b["text"] for b in picker["buttons"]]
-    assert any("Gemini 4 Neon" in label for label in labels)
+    for name in ("Gemini 4 Neon", "Gemini 4 Hydrogen", "Gemini 4 Carbon", "Gemini 4 Argon", "Gemini 3.8 Flash"):
+        assert any(name in label for label in labels)
+    assert not any("GPT" in label or "3.1 Pro" in label for label in labels)
 
     reply = await handle_command("model", "pi-neon", "u", "oc_1", s, bot=_bot())
     cur = await s.get_current("u", "oc_1")
@@ -144,12 +152,19 @@ async def test_model_picker_alias_and_effort_for_pi(tmp_path, monkeypatch):
     bad = await handle_command("model", "opus", "u", "oc_1", s, bot=_bot())
     assert "不兼容" in bad
 
+    # Neon 有 xhigh
     picker = await handle_command("effort", "", "u", "oc_1", s, bot=_bot())
     levels = [b["text"].lower() for b in picker["buttons"]]
-    assert "max" in levels and "minimal" in levels
+    assert "xhigh" in levels and "high" in levels and "max" not in levels and "minimal" not in levels
     await handle_command("effort", "xhigh", "u", "oc_1", s, bot=_bot())
     raw = await s.get_current_raw("u", "oc_1")
     assert raw["effort_override"] == "xhigh"
+
+    # 3.8 Flash 只有三档
+    await handle_command("model", "pi-flash", "u", "oc_1", s, bot=_bot())
+    picker = await handle_command("effort", "", "u", "oc_1", s, bot=_bot())
+    levels = [b["text"].lower() for b in picker["buttons"]]
+    assert "xhigh" not in levels and "high" in levels
 
 
 @pytest.mark.asyncio
