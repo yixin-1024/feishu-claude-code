@@ -159,3 +159,212 @@ def test_qoder_runner_appends_brief_and_links_skills(tmp_path, monkeypatch):
     assert "GLOBAL RULE X" in prompt
     assert str(qhome / "skills") in prompt
     assert (qhome / "skills" / "spxpay-config").is_symlink()
+
+
+# ── codex / agy 接 Claude 记忆（2026-11-20）──────────────────────────
+
+
+def _memory(home, cwd, text="# Memory Index\n- [部署](project_deploy.md) — 走 systemd\n"):
+    mem = home / "projects" / claude_project_slug(str(cwd)) / "memory"
+    mem.mkdir(parents=True)
+    (mem / "MEMORY.md").write_text(text)
+    return mem
+
+
+def test_global_rules_expand_import_lines(tmp_path, monkeypatch):
+    claude, _ = _fake_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    gm = claude / "global-memory"
+    gm.mkdir()
+    (gm / "MEMORY.md").write_text("- [称呼](feedback/call_user.md) — 叫 yixin")
+    (claude / "CLAUDE.md").write_text(
+        f"# 全局\n规则A\n\n@{gm / 'MEMORY.md'}\n\n```\n@{gm / 'MEMORY.md'}\n```\n"
+    )
+    cwd = tmp_path / "home" / "p"
+    cwd.mkdir()
+
+    brief = build_claude_context_brief(str(cwd))
+
+    assert "规则A" in brief
+    assert "叫 yixin" in brief
+    assert f"相对链接都相对 {gm}" in brief
+    assert brief.count("叫 yixin") == 1   # 代码块里的 @ 行不展开
+
+
+def test_imports_mode_skips_rules_body_but_keeps_global_memory(tmp_path, monkeypatch):
+    claude, _ = _fake_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (claude / "global.md").write_text("全局记忆条目")
+    (claude / "CLAUDE.md").write_text("规则正文\n@global.md\n")
+    cwd = tmp_path / "home" / "p"
+    cwd.mkdir()
+
+    brief = build_claude_context_brief(str(cwd), global_rules="imports")
+
+    assert "规则正文" not in brief
+    assert "全局记忆条目" in brief and "■ 全局记忆" in brief
+
+
+def test_claude_home_picks_the_other_config_dir(tmp_path, monkeypatch):
+    claude, _ = _fake_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    research = tmp_path / "home" / ".claude-research"
+    research.mkdir()
+    (research / "CLAUDE.md").write_text("研究规矩")
+    cwd = tmp_path / "data" / "research"
+    cwd.mkdir(parents=True)
+    _memory(claude, cwd, "SPX 那边的记忆")
+    mem = _memory(research, cwd, "研究记忆索引")
+
+    brief = build_claude_context_brief(str(cwd), claude_home=str(research))
+
+    assert "研究规矩" in brief and "研究记忆索引" in brief
+    assert "SPX 那边的记忆" not in brief
+    assert str(mem) in brief
+    assert claude_memory_dir(str(cwd), str(research)) == str(mem)
+
+
+def test_compact_brief_gives_paths_not_contents(tmp_path, monkeypatch):
+    claude, _ = _fake_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (claude / "CLAUDE.md").write_text("规则正文")
+    proj = tmp_path / "home" / "proj"
+    proj.mkdir()
+    (proj / "CLAUDE.md").write_text("项目规矩")
+    mem = _memory(claude, proj, "# Memory Index\n- 很长的索引")
+
+    brief = build_claude_context_brief(str(proj), full=False)
+
+    assert "规则正文" not in brief and "很长的索引" not in brief
+    assert f"{claude}/CLAUDE.md" in brief
+    assert str(proj / "CLAUDE.md") in brief
+    assert f"{mem}/MEMORY.md" in brief
+
+
+def test_skip_rule_files_drops_ones_backend_already_loads(tmp_path, monkeypatch):
+    _fake_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    proj = tmp_path / "home" / "proj"
+    proj.mkdir(parents=True)
+    (proj / "CLAUDE.md").write_text("项目规矩")
+
+    assert str(proj / "CLAUDE.md") in build_claude_context_brief(str(proj))
+    assert build_claude_context_brief(str(proj), skip_rule_files=[str(proj / "CLAUDE.md")]) == ""
+
+
+def test_codex_loaded_claude_mds_follows_codex_project_doc_rules(tmp_path, monkeypatch):
+    import codex_runner
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    repo = tmp_path / "repo"
+    sub = repo / "svc"
+    other = sub / "agents"
+    other.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (tmp_path / "CLAUDE.md").write_text("仓库外面的")    # git 根以上，codex 不读
+    (repo / "CLAUDE.md").write_text("root")
+    (sub / "CLAUDE.md").write_text("svc")
+    (other / "CLAUDE.md").write_text("x")
+    (other / "AGENTS.md").write_text("y")               # 有 AGENTS.md 时 codex 读它，不读 CLAUDE.md
+
+    assert codex_runner.codex_loaded_claude_mds(str(other)) == []   # 没配 fallback
+
+    (codex_home / "config.toml").write_text('project_doc_fallback_filenames = ["CLAUDE.md"]\n')
+    loaded = codex_runner.codex_loaded_claude_mds(str(other))
+    assert sorted(loaded) == sorted([str(repo / "CLAUDE.md"), str(sub / "CLAUDE.md")])
+
+    plain = tmp_path / "plain" / "deep"
+    plain.mkdir(parents=True)
+    (plain / "CLAUDE.md").write_text("z")
+    (plain.parent / "CLAUDE.md").write_text("w")
+    # 不在 git 仓库里：只看 cwd
+    assert codex_runner.codex_loaded_claude_mds(str(plain)) == [str(plain / "CLAUDE.md")]
+
+
+def _agent_profile(name, runner):
+    from bot_config import Profile
+    return Profile(
+        name=name, app_id="a", app_secret="b", platform="lark",
+        domain="https://open.larksuite.com", default_cwd="/tmp", runner=runner,
+        default_model="gpt-6.2-astra" if runner == "codex" else "gemini-4-neon",
+    )
+
+
+def _research_setup(tmp_path, monkeypatch):
+    claude, _ = _fake_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (claude / "CLAUDE.md").write_text("SPX 全局规则")
+    research = tmp_path / "home" / ".claude-research"
+    research.mkdir()
+    (research / "CLAUDE.md").write_text("研究全局规矩")
+    cwd = tmp_path / "data" / "research"
+    cwd.mkdir(parents=True)
+    _memory(research, cwd, "研究记忆索引")
+    return claude, research, cwd
+
+
+def test_agent_runner_gives_agy_full_brief_only_on_new_session(tmp_path, monkeypatch):
+    import agent_runner
+
+    _, research, cwd = _research_setup(tmp_path, monkeypatch)
+    monkeypatch.delenv("CC_LARK_CLAUDE_CONTEXT", raising=False)
+    monkeypatch.setenv("CTXTESTGEMINI_CLAUDE_CONTEXT_DIR", str(research))
+    monkeypatch.setenv("CTXTESTGEMINI_CLAUDE_CONTEXT", "memory")
+    seen = []
+
+    async def fake_agy(**kw):
+        seen.append(kw["append_system_prompt"])
+        return "ok", "conv", False
+
+    monkeypatch.setattr(agent_runner, "run_agy", fake_agy)
+    prof = _agent_profile("ctxtestgemini", "agy")
+    for sid in (None, "conv"):
+        asyncio.run(agent_runner.run_agent(
+            profile=prof, runner="agy", message="hi", session_id=sid, cwd=str(cwd),
+            append_system_prompt="LARK PROMPT",
+        ))
+
+    first, later = seen
+    assert first.startswith("LARK PROMPT") and "研究记忆索引" in first
+    assert "研究全局规矩" not in first          # memory 模式不贴全局规则正文
+    assert "研究记忆索引" not in later and str(research) in later
+
+
+def test_agent_runner_codex_uses_claude_env_file_dir_and_full_on_app_server(tmp_path, monkeypatch):
+    import agent_runner
+
+    _, research, cwd = _research_setup(tmp_path, monkeypatch)
+    monkeypatch.delenv("CC_LARK_CLAUDE_CONTEXT", raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nocodex"))
+    env_file = tmp_path / ".env.research"
+    env_file.write_text(f"CLAUDE_CONFIG_DIR={research}\n")
+    seen = []
+
+    async def fake_codex(**kw):
+        seen.append(kw["append_system_prompt"])
+        return "ok", "t1", False
+
+    monkeypatch.setattr(agent_runner, "run_codex", fake_codex)
+    prof = _agent_profile("ctxtestcodex", "codex")
+    prof.claude_env_file = str(env_file)
+
+    monkeypatch.setenv("CTXTESTCODEX_CODEX_TRANSPORT", "app-server")
+    asyncio.run(agent_runner.run_agent(
+        profile=prof, runner="codex", message="hi", session_id="t1", cwd=str(cwd),
+    ))
+    monkeypatch.setenv("CTXTESTCODEX_CODEX_TRANSPORT", "exec")
+    asyncio.run(agent_runner.run_agent(
+        profile=prof, runner="codex", message="hi", session_id="t1", cwd=str(cwd),
+    ))
+    monkeypatch.setenv("CTXTESTCODEX_CLAUDE_CONTEXT", "off")
+    asyncio.run(agent_runner.run_agent(
+        profile=prof, runner="codex", message="hi", session_id=None, cwd=str(cwd),
+    ))
+
+    app_server, exec_resume, off = seen
+    assert "研究全局规矩" in app_server and "研究记忆索引" in app_server
+    assert "SPX 全局规则" not in app_server
+    assert "研究记忆索引" not in exec_resume and str(research) in exec_resume
+    assert off is None

@@ -269,7 +269,9 @@ def context_window_for(model: Optional[str] = None) -> int:
     return _CONTEXT_WINDOW
 
 
-def _with_claude_context(append_system_prompt: Optional[str], cwd: Optional[str]) -> str:
+def _with_claude_context(
+    append_system_prompt: Optional[str], cwd: Optional[str], claude_home: Optional[str] = None,
+) -> str:
     base = append_system_prompt or ""
     if os.getenv("CC_LARK_PI_CLAUDE_CONTEXT", "1") == "0":
         return base
@@ -281,6 +283,7 @@ def _with_claude_context(append_system_prompt: Optional[str], cwd: Optional[str]
                 "pi 本来就会扫），都在你的 skill 列表里，按名字正常用。"
             ),
             include_project_rules=False,
+            claude_home=claude_home,
         )
     except Exception as exc:  # noqa: BLE001 — 接不上 Claude 的上下文不该拖垮这一轮
         print(f"[run_pi] Claude 上下文跳过: {type(exc).__name__}: {exc}", flush=True)
@@ -363,8 +366,11 @@ async def run_pi(
     dangerously_skip_permissions: bool = True,
     idle_timeout_sec: int = IDLE_TIMEOUT,
     sessions_dir: Optional[str] = None,
+    claude_home: Optional[str] = None,
 ) -> tuple[str, Optional[str], bool]:
-    """返回 (full_text, session_id, used_fresh_session_fallback)。"""
+    """返回 (full_text, session_id, used_fresh_session_fallback)。
+
+    claude_home：从哪套 Claude Code 配置取规则 / 记忆（research 是 ~/.claude-research）。"""
     del on_status  # 那是 PTY 限流告警通道，pi 的重试只记日志
     profile_name = (extra_env or {}).get("CC_LARK_PROFILE")
     resolved_model = resolve_model(model, profile_name)
@@ -402,7 +408,7 @@ async def run_pi(
     else:
         env.pop("CC_LARK_PI_MCP_CONFIG", None)
 
-    system_prompt = _with_claude_context(append_system_prompt, cwd)
+    system_prompt = _with_claude_context(append_system_prompt, cwd, claude_home)
     tmp_dir = tempfile.mkdtemp(prefix="cc-lark-pi-")
     prompt_file = ""
     if system_prompt:

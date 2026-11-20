@@ -44,6 +44,8 @@ def _isolate_sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("CC_LARK_QODER_CLAUDE_CONTEXT", "0")
     monkeypatch.setenv("CC_LARK_KIRO_CLAUDE_CONTEXT", "0")
     monkeypatch.setenv("CC_LARK_PI_CLAUDE_CONTEXT", "0")
+    # codex / agy 的同一份简报由 agent_runner 拼（CC_LARK_CLAUDE_CONTEXT / <PREFIX>_CLAUDE_CONTEXT）
+    monkeypatch.setenv("CC_LARK_CLAUDE_CONTEXT", "0")
     # pi 的会话文件别落到真 ~/.feishu-claude/pi-sessions
     monkeypatch.setenv("PI_SESSION_DIR", str(tmp_path / "pi-sessions"))
     # agy 账号快照 / keychain 同理，而且更凶：~/.gemini/accounts 里是**真凭证**，

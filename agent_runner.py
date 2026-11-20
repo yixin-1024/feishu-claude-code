@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional
 
-from bot_config import Profile, load_claude_extra_env, resolve_cc_lark_gates
+from bot_config import Profile, _profile_env_prefix, load_claude_extra_env, resolve_cc_lark_gates
+from claude_context import build_claude_context_brief
 from claude_runner import run_claude
-from codex_runner import run_codex
+from codex_runner import codex_loaded_claude_mds, codex_transport, run_codex
 from opencode_runner import run_opencode
 from mimo_runner import run_mimo
 from grok_runner import run_grok
@@ -16,6 +18,76 @@ from qoder_runner import run_qoder
 from kiro_runner import run_kiro
 from pi_runner import run_pi
 from dots_runner import run_dots
+
+
+# ── 把 Claude Code 的规则 / 记忆接给 codex、agy ─────────────────────────
+# 用户最早一直用 Claude Code，记忆攒在它那边最全；换成 codex / agy 的 bot 默认看不到。
+#   <PREFIX>_CLAUDE_CONTEXT       full（默认）= 全局规则 + 项目规则 + 记忆索引；
+#                                 memory = 不贴全局规则正文（后端自己的全局规则文件已经是
+#                                 改写过的同一套规矩，比如飞书 gemini / codex 那份），只贴
+#                                 它导入的全局记忆 + 项目规则 + 记忆索引；off = 不接。
+#                                 没设看全局 CC_LARK_CLAUDE_CONTEXT。
+#   <PREFIX>_CLAUDE_CONTEXT_DIR   读哪套 Claude 配置。没设就看这个 profile 的 claude env
+#                                 文件里的 CLAUDE_CONFIG_DIR，再没有就是 ~/.claude。
+# 改 .env 要 /restart；记忆文件本身每轮现读，Claude 新记的下一轮就带上。
+_CLAUDE_CONTEXT_OFF = {"0", "off", "false", "no", "none"}
+
+
+def claude_context_dir(profile: Profile) -> str:
+    """这个 profile 该读的 Claude 配置目录；空串 = 默认 ~/.claude。"""
+    home = (os.getenv(_profile_env_prefix(profile.name) + "CLAUDE_CONTEXT_DIR") or "").strip()
+    if not home:
+        try:
+            home = (load_claude_extra_env(profile).get("CLAUDE_CONFIG_DIR") or "").strip()
+        except Exception:  # noqa: BLE001
+            home = ""
+    return os.path.expanduser(home) if home else ""
+
+
+def _claude_context_rules(profile: Profile) -> str:
+    """build_claude_context_brief 的 global_rules 模式；空串 = 不接。"""
+    mode = (
+        os.getenv(_profile_env_prefix(profile.name) + "CLAUDE_CONTEXT")
+        or os.getenv("CC_LARK_CLAUDE_CONTEXT")
+        or "full"
+    ).strip().lower()
+    if mode in _CLAUDE_CONTEXT_OFF:
+        return ""
+    return "imports" if mode == "memory" else "paste"
+
+
+def _with_claude_context(
+    profile: Profile,
+    backend: str,
+    append_system_prompt: Optional[str],
+    cwd: Optional[str],
+    *,
+    full: bool,
+) -> Optional[str]:
+    """把 Claude Code 的规则 / 记忆简报拼到系统提示后面。出错只记日志，不拖垮这一轮。"""
+    rules = _claude_context_rules(profile)
+    if not rules:
+        return append_system_prompt
+    home = claude_context_dir(profile)
+    skills_dir = os.path.join(home or os.path.expanduser("~/.claude"), "skills")
+    try:
+        brief = build_claude_context_brief(
+            cwd,
+            skills_note=(
+                f"Claude Code 的 skill 在 {skills_dir}（每个子目录一个 SKILL.md）。你的 skill 列表里"
+                "没有、但任务对得上的，直接读对应的 SKILL.md 照着做。"
+            ),
+            claude_home=home or None,
+            global_rules=rules,
+            skip_rule_files=codex_loaded_claude_mds(cwd) if backend == "codex" else (),
+            full=full,
+        )
+    except Exception as exc:  # noqa: BLE001 — 接不上 Claude 的上下文不该拖垮这一轮
+        print(f"[run_agent] {backend} 的 Claude 上下文跳过: {type(exc).__name__}: {exc}", flush=True)
+        return append_system_prompt
+    if not brief:
+        return append_system_prompt
+    return f"{append_system_prompt}\n\n{brief}" if append_system_prompt else brief
 
 
 async def run_agent(
@@ -171,6 +243,10 @@ async def run_agent(
         agy_env = dict(wake_context or {})
         agy_env["CC_LARK_PROFILE"] = profile.name
         agy_env.update(resolve_cc_lark_gates(profile.name))
+        # agy 每轮把系统提示拼进用户消息：记忆索引只在新会话第一轮贴全文，后面只给路径。
+        append_system_prompt = _with_claude_context(
+            profile, "agy", append_system_prompt, cwd, full=not session_id,
+        )
         return await run_agy(
             message=message,
             session_id=session_id,
@@ -268,6 +344,7 @@ async def run_agent(
             append_system_prompt=append_system_prompt,
             pi_bin=getattr(profile, "pi_bin", "") or None,
             agent_dir=getattr(profile, "pi_agent_dir", "") or None,
+            claude_home=claude_context_dir(profile) or None,
             dangerously_skip_permissions=bool(getattr(profile, "pi_dangerous_skip", 1)),
             idle_timeout_sec=int(getattr(profile, "pi_idle_timeout_sec", 600) or 600),
             extra_env=pi_env,
@@ -278,6 +355,12 @@ async def run_agent(
         # <PROFILE>_CODEX_REASONING_EFFORT / AUTO_CONTINUE 等 profile 级配置。
         codex_env = dict(wake_context or {})
         codex_env["CC_LARK_PROFILE"] = profile.name
+        # app-server 把系统提示放 developerInstructions，会话里只记一份，每轮都给全文；
+        # exec 传输是拼进用户消息，同 agy，续聊只给路径。
+        append_system_prompt = _with_claude_context(
+            profile, "codex", append_system_prompt, cwd,
+            full=not session_id or codex_transport(codex_env) == "app-server",
+        )
         return await run_codex(
             message=message,
             session_id=session_id,

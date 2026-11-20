@@ -172,6 +172,48 @@ def codex_transport(extra_env: Optional[dict] = None) -> str:
     return DEFAULT_TRANSPORT
 
 
+def _codex_doc_fallbacks() -> list[str]:
+    """$CODEX_HOME/config.toml 里的 project_doc_fallback_filenames；没配就空。"""
+    path = os.path.join(os.path.expanduser(os.getenv("CODEX_HOME") or "~/.codex"), "config.toml")
+    try:
+        import tomllib
+        with open(path, "rb") as fh:
+            names = tomllib.load(fh).get("project_doc_fallback_filenames") or []
+    except (OSError, ValueError):
+        return []
+    return [n for n in names if isinstance(n, str) and n]
+
+
+def codex_loaded_claude_mds(cwd: Optional[str]) -> list[str]:
+    """codex 自己会加载的项目 CLAUDE.md（给 Claude 上下文简报去重用）。
+
+    codex 从 git 根（不在仓库里就只看 cwd）一路往下到 cwd，每层取第一个存在的
+    AGENTS.override.md / AGENTS.md / fallback 文件名。本机 config.toml 配了
+    fallback=CLAUDE.md，所以没有 AGENTS.md 的目录里，CLAUDE.md 它已经读了。
+    """
+    fallbacks = _codex_doc_fallbacks()
+    if not cwd or "CLAUDE.md" not in fallbacks:
+        return []
+    start = os.path.realpath(os.path.expanduser(cwd))
+    chain = [start]
+    cur = start
+    while not os.path.exists(os.path.join(cur, ".git")):
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            chain = [start]   # 不在 git 仓库里：只看 cwd
+            break
+        cur = parent
+        chain.append(cur)
+    loaded = []
+    for d in chain:
+        for name in ("AGENTS.override.md", "AGENTS.md", *fallbacks):
+            if os.path.isfile(os.path.join(d, name)):
+                if name == "CLAUDE.md":
+                    loaded.append(os.path.join(d, name))
+                break
+    return loaded
+
+
 def _sandbox_and_approval(
     sandbox_mode: Optional[str],
     approval_policy: Optional[str],
