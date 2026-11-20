@@ -554,10 +554,18 @@ def ensure_keychain_intact() -> tuple[str, Optional[str]]:
 
     返回 (status, name)：
         ("ok",        None)  keychain 完整，no-op
+        ("pinned",    key)   凭证被 env 钉死（setup-token 等），claude CLI 不读
+                             keychain / credentials.json，不检查也不改写
         ("restored",  name)  blob 缺失，已从 saved 文件写回
         ("no_active", None)  blob 缺失且没有可用 saved 文件
         ("error",     msg)   写回过程异常
     """
+    # setup-token 模式下 CLI 只认 env 那份，credentials.json 里缺不缺 claudeAiOauth
+    # 都不影响跑活；照旧检查只会每次 /restart 都私信 owner 一条假警报（2026-11-20）。
+    pin_key, _ = pinned_env_credential()
+    if pin_key:
+        return ("pinned", pin_key)
+
     blob = _read_keychain_blob()
     if blob:
         try:

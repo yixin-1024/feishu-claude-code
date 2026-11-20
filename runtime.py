@@ -383,7 +383,10 @@ def start_quota_watcher(
         )
         store = credentials_store_label()
         status, name = ensure_keychain_intact()
-        if status == "restored":
+        if status == "pinned":
+            log("global", "switcher", "info",
+                f"凭证由 env `{name}` 指定，跳过 {store} 自检")
+        elif status == "restored":
             log("global", "switcher", "warn",
                 f"{store} claudeAiOauth 缺失，已从 {name!r} 自动恢复")
             _send(
@@ -401,8 +404,9 @@ def start_quota_watcher(
         # 顺便：当前账户的 saved file 如果没存 identity，把 ~/.claude.json 抠一份补上。
         # 用户手动 login 切到 reg 干了一阵子，cc-lark 启动时就能自动把当时的 reg
         # identity stash 回 reg.json，下次切换才丝滑。
+        # env 钉死时账户池不生效，没必要动 saved 账户文件。
         try:
-            st, nm = auto_stash_identity_for_current()
+            st, nm = ("noop", None) if status == "pinned" else auto_stash_identity_for_current()
             if st == "stashed":
                 log("global", "switcher", "info",
                     f"identity 已从 ~/.claude.json 自动 stash 回 {nm!r}")

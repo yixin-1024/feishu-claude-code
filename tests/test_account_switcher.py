@@ -1024,6 +1024,20 @@ def test_ensure_keychain_intact_no_active_when_dir_empty(monkeypatch, tmp_path):
     assert name is None
 
 
+def test_ensure_keychain_intact_skips_when_env_pinned(monkeypatch, tmp_path):
+    """setup-token 钉在 env 里时 CLI 不读 credentials.json：不检查、不写、不报 no_active。"""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-pinned")
+    monkeypatch.setattr(accs, "ACCOUNTS_DIR", str(tmp_path / "empty"))
+    os.makedirs(str(tmp_path / "empty"))
+    monkeypatch.setattr(accs, "_read_keychain_blob",
+                        lambda: '{"mcpOAuth": {}, "claudeAiOauth": {"accessToken": ""}}')
+    monkeypatch.setattr(accs, "_write_keychain_blob",
+                        lambda blob: (_ for _ in ()).throw(AssertionError("should not write")))
+    status, name = accs.ensure_keychain_intact()
+    assert status == "pinned"
+    assert name == "CLAUDE_CODE_OAUTH_TOKEN"
+
+
 def test_ensure_keychain_intact_skips_saved_files_without_oauth(monkeypatch, tmp_path):
     """saved 文件本身不含 claudeAiOauth 的应该被跳过。"""
     monkeypatch.setattr(accs, "ACCOUNTS_DIR", _make_account_dir(tmp_path, {
