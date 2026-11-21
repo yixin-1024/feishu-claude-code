@@ -583,3 +583,203 @@ def test_tool_summaries():
     assert s("Grep", {"pattern": "foo", "path": "src"}) == "foo @ src"
     assert s("WebSearch", {"query": "MAS notice"}) == "MAS notice"
     assert len(s("Bash", {"command": "x" * 1000})) == gwmod._SUMMARY_CHARS
+
+
+# ── 运维只读列表 GET /v1/apps/{app}/runs ──────────────────────
+
+_LIST = "/v1/apps/rg-next/runs"
+_BRIEF_KEYS = {"run_id", "app", "conversation_id", "session_id", "resume_session_id",
+               "session_reset", "status", "model", "effort", "created_at", "started_at",
+               "ended_at", "wait_ms", "duration_ms", "error", "usage", "pid"}
+
+
+def _write_meta(runs_dir: Path, rid: str, **meta) -> None:
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    (runs_dir / f"{rid}.json").write_text(json.dumps({"run_id": rid, **meta}))
+
+
+async def _wait_status(client, run_id, want, timeout=10):
+    for _ in range(int(timeout / 0.05)):
+        if (await client.req("GET", f"/v1/runs/{run_id}"))[1].get("status") == want:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"run never reached {want}")
+
+
+async def test_list_runs_requires_bearer(make_gw):
+    gw, client, _ = await make_gw()
+    for tok in ("x" * 43, ""):
+        st, body = await client.req("GET", _LIST, token=tok)
+        assert st == 401 and body["error"]["code"] == "unauthorized"
+    # 鉴权先于 app 校验：错 token 查未知 app 也是 401，不泄露 app 是否存在
+    assert (await client.req("GET", "/v1/apps/nope/runs", token="x" * 43))[0] == 401
+    st, body = await client.req("GET", _LIST)
+    assert st == 200
+    assert body == {"app": "rg-next", "generated_at": body["generated_at"], "limit": 50,
+                    "running": [], "queued": [], "recent": [], "recent_total": 0}
+
+
+async def test_list_runs_fails_closed_without_gateway_token(make_gw):
+    gw, client, _ = await make_gw(CC_WEB_GATEWAY_TOKEN="")
+    st, body = await client.req("GET", _LIST)
+    assert st == 503 and body["error"]["code"] == "gateway_not_configured"
+
+
+async def test_list_runs_unknown_app_404_and_method_405(make_gw):
+    gw, client, _ = await make_gw()
+    for path in ("/v1/apps/nope/runs", "/v1/apps/RG-NEXT/runs", "/v1/apps/rg-next%2F../runs"):
+        st, body = await client.req("GET", path)
+        assert st == 404 and body["error"]["code"] == "app_not_found", path
+    st, body = await client.req("POST", _LIST, {})
+    assert st == 405 and body["error"]["code"] == "method_not_allowed"
+    # 尾斜杠和别的 GET 一样容忍
+    assert (await client.req("GET", _LIST + "/"))[0] == 200
+
+
+async def test_list_runs_groups_and_orders(make_gw):
+    gw, client, cwd = await make_gw(CC_WEB_MAX_CONCURRENT=1)
+    ok1 = await _start(client, conv="d1")
+    await _wait_done(client, ok1)
+    bad = await _start(client, conv="d2", prompt="MODE:apierror")
+    await _wait_done(client, bad)
+    ok2 = await _start(client, conv="d3", model="opus", effort="high")
+    await _wait_done(client, ok2)
+    slow = await _start(client, conv="s", prompt="MODE:slow")
+    await _wait_status(client, slow, "running")
+    q1 = await _start(client, conv="q1")
+    q2 = await _start(client, conv="q2")
+
+    st, body = await client.req("GET", _LIST)
+    assert st == 200
+    assert [r["run_id"] for r in body["running"]] == [slow]
+    assert [r["run_id"] for r in body["queued"]] == [q1, q2]  # 先来的在前
+    assert [r["run_id"] for r in body["recent"]] == [ok2, bad, ok1]  # 结束晚的在前
+    assert body["recent_total"] == 3
+    for r in body["running"] + body["queued"] + body["recent"]:
+        assert set(r) == _BRIEF_KEYS and r["app"] == "rg-next"
+
+    run = body["running"][0]
+    assert run["status"] == "running" and run["conversation_id"] == "s"
+    assert run["started_at"] and run["ended_at"] is None and run["error"] is None
+    assert isinstance(run["pid"], int) and run["pid"] == gw.runs[slow].pid
+    assert run["duration_ms"] >= 0 and run["wait_ms"] >= 0
+    for q in body["queued"]:
+        assert q["status"] == "queued" and q["started_at"] is None
+        assert q["duration_ms"] is None and q["wait_ms"] >= 0 and q["pid"] is None
+
+    r_ok2, r_bad, r_ok1 = body["recent"]
+    assert r_ok2["status"] == "succeeded" and r_ok2["model"] == "opus"
+    assert r_ok2["effort"] == "high" and r_ok2["session_id"] and r_ok2["pid"] is None
+    assert r_ok2["usage"] == {"input_tokens": 10, "output_tokens": 3,
+                              "cache_read_input_tokens": 5, "total_cost_usd": 0.0012,
+                              "num_turns": 1}
+    assert r_ok2["ended_at"] and r_ok2["duration_ms"] >= 0 and r_ok2["error"] is None
+    assert r_bad["status"] == "failed" and r_bad["error"]["code"] == "claude_error"
+    assert 0 < len(r_bad["error"]["message"]) <= gwmod._LIST_ERROR_CHARS
+    assert r_ok1["model"] == "sonnet" and r_ok1["effort"] == "medium"
+
+    # 排队时被取消：没开跑过 → duration_ms 为 null，wait_ms 记到取消时
+    await client.req("POST", f"/v1/runs/{q2}/cancel")
+    await client.req("POST", f"/v1/runs/{slow}/cancel")
+    await _wait_done(client, q1)
+    st, body = await client.req("GET", _LIST)
+    assert body["running"] == [] and body["queued"] == []
+    assert [r["run_id"] for r in body["recent"]] == [q1, slow, q2, ok2, bad, ok1]
+    by_id = {r["run_id"]: r for r in body["recent"]}
+    assert by_id[q2]["status"] == "cancelled" and by_id[q2]["started_at"] is None
+    assert by_id[q2]["duration_ms"] is None and by_id[q2]["wait_ms"] >= 0
+    assert by_id[slow]["status"] == "cancelled" and by_id[slow]["error"]["code"] == "cancelled"
+    assert by_id[slow]["duration_ms"] > 0 and by_id[slow]["pid"] is None
+
+
+async def test_list_runs_never_leaks_prompt_output_env_or_tokens(make_gw, tmp_path):
+    runs_dir = tmp_path / "state" / "runs"
+    now = __import__("time").time()
+    # 上一代进程留下的历史 run（只在盘上），元数据里塞满不该出现的字段
+    _write_meta(runs_dir, "run_" + "1" * 32, app="rg-next", conversation_id="hist",
+                status="succeeded", created_at=now - 60, started_at=now - 59,
+                ended_at=now - 50, text="HIST-OUTPUT-SECRET", prompt="HIST-PROMPT-SECRET",
+                env={"RG_RUN_TOKEN": "HIST-ENV-SECRET"}, idempotency_key="HIST-IDEM-SECRET",
+                prompt_chars=18, usage={"output_tokens": 7, "models": ["HIST-MODEL-LIST"]},
+                error=None)
+    # 崩溃前还在跑的 → 启动恢复后应进 recent 且是 interrupted，不在 running
+    _write_meta(runs_dir, "run_" + "2" * 32, app="rg-next", conversation_id="crash",
+                status="running", created_at=now - 40, started_at=now - 39, pid=999999999)
+    # 别的 app 的 run、坏文件、非 run 文件都不进列表
+    _write_meta(runs_dir, "run_" + "3" * 32, app="other-app", conversation_id="x",
+                status="succeeded", created_at=now - 30, ended_at=now - 29)
+    (runs_dir / "garbage.json").write_text("{not json")
+    (runs_dir / "notes.json").write_text(json.dumps({"run_id": "../../etc", "app": "rg-next"}))
+
+    gw, client, cwd = await make_gw()
+    st, body = await client.req(
+        "POST", "/v1/runs",
+        {"app": "rg-next", "conversation_id": "leak",
+         "prompt": "MODE:echoenv PROMPT-MARKER-7f3a",
+         "system_context": "CTX-MARKER-91c2",
+         "env": {"RG_RUN_TOKEN": "run-token-abcdef", "RG_API_BASE": "http://api-base-marker"}},
+        headers={"Idempotency-Key": "idem-marker-55"})
+    assert st == 202
+    live = body["run_id"]
+    assert (await _wait_done(client, live))["text"] == "token is ***"  # 单条 GET 才给正文
+
+    st, body = await client.req("GET", _LIST)
+    assert st == 200
+    assert [r["run_id"] for r in body["recent"]] == [live, "run_" + "2" * 32, "run_" + "1" * 32]
+    crashed = body["recent"][1]
+    assert crashed["status"] == "interrupted" and crashed["error"]["code"] == "interrupted"
+    assert crashed["pid"] is None
+    hist = body["recent"][2]
+    assert hist["usage"] == {"output_tokens": 7}
+    assert hist["wait_ms"] == 1000 and hist["duration_ms"] == 9000
+    for r in body["recent"]:
+        assert set(r) == _BRIEF_KEYS
+    blob = json.dumps(body, ensure_ascii=False)
+    for needle in ("PROMPT-MARKER-7f3a", "CTX-MARKER-91c2", "token is", "run-token-abcdef",
+                   "api-base-marker", "idem-marker-55", "fake-cred", TOKEN, "HIST-",
+                   "prompt_chars", "\"text\"", "\"prompt\"", "\"env\"", "idempotency"):
+        assert needle not in blob, needle
+    # 列表是只读的：不把历史 run 塞进内存
+    assert set(gw.runs) == {live}
+
+
+async def test_list_runs_limit_default_cap_and_validation(make_gw, tmp_path):
+    runs_dir = tmp_path / "state" / "runs"
+    base = __import__("time").time() - 3600
+    ids = ["run_%032x" % i for i in range(205)]
+    for i, rid in enumerate(ids):
+        _write_meta(runs_dir, rid, app="rg-next", conversation_id=f"c{i}", status="succeeded",
+                    model="sonnet", effort="medium", created_at=base + i,
+                    started_at=base + i, ended_at=base + i + 0.5)
+    gw, client, _ = await make_gw()
+    newest_first = ids[::-1]
+
+    st, body = await client.req("GET", _LIST)
+    assert body["limit"] == 50 and body["recent_total"] == 205
+    assert [r["run_id"] for r in body["recent"]] == newest_first[:50]
+    assert body["recent"][0]["duration_ms"] == 500 and body["recent"][0]["wait_ms"] == 0
+
+    st, body = await client.req("GET", _LIST + "?limit=7")
+    assert body["limit"] == 7 and [r["run_id"] for r in body["recent"]] == newest_first[:7]
+    st, body = await client.req("GET", _LIST + "?limit=999")
+    assert st == 200 and body["limit"] == 200 and len(body["recent"]) == 200
+    assert [r["run_id"] for r in body["recent"]] == newest_first[:200]
+    st, body = await client.req("GET", _LIST + "?limit=0")
+    assert body["recent"] == [] and body["recent_total"] == 205
+    for bad in ("abc", "-1", "1.5"):
+        st, body = await client.req("GET", _LIST + f"?limit={bad}")
+        assert st == 400 and body["error"]["code"] == "invalid_limit", bad
+
+    # 盘上元数据变了（换 inode 的原子写）→ 缓存失效，下一次列表看得到
+    _write_meta(runs_dir, ids[0], app="rg-next", conversation_id="c0", status="failed",
+                created_at=base + 999, started_at=base + 999, ended_at=base + 1000,
+                error={"code": "claude_error", "message": "x" * 1000})
+    st, body = await client.req("GET", _LIST + "?limit=1")
+    top = body["recent"][0]
+    assert top["run_id"] == ids[0] and top["status"] == "failed"
+    assert len(top["error"]["message"]) == gwmod._LIST_ERROR_CHARS
+    # 文件被删（保留期清理）→ 不再出现
+    (runs_dir / f"{ids[0]}.json").unlink()
+    st, body = await client.req("GET", _LIST + "?limit=1")
+    assert body["recent_total"] == 204 and body["recent"][0]["run_id"] == ids[-1]
+    assert len(gw._list_cache) == 204

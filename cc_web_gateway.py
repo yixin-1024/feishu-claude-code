@@ -11,6 +11,7 @@ Lark 会话的父进程，不能为了网页需求重启它。本模块只 impor
     GET  /v1/runs/{id}                状态 / session_id / 最终文本 / 用量
     POST /v1/runs/{id}/cancel         杀进程组
     GET  /v1/health
+    GET  /v1/apps/{app}/runs?limit=N  运维只读：在跑 / 排队 / 最近完成的 run（不含正文）
 
 安全边界：
   · cwd / 模型白名单 / 工具白名单 / 权限模式只来自配置（env 文件），请求改不了。
@@ -35,6 +36,7 @@ import re
 import secrets
 import signal
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -89,6 +91,21 @@ TERMINAL_EVENTS = frozenset({"done", "error"})
 
 _MAX_BODY_BYTES = 512 * 1024
 _SUMMARY_CHARS = 300
+
+# GET /v1/apps/{app}/runs（运维只读列表）
+_LIST_DEFAULT_LIMIT = 50
+_LIST_MAX_LIMIT = 200
+_LIST_ERROR_CHARS = 200
+# 列表只从 run 元数据里取这些键（白名单）；text / prompt / idempotency_key / env 一律不碰
+_LIST_META_FIELDS = (
+    "run_id", "app", "conversation_id", "status", "session_id", "resume_session_id",
+    "session_reset", "model", "effort", "created_at", "started_at", "ended_at", "pid",
+    "error", "usage",
+)
+_LIST_USAGE_KEYS = (
+    "input_tokens", "output_tokens", "cache_read_input_tokens",
+    "cache_creation_input_tokens", "total_cost_usd", "num_turns",
+)
 
 
 # ── 配置 ──────────────────────────────────────────────────────
@@ -480,6 +497,76 @@ class RunFailure(Exception):
         self.status = status
 
 
+# ── 运维列表（GET /v1/apps/{app}/runs）────────────────────────
+
+def _slim_meta(meta: dict) -> dict:
+    """只留列表要用的白名单键（缓存里也只存这些，正文 text 不进内存缓存）。"""
+    return {k: meta.get(k) for k in _LIST_META_FIELDS}
+
+
+def _ts(v: Any) -> Optional[float]:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        return None
+    return float(v)
+
+
+def _span_ms(start: Optional[float], end: Optional[float]) -> Optional[int]:
+    if start is None or end is None:
+        return None
+    return max(0, int(round((end - start) * 1000)))
+
+
+def run_brief(meta: dict, now: float) -> dict:
+    """一条 run 的运维摘要。逐键白名单拼出来，不透传 meta（不含 prompt / 输出 / env / token）。
+
+    wait_ms：创建 → 开跑（排队中 = 到现在；排队时就被取消 = 到结束）。
+    duration_ms：开跑 → 结束（在跑 = 到现在；没开跑过 = null）。
+    """
+    status = str(meta.get("status") or "")
+    created, started, ended = (_ts(meta.get(k)) for k in ("created_at", "started_at",
+                                                          "ended_at"))
+    active = status in ACTIVE_STATUSES
+    if started is not None:
+        wait_ms = _span_ms(created, started)
+        duration_ms = _span_ms(started, now if active else ended)
+    else:
+        wait_ms = _span_ms(created, now if active else ended)
+        duration_ms = None
+    err = meta.get("error")
+    error = None
+    if isinstance(err, dict):
+        error = {"code": str(err.get("code") or ""),
+                 "message": _clip(str(err.get("message") or ""), _LIST_ERROR_CHARS)}
+    raw_usage = meta.get("usage")
+    usage = None
+    if isinstance(raw_usage, dict):
+        usage = {k: raw_usage[k] for k in _LIST_USAGE_KEYS
+                 if isinstance(raw_usage.get(k), (int, float))
+                 and not isinstance(raw_usage.get(k), bool)} or None
+    pid = meta.get("pid")
+    return {
+        "run_id": str(meta.get("run_id") or ""),
+        "app": str(meta.get("app") or ""),
+        "conversation_id": str(meta.get("conversation_id") or ""),
+        "session_id": meta.get("session_id") or None,
+        "resume_session_id": meta.get("resume_session_id") or None,
+        "session_reset": bool(meta.get("session_reset")),
+        "status": status,
+        "model": str(meta.get("model") or ""),
+        "effort": str(meta.get("effort") or ""),
+        "created_at": _iso(created),
+        "started_at": _iso(started),
+        "ended_at": _iso(ended),
+        "wait_ms": wait_ms,
+        "duration_ms": duration_ms,
+        "error": error,
+        "usage": usage,
+        # 只有在跑的 run 给 pid（运维要看 / 杀进程组时用）
+        "pid": pid if status == "running" and isinstance(pid, int)
+        and not isinstance(pid, bool) else None,
+    }
+
+
 # ── Gateway ───────────────────────────────────────────────────
 
 class Gateway:
@@ -500,6 +587,10 @@ class Gateway:
         self.conversations: dict = _read_json(self.conv_path, {})
         self.sessions: dict = _read_json(self.sessions_path, {})
         self.idempotency: dict = _read_json(self.idem_path, {})
+        # 运维列表的盘上元数据缓存：文件名 → ((ino, mtime_ns, size), slim meta | None)。
+        # 只在工作线程里读写，_list_lock 串行化（同一时刻只有一次扫盘）。
+        self._list_cache: dict[str, tuple[tuple[int, int, int], Optional[dict]]] = {}
+        self._list_lock = threading.Lock()
 
     # 路径
     @property
@@ -636,6 +727,11 @@ class Gateway:
             if method != "GET":
                 return 405, _err("method_not_allowed", "use GET")
             return 200, run.public()
+        m = re.match(r"^/v1/apps/([^/]+)/runs$", path)
+        if m:
+            if method != "GET":
+                return 405, _err("method_not_allowed", "use GET")
+            return await self.list_app_runs(m.group(1), query)
         return 404, _err("not_found", "unknown endpoint")
 
     def health(self) -> dict:
@@ -649,6 +745,88 @@ class Gateway:
             "apps": sorted(self.cfg.apps),
             "claude_cli": os.path.basename(self.cfg.claude_cli),
         }
+
+    # ── 运维只读列表 ──
+    async def list_app_runs(self, app_name: str, query: dict) -> tuple[int, dict]:
+        """GET /v1/apps/{app}/runs：在跑 / 排队 / 最近完成的 run 摘要（见 run_brief）。
+
+        盘上 runs/*.json 是全集（含重启前的历史），本进程内存里的 run 覆盖盘上同 id 的
+        记录（在跑的 run 以内存为准）。只读：不改任何状态、不把历史 run 塞进 self.runs。
+        """
+        if app_name not in self.cfg.apps:
+            return 404, _err("app_not_found", "app is not configured on this gateway")
+        raw = str(query.get("limit") or "").strip()
+        if raw:
+            try:
+                limit = int(raw)
+            except ValueError:
+                return 400, _err("invalid_limit", "limit must be a non-negative integer")
+            if limit < 0:
+                return 400, _err("invalid_limit", "limit must be a non-negative integer")
+        else:
+            limit = _LIST_DEFAULT_LIMIT
+        limit = min(limit, _LIST_MAX_LIMIT)
+
+        metas = await asyncio.to_thread(self._scan_app_metas, app_name)
+        by_id = {m["run_id"]: m for m in metas}
+        for run in list(self.runs.values()):
+            if run.app == app_name:
+                by_id[run.run_id] = _slim_meta(run.meta())
+
+        now = _now()
+        running, queued, done = [], [], []
+        for m in by_id.values():
+            st = m.get("status")
+            (running if st == "running" else queued if st == "queued" else done).append(m)
+        # 在跑：开跑早的在前；排队：先来的在前（= 信号量 FIFO 顺序）；最近：结束晚的在前
+        running.sort(key=lambda m: (_ts(m.get("started_at")) or _ts(m.get("created_at")) or 0,
+                                    m["run_id"]))
+        queued.sort(key=lambda m: (_ts(m.get("created_at")) or 0, m["run_id"]))
+        done.sort(key=lambda m: (_ts(m.get("ended_at")) or _ts(m.get("created_at")) or 0,
+                                 _ts(m.get("created_at")) or 0, m["run_id"]), reverse=True)
+        return 200, {
+            "app": app_name,
+            "generated_at": _iso(now),
+            "limit": limit,
+            "running": [run_brief(m, now) for m in running],
+            "queued": [run_brief(m, now) for m in queued],
+            "recent": [run_brief(m, now) for m in done[:limit]],
+            "recent_total": len(done),
+        }
+
+    def _scan_app_metas(self, app_name: str) -> list[dict]:
+        """在工作线程里扫 runs/*.json，按 (inode, mtime_ns, size) 缓存解析结果（终态 run 不再变；
+        save_meta 是 os.replace，每次写都换 inode）。"""
+        out: list[dict] = []
+        with self._list_lock:
+            try:
+                names = os.listdir(self.runs_dir)
+            except OSError:
+                return out
+            seen: set[str] = set()
+            for fn in names:
+                if not fn.endswith(".json"):  # 跳过 .jsonl 事件文件和 .tmp.<pid>
+                    continue
+                path = os.path.join(self.runs_dir, fn)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                seen.add(fn)
+                sig = (st.st_ino, st.st_mtime_ns, st.st_size)
+                hit = self._list_cache.get(fn)
+                if hit is not None and hit[0] == sig:
+                    slim = hit[1]
+                else:
+                    meta = _read_json(path, None)
+                    ok = isinstance(meta, dict) and _RUN_ID_RE.match(str(meta.get("run_id", "")))
+                    slim = _slim_meta(meta) if ok else None
+                    self._list_cache[fn] = (sig, slim)
+                if slim is not None and slim.get("app") == app_name:
+                    out.append(slim)
+            for fn in [k for k in self._list_cache if k not in seen]:
+                del self._list_cache[fn]
+        return out
 
     async def create_run(self, headers: dict, body: bytes) -> tuple[int, dict]:
         try:

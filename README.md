@@ -868,6 +868,7 @@ See Chinese sections above for detailed setup instructions.
 - Claude 以 `--restricted --strict-mcp-config --permission-mode dontAsk` 跑：文件工具锁在配置的 cwd，Bash 只放行白名单前缀（如 `rg-tool`），不带任何 MCP，子进程 env 显式白名单。
 - 配置：`~/.config/cc-lark-web.env`（模板 `deploy/cc-lark-web.env.example`）；systemd 单元 `deploy/cc-lark-web.service`；状态目录 `~/.local/state/cc-lark-web/`。
 - 接口契约：rg-next 仓 `docs/ai/GATEWAY-API.md`。测试：`pytest tests/test_cc_web_gateway.py`（假 claude：`tests/fake_claude_web.py`）。
+- 运维只读：`GET /v1/apps/<app>/runs?limit=50`（同一个 Bearer）列出该 app 在跑 / 排队 / 最近完成的 run（状态、模型、耗时、错误摘要），不含 prompt / 输出 / env。
 
 ## License
 
