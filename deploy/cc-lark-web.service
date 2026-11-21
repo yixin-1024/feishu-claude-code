@@ -1,0 +1,32 @@
+# cc-lark web gateway：给网页产品（RG Next 等）起 / 续 / 停 Claude Code 会话。
+# 独立于主 bot（cc-lark.service）——重启它不影响任何 Lark 会话。
+# 安装：sudo cp deploy/cc-lark-web.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#       && sudo systemctl enable --now cc-lark-web
+# 配置：/home/yixin/.config/cc-lark-web.env（600，模板见 deploy/cc-lark-web.env.example）
+[Unit]
+Description=cc-lark web gateway (Claude Code sessions for web apps, 127.0.0.1:8096)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=yixin
+Group=yixin
+WorkingDirectory=/home/yixin/feishu-claude-code
+Environment=HOME=/home/yixin
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/yixin/.local/bin
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/yixin/.config/cc-lark-web.env
+ExecStart=/home/yixin/feishu-claude-code/.venv/bin/python cc_web_gateway.py
+Restart=always
+RestartSec=5
+# 停服务时连同在跑的 claude 进程组一起收掉（网关会先把它们记成 interrupted）
+KillMode=control-group
+TimeoutStopSec=20
+NoNewPrivileges=yes
+MemoryMax=6G
+
+[Install]
+WantedBy=multi-user.target

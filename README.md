@@ -861,6 +861,14 @@ Quick start: clone, `pip install -r requirements.txt`, configure `.env` with Fei
 
 See Chinese sections above for detailed setup instructions.
 
+## Web gateway（`cc_web_gateway.py`，独立服务 `cc-lark-web`）
+
+给网页产品（目前是 RG Next）用的 AI 会话网关：网页后端通过 `127.0.0.1:8096` 的 HTTP 接口起 / 续 / 停 Claude Code 会话，事件走 SSE（落盘 jsonl，断线可续）。**独立进程**，和主 bot 互不影响，装 / 重启它不需要 `/restart`。
+
+- Claude 以 `--restricted --strict-mcp-config --permission-mode dontAsk` 跑：文件工具锁在配置的 cwd，Bash 只放行白名单前缀（如 `rg-tool`），不带任何 MCP，子进程 env 显式白名单。
+- 配置：`~/.config/cc-lark-web.env`（模板 `deploy/cc-lark-web.env.example`）；systemd 单元 `deploy/cc-lark-web.service`；状态目录 `~/.local/state/cc-lark-web/`。
+- 接口契约：rg-next 仓 `docs/ai/GATEWAY-API.md`。测试：`pytest tests/test_cc_web_gateway.py`（假 claude：`tests/fake_claude_web.py`）。
+
 ## License
 
 [MIT](LICENSE)
