@@ -142,7 +142,7 @@ async def test_cross_agent_uses_target_profile_dispatch_model(spawns):
     child.profile.name = "regtank"
     child.profile.runner = "codex"
     await _dispatch(parent, target_bot=child)
-    assert spawns[0]["model"] == "gpt-5.1-codex-max"
+    assert spawns[0]["model"] == "gpt-6.2-astra"
 
 
 async def test_bad_effort_rejected_before_creating_topic(spawns):

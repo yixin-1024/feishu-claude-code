@@ -9,6 +9,7 @@ import glob
 import json
 import math
 import os
+import re
 import select
 import shlex
 import subprocess
@@ -70,9 +71,10 @@ MODEL_ALIASES = {
     "sonnet-5": "claude-sonnet-5[1m]",
     "sonnet-4-6": "claude-sonnet-4-6",
     "sonnet4.6": "claude-sonnet-4-6",
-    "codex-max": "gpt-5.1-codex-max",
-    "codex": "gpt-5.1-codex",
-    "gpt5": "gpt-5.1",
+    # Codex：/model 卡片的按钮直接用模型 id（照 codex 的模型目录生成，见 _codex_model_buttons），
+    # 这两个是老习惯/老派活参数里的叫法，指向当前最强的 Astra
+    "codex": "gpt-6.2-astra",
+    "codex-max": "gpt-6.2-astra",
     "gemini": "google/gemini-3.8-flash",
     "gemini38": "google/gemini-3.8-flash",
     "gemini-3.8-flash": "google/gemini-3.8-flash",
@@ -276,27 +278,72 @@ def _effective_effort_label(store: SessionStore, bot, runner: str, override: Opt
     return override or _default_effort_for(store, bot, runner, chat_id)[0] or "CLI 默认"
 
 
+# codex 自己从服务端拉的模型目录（登录的那个号能用哪些模型、各支持哪些档位），codex 每次
+# 启动会刷新。/model 按钮和 /effort 档位都照它来，OpenAI 出新模型不用改代码。
+CODEX_MODELS_CACHE = "~/.codex/models_cache.json"
+
+# 目录还没有（这台机器上 codex 一次都没跑过）时 /model 卡片的兜底按钮
+_CODEX_FALLBACK_MODEL_BUTTONS: Tuple[Tuple[str, str], ...] = (
+    ("gpt-6.2-astra", "GPT-6.2-Astra"),
+    ("gpt-6.2-sol", "GPT-6.2-Sol"),
+    ("gpt-6.1-terra", "GPT-6.1 Terra"),
+)
+
+_CODEX_SLUG_RE = re.compile(r"^gpt-(\d+(?:\.\d+)*)-([a-z]+)$")
+
+
+def _codex_catalog() -> list[dict]:
+    """codex 模型目录里的模型，按目录原顺序；读不到就是空表。"""
+    try:
+        with open(os.path.expanduser(CODEX_MODELS_CACHE), encoding="utf-8") as cache_file:
+            models = (json.load(cache_file) or {}).get("models", [])
+    except (OSError, TypeError, ValueError, AttributeError):
+        return []
+    if not isinstance(models, list):
+        return []
+    return [m for m in models if isinstance(m, dict) and isinstance(m.get("slug"), str) and m["slug"]]
+
+
+def _codex_model_buttons() -> list[Tuple[str, str]]:
+    """/model 卡片上 codex 的按钮 (模型 id, 显示名)。
+
+    取目录里公开列出（visibility=list）的模型，同一系列（sol / astra / terra / luna …）
+    只留版本号最大的那款，旧款要用就直接发 `/model gpt-6-astra`。按目录的 priority 排序。
+    """
+    newest: dict[str, Tuple[Tuple[int, ...], dict]] = {}
+    for item in _codex_catalog():
+        if item.get("visibility", "list") != "list":
+            continue
+        slug = item["slug"]
+        m = _CODEX_SLUG_RE.match(slug)
+        family, version = (m.group(2), tuple(int(p) for p in m.group(1).split("."))) if m else (slug, ())
+        if family not in newest or version > newest[family][0]:
+            newest[family] = (version, item)
+    if not newest:
+        return list(_CODEX_FALLBACK_MODEL_BUTTONS)
+
+    def _priority(item: dict) -> float:
+        p = item.get("priority")
+        return p if isinstance(p, (int, float)) else float("inf")
+
+    picked = sorted((item for _, item in newest.values()), key=_priority)
+    return [(item["slug"], str(item.get("display_name") or item["slug"])) for item in picked]
+
+
 def _codex_effort_levels(model: str) -> tuple[str, ...]:
     """Use Codex's local model catalog when available; fall back to the stable UI set."""
-    try:
-        cache_path = os.path.expanduser("~/.codex/models_cache.json")
-        with open(cache_path, encoding="utf-8") as cache_file:
-            models = (json.load(cache_file) or {}).get("models", [])
-        for item in models:
-            if not isinstance(item, dict):
-                continue
-            if item.get("slug") != model:
-                continue
-            supported = tuple(
-                level.get("effort")
-                for level in item.get("supported_reasoning_levels", [])
-                if isinstance(level, dict)
-                and level.get("effort") in CODEX_EFFORT_LEVELS
-            )
-            if supported:
-                return supported
-    except (OSError, TypeError, ValueError):
-        pass
+    for item in _codex_catalog():
+        if item.get("slug") != model:
+            continue
+        levels = item.get("supported_reasoning_levels")
+        supported = tuple(
+            level.get("effort")
+            for level in (levels if isinstance(levels, list) else [])
+            if isinstance(level, dict)
+            and level.get("effort") in CODEX_EFFORT_LEVELS
+        )
+        if supported:
+            return supported
     return CODEX_EFFORT_LEVELS
 
 HELP_TEXT = """\
@@ -1899,7 +1946,7 @@ def _runner_default_model(bot, runner: str) -> str:
     if profile and getattr(profile, "runner", "") == runner and getattr(profile, "default_model", ""):
         return profile.default_model
     if runner == "codex":
-        return "gpt-5.5"
+        return _codex_model_buttons()[0][0]
     if runner == "opencode":
         return "google/gemini-3.8-flash"
     if runner == "mimo":
@@ -3004,9 +3051,8 @@ async def handle_command(
                 return "当前 runner：**dots**（网页版 OpenAI Dots）\n模型由 Dot 自己决定，这里没有可切换的模型。"
             if runner == "codex":
                 buttons = [
-                    {"text": "Codex Max", "value": {"action": "run_cmd", "cmd": "/model codex-max", "cid": chat_id}},
-                    {"text": "Codex", "value": {"action": "run_cmd", "cmd": "/model codex", "cid": chat_id}},
-                    {"text": "GPT-5.1", "value": {"action": "run_cmd", "cmd": "/model gpt5", "cid": chat_id}},
+                    {"text": label, "value": {"action": "run_cmd", "cmd": f"/model {slug}", "cid": chat_id}}
+                    for slug, label in _codex_model_buttons()
                 ]
             elif runner == "opencode":
                 buttons = [
