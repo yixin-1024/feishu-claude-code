@@ -34,6 +34,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import sys
 import threading
@@ -75,6 +76,8 @@ _SESSION_ID_RE = re.compile(
 _RUN_ID_RE = re.compile(r"^run_[0-9a-f]{32}$")
 _ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _IDEM_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+# <rg_context> / </rg_context> 的各种写法（大小写、空白、属性、全角括号不算）
+_CTX_TAG_RE = re.compile(r"<\s*/?\s*rg_context\b[^>]*>", re.IGNORECASE)
 
 # 子进程 env 从本进程继承的键（其余一律不给）。凭证另行注入。
 _INHERIT_ENV_KEYS = (
@@ -154,6 +157,10 @@ class AppConfig:
     env_keys: list[str]
     path_prepend: list[str]
     system_prompt_file: str  # 空 = 用 cwd/CLAUDE.md（存在才带）
+    # 每个 conversation 一个独立工作目录（state_dir/work/<app>/<hash>）。agent 的文件工具
+    # （--restricted 锁在 cwd）和 rg-tool 落地的客户原件（./.files）因此按话题隔离——
+    # 共用 app.cwd 时，别的用户的话题能 Glob/Read 到这里的原件（D4 安全审查实测）。
+    isolate_cwd: bool = True
 
     @property
     def builtin_tools(self) -> list[str]:
@@ -252,6 +259,8 @@ def load_config(env: Optional[dict] = None) -> GatewayConfig:
             allowed_tools=tools, permission_mode=perm, env_keys=env_keys,
             path_prepend=path_prepend,
             system_prompt_file=(env.get(p + "SYSTEM_PROMPT_FILE") or "").strip(),
+            isolate_cwd=(env.get(p + "ISOLATE_CWD") or "1").strip().lower()
+            not in ("0", "false", "no", "off"),
         )
     return cfg
 
@@ -652,6 +661,18 @@ class Gateway:
                 pruned += 1
                 continue
             # 不把历史 run 全量常驻内存：按需 load_run 读盘
+        # 隔离工作目录（state_dir/work/<app>/<hash>）：久未使用的整个删掉（里面只有 rg-tool
+        # 落地的原件缓存，会话本身在 ~/.claude 里）。
+        work_root = os.path.join(self.cfg.state_dir, "work")
+        for app_name in (os.listdir(work_root) if os.path.isdir(work_root) else []):
+            app_dir = os.path.join(work_root, app_name)
+            for h in (os.listdir(app_dir) if os.path.isdir(app_dir) else []):
+                d = os.path.join(app_dir, h)
+                try:
+                    if os.path.getmtime(d) < cutoff:
+                        shutil.rmtree(d, ignore_errors=True)
+                except OSError:
+                    pass
         now = _now()
         self.idempotency = {k: v for k, v in self.idempotency.items()
                             if now - float(v.get("at", 0)) < 86400}
@@ -1057,11 +1078,25 @@ class Gateway:
 
     @staticmethod
     def build_message(prompt: str, ctx: str) -> str:
+        # 用户输入里伪造的上下文定界符一律抹掉（大小写 / 空格 / 属性变体都算），
+        # 有没有 system_context 都抹——免得冒充服务端上下文
+        prompt = _CTX_TAG_RE.sub("", prompt)
         if not ctx:
             return prompt
-        # 用户输入里伪造的上下文定界符一律抹掉，免得冒充服务端上下文
-        prompt = prompt.replace("<rg_context>", "").replace("</rg_context>", "")
+        # 服务端上下文里可能带客户资料（名字、文件名…）：里面的定界符同样不能提前闭合块
+        ctx = _CTX_TAG_RE.sub(lambda m: m.group(0).replace("<", "&lt;"), ctx)
         return f"<rg_context>\n{ctx}\n</rg_context>\n\n{prompt}"
+
+    def work_dir(self, app: AppConfig, conversation_id: str) -> str:
+        """这一轮的 cwd：开了隔离就是这个 conversation 自己的目录（700，按需建）。"""
+        if not app.isolate_cwd:
+            return app.cwd
+        h = hashlib.sha256(self._conv_disk_key(app.name, conversation_id).encode()).hexdigest()[:32]
+        d = os.path.join(self.cfg.state_dir, "work", app.name, h)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+        os.utime(d)  # 在用的目录不会被启动清理当成过期
+        return d
 
     async def _run_claude(self, run: Run, app: AppConfig, prompt: str, ctx: str,
                           env_in: dict) -> tuple[Optional[str], str, Optional[dict], bool]:
@@ -1092,7 +1127,7 @@ class Gateway:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=app.cwd,
+            cwd=self.work_dir(app, run.conversation_id),
             env=env,
             limit=10 * 1024 * 1024,
             start_new_session=True,  # 自成进程组，cancel / 超时 killpg 一锅端
