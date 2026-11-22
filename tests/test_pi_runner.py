@@ -13,6 +13,14 @@ import pi_runner
 from pi_runner import run_pi
 
 
+@pytest.fixture(autouse=True)
+def _no_real_local_providers(monkeypatch):
+    """导入 bot_config 时会把本机 .env 灌进环境（服务器上配了 Lebrel + Venice），每个用例先清掉。"""
+    for k in list(os.environ):
+        if k.startswith("PI_LOCAL_") or k == "PI_GEMINI_BUTTONS":
+            monkeypatch.delenv(k, raising=False)
+
+
 class FakeStdout:
     def __init__(self, lines):
         self._lines = list(lines)
@@ -520,3 +528,126 @@ def test_run_with_local_model(monkeypatch, sessions, local):
     assert cmd[cmd.index("--thinking") + 1] == "off"  # PI_EFFORT=none → 关掉思考
     assert [p["provider"] for p in json.loads(env["CC_LARK_PI_PROVIDER"])] == ["google", "ollama"]
     assert usages[-1]["_context_window"] == 65_536
+
+
+# ── 同时挂几家收费 provider（11-22：Lebrel 为主 + Venice，/model 一家一个按钮）──────────
+
+
+@pytest.fixture
+def two_providers(monkeypatch):
+    monkeypatch.setenv("PI_LOCAL_PROVIDER", "lebrel")
+    monkeypatch.setenv("PI_LOCAL_MODELS", "lebrel/deepseek-v4.1-flash-uncensored")
+    monkeypatch.setenv("PI_LOCAL_BASE_URL", "https://attested.lebrel.ai/v1")
+    monkeypatch.setenv("PI_LOCAL_API_KEY_ENV", "LEBREL_API_KEY")
+    monkeypatch.setenv("PI_LOCAL_CONTEXT_WINDOW", "262144")
+    monkeypatch.setenv("PI_LOCAL_COST", "0.33,1.32,0.01")
+    monkeypatch.setenv("PI_LOCAL_LABEL", "🐕 Lebrel")
+    monkeypatch.setenv("PI_LOCAL_MORE_PROVIDERS", "Venice, nobody")  # nobody 没配模型，忽略
+    monkeypatch.setenv("PI_LOCAL_VENICE_MODELS", "deepseek-v4-1-flash-1017-uncensored")
+    monkeypatch.setenv("PI_LOCAL_VENICE_BASE_URL", "https://api.venice.ai/api/v1")
+    monkeypatch.setenv("PI_LOCAL_VENICE_API_KEY_ENV", "VENICE_API_KEY")
+    monkeypatch.setenv("PI_LOCAL_VENICE_CONTEXT_WINDOW", "131072")
+    monkeypatch.setenv("PI_LOCAL_VENICE_COST", "0.33,1.32,0.00825")
+    monkeypatch.setenv("PI_LOCAL_VENICE_EXTRA_BODY", '{"venice_parameters":{"include_venice_system_prompt":false}}')
+    monkeypatch.setenv("PI_LOCAL_VENICE_LABEL", "🐋 Venice")
+    for k in ("PI_CONTEXT_WINDOW", "PI_MODEL", "GEMINI_API_KEY", "AGY_API_KEY", "PI_GEMINI_KEY_FROM"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_two_providers_registered_with_own_settings(two_providers):
+    from bot_config import pi_local_providers
+    assert pi_local_providers() == ("lebrel", "venice")
+    cfgs = {c["provider"]: c for c in pi_runner.local_provider_configs()}
+    assert list(cfgs) == ["lebrel", "venice"]
+    assert cfgs["lebrel"]["config"]["apiKey"] == "$LEBREL_API_KEY"
+    assert cfgs["venice"]["config"]["apiKey"] == "$VENICE_API_KEY"
+    assert cfgs["venice"]["config"]["models"][0]["cost"]["cacheRead"] == 0.00825
+    assert cfgs["lebrel"]["config"]["models"][0]["cost"]["cacheRead"] == 0.01
+    assert "extraBody" not in cfgs["lebrel"]
+    assert cfgs["venice"]["extraBody"] == {"venice_parameters": {"include_venice_system_prompt": False}}
+    assert [p["provider"] for p in pi_runner.provider_configs()] == ["google", "lebrel", "venice"]
+
+
+def test_two_providers_model_ids_and_buttons(two_providers):
+    from bot_config import normalize_model_for_runner, pi_local_ref
+    # Lebrel 的 id 自己带斜杠：provider/id 和裸 id 都认
+    assert pi_local_ref("lebrel/lebrel/deepseek-v4.1-flash-uncensored") == ("lebrel", "lebrel/deepseek-v4.1-flash-uncensored")
+    assert pi_local_ref("lebrel/deepseek-v4.1-flash-uncensored") == ("lebrel", "lebrel/deepseek-v4.1-flash-uncensored")
+    assert pi_local_ref("venice/deepseek-v4-1-flash-1017-uncensored") == ("venice", "deepseek-v4-1-flash-1017-uncensored")
+    assert pi_local_ref("deepseek-v4-1-flash-1017-uncensored") == ("venice", "deepseek-v4-1-flash-1017-uncensored")
+    assert pi_local_ref("venice/lebrel/deepseek-v4.1-flash-uncensored") is None
+    assert normalize_model_for_runner("venice/deepseek-v4-1-flash-1017-uncensored", "pi") == \
+        "venice/deepseek-v4-1-flash-1017-uncensored"
+    assert normalize_model_for_runner("lebrel/deepseek-v4.1-flash-uncensored", "pi") == \
+        "lebrel/lebrel/deepseek-v4.1-flash-uncensored"
+    assert pi_runner.model_buttons() == [
+        ("lebrel/lebrel/deepseek-v4.1-flash-uncensored", "🐕 Lebrel"),
+        ("venice/deepseek-v4-1-flash-1017-uncensored", "🐋 Venice"),
+    ]
+    assert pi_runner.context_window_for("venice/deepseek-v4-1-flash-1017-uncensored") == 131_072
+    assert pi_runner.context_window_for("lebrel/lebrel/deepseek-v4.1-flash-uncensored") == 262_144
+    assert pi_runner.normalize_thinking("none", "venice/deepseek-v4-1-flash-1017-uncensored") == "off"
+
+
+def test_two_providers_default_label_names_provider(two_providers, monkeypatch):
+    monkeypatch.delenv("PI_LOCAL_LABEL")
+    assert pi_runner.model_buttons()[0] == (
+        "lebrel/lebrel/deepseek-v4.1-flash-uncensored", "🖥️ Lebrel · lebrel/deepseek-v4.1-flash-uncensored",
+    )
+
+
+def test_balance_lines(two_providers, monkeypatch):
+    monkeypatch.setenv("VENICE_API_KEY", "vk")
+    monkeypatch.setenv("LEBREL_API_KEY", "lk")
+    monkeypatch.setenv("PI_LOCAL_BALANCE_URL", "https://lebrel.ai/dashboard")
+    calls = []
+
+    def fake_http(url, key="", timeout=5.0):
+        calls.append((url, key))
+        if url == "https://api.venice.ai/api/v1/api_keys/rate_limits":
+            return {"data": {"balances": {"USD": 9.10381, "DIEM": 0}}}
+        if url.endswith("/api/drop/policy"):
+            return {"phase": {"free": False}, "price": {"percent": 40}}
+        return None  # 推理 key 查 /api/overview 回 403
+
+    monkeypatch.setattr(pi_runner, "_http_json", fake_http)
+    assert pi_runner.local_balance_lines() == [
+        "💰 Lebrel 余额 [后台查看](https://lebrel.ai/dashboard) · 现在原价 4 折",
+        "💰 Venice 余额 $9.10",
+    ]
+    assert ("https://lebrel.ai/api/overview", "lk") in calls
+    # 配了只读 key 就查得到余额；免费时段报到几点（北京时间）
+    monkeypatch.setenv("PI_LOCAL_BALANCE_KEY_ENV", "LEBREL_ACCOUNT_KEY")
+    monkeypatch.setenv("LEBREL_ACCOUNT_KEY", "ro")
+
+    def fake_http2(url, key="", timeout=5.0):
+        if url == "https://lebrel.ai/api/overview":
+            return {"balanceMicrousd": 12_345_678} if key == "ro" else None
+        if url.endswith("/api/drop/policy"):
+            return {"phase": {"free": True, "freeUntil": 1795374000000}}
+        return None
+
+    monkeypatch.setattr(pi_runner, "_http_json", fake_http2)
+    assert pi_runner.local_balance_lines() == [
+        "💰 Lebrel 余额 $12.35 · 现在免费（到 03:00）",
+        "💰 Venice 余额 [后台查看](https://venice.ai/settings/api)"
+        if os.getenv("PI_LOCAL_VENICE_BALANCE_URL") else "💰 Venice 余额 查不到",
+    ]
+
+
+def test_balance_skips_free_local_server(local):
+    # Ollama 不收费：认不出是哪家就不报余额
+    assert pi_runner.local_balance_lines() == []
+
+
+def test_gemini_buttons_can_be_hidden_when_local_models_exist(two_providers, monkeypatch):
+    monkeypatch.setenv("AGY_API_KEY", "k")
+    assert ("pi-neon", "✴️ Gemini 4 Neon") in pi_runner.model_buttons()
+    monkeypatch.setenv("PI_GEMINI_BUTTONS", "0")
+    assert [a for a, _ in pi_runner.model_buttons()] == [
+        "lebrel/lebrel/deepseek-v4.1-flash-uncensored", "venice/deepseek-v4-1-flash-1017-uncensored",
+    ]
+    # 一个本地模型都没有时照样摆 Gemini，免得面板空了
+    for k in ("PI_LOCAL_MODELS", "PI_LOCAL_VENICE_MODELS"):
+        monkeypatch.delenv(k)
+    assert pi_runner.model_buttons() == pi_runner.PI_MODEL_BUTTONS

@@ -150,24 +150,66 @@ PI_MODELS = frozenset({
 #   PI_LOCAL_MODELS=qwen36-uncensored[,...]   本地服务里的模型名（Ollama 的 `ollama list` 那列）
 #   PI_LOCAL_PROVIDER=ollama                  pi 里的 provider 名，模型写成 <provider>/<id>
 # 接口地址、上下文窗口等在 pi_runner.local_provider_config 里读。
+#
+# 同时挂几家（11-22 起服务器上 Venice + Lebrel，/model 面板一家一个按钮）：
+#   PI_LOCAL_MORE_PROVIDERS=venice[,...]      上面那家之外再注册的 provider
+#   PI_LOCAL_VENICE_MODELS=...                每家的配置 = PI_LOCAL_<名字大写>_<项>，
+#   PI_LOCAL_VENICE_BASE_URL=...              项和上面那家一样（MODELS / BASE_URL / API_KEY_ENV /
+#                                             CONTEXT_WINDOW / MAX_TOKENS / COST / EXTRA_BODY / LABEL …）
 def pi_local_provider() -> str:
+    """主 provider（不带名字前缀的 PI_LOCAL_* 那套）的名字。"""
     return (os.getenv("PI_LOCAL_PROVIDER") or "ollama").strip().lower() or "ollama"
 
 
-def pi_local_models() -> tuple[str, ...]:
-    raw = os.getenv("PI_LOCAL_MODELS") or ""
+def pi_local_env(provider: Optional[str], key: str) -> str:
+    """某家本地 provider 的一项配置：主 provider 读 PI_LOCAL_<项>，其余读 PI_LOCAL_<名字>_<项>。"""
+    prov = (provider or "").strip().lower()
+    if not prov or prov == pi_local_provider():
+        name = f"PI_LOCAL_{key}"
+    else:
+        name = "PI_LOCAL_" + re.sub(r"[^A-Z0-9]", "_", prov.upper()) + f"_{key}"
+    return (os.getenv(name) or "").strip()
+
+
+def pi_local_models(provider: Optional[str] = None) -> tuple[str, ...]:
+    """某家（默认主 provider）配置的模型 id。"""
+    raw = pi_local_env(provider, "MODELS")
     return tuple(dict.fromkeys(m.strip() for m in raw.split(",") if m.strip()))
+
+
+def pi_local_providers() -> tuple[str, ...]:
+    """配了模型的本地 provider，主 provider 在前。"""
+    names = [pi_local_provider()]
+    names += [p.strip().lower() for p in (os.getenv("PI_LOCAL_MORE_PROVIDERS") or "").split(",") if p.strip()]
+    return tuple(p for p in dict.fromkeys(names) if pi_local_models(p))
+
+
+def pi_local_ref(model: Optional[str]) -> Optional[tuple[str, str]]:
+    """<provider>/<id> 或裸 id 是配置里的本地模型 → (provider, 配置里的原样 id)，否则 None。
+
+    id 自己可能带斜杠（Lebrel 的 lebrel/deepseek-…），所以先按「provider/ 前缀 + id」找，
+    再把整串当裸 id 找。"""
+    low = (model or "").strip().lower()
+    if not low:
+        return None
+    providers = pi_local_providers()
+    for prov in providers:
+        prefix = prov + "/"
+        if low.startswith(prefix):
+            for mid in pi_local_models(prov):
+                if mid.lower() == low[len(prefix):]:
+                    return prov, mid
+    for prov in providers:
+        for mid in pi_local_models(prov):
+            if mid.lower() == low:
+                return prov, mid
+    return None
 
 
 def pi_local_model_id(model: Optional[str]) -> Optional[str]:
     """<provider>/<id> 或裸 id 是配置里的本地模型 → 返回配置里的原样 id，否则 None。"""
-    low = (model or "").strip().lower()
-    prefix = pi_local_provider() + "/"
-    bare = low[len(prefix):] if low.startswith(prefix) else low
-    for mid in pi_local_models():
-        if mid.lower() == bare:
-            return mid
-    return None
+    ref = pi_local_ref(model)
+    return ref[1] if ref else None
 
 
 def _pi_model_id(model: str) -> str:
@@ -176,8 +218,8 @@ def _pi_model_id(model: str) -> str:
     bare = low[len("google/"):] if low.startswith("google/") else low
     if bare in PI_MODELS:
         return f"google/{bare}"
-    local = pi_local_model_id(model)
-    return f"{pi_local_provider()}/{local}" if local else model
+    ref = pi_local_ref(model)
+    return f"{ref[0]}/{ref[1]}" if ref else model
 
 # kiro 的模型名（kiro-cli chat --list-models，2.28.0）：auto + Claude / GPT-5.6 / 开源权重。
 # Claude 那批写法是 claude-opus-5.5（点号），和 Claude Code 的 claude-opus-5-5 不是一回事。

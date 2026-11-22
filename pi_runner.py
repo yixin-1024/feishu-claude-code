@@ -32,8 +32,10 @@ Neon / Hydrogen / Carbon 会被当「自定义 id」照抄 Argon 的元数据（
 机器上，扩展再注册一个 OpenAI 兼容的 provider（默认叫 ollama，模型写成 ollama/<id>），见
 local_provider_config。思考开关走 reasoning_effort（Ollama 实测 none=不想、low~high=想；
 Qwen 只有开 / 关，没有深浅），所以档位是 none / low / medium / high。Ollama 不花钱，footer 不显示花费；
-服务器上同一套开关接的是 Venice（收费，OpenAI 兼容），PI_LOCAL_COST 给价目、PI_LOCAL_EXTRA_BODY 关掉
-Venice 自带的系统提示，见 local_provider_config。
+服务器上同一套开关接的是收费的 OpenAI 兼容服务，PI_LOCAL_COST 给价目、PI_LOCAL_EXTRA_BODY 并进请求体
+（Venice 用它关掉自带的系统提示），见 local_provider_config。可以同时挂几家（11-22 起 Lebrel 为主 +
+Venice：PI_LOCAL_MORE_PROVIDERS + PI_LOCAL_<名字>_<项>，见 bot_config.pi_local_env），/model 面板
+一家一个按钮、正文报余额（local_balance_lines）。
 
 推理强度：`--thinking`。Gemini 只有 low / medium / high，Neon / Hydrogen 多一档 xhigh
 （11-20 直接打 Gemini API 实测：这两款收 thinkingLevel=xhigh，Carbon 回 400）。
@@ -73,9 +75,11 @@ import tempfile
 from typing import Callable, Optional
 
 from bot_config import (
-    pi_local_model_id,
+    pi_local_env,
     pi_local_models,
     pi_local_provider,
+    pi_local_providers,
+    pi_local_ref,
     resolve_claude_wall_clock_limit,
 )
 from claude_context import CLAUDE_SKILLS_DIR, build_claude_context_brief
@@ -154,11 +158,16 @@ def _bare_model(model: Optional[str]) -> str:
 
 
 def is_local_model(model: Optional[str]) -> bool:
-    return pi_local_model_id(model) is not None
+    return pi_local_ref(model) is not None
 
 
 def _env_int(name: str, default: int) -> int:
     raw = (os.getenv(name) or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else default
+
+
+def _local_int(provider: Optional[str], key: str, default: int) -> int:
+    raw = pi_local_env(provider, key)
     return int(raw) if raw.isdigit() and int(raw) > 0 else default
 
 
@@ -234,8 +243,11 @@ def provider_config(api_key_env: str = "GEMINI_API_KEY") -> dict:
     }
 
 
-def local_provider_config() -> Optional[dict]:
+def local_provider_config(provider: Optional[str] = None) -> Optional[dict]:
     """本机配了 PI_LOCAL_MODELS 时，扩展拿去注册的本地 OpenAI 兼容 provider；没配返回 None。
+
+    provider：哪一家（默认主 provider）；PI_LOCAL_MORE_PROVIDERS 里的那几家读
+    PI_LOCAL_<名字>_<项>，见 bot_config.pi_local_env。
 
     PI_LOCAL_BASE_URL（默认本机 Ollama）、PI_LOCAL_API_KEY_ENV（要鉴权的服务填装 key 的环境
     变量名，Ollama 不用）、PI_LOCAL_CONTEXT_WINDOW（默认 64K，和 Modelfile 的 num_ctx 对齐）、
@@ -246,17 +258,18 @@ def local_provider_config() -> Optional[dict]:
     PI_LOCAL_EXTRA_BODY=JSON 对象，扩展在请求发出前并进请求体（Venice 用它关掉平台自带的
     系统提示：{"venice_parameters":{"include_venice_system_prompt":false}}）。
     """
-    ids = pi_local_models()
+    prov = (provider or pi_local_provider()).strip().lower()
+    ids = pi_local_models(prov)
     if not ids:
         return None
-    base_url = (os.getenv("PI_LOCAL_BASE_URL") or LOCAL_BASE_URL).strip().rstrip("/")
-    key_env = (os.getenv("PI_LOCAL_API_KEY_ENV") or "").strip()
-    window = _env_int("PI_LOCAL_CONTEXT_WINDOW", LOCAL_CONTEXT_WINDOW)
-    max_out = min(_env_int("PI_LOCAL_MAX_TOKENS", LOCAL_MAX_TOKENS), window)
-    inputs = ["text"] if os.getenv("PI_LOCAL_VISION", "1") == "0" else ["text", "image"]
+    base_url = (pi_local_env(prov, "BASE_URL") or LOCAL_BASE_URL).rstrip("/")
+    key_env = pi_local_env(prov, "API_KEY_ENV")
+    window = _local_int(prov, "CONTEXT_WINDOW", LOCAL_CONTEXT_WINDOW)
+    max_out = min(_local_int(prov, "MAX_TOKENS", LOCAL_MAX_TOKENS), window)
+    inputs = ["text"] if pi_local_env(prov, "VISION") == "0" else ["text", "image"]
     # Ollama 的 /v1/chat/completions 收 reasoning_effort：none 关掉思考，其余都是开
     compat = {"thinkingFormat": "openai", "supportsReasoningEffort": True}
-    cost = _local_cost()
+    cost = _local_cost(prov)
     models = [{
         "id": mid,
         "name": mid,
@@ -274,9 +287,9 @@ def local_provider_config() -> Optional[dict]:
         },
     } for mid in ids]
     out = {
-        "provider": pi_local_provider(),
+        "provider": prov,
         "config": {
-            "name": "Local",
+            "name": prov.capitalize() if prov != "ollama" else "Local",
             "baseUrl": base_url,
             "api": "openai-completions",
             # 不要鉴权的服务（Ollama）也得给个非空 key，pi 才会把模型当成可用
@@ -285,17 +298,22 @@ def local_provider_config() -> Optional[dict]:
             "models": models,
         },
     }
-    extra = _local_extra_body()
+    extra = _local_extra_body(prov)
     if extra:
         out["extraBody"] = extra
     return out
 
 
-def _local_cost() -> dict:
+def local_provider_configs() -> list[dict]:
+    """本机配了的全部本地 provider（主 provider 在前）。"""
+    return [cfg for cfg in (local_provider_config(p) for p in pi_local_providers()) if cfg]
+
+
+def _local_cost(provider: Optional[str] = None) -> dict:
     """PI_LOCAL_COST=输入,输出[,缓存命中[,缓存写入]]（美元/百万 token）→ pi 模型表的 cost；没配或写错都是 0。"""
     keys = ("input", "output", "cacheRead", "cacheWrite")
     cost = dict.fromkeys(keys, 0.0)
-    raw = (os.getenv("PI_LOCAL_COST") or "").strip()
+    raw = pi_local_env(provider, "COST")
     if not raw:
         return cost
     try:
@@ -310,9 +328,9 @@ def _local_cost() -> dict:
     return cost
 
 
-def _local_extra_body() -> Optional[dict]:
+def _local_extra_body(provider: Optional[str] = None) -> Optional[dict]:
     """PI_LOCAL_EXTRA_BODY（JSON 对象）：扩展在请求发出前并进本地 provider 的请求体。"""
-    raw = (os.getenv("PI_LOCAL_EXTRA_BODY") or "").strip()
+    raw = pi_local_env(provider, "EXTRA_BODY")
     if not raw:
         return None
     try:
@@ -327,11 +345,7 @@ def _local_extra_body() -> Optional[dict]:
 
 def provider_configs() -> list[dict]:
     """扩展每轮要注册的全部 provider：Google（换成 PI_GEMINI_MODELS）+ 本机配了的本地 provider。"""
-    configs = [provider_config()]
-    local = local_provider_config()
-    if local:
-        configs.append(local)
-    return configs
+    return [provider_config()] + local_provider_configs()
 
 
 def _gemini_key_available() -> bool:
@@ -339,13 +353,113 @@ def _gemini_key_available() -> bool:
     return bool(os.getenv("GEMINI_API_KEY") or (src and os.getenv(src)))
 
 
+def local_model_label(provider: str, model_id: str) -> str:
+    """本地模型的按钮字：PI_LOCAL[_<名字>]_LABEL（配一款模型时用）；没配就是 🖥️ <id>，挂了几家再带上家名。"""
+    label = pi_local_env(provider, "LABEL")
+    if label and len(pi_local_models(provider)) == 1:
+        return label
+    if len(pi_local_providers()) > 1:
+        return f"🖥️ {provider.capitalize()} · {model_id}"
+    return f"🖥️ {model_id}"
+
+
 def model_buttons() -> list[tuple[str, str]]:
-    """/model 面板的 (命令参数, 按钮字)：本地模型在前；本机没有 Gemini key 就不摆 Gemini。"""
-    prov = pi_local_provider()
-    buttons = [(f"{prov}/{mid}", f"🖥️ {mid}") for mid in pi_local_models()]
-    if _gemini_key_available() or not buttons:
+    """/model 面板的 (命令参数, 按钮字)：本地模型在前；本机没有 Gemini key 就不摆 Gemini。
+
+    PI_GEMINI_BUTTONS=0：有本地模型时不摆 Gemini（11-22 服务器上那把 Gemini key 没钱了，点了只会 402）。"""
+    buttons = [
+        (f"{prov}/{mid}", local_model_label(prov, mid))
+        for prov in pi_local_providers() for mid in pi_local_models(prov)
+    ]
+    show_gemini = _gemini_key_available() and os.getenv("PI_GEMINI_BUTTONS", "1").strip() != "0"
+    if show_gemini or not buttons:
         buttons += PI_MODEL_BUTTONS
     return buttons
+
+
+# ── 收费本地 provider 的余额（/model 面板上显示，11-22 加）────────────────────────
+# 按接口地址认是哪家：
+#   Venice：GET <base>/api_keys/rate_limits（推理 key 就能查）→ data.balances.USD
+#   Lebrel：GET https://lebrel.ai/api/overview → balanceMicrousd，要带 account:read 权限的 key
+#           （推理 key 只有 inference:write，回 403）；PI_LOCAL_<名字>_BALANCE_KEY_ENV 指向那把只读 key。
+#           另外 /api/drop/policy 是公开的：现在是不是免费时段、打几折。
+# 查不到时，配了 PI_LOCAL_<名字>_BALANCE_URL 就给个后台链接。
+_LEBREL_SITE = "https://lebrel.ai"
+
+
+def _http_json(url: str, key: str = "", timeout: float = 5.0) -> Optional[dict]:
+    import urllib.request
+    headers = {"Accept": "application/json", "User-Agent": "cc-lark"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 — 网络 / 401 / 403 / 非 JSON 一律当查不到
+        return None
+
+
+def _money(usd: float) -> str:
+    return f"${usd:,.2f}"
+
+
+def _lebrel_phase(now_ms: Optional[float] = None) -> str:
+    """Lebrel 当前价位（公开接口）：免费时段 / 原价几折；查不到返回空串。"""
+    import time as _time
+    data = _http_json(f"{_LEBREL_SITE}/api/drop/policy")
+    if not data:
+        return ""
+    phase = data.get("phase") or {}
+    if phase.get("free"):
+        until = phase.get("freeUntil")
+        if isinstance(until, (int, float)):
+            # 北京时间（固定 UTC+8）
+            hhmm = _time.strftime("%H:%M", _time.gmtime(until / 1000 + 8 * 3600))
+            return f"现在免费（到 {hhmm}）"
+        return "现在免费"
+    pct = (data.get("price") or {}).get("percent")
+    if isinstance(pct, (int, float)):
+        return "现在原价" if pct >= 100 else f"现在原价 {pct / 10:g} 折"
+    return ""
+
+
+def local_balance_line(provider: str) -> str:
+    """某家本地 provider 的余额一行（不收费 / 认不出是哪家的返回空串）。"""
+    base = (pi_local_env(provider, "BASE_URL") or "").rstrip("/")
+    key_env = pi_local_env(provider, "BALANCE_KEY_ENV") or pi_local_env(provider, "API_KEY_ENV")
+    key = os.getenv(key_env, "") if key_env else ""
+    link = pi_local_env(provider, "BALANCE_URL")
+    name = provider.capitalize()
+    host = base.split("://", 1)[-1].split("/", 1)[0].lower()
+    balance = ""
+    extra = ""
+    if host.endswith("venice.ai"):
+        data = _http_json(f"{base}/api_keys/rate_limits", key) if key else None
+        usd = (((data or {}).get("data") or {}).get("balances") or {}).get("USD")
+        if isinstance(usd, (int, float)):
+            balance = _money(float(usd))
+    elif host.endswith("lebrel.ai"):
+        data = _http_json(f"{_LEBREL_SITE}/api/overview", key) if key else None
+        micro = (data or {}).get("balanceMicrousd")
+        if isinstance(micro, (int, float)):
+            balance = _money(micro / 1_000_000)
+        extra = _lebrel_phase()
+    else:
+        return ""
+    if not balance:
+        balance = f"[后台查看]({link})" if link else "查不到"
+    return f"💰 {name} 余额 {balance}" + (f" · {extra}" if extra else "")
+
+
+def local_balance_lines() -> list[str]:
+    """全部本地 provider 的余额（并发查，每家最多等 5 秒）。"""
+    from concurrent.futures import ThreadPoolExecutor
+    providers = pi_local_providers()
+    if not providers:
+        return []
+    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+        lines = list(pool.map(local_balance_line, providers))
+    return [line for line in lines if line]
 
 
 def default_effort(profile_name: Optional[str] = None, model: Optional[str] = None) -> Optional[str]:
@@ -367,8 +481,8 @@ def default_model(profile_name: Optional[str] = None) -> str:
     bare = _bare_model(raw)
     if bare in PI_GEMINI_MODELS:
         return f"google/{bare}"
-    local = pi_local_model_id(raw)
-    return f"{pi_local_provider()}/{local}" if local else DEFAULT_MODEL
+    ref = pi_local_ref(raw)
+    return f"{ref[0]}/{ref[1]}" if ref else DEFAULT_MODEL
 
 
 def resolve_model(model: Optional[str], profile_name: Optional[str] = None) -> str:
@@ -427,8 +541,9 @@ def context_window_for(model: Optional[str] = None) -> int:
     override = (os.getenv("PI_CONTEXT_WINDOW") or "").strip()
     if override.isdigit() and int(override) > 0:
         return int(override)
-    if is_local_model(model):
-        return _env_int("PI_LOCAL_CONTEXT_WINDOW", LOCAL_CONTEXT_WINDOW)
+    ref = pi_local_ref(model)
+    if ref:
+        return _local_int(ref[0], "CONTEXT_WINDOW", LOCAL_CONTEXT_WINDOW)
     return _CONTEXT_WINDOW
 
 

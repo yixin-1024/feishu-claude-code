@@ -72,6 +72,12 @@ def _isolate_sessions(tmp_path, monkeypatch):
     # 用例（test_run_claude_prefers_final_result_over_partial_deltas）在那台机器上
     # 一直红。默认关才是代码的默认值；要测打开的用例自己 monkeypatch.setenv。
     monkeypatch.delenv("CLAUDE_PRINT_STREAM_INPUT", raising=False)
+    # pi 的本地 / 收费 provider 同理：服务器 .env 挂着 Lebrel + Venice（PI_LOCAL_*）、
+    # 还用 PI_GEMINI_BUTTONS=0 藏了 Gemini 按钮，漏进测试后 /model 面板和模型解析都变样。
+    # 要测本地模型的用例自己 monkeypatch.setenv。
+    for _k in list(os.environ):
+        if _k.startswith("PI_LOCAL_") or _k == "PI_GEMINI_BUTTONS":
+            monkeypatch.delenv(_k, raising=False)
     # env token 池（~/.claude/env_tokens.json）同理：里面是真 token，读到了会把
     # 上面删掉的 CLAUDE_CODE_OAUTH_TOKEN 又同步回 os.environ。
     import account_switcher as _acs

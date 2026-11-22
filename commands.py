@@ -3066,6 +3066,7 @@ async def handle_command(
             raw = await store.get_current_raw(user_id, chat_id)
             overridden = bool(raw.get("model_override"))
             runner = (getattr(cur, "runner", "") or getattr(getattr(bot, "profile", None), "runner", "claude")).lower()
+            pi_balance_hint = ""
             if runner == "dots":
                 return "当前 runner：**dots**（网页版 OpenAI Dots）\n模型由 Dot 自己决定，这里没有可切换的模型。"
             if runner == "codex":
@@ -3139,10 +3140,25 @@ async def handle_command(
                     {"text": "🇨🇳 Qwen3 Coder 0.05x", "value": {"action": "run_cmd", "cmd": "/model kiro-qwen", "cid": chat_id}},
                 ]
             elif runner == "pi":
+                # 当前用的那款前面带 ●；收费的本地 provider（Venice / Lebrel）在正文里报余额
+                from pi_runner import local_balance_lines, resolve_model as pi_resolve_model
+                try:
+                    pi_current = pi_resolve_model(cur.model, getattr(getattr(bot, "profile", None), "name", None)).lower()
+                except Exception:  # noqa: BLE001
+                    pi_current = ""
                 buttons = [
-                    {"text": label, "value": {"action": "run_cmd", "cmd": f"/model {alias}", "cid": chat_id}}
+                    {
+                        "text": ("● " if alias.lower() == pi_current else "") + label,
+                        "value": {"action": "run_cmd", "cmd": f"/model {alias}", "cid": chat_id},
+                    }
                     for alias, label in pi_model_buttons()
                 ]
+                try:
+                    balance_lines = await asyncio.wait_for(asyncio.to_thread(local_balance_lines), timeout=8)
+                except Exception:  # noqa: BLE001 — 查余额失败不影响切模型
+                    balance_lines = []
+                if balance_lines:
+                    pi_balance_hint = "\n" + "\n".join(balance_lines)
             elif runner == "grok":
                 buttons = [
                     {"text": "🤖 GPT-5.4", "value": {"action": "run_cmd", "cmd": "/model wow-gpt", "cid": chat_id}},
@@ -3169,7 +3185,7 @@ async def handle_command(
             )
             hint = (
                 "\n按钮上是每轮 credits 倍率；◑ 每天 22:00–8:00 打折"
-                if runner == "qoder" else ""
+                if runner == "qoder" else pi_balance_hint
             )
             return {
                 "text": (
