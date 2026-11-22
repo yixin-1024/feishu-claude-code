@@ -193,7 +193,7 @@ if [[ -f "$ENV_FILE" ]]; then
     done < <(grep -E "^(CALLBACK_PORT|NGROK_DOMAIN)=" "$ENV_FILE")
 fi
 
-export PATH="__EXTRA_PATH__/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="__EXTRA_PATH__/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export HOME="__HOME_DIR__"
 
 cd "$REPO_ROOT" || { echo "[$(date)] cd $REPO_ROOT failed" >>"$BOT_LOG"; exit 1; }
