@@ -337,6 +337,40 @@ def test_auto_continue_reuses_the_same_process(fake, monkeypatch):
     assert DONE_SENTINEL in _requests(log, "thread/start")[0]["params"]["developerInstructions"]
 
 
+def test_done_marker_is_stripped_without_auto_continue(fake, monkeypatch):
+    # 关掉续跑后老会话仍会惯性吐完成标记：剥掉，但不注入提示、不催第二个 turn
+    codex_bin, read_log = fake({"turns": [{"frames": [
+        {"method": "item/agentMessage/delta", "params": {"threadId": "$THREAD", "turnId": "$TURN",
+                                                          "itemId": "m", "delta": f"half done\n{DONE_SENTINEL}"}},
+        {"method": "turn/completed", "params": {"threadId": "$THREAD", "turn": {
+            "id": "$TURN", "items": [], "status": "completed"}}},
+    ]}]})
+    monkeypatch.setenv("CODEX_AUTO_CONTINUE", "0")
+    chunks = []
+    text, _, _ = _run(message="hi", codex_bin=codex_bin, on_text_chunk=chunks.append)
+    assert text == "half done"
+    assert DONE_SENTINEL not in "".join(chunks)
+    assert "自动续跑" not in "".join(chunks)
+    log = read_log()
+    assert len(_requests(log, "turn/start")) == 1
+    assert DONE_SENTINEL not in (_requests(log, "thread/start")[0]["params"].get("developerInstructions") or "")
+
+
+def test_no_marker_without_auto_continue_ends_after_one_turn(fake, monkeypatch):
+    codex_bin, read_log = fake({"turns": [{"frames": [
+        {"method": "item/agentMessage/delta", "params": {"threadId": "$THREAD", "turnId": "$TURN",
+                                                          "itemId": "m", "delta": "step 1 only"}},
+        {"method": "turn/completed", "params": {"threadId": "$THREAD", "turn": {
+            "id": "$TURN", "items": [], "status": "completed"}}},
+    ]}]})
+    monkeypatch.setenv("CODEX_AUTO_CONTINUE", "0")
+    chunks = []
+    text, _, _ = _run(message="hi", codex_bin=codex_bin, on_text_chunk=chunks.append)
+    assert text == "step 1 only"
+    assert "自动续跑" not in "".join(chunks)
+    assert len(_requests(read_log(), "turn/start")) == 1
+
+
 def test_mcp_flags_are_passed_to_app_server(fake, monkeypatch):
     codex_bin, read_log = fake({"turns": [{"fixture": "turn_resume_recall.json"}]})
     monkeypatch.setenv("CC_LARK_WAKE_MCP", "1")

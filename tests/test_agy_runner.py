@@ -1428,7 +1428,8 @@ def test_auto_continue_disabled_runs_single_pass(monkeypatch):
 
     assert (text, sid, fallback) == ("one shot", "conv-3", False)
     assert len(calls) == 1
-    assert calls[0]["sentinel"] == ""
+    # 仍剥标记（老会话会惯性吐），但不注入续跑提示
+    assert calls[0]["sentinel"] == agy_runner.DONE_SENTINEL
     assert calls[0].get("append_system_prompt") is None
 
 

@@ -716,7 +716,9 @@ async def run_codex(
     if not _auto_continue_enabled(extra_env):
         return await _run_codex_once(
             message, session_id=session_id, append_system_prompt=append_system_prompt,
-            sentinel="", **common,
+            # 不注入续跑提示，但仍剥掉标记：老会话历史里有「输出完成标记」的指令，
+            # 模型会惯性继续吐 ⟦CC_TASK_DONE⟧，不剥就漏到卡片上。
+            sentinel=_DONE_SENTINEL, **common,
         )
 
     sentinel = _DONE_SENTINEL
@@ -806,7 +808,9 @@ async def _run_codex_app_server(
     cmd = [resolve_codex_bin(codex_bin), "app-server", *_cc_lark_mcp_config_flags(extra_env)]
 
     developer = (append_system_prompt or "").strip()
-    auto = None
+    # 不续跑时也带上标记但 max_passes=0：只从输出里剥掉、不注入提示也不催。老会话历史里有
+    # 「输出完成标记」的指令，模型会惯性继续吐 ⟦CC_TASK_DONE⟧，不剥就漏到卡片上。
+    auto = {"sentinel": _DONE_SENTINEL, "max_passes": 0, "budget": 0}
     if _auto_continue_enabled(extra_env):
         hint = _CONTINUE_SYSTEM_HINT.format(sentinel=_DONE_SENTINEL)
         developer = f"{developer}\n\n{hint}".strip() if developer else hint

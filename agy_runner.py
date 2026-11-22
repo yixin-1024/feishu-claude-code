@@ -1402,7 +1402,8 @@ async def run_agy(**kwargs):
         return "", kwargs.get("session_id"), False
 
     if not _auto_continue_enabled(extra_env):
-        text, sid, _ = await _run_agy_pass(sentinel="", **kwargs)
+        # 不注入续跑提示，但仍剥掉标记（老会话会惯性吐 ⟦CC_TASK_DONE⟧）。
+        text, sid, _ = await _run_agy_pass(sentinel=DONE_SENTINEL, **kwargs)
         return text, sid, False
 
     message = kwargs.pop("message")
