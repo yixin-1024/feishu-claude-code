@@ -1734,7 +1734,7 @@ def test_run_agy_profile_home_with_api_key_writes_its_own_settings(monkeypatch, 
     _patch_exec(monkeypatch, FakeProc(STREAM_LINES), captured)
     writes = []
     monkeypatch.setattr(agy_runner, "ensure_model_provider",
-                        lambda provider, path=None: writes.append(path) or real_ensure_provider(provider, path))
+                        lambda provider, path=None, **kw: writes.append(path) or real_ensure_provider(provider, path, **kw))
     home = _profile_home(monkeypatch, tmp_path)
 
     asyncio.run(run_agy(message="hi", cwd="/tmp", model_provider="gemini", home=str(home)))
@@ -1743,6 +1743,40 @@ def test_run_agy_profile_home_with_api_key_writes_its_own_settings(monkeypatch, 
     assert writes == [str(settings)]
     assert json.loads(settings.read_text())["modelProvider"] == "gemini"
     assert captured["env"]["HOME"] == str(home)
+
+
+def test_ensure_model_provider_clears_stale_provider_only_when_asked(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text('{"modelProvider": "gemini", "trustedWorkspaces": ["/w"]}\n', encoding="utf-8")
+    # 默认：空 provider = 不管（共用 ~/.gemini 的老路径）
+    assert ensure_model_provider("", str(path)) is False
+    assert json.loads(path.read_text())["modelProvider"] == "gemini"
+    # 专用 HOME：空 provider = 走 OAuth，删掉残留字段，其它配置原样保留
+    assert ensure_model_provider("", str(path), clear_when_empty=True) is True
+    assert json.loads(path.read_text()) == {"trustedWorkspaces": ["/w"]}
+    assert ensure_model_provider("", str(path), clear_when_empty=True) is False
+    # 文件不存在 / 读不懂：不创建、不清空
+    missing = tmp_path / "nope" / "settings.json"
+    assert ensure_model_provider("", str(missing), clear_when_empty=True) is False
+    assert not missing.exists()
+    path.write_text("{broken", encoding="utf-8")
+    assert ensure_model_provider("", str(path), clear_when_empty=True) is False
+    assert path.read_text() == "{broken"
+
+
+def test_run_agy_profile_home_oauth_drops_stale_api_key_provider(monkeypatch, tmp_path):
+    real_ensure_provider = agy_runner.ensure_model_provider
+    captured = {}
+    _patch_exec(monkeypatch, FakeProc(STREAM_LINES), captured)
+    monkeypatch.setattr(agy_runner, "ensure_model_provider", real_ensure_provider)
+    home = _profile_home(monkeypatch, tmp_path)
+    settings = home / ".gemini" / "antigravity-cli" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text('{"modelProvider": "gemini"}\n', encoding="utf-8")
+
+    asyncio.run(run_agy(message="hi", cwd="/tmp", model_provider="", home=str(home)))
+
+    assert "modelProvider" not in json.loads(settings.read_text())
 
 
 def test_load_profile_reads_agy_home(monkeypatch):

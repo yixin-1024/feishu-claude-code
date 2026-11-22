@@ -280,26 +280,40 @@ def ensure_bot_home() -> bool:
     return touched
 
 
-def ensure_model_provider(provider: str = "gemini", path: str = AGY_SETTINGS_PATH) -> bool:
+def ensure_model_provider(
+    provider: str = "gemini", path: str = AGY_SETTINGS_PATH, *, clear_when_empty: bool = False
+) -> bool:
     """把 modelProvider 写进 agy 的 settings.json。返回是否发生写入。
 
     provider="gemini" = 用 GEMINI_API_KEY 直连 Gemini API（不走 OAuth）。
-    空 provider 表示"不管"，交回用户/OAuth 默认。
+    空 provider 默认表示"不管"，交回用户/OAuth 默认。
+    clear_when_empty=True（bot 自己的 <PREFIX>_AGY_HOME 用）：空 provider 就是要走
+    OAuth，把残留的 modelProvider 删掉——否则从 key 模式切回订阅时，旧值会一直
+    把 agy 钉在 API key 通道上，非得手动改 settings.json。
     """
     provider = (provider or "").strip()
-    if not provider:
+    if not provider and not clear_when_empty:
         return False
     path = os.path.expanduser(path)
+    if not provider and not os.path.exists(path):
+        return False
     data: dict = {}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh) or {}
         except (OSError, json.JSONDecodeError):
+            if not provider:
+                return False  # 读不懂就别动，免得把用户的配置清空
             data = {}
-    if data.get("modelProvider") == provider:
+    if not provider:
+        if "modelProvider" not in data:
+            return False
+        data.pop("modelProvider")
+    elif data.get("modelProvider") == provider:
         return False
-    data["modelProvider"] = provider
+    else:
+        data["modelProvider"] = provider
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -859,7 +873,9 @@ async def _run_agy_once(
         if profile_home:
             restore_home_script = ensure_profile_home(profile_home)
             ensure_model_provider(
-                model_provider, os.path.join(profile_home_paths(profile_home)[0], "settings.json")
+                model_provider,
+                os.path.join(profile_home_paths(profile_home)[0], "settings.json"),
+                clear_when_empty=True,
             )
         else:
             ensure_bot_home()
