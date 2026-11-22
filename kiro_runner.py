@@ -21,6 +21,11 @@ found")，这里识别后退回新会话。v3 的几种事件也顺手解析，C
 Claude Code 的规则/记忆，mcpServers = cc-lark 运行时 MCP），`--agent` 指过去，跑完
 删掉。会话里存的是对话历史，换个同内容的临时 agent 续轮不影响上下文（实测）。
 
+⚠️ 但 agent 的 `prompt` 不是 system 参数：2.28.0 实测它被拼成会话开头第一条 user 侧
+上下文条目（模板 `Follow this instruction: <prompt>`，前面是 skill 清单、后面是
+`The current model is …`）。kiro 自己那条 system prompt（内置 kiro_default 的 4 行）
+盖不掉，只能靠 kiro 的前言 `You must follow any requests` 抬这条指令的权重。
+
 模型：auto / claude-opus-5.5 / claude-sonnet-5.5 / gpt-5.6-* / deepseek-3.2 …（`kiro-cli
 chat --list-models` 看全表和倍率）。传了不存在的模型会 runError："The model … is not
 available"。
@@ -38,6 +43,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 import uuid
@@ -55,6 +61,28 @@ from claude_runner import (
 IDLE_TIMEOUT = 600  # 无输出且无子进程 → 视为挂死
 STUCK_CHILD_TIMEOUT = int(os.getenv("STUCK_CHILD_TIMEOUT_SEC", "3600"))
 _CHECK_INTERVAL = 30
+
+
+def _kill_tree(proc) -> None:
+    """SIGKILL kiro 整个进程组。
+
+    `kiro-cli`（homebrew 那个）只是个 launcher，真正干活、持有会话锁的是它 fork 出的
+    `kiro-cli-chat chat` + `kiro-cli-chat acp`。只 proc.kill() 杀掉 launcher 的话，
+    这两个会被 init 收养、继续占着 session，下一轮 --resume-id 就报
+    "Session is active in another process"（2026-10-12 实测挂了 9 小时）。
+    proc 是 start_new_session=True 起的，pgid == proc.pid，按组杀；绝不碰 bot 自己的组。
+    """
+    try:
+        pgid = int(proc.pid)
+        if pgid > 1 and pgid != os.getpgrp():
+            os.killpg(pgid, signal.SIGKILL)
+            return
+    except (ProcessLookupError, PermissionError, AttributeError, TypeError, ValueError):
+        pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 # kiro-cli --effort（2.28.0 help 里的例子）；模型不支持推理时 CLI 只在 stderr 警告一句
 KIRO_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
@@ -514,7 +542,7 @@ async def run_kiro(
         try:
             while True:
                 if wall_clock_limit > 0 and loop.time() - start_time >= wall_clock_limit:
-                    proc.kill()
+                    _kill_tree(proc)
                     await proc.wait()
                     raise RuntimeError(
                         f"Kiro 单轮执行超过 wall-clock 最终上限（{int(wall_clock_limit)}秒），已终止进程。"
@@ -522,12 +550,19 @@ async def run_kiro(
                 try:
                     raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=_CHECK_INTERVAL)
                     idle_seconds = 0
+                except ValueError as e:
+                    # 单行超过 StreamReader limit（读图时 tool 结果带整张 base64 等）：
+                    # readline 已把缓冲清掉，剩下半截行不以 "{" 开头/解析失败会被下面跳过。
+                    # 以前这里直接冒泡 → 杀 launcher → 留孤儿进程锁死 session。
+                    print(f"[run_kiro] skip oversized stdout line: {e}", flush=True)
+                    idle_seconds = 0
+                    continue
                 except asyncio.TimeoutError:
                     idle_seconds += _CHECK_INTERVAL
                     has_kids = _has_children(proc.pid)
                     threshold = STUCK_CHILD_TIMEOUT if has_kids else idle_limit
                     if idle_seconds >= threshold:
-                        proc.kill()
+                        _kill_tree(proc)
                         await proc.wait()
                         if has_kids:
                             raise RuntimeError(
@@ -610,14 +645,11 @@ async def run_kiro(
                         raise exc
         except BaseException:
             stderr_task.cancel()
-            try:
-                if proc.returncode is None:
-                    proc.kill()
-            except ProcessLookupError:
-                pass
+            _kill_tree(proc)  # launcher 已退也要杀：它 fork 的 chat/acp 还在组里
             raise
 
         await proc.wait()
+        _kill_tree(proc)  # 正常退出也扫一遍同组残留（组里没人时 ESRCH 被忽略）
         stderr_text = (await stderr_task).decode("utf-8", errors="replace").strip()
         if stderr_text:
             print(f"[run_kiro] stderr: {stderr_text[-500:]}", flush=True)

@@ -16,7 +16,10 @@ class FakeStdout:
         self._lines = list(lines)
 
     async def readline(self):
-        return self._lines.pop(0) if self._lines else b""
+        item = self._lines.pop(0) if self._lines else b""
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
 
 class FakeStderr:
@@ -105,6 +108,14 @@ def _patch_exec(monkeypatch, procs, captured):
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+
+@pytest.fixture(autouse=True)
+def killpg_calls(monkeypatch):
+    """FakeProc.pid 是假的，绝不能真 killpg 出去。"""
+    calls = []
+    monkeypatch.setattr(kiro_runner.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+    return calls
 
 
 @pytest.fixture
@@ -365,3 +376,31 @@ def test_usage_lines_report_failure(monkeypatch):
         raise RuntimeError("no panel")
     monkeypatch.setattr(kiro_runner, "fetch_kiro_plan_usage", boom)
     assert "读取失败" in commands._kiro_plan_lines(None)[0]
+
+
+def test_oversized_stdout_line_is_skipped_not_fatal(monkeypatch, agents_dir):
+    # 读大图时一行 stream-json 超 StreamReader limit：readline 抛 ValueError。
+    # 以前直接冒泡、只杀 launcher，留下孤儿 kiro-cli-chat 锁死 session。
+    lines = [STREAM[0], ValueError("Separator is not found, and chunk exceed the limit"),
+             b'AAAA_tail_of_base64"}}}\n'] + STREAM[1:]
+    captured = {}
+    _patch_exec(monkeypatch, [FakeProc(lines)], captured)
+    text, sid, _ = _run(agents_dir)
+    assert text == "DONE" and sid == SID
+
+
+def test_error_kills_whole_process_group(monkeypatch, agents_dir, killpg_calls):
+    import signal
+    err = _j({"type": "runError", "data": {"sessionId": SID, "stage": "run", "message": "boom"}})
+    captured = {}
+    _patch_exec(monkeypatch, [FakeProc([STREAM[0], STREAM[1], err])], captured)
+    with pytest.raises(RuntimeError):
+        _run(agents_dir)
+    assert (4343, signal.SIGKILL) in killpg_calls
+
+
+def test_normal_exit_sweeps_leftover_group(monkeypatch, agents_dir, killpg_calls):
+    captured = {}
+    _patch_exec(monkeypatch, [FakeProc(STREAM)], captured)
+    _run(agents_dir)
+    assert [c[0] for c in killpg_calls] == [4343]
