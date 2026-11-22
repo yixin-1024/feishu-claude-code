@@ -3554,6 +3554,7 @@ _TOOL_HISTORY_SHOWN = 10
 _TOOL_PRIMARY_KEYS = (
     "command", "CommandLine",                    # shell
     "file_path", "path", "AbsolutePath", "TargetFile", "target_file", "notebook_path",
+    "image_path", "image_paths",                 # 图片读取
     "pattern", "Pattern", "query", "Query",      # 搜索
     "DirectoryPath", "SearchDirectory", "SearchPath",
     "url", "Url", "description", "prompt", "tool_name", "name",
@@ -3579,8 +3580,37 @@ def _tool_primary_arg(inp: dict) -> str:
     if not isinstance(inp, dict):
         return ""
     for key in _TOOL_PRIMARY_KEYS:
-        if key in inp and isinstance(inp[key], (str, int, float)) and str(inp[key]).strip():
-            return _short_arg(inp[key])
+        val = inp.get(key)
+        if isinstance(val, (str, int, float)) and str(val).strip():
+            return _short_arg(val)
+        if isinstance(val, list) and val:
+            strs = [str(x).strip() for x in val if isinstance(x, (str, int, float)) and str(x).strip()]
+            if strs:
+                return _short_arg(", ".join(strs))
+    # 支持 Kiro CLI 等将参数放在 operations: [{mode: ..., path: ..., image_paths: [...]}] 里的结构
+    ops = inp.get("operations")
+    if isinstance(ops, list) and ops:
+        targets: list[str] = []
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            for key in _TOOL_PRIMARY_KEYS:
+                v = op.get(key)
+                if isinstance(v, (str, int, float)) and str(v).strip():
+                    targets.append(str(v).strip())
+                    break
+                if isinstance(v, list) and v:
+                    strs = [str(x).strip() for x in v if isinstance(x, (str, int, float)) and str(x).strip()]
+                    if strs:
+                        targets.extend(strs)
+                        break
+            else:
+                for k, val in op.items():
+                    if not k.startswith("_") and isinstance(val, str) and val.strip() and k not in ("mode",):
+                        targets.append(val.strip())
+                        break
+        if targets:
+            return _short_arg(", ".join(targets))
     # 没命中已知字段名时，退而取第一个非空短字符串（未知后端的新工具也能有内容）。
     # 跳过 _ 开头的键——那是 runner 塞进来的内部标记（如 _agy_state），
     # 不能进 identity，否则 ACTIVE→DONE 会被当成两个不同的工具各占一行。
@@ -3589,6 +3619,10 @@ def _tool_primary_arg(inp: dict) -> str:
             continue
         if isinstance(val, str) and val.strip():
             return _short_arg(val)
+        if isinstance(val, list) and val:
+            strs = [str(x).strip() for x in val if isinstance(x, (str, int, float)) and str(x).strip()]
+            if strs:
+                return _short_arg(", ".join(strs))
     return ""
 
 
@@ -3596,13 +3630,51 @@ def _pick(inp: dict, *keys: str) -> str:
     """按 keys 优先级取入参；都没命中就回落到通用主参数。
 
     各后端字段名不统一（Claude=file_path、agy=AbsolutePath/TargetFile、
-    grok=target_file、opencode/mimo 把入参压成一个 command 字符串），
+    grok=target_file、opencode/mimo 把入参压成一个 command 字符串、
+    kiro 把读取放在 operations: [{mode: ..., path: ..., image_paths: [...]}]），
     这里统一兜住，卡片上就不会出现「读取：``」这种空壳。
     """
     for key in keys:
         val = inp.get(key)
         if isinstance(val, (str, int, float)) and str(val).strip():
             return _short_arg(val)
+        if isinstance(val, list) and val:
+            strs = [str(x).strip() for x in val if isinstance(x, (str, int, float)) and str(x).strip()]
+            if strs:
+                return _short_arg(", ".join(strs))
+    # 支持 Kiro CLI 等将参数放在 operations: [{mode: ..., path: ..., image_paths: [...]}] 里的结构
+    ops = inp.get("operations")
+    if isinstance(ops, list) and ops:
+        targets: list[str] = []
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            found = False
+            for k in keys:
+                v = op.get(k)
+                if isinstance(v, (str, int, float)) and str(v).strip():
+                    targets.append(str(v).strip())
+                    found = True
+                    break
+                if isinstance(v, list) and v:
+                    strs = [str(x).strip() for x in v if isinstance(x, (str, int, float)) and str(x).strip()]
+                    if strs:
+                        targets.extend(strs)
+                        found = True
+                        break
+            if not found:
+                for subk in ("path", "file_path", "image_paths", "image_path", "AbsolutePath", "target_file"):
+                    v = op.get(subk)
+                    if isinstance(v, (str, int, float)) and str(v).strip():
+                        targets.append(str(v).strip())
+                        break
+                    if isinstance(v, list) and v:
+                        strs = [str(x).strip() for x in v if isinstance(x, (str, int, float)) and str(x).strip()]
+                        if strs:
+                            targets.extend(strs)
+                            break
+        if targets:
+            return _short_arg(", ".join(targets))
     return _tool_primary_arg(inp)
 
 
@@ -3649,32 +3721,35 @@ def _format_tool(name: str, inp: dict) -> str:
         tail = f"  ·  `{cwd_hint}`" if cwd_hint else ""
         return f"{mark('🔧')} **执行命令：** `{cmd}`{tail}" if cmd else f"{mark('🔧')} **执行命令...**"
     elif n in ("read_file", "read", "view_file", "view_code_item", "notebook_read"):
-        target = _pick(inp, "file_path", "path", "AbsolutePath", "target_file")
-        return f"{mark('📄')} **读取：** `{target}`"
+        target = _pick(inp, "file_path", "path", "AbsolutePath", "target_file", "image_path", "image_paths")
+        return f"{mark('📄')} **读取：** `{target}`" if target else f"{mark('📄')} **读取文件...**"
     elif n in ("write_file", "write", "write_to_file"):
         target = _pick(inp, "file_path", "path", "TargetFile", "target_file")
-        return f"{mark('✏️')} **写入：** `{target}`"
+        return f"{mark('✏️')} **写入：** `{target}`" if target else f"{mark('✏️')} **写入文件...**"
     elif n in ("edit_file", "edit", "replace_file_content", "multi_replace_file_content",
                "sed_file", "notebook_edit"):
         target = _pick(inp, "file_path", "path", "TargetFile", "target_file")
-        return f"{mark('✂️')} **编辑：** `{target}`"
+        return f"{mark('✂️')} **编辑：** `{target}`" if target else f"{mark('✂️')} **编辑文件...**"
     elif n in ("glob", "find_by_name"):
         pat = _pick(inp, "pattern", "Pattern", "SearchDirectory")
-        return f"{mark('🔍')} **搜索文件：** `{pat}`"
+        return f"{mark('🔍')} **搜索文件：** `{pat}`" if pat else f"{mark('🔍')} **搜索文件...**"
     elif n in ("grep", "grep_search"):
         pat = _pick(inp, "pattern", "Query", "query")
         where = _short_arg(inp.get("path") or inp.get("SearchPath") or "", 40)
         tail = f"  ·  `{where}`" if where else ""
-        return f"{mark('🔎')} **搜索内容：** `{pat}`{tail}"
+        return f"{mark('🔎')} **搜索内容：** `{pat}`{tail}" if pat else f"{mark('🔎')} **搜索内容...**"
     elif n in ("list_dir",):
-        return f"{mark('📁')} **列目录：** `{_pick(inp, 'DirectoryPath', 'path')}`"
+        dir_path = _pick(inp, "DirectoryPath", "path")
+        return f"{mark('📁')} **列目录：** `{dir_path}`" if dir_path else f"{mark('📁')} **列目录...**"
     elif n in ("task", "invoke_subagent", "define_subagent", "manage_subagents"):
         detail = _pick(inp, "description", "prompt", "name")[:60]
-        return f"{mark('🤖')} **子任务：** {detail}"
+        return f"{mark('🤖')} **子任务：** {detail}" if detail else f"{mark('🤖')} **子任务**"
     elif n in ("webfetch", "read_url_content", "open_browser_url"):
-        return f"{mark('🌐')} **抓取网页：** `{_pick(inp, 'url', 'Url')}`"
+        url = _pick(inp, "url", "Url")
+        return f"{mark('🌐')} **抓取网页：** `{url}`" if url else f"{mark('🌐')} **抓取网页...**"
     elif n in ("websearch", "search_web"):
-        return f"{mark('🔍')} **搜索：** {_pick(inp, 'query', 'Query')}"
+        q = _pick(inp, "query", "Query")
+        return f"{mark('🔍')} **搜索：** {q}" if q else f"{mark('🔍')} **网络搜索...**"
     elif n == "call_mcp_tool":
         server = _short_arg(inp.get("ServerName") or inp.get("server") or "", 30)
         tool = _short_arg(inp.get("ToolName") or inp.get("tool_name") or inp.get("tool") or "", 40)

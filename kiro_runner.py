@@ -424,6 +424,23 @@ def _tool_display(update: dict) -> tuple[str, dict]:
     inp = {k: v for k, v in raw.items() if k != "__tool_use_purpose"} if isinstance(raw, dict) else {}
     if not inp and isinstance(raw, dict) and raw.get("__tool_use_purpose"):
         inp = {"purpose": raw["__tool_use_purpose"]}
+    # 如果有 operations（Kiro 内置的 read / write 等），提取 path / image_paths 便于上层统一消费
+    ops = inp.get("operations")
+    if isinstance(ops, list) and ops and "path" not in inp:
+        for op in ops:
+            if isinstance(op, dict):
+                p = op.get("path") or op.get("file_path") or op.get("target_file")
+                if p:
+                    inp["path"] = p
+                    break
+                imgs = op.get("image_paths") or op.get("image_path")
+                if imgs:
+                    inp["image_paths"] = imgs
+                    if isinstance(imgs, list) and imgs:
+                        inp["path"] = imgs[0]
+                    elif isinstance(imgs, str):
+                        inp["path"] = imgs
+                    break
     return name, inp
 
 

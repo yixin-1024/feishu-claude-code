@@ -378,6 +378,29 @@ def test_usage_lines_report_failure(monkeypatch):
     assert "读取失败" in commands._kiro_plan_lines(None)[0]
 
 
+def test_tool_display_extracts_operations_path_and_images():
+    name, inp = kiro_runner._tool_display({
+        "_meta": {"kiro": {"toolName": "read"}},
+        "rawInput": {
+            "operations": [{"mode": "Image", "image_paths": ["/tmp/pic.jpg"]}],
+            "__tool_use_purpose": "look at image",
+        },
+    })
+    assert name == "read"
+    assert inp["path"] == "/tmp/pic.jpg"
+    assert inp["image_paths"] == ["/tmp/pic.jpg"]
+
+    name2, inp2 = kiro_runner._tool_display({
+        "_meta": {"kiro": {"toolName": "read"}},
+        "rawInput": {
+            "operations": [{"mode": "Line", "path": "/tmp/code.py", "limit": 50}],
+        },
+    })
+    assert name2 == "read"
+    assert inp2["path"] == "/tmp/code.py"
+
+
+
 def test_oversized_stdout_line_is_skipped_not_fatal(monkeypatch, agents_dir):
     # 读大图时一行 stream-json 超 StreamReader limit：readline 抛 ValueError。
     # 以前直接冒泡、只杀 launcher，留下孤儿 kiro-cli-chat 锁死 session。

@@ -142,11 +142,33 @@ def test_other_backends_arg_fields_are_covered():
     # opencode / mimo：把入参压进 command，且自带 status
     oc = _format_tool("read", {"command": "src/app.tsx", "status": "completed"})
     assert oc == "✅ **读取：** `src/app.tsx`"
+    # kiro：read 工具在 operations 列表里嵌套（Image 模式与 Line 模式）
+    kiro_img = _format_tool("read", {
+        "operations": [{"mode": "Image", "image_paths": ["/tmp/feishu-image-123.jpg"]}],
+    })
+    assert kiro_img == "📄 **读取：** `/tmp/feishu-image-123.jpg`"
+    kiro_file = _format_tool("read", {
+        "operations": [{"mode": "Line", "path": os.path.expanduser("~/app.py"), "limit": 100}],
+    })
+    assert kiro_file == "📄 **读取：** `~/app.py`"
     # codex：bash + status/exit_code（保留 exit 码细节）
     bad = _format_tool("bash", {"command": "pytest", "status": "completed", "exit_code": 1})
     assert bad.startswith("⚠️") and "exit 1" in bad
     # opencode 的非 bash 工具失败态
     assert _format_tool("edit", {"command": "a.py", "status": "error"}).startswith("❌")
+
+
+def test_empty_targets_never_render_empty_backticks():
+    """入参全为空时，绝不能出现「读取：``」或「写入：``」这种空壳。"""
+    assert _format_tool("read", {}) == "📄 **读取文件...**"
+    assert _format_tool("read_file", {}) == "📄 **读取文件...**"
+    assert _format_tool("write", {}) == "✏️ **写入文件...**"
+    assert _format_tool("write_file", {}) == "✏️ **写入文件...**"
+    assert _format_tool("edit", {}) == "✂️ **编辑文件...**"
+    assert _format_tool("glob", {}) == "🔍 **搜索文件...**"
+    assert _format_tool("list_dir", {}) == "📁 **列目录...**"
+    assert _format_tool("webfetch", {}) == "🌐 **抓取网页...**"
+    assert _format_tool("websearch", {}) == "🔍 **网络搜索...**"
 
 
 def test_usage_footer_separates_turn_spend_from_context():
