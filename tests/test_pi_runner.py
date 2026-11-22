@@ -389,7 +389,8 @@ def test_extension_file_registers_models_and_servers():
 def local(monkeypatch):
     monkeypatch.setenv("PI_LOCAL_MODELS", "qwen36-uncensored, Other:7b")
     for k in ("PI_LOCAL_PROVIDER", "PI_LOCAL_BASE_URL", "PI_LOCAL_API_KEY_ENV", "PI_LOCAL_CONTEXT_WINDOW",
-              "PI_LOCAL_MAX_TOKENS", "PI_LOCAL_VISION", "PI_CONTEXT_WINDOW", "PI_MODEL", "MAIN_PI_MODEL"):
+              "PI_LOCAL_MAX_TOKENS", "PI_LOCAL_VISION", "PI_LOCAL_COST", "PI_LOCAL_EXTRA_BODY",
+              "PI_CONTEXT_WINDOW", "PI_MODEL", "MAIN_PI_MODEL"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -429,6 +430,31 @@ def test_local_provider_key_env_and_custom_name(local, monkeypatch):
     assert cfg["config"]["models"][0]["input"] == ["text"]
     assert pi_runner.is_local_model("lmstudio/qwen36-uncensored")
     assert not pi_runner.is_local_model("ollama/qwen36-uncensored")
+
+
+def test_local_provider_cost_and_extra_body(local, monkeypatch):
+    # 收费的 OpenAI 兼容服务（Venice）：价目进模型表，extraBody 交给扩展并进请求体
+    monkeypatch.setenv("PI_LOCAL_PROVIDER", "venice")
+    monkeypatch.setenv("PI_LOCAL_COST", "0.33, 1.32,0.00825")
+    monkeypatch.setenv("PI_LOCAL_EXTRA_BODY", '{"venice_parameters":{"include_venice_system_prompt":false}}')
+    cfg = pi_runner.local_provider_config()
+    assert cfg["config"]["models"][0]["cost"] == {"input": 0.33, "output": 1.32, "cacheRead": 0.00825, "cacheWrite": 0.0}
+    # 每个模型一份，别共用同一个 dict
+    assert cfg["config"]["models"][0]["cost"] is not cfg["config"]["models"][1]["cost"]
+    assert cfg["extraBody"] == {"venice_parameters": {"include_venice_system_prompt": False}}
+
+
+@pytest.mark.parametrize("cost", ["abc", "1,2,3,4,5", "-1,2"])
+def test_local_provider_bad_cost_is_free(local, monkeypatch, cost):
+    monkeypatch.setenv("PI_LOCAL_COST", cost)
+    cfg = pi_runner.local_provider_config()
+    assert cfg["config"]["models"][0]["cost"] == {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+
+
+@pytest.mark.parametrize("body", ["not json", "[1]", "{}"])
+def test_local_provider_bad_extra_body_ignored(local, monkeypatch, body):
+    monkeypatch.setenv("PI_LOCAL_EXTRA_BODY", body)
+    assert "extraBody" not in pi_runner.local_provider_config()
 
 
 def test_local_model_resolution(local, monkeypatch):

@@ -7,6 +7,8 @@
 //    xhighModels（Neon / Hydrogen）：pi 的 Google 适配层只放行 minimal/low/medium/high，
 //    模型表里 xhigh 映射成 high；会话档位是 xhigh 时，这里在请求发出前改写成 XHIGH。
 //    本机配了本地模型（PI_LOCAL_MODELS）时数组里还有一个 OpenAI 兼容的 provider（默认 ollama）。
+//    extraBody（PI_LOCAL_EXTRA_BODY）：这个 provider 的每个请求发出前并进请求体顶层，
+//    比如 Venice 的 {"venice_parameters": {"include_venice_system_prompt": false}}。
 //
 // 2) cc-lark 运行时 MCP：pi 没有 --mcp-config，全局 ~/.pi/agent/mcp.json 又是所有会话共用的，
 //    并发话题的 CC_LARK_* 各不相同，写进去会串。pi_runner 把本轮配置（Claude `--mcp-config`
@@ -32,6 +34,16 @@ export default function (pi: any) {
       pi.registerProvider(provider.provider, provider.config);
     } catch (err) {
       console.error(`[cc-lark] 注册模型表 ${provider.provider} 失败: ${err}`);
+    }
+    const extraBody = provider.extraBody;
+    if (extraBody && typeof extraBody === "object" && !Array.isArray(extraBody)) {
+      pi.on("before_provider_request", (event: any, ctx: any) => {
+        const model = ctx && ctx.model;
+        if (!model || model.provider !== provider.provider) return undefined;
+        const payload = event && event.payload;
+        if (!payload || typeof payload !== "object") return undefined;
+        return { ...payload, ...extraBody };
+      });
     }
     const xhighModels = new Set<string>(provider.xhighModels || []);
     if (xhighModels.size) {

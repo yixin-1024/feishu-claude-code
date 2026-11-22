@@ -31,7 +31,9 @@ Neon / Hydrogen / Carbon 会被当「自定义 id」照抄 Argon 的元数据（
 本地模型（11-22 加，mini2 上的 Ollama 跑 Qwen3.6 35B-A3B 去审查版）：配了 PI_LOCAL_MODELS 的
 机器上，扩展再注册一个 OpenAI 兼容的 provider（默认叫 ollama，模型写成 ollama/<id>），见
 local_provider_config。思考开关走 reasoning_effort（Ollama 实测 none=不想、low~high=想；
-Qwen 只有开 / 关，没有深浅），所以档位是 none / low / medium / high。不花钱，footer 不显示花费。
+Qwen 只有开 / 关，没有深浅），所以档位是 none / low / medium / high。Ollama 不花钱，footer 不显示花费；
+服务器上同一套开关接的是 Venice（收费，OpenAI 兼容），PI_LOCAL_COST 给价目、PI_LOCAL_EXTRA_BODY 关掉
+Venice 自带的系统提示，见 local_provider_config。
 
 推理强度：`--thinking`。Gemini 只有 low / medium / high，Neon / Hydrogen 多一档 xhigh
 （11-20 直接打 Gemini API 实测：这两款收 thinkingLevel=xhigh，Carbon 回 400）。
@@ -238,6 +240,11 @@ def local_provider_config() -> Optional[dict]:
     PI_LOCAL_BASE_URL（默认本机 Ollama）、PI_LOCAL_API_KEY_ENV（要鉴权的服务填装 key 的环境
     变量名，Ollama 不用）、PI_LOCAL_CONTEXT_WINDOW（默认 64K，和 Modelfile 的 num_ctx 对齐）、
     PI_LOCAL_MAX_TOKENS（单条回复上限，默认 16K）、PI_LOCAL_VISION=0 关掉图片输入。
+
+    收费的 OpenAI 兼容服务（11-22 起服务器上的 Venice）另有两项：
+    PI_LOCAL_COST=输入,输出[,缓存命中[,缓存写入]]（美元/百万 token），配了 footer 才显示花费；
+    PI_LOCAL_EXTRA_BODY=JSON 对象，扩展在请求发出前并进请求体（Venice 用它关掉平台自带的
+    系统提示：{"venice_parameters":{"include_venice_system_prompt":false}}）。
     """
     ids = pi_local_models()
     if not ids:
@@ -249,6 +256,7 @@ def local_provider_config() -> Optional[dict]:
     inputs = ["text"] if os.getenv("PI_LOCAL_VISION", "1") == "0" else ["text", "image"]
     # Ollama 的 /v1/chat/completions 收 reasoning_effort：none 关掉思考，其余都是开
     compat = {"thinkingFormat": "openai", "supportsReasoningEffort": True}
+    cost = _local_cost()
     models = [{
         "id": mid,
         "name": mid,
@@ -256,7 +264,7 @@ def local_provider_config() -> Optional[dict]:
         "baseUrl": base_url,
         "reasoning": True,
         "input": inputs,
-        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        "cost": dict(cost),
         "contextWindow": window,
         "maxTokens": max_out,
         "compat": compat,
@@ -265,7 +273,7 @@ def local_provider_config() -> Optional[dict]:
             "xhigh": None, "max": None,
         },
     } for mid in ids]
-    return {
+    out = {
         "provider": pi_local_provider(),
         "config": {
             "name": "Local",
@@ -277,6 +285,44 @@ def local_provider_config() -> Optional[dict]:
             "models": models,
         },
     }
+    extra = _local_extra_body()
+    if extra:
+        out["extraBody"] = extra
+    return out
+
+
+def _local_cost() -> dict:
+    """PI_LOCAL_COST=输入,输出[,缓存命中[,缓存写入]]（美元/百万 token）→ pi 模型表的 cost；没配或写错都是 0。"""
+    keys = ("input", "output", "cacheRead", "cacheWrite")
+    cost = dict.fromkeys(keys, 0.0)
+    raw = (os.getenv("PI_LOCAL_COST") or "").strip()
+    if not raw:
+        return cost
+    try:
+        vals = [float(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        print(f"[run_pi] PI_LOCAL_COST 不是数字列表，按 0 算：{raw!r}", flush=True)
+        return cost
+    if len(vals) > len(keys) or any(v < 0 for v in vals):
+        print(f"[run_pi] PI_LOCAL_COST 最多 4 个非负数，按 0 算：{raw!r}", flush=True)
+        return cost
+    cost.update(zip(keys, vals))
+    return cost
+
+
+def _local_extra_body() -> Optional[dict]:
+    """PI_LOCAL_EXTRA_BODY（JSON 对象）：扩展在请求发出前并进本地 provider 的请求体。"""
+    raw = (os.getenv("PI_LOCAL_EXTRA_BODY") or "").strip()
+    if not raw:
+        return None
+    try:
+        val = json.loads(raw)
+    except ValueError:
+        val = None
+    if not isinstance(val, dict) or not val:
+        print(f"[run_pi] PI_LOCAL_EXTRA_BODY 要是非空 JSON 对象，忽略：{raw[:200]!r}", flush=True)
+        return None
+    return val
 
 
 def provider_configs() -> list[dict]:
