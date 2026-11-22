@@ -28,6 +28,11 @@ Neon / Hydrogen / Carbon 会被当「自定义 id」照抄 Argon 的元数据（
 所以扩展每轮用 registerProvider("google", {models}) 把 Google 的模型表整张换成这 5 款。
 凭据：GEMINI_API_KEY；本机没单独配时借 agy 那把（AGY_API_KEY，PI_GEMINI_KEY_FROM 可改）。
 
+本地模型（11-22 加，mini2 上的 Ollama 跑 Qwen3.6 35B-A3B 去审查版）：配了 PI_LOCAL_MODELS 的
+机器上，扩展再注册一个 OpenAI 兼容的 provider（默认叫 ollama，模型写成 ollama/<id>），见
+local_provider_config。思考开关走 reasoning_effort（Ollama 实测 none=不想、low~high=想；
+Qwen 只有开 / 关，没有深浅），所以档位是 none / low / medium / high。不花钱，footer 不显示花费。
+
 推理强度：`--thinking`。Gemini 只有 low / medium / high，Neon / Hydrogen 多一档 xhigh
 （11-20 直接打 Gemini API 实测：这两款收 thinkingLevel=xhigh，Carbon 回 400）。
 none / minimal 落到 low，max 落到该模型的最高档。⚠️ pi 1.5.2 的 Google 适配层把档位写死成
@@ -65,7 +70,12 @@ import shutil
 import tempfile
 from typing import Callable, Optional
 
-from bot_config import resolve_claude_wall_clock_limit
+from bot_config import (
+    pi_local_model_id,
+    pi_local_models,
+    pi_local_provider,
+    resolve_claude_wall_clock_limit,
+)
 from claude_context import CLAUDE_SKILLS_DIR, build_claude_context_brief
 from claude_runner import (
     _fire_callback,
@@ -80,6 +90,14 @@ _CHECK_INTERVAL = 30
 
 # 基础三档；Neon / Hydrogen 多一档 xhigh（见 PI_GEMINI_MODELS）
 PI_EFFORT_LEVELS = ("low", "medium", "high")
+# 本地模型多一档 none（关掉思考）
+PI_LOCAL_EFFORT_LEVELS = ("none",) + PI_EFFORT_LEVELS
+
+# 本地 provider 的默认值（PI_LOCAL_* 环境变量可改）。上下文窗口要和本地服务实际给的一致：
+# Ollama 的 OpenAI 接口不收 num_ctx，得在 Modelfile 里写 PARAMETER num_ctx。
+LOCAL_BASE_URL = "http://127.0.0.1:11434/v1"
+LOCAL_CONTEXT_WINDOW = 65_536
+LOCAL_MAX_TOKENS = 16_384
 
 DEFAULT_MODEL = "google/gemini-3.8-flash"
 DEFAULT_SESSION_DIR = os.path.expanduser("~/.feishu-claude/pi-sessions")
@@ -133,8 +151,19 @@ def _bare_model(model: Optional[str]) -> str:
     return low[len("google/"):] if low.startswith("google/") else low
 
 
+def is_local_model(model: Optional[str]) -> bool:
+    return pi_local_model_id(model) is not None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else default
+
+
 def effort_levels_for_model(model: Optional[str]) -> tuple[str, ...]:
-    """该模型能用的推理档位：low / medium / high，Neon / Hydrogen 多一档 xhigh。"""
+    """该模型能用的推理档位：low / medium / high，Neon / Hydrogen 多一档 xhigh，本地模型多一档 none。"""
+    if is_local_model(model):
+        return PI_LOCAL_EFFORT_LEVELS
     meta = PI_GEMINI_MODELS.get(_bare_model(model))
     return PI_EFFORT_LEVELS + (("xhigh",) if meta and meta[3] else ())
 
@@ -148,6 +177,17 @@ def normalize_thinking(effort: Optional[str], model: Optional[str] = None) -> Op
     e = (effort or "").strip().lower()
     if not e or e in ("auto", "default"):
         return None
+    if is_local_model(model):
+        # 本地模型：none / off → pi 的 off（发 reasoning_effort=none 关掉思考），xhigh / max 封顶 high
+        if e in ("none", "off"):
+            return "off"
+        if e == "minimal":
+            return "low"
+        if e in PI_EFFORT_LEVELS:
+            return e
+        if e in ("xhigh", "max"):
+            return "high"
+        raise ValueError(f"invalid pi thinking level {e!r}; expected one of none/low/medium/high")
     if e in ("none", "off", "minimal"):
         return "low"
     if e in PI_EFFORT_LEVELS:
@@ -192,6 +232,76 @@ def provider_config(api_key_env: str = "GEMINI_API_KEY") -> dict:
     }
 
 
+def local_provider_config() -> Optional[dict]:
+    """本机配了 PI_LOCAL_MODELS 时，扩展拿去注册的本地 OpenAI 兼容 provider；没配返回 None。
+
+    PI_LOCAL_BASE_URL（默认本机 Ollama）、PI_LOCAL_API_KEY_ENV（要鉴权的服务填装 key 的环境
+    变量名，Ollama 不用）、PI_LOCAL_CONTEXT_WINDOW（默认 64K，和 Modelfile 的 num_ctx 对齐）、
+    PI_LOCAL_MAX_TOKENS（单条回复上限，默认 16K）、PI_LOCAL_VISION=0 关掉图片输入。
+    """
+    ids = pi_local_models()
+    if not ids:
+        return None
+    base_url = (os.getenv("PI_LOCAL_BASE_URL") or LOCAL_BASE_URL).strip().rstrip("/")
+    key_env = (os.getenv("PI_LOCAL_API_KEY_ENV") or "").strip()
+    window = _env_int("PI_LOCAL_CONTEXT_WINDOW", LOCAL_CONTEXT_WINDOW)
+    max_out = min(_env_int("PI_LOCAL_MAX_TOKENS", LOCAL_MAX_TOKENS), window)
+    inputs = ["text"] if os.getenv("PI_LOCAL_VISION", "1") == "0" else ["text", "image"]
+    # Ollama 的 /v1/chat/completions 收 reasoning_effort：none 关掉思考，其余都是开
+    compat = {"thinkingFormat": "openai", "supportsReasoningEffort": True}
+    models = [{
+        "id": mid,
+        "name": mid,
+        "api": "openai-completions",
+        "baseUrl": base_url,
+        "reasoning": True,
+        "input": inputs,
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        "contextWindow": window,
+        "maxTokens": max_out,
+        "compat": compat,
+        "thinkingLevelMap": {
+            "off": "none", "minimal": "low", "low": "low", "medium": "medium", "high": "high",
+            "xhigh": None, "max": None,
+        },
+    } for mid in ids]
+    return {
+        "provider": pi_local_provider(),
+        "config": {
+            "name": "Local",
+            "baseUrl": base_url,
+            "api": "openai-completions",
+            # 不要鉴权的服务（Ollama）也得给个非空 key，pi 才会把模型当成可用
+            "apiKey": f"${key_env}" if key_env else "local",
+            "compat": compat,
+            "models": models,
+        },
+    }
+
+
+def provider_configs() -> list[dict]:
+    """扩展每轮要注册的全部 provider：Google（换成 PI_GEMINI_MODELS）+ 本机配了的本地 provider。"""
+    configs = [provider_config()]
+    local = local_provider_config()
+    if local:
+        configs.append(local)
+    return configs
+
+
+def _gemini_key_available() -> bool:
+    src = os.getenv("PI_GEMINI_KEY_FROM", "AGY_API_KEY")
+    return bool(os.getenv("GEMINI_API_KEY") or (src and os.getenv(src)))
+
+
+def model_buttons() -> list[tuple[str, str]]:
+    """/model 面板的 (命令参数, 按钮字)：本地模型在前；本机没有 Gemini key 就不摆 Gemini。"""
+    prov = pi_local_provider()
+    buttons = [(f"{prov}/{mid}", f"🖥️ {mid}") for mid in pi_local_models()]
+    if _gemini_key_available() or not buttons:
+        buttons += PI_MODEL_BUTTONS
+    return buttons
+
+
 def default_effort(profile_name: Optional[str] = None, model: Optional[str] = None) -> Optional[str]:
     """profile 级默认强度：<PROFILE>_PI_EFFORT 优先，再退到 PI_EFFORT；非法值当没配。"""
     prof = (profile_name or "").strip().upper()
@@ -203,11 +313,16 @@ def default_effort(profile_name: Optional[str] = None, model: Optional[str] = No
 
 
 def default_model(profile_name: Optional[str] = None) -> str:
-    """没 /model 覆盖时用的模型：<PROFILE>_PI_MODEL > PI_MODEL > google/gemini-3.8-flash。"""
+    """没 /model 覆盖时用的模型：<PROFILE>_PI_MODEL > PI_MODEL > google/gemini-3.8-flash。
+
+    PI_MODEL 可以是本地模型（ollama/<id> 或裸 id，得在 PI_LOCAL_MODELS 里）。"""
     prof = (profile_name or "").strip().upper()
     raw = (os.getenv(f"{prof}_PI_MODEL") if prof else None) or os.getenv("PI_MODEL") or ""
     bare = _bare_model(raw)
-    return f"google/{bare}" if bare in PI_GEMINI_MODELS else DEFAULT_MODEL
+    if bare in PI_GEMINI_MODELS:
+        return f"google/{bare}"
+    local = pi_local_model_id(raw)
+    return f"{pi_local_provider()}/{local}" if local else DEFAULT_MODEL
 
 
 def resolve_model(model: Optional[str], profile_name: Optional[str] = None) -> str:
@@ -262,10 +377,12 @@ def session_cost(session_id: Optional[str], sessions: Optional[str] = None) -> O
 
 
 def context_window_for(model: Optional[str] = None) -> int:
-    """这几款 Gemini 都是 1M 窗口；PI_CONTEXT_WINDOW 可覆盖。"""
+    """这几款 Gemini 都是 1M 窗口；本地模型按 PI_LOCAL_CONTEXT_WINDOW；PI_CONTEXT_WINDOW 全局覆盖。"""
     override = (os.getenv("PI_CONTEXT_WINDOW") or "").strip()
     if override.isdigit() and int(override) > 0:
         return int(override)
+    if is_local_model(model):
+        return _env_int("PI_LOCAL_CONTEXT_WINDOW", LOCAL_CONTEXT_WINDOW)
     return _CONTEXT_WINDOW
 
 
@@ -400,8 +517,9 @@ async def run_pi(
         src = os.getenv("PI_GEMINI_KEY_FROM", "AGY_API_KEY")
         if src and env.get(src):
             env["GEMINI_API_KEY"] = env[src]
-    # 扩展把 Google 的模型表换成 PI_GEMINI_MODELS（只接这几款 Gemini、价格和档位对得上）
-    env["CC_LARK_PI_PROVIDER"] = json.dumps(provider_config(), ensure_ascii=False)
+    # 扩展把 Google 的模型表换成 PI_GEMINI_MODELS（只接这几款 Gemini、价格和档位对得上），
+    # 本机配了本地模型再加一个 OpenAI 兼容的 provider
+    env["CC_LARK_PI_PROVIDER"] = json.dumps(provider_configs(), ensure_ascii=False)
     mcp_cfg = cc_lark_mcp_config(extra_env, log_tag="run_pi")
     if mcp_cfg:
         env["CC_LARK_PI_MCP_CONFIG"] = json.dumps(mcp_cfg, ensure_ascii=False)

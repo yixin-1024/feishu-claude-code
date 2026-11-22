@@ -30,7 +30,7 @@ from grok_runner import GROK_EFFORT_LEVELS
 from agy_runner import AGY_EFFORT_LEVELS, resolve_agy_bin
 from qoder_runner import QODER_EFFORT_LEVELS
 from kiro_runner import KIRO_EFFORT_LEVELS
-from pi_runner import PI_MODEL_BUTTONS
+from pi_runner import model_buttons as pi_model_buttons
 from run_control import RUN_GATE
 import group_allowlist
 import user_acl
@@ -3141,7 +3141,7 @@ async def handle_command(
             elif runner == "pi":
                 buttons = [
                     {"text": label, "value": {"action": "run_cmd", "cmd": f"/model {alias}", "cid": chat_id}}
-                    for alias, label in PI_MODEL_BUTTONS
+                    for alias, label in pi_model_buttons()
                 ]
             elif runner == "grok":
                 buttons = [
@@ -3477,7 +3477,7 @@ async def handle_command(
             lines.extend(await asyncio.to_thread(_kiro_plan_lines, getattr(bot, "profile", None)))
             return _wrap_usage_output(lines)
         if runner == "pi":
-            from pi_runner import format_cost, resolve_model, session_cost
+            from pi_runner import format_cost, is_local_model, resolve_model, session_cost
             profile_name = getattr(getattr(bot, "profile", None), "name", "") or ""
             model = resolve_model(_session_model(store, cur, chat_id, runner), profile_name)
             lines = ["📈 **pi 用量**"]
@@ -3490,12 +3490,15 @@ async def handle_command(
             )
             if ctx_line:
                 lines.append(ctx_line)
-            turn = format_cost((last_usage or {}).get("_turn_cost_usd"))
-            if turn:
-                lines.append(f"上一轮花费：{turn}（pi 按模型价目表估算）")
-            total = format_cost(await asyncio.to_thread(session_cost, cur.get("session_id")))
-            if total:
-                lines.append(f"本会话累计：{total}")
+            if is_local_model(model):
+                lines.append("本地模型，不计费")
+            else:
+                turn = format_cost((last_usage or {}).get("_turn_cost_usd"))
+                if turn:
+                    lines.append(f"上一轮花费：{turn}（pi 按模型价目表估算）")
+                total = format_cost(await asyncio.to_thread(session_cost, cur.get("session_id")))
+                if total:
+                    lines.append(f"本会话累计：{total}")
             lines.append("Runner: `pi`")
             lines.append(f"模型: `{model}`")
             lines.append("走本机的 Gemini API key 计费；Gemini 4 价格是估算。")

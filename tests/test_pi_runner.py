@@ -129,6 +129,7 @@ def sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("PI_CONTEXT_WINDOW", "1000000")
     monkeypatch.delenv("PI_MODEL", raising=False)
     monkeypatch.delenv("PI_EFFORT", raising=False)
+    monkeypatch.delenv("PI_LOCAL_MODELS", raising=False)
     d = tmp_path / "pi-sessions"
     d.mkdir()
     return str(d)
@@ -195,7 +196,9 @@ def test_builds_expected_argv_and_env(monkeypatch, sessions):
     assert env["GEMINI_API_KEY"] == "gem-key"  # 借 agy 的 Gemini key
     assert env["PI_SKIP_VERSION_CHECK"] == "1"
     # 模型表：Google 只留那 5 款，Neon / Hydrogen 标成要改写 xhigh
-    provider = json.loads(env["CC_LARK_PI_PROVIDER"])
+    providers = json.loads(env["CC_LARK_PI_PROVIDER"])
+    assert [p["provider"] for p in providers] == ["google"]  # 没配本地模型就只有 Google
+    provider = providers[0]
     assert provider["provider"] == "google"
     assert provider["config"]["apiKey"] == "$GEMINI_API_KEY"
     assert sorted(m["id"] for m in provider["config"]["models"]) == sorted(pi_runner.PI_GEMINI_MODELS)
@@ -372,7 +375,122 @@ def test_default_model_ignores_non_gemini(monkeypatch):
 def test_extension_file_registers_models_and_servers():
     src = open(pi_runner.EXTENSION_PATH, encoding="utf-8").read()
     assert "CC_LARK_PI_PROVIDER" in src and "registerProvider" in src
+    assert "Array.isArray(raw)" in src  # 多个 provider（Google + 本地）
     assert "before_provider_request" in src and '"XHIGH"' in src
     assert "CC_LARK_PI_MCP_CONFIG" in src
     assert "registerMcpServer" in src
     assert 'exposure: "direct"' in src
+
+
+# ── 本地模型（PI_LOCAL_MODELS，mini2 上的 Ollama）────────────────────────────
+
+
+@pytest.fixture
+def local(monkeypatch):
+    monkeypatch.setenv("PI_LOCAL_MODELS", "qwen36-uncensored, Other:7b")
+    for k in ("PI_LOCAL_PROVIDER", "PI_LOCAL_BASE_URL", "PI_LOCAL_API_KEY_ENV", "PI_LOCAL_CONTEXT_WINDOW",
+              "PI_LOCAL_MAX_TOKENS", "PI_LOCAL_VISION", "PI_CONTEXT_WINDOW", "PI_MODEL", "MAIN_PI_MODEL"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_local_provider_absent_without_config(monkeypatch):
+    monkeypatch.delenv("PI_LOCAL_MODELS", raising=False)
+    assert pi_runner.local_provider_config() is None
+    assert [p["provider"] for p in pi_runner.provider_configs()] == ["google"]
+    assert not pi_runner.is_local_model("ollama/qwen36-uncensored")
+
+
+def test_local_provider_config(local, monkeypatch):
+    monkeypatch.setenv("PI_LOCAL_CONTEXT_WINDOW", "32768")
+    monkeypatch.setenv("PI_LOCAL_MAX_TOKENS", "999999")
+    cfg = pi_runner.local_provider_config()
+    assert cfg["provider"] == "ollama"
+    c = cfg["config"]
+    assert c["api"] == "openai-completions" and c["baseUrl"] == "http://127.0.0.1:11434/v1"
+    assert c["apiKey"] == "local"  # Ollama 不鉴权，但 pi 要非空 key 才认模型
+    assert [m["id"] for m in c["models"]] == ["qwen36-uncensored", "Other:7b"]
+    m = c["models"][0]
+    assert m["contextWindow"] == 32768 and m["maxTokens"] == 32768  # 回复上限不超过窗口
+    assert m["thinkingLevelMap"]["off"] == "none" and m["thinkingLevelMap"]["xhigh"] is None
+    assert m["compat"]["thinkingFormat"] == "openai"
+    assert m["cost"]["input"] == 0 and m["input"] == ["text", "image"]
+    assert [p["provider"] for p in pi_runner.provider_configs()] == ["google", "ollama"]
+
+
+def test_local_provider_key_env_and_custom_name(local, monkeypatch):
+    monkeypatch.setenv("PI_LOCAL_PROVIDER", "LMStudio")
+    monkeypatch.setenv("PI_LOCAL_API_KEY_ENV", "LMS_KEY")
+    monkeypatch.setenv("PI_LOCAL_BASE_URL", "http://10.0.0.2:1234/v1/")
+    monkeypatch.setenv("PI_LOCAL_VISION", "0")
+    cfg = pi_runner.local_provider_config()
+    assert cfg["provider"] == "lmstudio"
+    assert cfg["config"]["apiKey"] == "$LMS_KEY"
+    assert cfg["config"]["baseUrl"] == "http://10.0.0.2:1234/v1"
+    assert cfg["config"]["models"][0]["input"] == ["text"]
+    assert pi_runner.is_local_model("lmstudio/qwen36-uncensored")
+    assert not pi_runner.is_local_model("ollama/qwen36-uncensored")
+
+
+def test_local_model_resolution(local, monkeypatch):
+    import bot_config
+    # 裸 id、带前缀、大小写都认，统一成 ollama/<配置里的原样 id>
+    assert bot_config.normalize_model_for_runner("qwen36-uncensored", "pi") == "ollama/qwen36-uncensored"
+    assert bot_config.normalize_model_for_runner("ollama/other:7B", "pi") == "ollama/Other:7b"
+    assert bot_config.is_model_compatible_with_runner("ollama/qwen36-uncensored", "pi")
+    assert not bot_config.is_model_compatible_with_runner("ollama/llama3", "pi")
+    # Gemini 照旧
+    assert bot_config.normalize_model_for_runner("pi-neon", "pi") == "google/gemini-4-neon"
+    # 默认模型可以是本地的
+    assert pi_runner.default_model("main") == "google/gemini-3.8-flash"
+    monkeypatch.setenv("PI_MODEL", "ollama/qwen36-uncensored")
+    assert pi_runner.default_model("main") == "ollama/qwen36-uncensored"
+    assert pi_runner.resolve_model("opus[1m]", "main") == "ollama/qwen36-uncensored"
+    assert pi_runner.resolve_model("qwen36-uncensored", "main") == "ollama/qwen36-uncensored"
+
+
+def test_local_thinking_levels(local):
+    nt = pi_runner.normalize_thinking
+    m = "ollama/qwen36-uncensored"
+    assert pi_runner.effort_levels_for_model(m) == ("none", "low", "medium", "high")
+    assert nt("none", m) == "off" and nt("off", m) == "off"
+    assert nt("minimal", m) == "low" and nt("high", m) == "high"
+    assert nt("max", m) == "high" and nt("xhigh", m) == "high"
+    with pytest.raises(ValueError):
+        nt("ultra", m)
+    # Gemini 的 none 还是抬到 low
+    assert nt("none", "google/gemini-4-neon") == "low"
+
+
+def test_local_context_window(local, monkeypatch):
+    assert pi_runner.context_window_for("ollama/qwen36-uncensored") == 65_536
+    monkeypatch.setenv("PI_LOCAL_CONTEXT_WINDOW", "131072")
+    assert pi_runner.context_window_for("ollama/qwen36-uncensored") == 131_072
+    assert pi_runner.context_window_for("google/gemini-4-neon") == 1_048_576
+
+
+def test_model_buttons_local_first_and_gemini_only_with_key(local, monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("AGY_API_KEY", raising=False)
+    monkeypatch.delenv("PI_GEMINI_KEY_FROM", raising=False)
+    assert pi_runner.model_buttons() == [
+        ("ollama/qwen36-uncensored", "🖥️ qwen36-uncensored"), ("ollama/Other:7b", "🖥️ Other:7b"),
+    ]
+    monkeypatch.setenv("AGY_API_KEY", "k")
+    btns = pi_runner.model_buttons()
+    assert btns[0][0] == "ollama/qwen36-uncensored" and ("pi-neon", "✴️ Gemini 4 Neon") in btns
+    monkeypatch.delenv("PI_LOCAL_MODELS")
+    assert pi_runner.model_buttons() == pi_runner.PI_MODEL_BUTTONS
+
+
+def test_run_with_local_model(monkeypatch, sessions, local):
+    captured, usages = {}, []
+    _patch_exec(monkeypatch, [FakeProc(STREAM)], captured)
+    monkeypatch.delenv("PI_CONTEXT_WINDOW", raising=False)
+    monkeypatch.setenv("PI_MODEL", "ollama/qwen36-uncensored")
+    monkeypatch.setenv("PI_EFFORT", "none")
+    _run(sessions, model="opus[1m]", on_usage=usages.append, extra_env={"CC_LARK_PROFILE": "main"})
+    cmd, env = captured["calls"][0]["cmd"], captured["calls"][0]["env"]
+    assert cmd[cmd.index("--model") + 1] == "ollama/qwen36-uncensored"
+    assert cmd[cmd.index("--thinking") + 1] == "off"  # PI_EFFORT=none → 关掉思考
+    assert [p["provider"] for p in json.loads(env["CC_LARK_PI_PROVIDER"])] == ["google", "ollama"]
+    assert usages[-1]["_context_window"] == 65_536

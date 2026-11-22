@@ -145,11 +145,39 @@ PI_MODELS = frozenset({
 })
 
 
+# pi 的本地模型（OpenAI 兼容接口：Ollama / LM Studio / llama.cpp server）。只在配了
+# PI_LOCAL_MODELS 的机器上有（11-22 起 mini2 跑 Ollama 上的 Qwen3.6 去审查版）。
+#   PI_LOCAL_MODELS=qwen36-uncensored[,...]   本地服务里的模型名（Ollama 的 `ollama list` 那列）
+#   PI_LOCAL_PROVIDER=ollama                  pi 里的 provider 名，模型写成 <provider>/<id>
+# 接口地址、上下文窗口等在 pi_runner.local_provider_config 里读。
+def pi_local_provider() -> str:
+    return (os.getenv("PI_LOCAL_PROVIDER") or "ollama").strip().lower() or "ollama"
+
+
+def pi_local_models() -> tuple[str, ...]:
+    raw = os.getenv("PI_LOCAL_MODELS") or ""
+    return tuple(dict.fromkeys(m.strip() for m in raw.split(",") if m.strip()))
+
+
+def pi_local_model_id(model: Optional[str]) -> Optional[str]:
+    """<provider>/<id> 或裸 id 是配置里的本地模型 → 返回配置里的原样 id，否则 None。"""
+    low = (model or "").strip().lower()
+    prefix = pi_local_provider() + "/"
+    bare = low[len(prefix):] if low.startswith(prefix) else low
+    for mid in pi_local_models():
+        if mid.lower() == bare:
+            return mid
+    return None
+
+
 def _pi_model_id(model: str) -> str:
-    """pi 的模型统一成 google/<id>：裸 id（agy 的写法）补上前缀，不认识的原样返回。"""
+    """pi 的模型统一成 google/<id> 或 <本地 provider>/<id>：裸 id 补上前缀，不认识的原样返回。"""
     low = (model or "").strip().lower()
     bare = low[len("google/"):] if low.startswith("google/") else low
-    return f"google/{bare}" if bare in PI_MODELS else model
+    if bare in PI_MODELS:
+        return f"google/{bare}"
+    local = pi_local_model_id(model)
+    return f"{pi_local_provider()}/{local}" if local else model
 
 # kiro 的模型名（kiro-cli chat --list-models，2.28.0）：auto + Claude / GPT-5.6 / 开源权重。
 # Claude 那批写法是 claude-opus-5.5（点号），和 Claude Code 的 claude-opus-5-5 不是一回事。
@@ -234,9 +262,10 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
         )
 
     if runner == "pi":
-        # pi: 只接 PI_MODELS 那几款 Gemini（google/<id> 或裸 id，pi-* 别名已在上面解析）
+        # pi: PI_MODELS 那几款 Gemini（google/<id> 或裸 id，pi-* 别名已在上面解析），
+        # 加上本机配了的本地模型（PI_LOCAL_MODELS）
         bare = low[len("google/"):] if low.startswith("google/") else low
-        return bare in PI_MODELS
+        return bare in PI_MODELS or pi_local_model_id(low) is not None
 
     if runner == "dots":
         # dots: 模型是 Dot 自己的（服务端决定），这里只认占位名
