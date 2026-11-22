@@ -18,9 +18,10 @@ grok_runner 同构。`--include-partial-messages` 不在 `--help` 里，但 1.1.
 `-r <同一 id>`。⚠️ qoder 的会话按**工作目录**归档（~/.qoder/projects/<cwd>），换了
 cwd 再 `-r` 会 rc=42 + "Error resuming session"，这里识别后退回新会话。
 
-模型：`Auto` / `Ultimate` / `Performance` / `Efficient` 这几个档位，加 Qwen / Kimi /
-GLM / DeepSeek / MiniMax 等具体模型（`qodercli --list-models` 看全表）。传了不存在的
-模型名不会报错，CLI 会在 stderr 说一句然后退回 Auto。
+模型：`Auto` / `Ultimate` / `Efficient` / `Sonus` / `Cantus` 几个档位，加 Qwen / Kimi /
+GLM / DeepSeek / MiniMax 等具体模型。全表以 `qodercli --list-models` 为准，而且上下架
+很勤（见 qoder_models()）。传了不存在的模型名不会报错，CLI 在 stderr 说一句然后退回
+auto——这一轮回复末尾会补一行提醒（_model_fallback_notice）。
 
 计费：qoder 不回 token 数（usage 全是 0），只给 `credits` 和
 `usage.context_usage_ratio`（上下文占比）。footer 显示占比 + 本轮 credits。
@@ -47,6 +48,7 @@ import select
 import shutil
 import signal
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -100,6 +102,177 @@ def resolve_qoder_bin(configured: Optional[str] = None) -> str:
     if os.path.exists(home_bin):
         return home_bin
     return "qodercli"
+
+
+# ── 模型表 ────────────────────────────────────────────────────
+# `qodercli --list-models` 是唯一权威（只打一列名字，一次约 3 秒），而且上下架很勤：
+# 11-22 对比 10-05，Performance / Kimi-K3 / MiniMax-M3 / DeepSeek-V4-Flash 都没了，多了
+# Qwen4-Max / Kimi-K3.1-Pro / Kimi-K2.8-Preview / GLM-5.3-Flash / DeepSeek-Flash /
+# MiniMax-M3.1-Flash。下架的名字 CLI 照收、悄悄退回 auto（Mac 上 Kimi-K3 就这样白跑过好几
+# 轮），所以 /model 的按钮和校验都跟着 CLI 的实时表走，下面两张表只是兜底和标价。
+QODER_FALLBACK_MODELS = (
+    "Auto", "Ultimate", "Efficient", "Sonus", "Cantus",
+    "Qwen4-Max", "Qwen3.8-Max", "Qwen3.8-Flash",
+    "Kimi-K3.1-Pro", "Kimi-K2.8-Preview",
+    "GLM-5.3", "GLM-5.3-Flash",
+    "DeepSeek-V4-Pro", "DeepSeek-Flash",
+    "MiniMax-M3.1-Flash",
+)  # 1.1.67 / 2026-11-22；CLI 调不通时 /model 卡片用它
+
+# 交互界面 /model 面板里的 credit 倍率（2026-11-22 抄的），只给按钮标价，没列的不标。
+QODER_MODEL_RATES = {
+    "auto": "0.3x", "ultimate": "2x", "efficient": "0.1x", "sonus": "8x", "cantus": "4x",
+    "qwen4-max": "0.4x", "qwen3.8-max": "0.5x", "qwen3.8-flash": "0.1x",
+    "kimi-k3.1-pro": "1x", "kimi-k2.8-preview": "0.8x",
+    "glm-5.3": "0.8x", "glm-5.3-flash": "0.1x",
+    "deepseek-v4-pro": "0.5x", "deepseek-flash": "0.1x",
+    "minimax-m3.1-flash": "0.1x",
+}
+# 面板上带 ◑ 的：每天 22:00–8:00（UTC+8）夜间打折（Ultimate 2 折、Qwen3.8-Max 4 折）
+QODER_OFF_PEAK_MODELS = frozenset({"ultimate", "qwen3.8-max", "qwen3.8-flash"})
+
+QODER_MODELS_TTL = 1800  # 秒；过期先回旧表、后台再拉
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
+_models_cache: dict[tuple, tuple[float, tuple[str, ...]]] = {}
+_models_refreshing: set[tuple] = set()
+_models_lock = threading.Lock()
+_last_models: tuple[str, ...] = ()
+
+
+def parse_qoder_model_list(text: str) -> list[str]:
+    """`qodercli --list-models` 的输出 → 模型名，保持 CLI 的顺序。
+
+    第一行是表头 MODEL，只认表头之后的行；以后要是多出几列，只取第一列。
+    """
+    lines = [re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", ln).strip() for ln in (text or "").splitlines()]
+    lines = [ln for ln in lines if ln]
+    header = next((i for i, ln in enumerate(lines) if ln.split()[0].upper() == "MODEL"), None)
+    if header is not None:
+        lines = lines[header + 1:]
+    names: list[str] = []
+    for ln in lines:
+        first = ln.split()[0]
+        if _MODEL_NAME_RE.match(first) and first not in names:
+            names.append(first)
+    return names
+
+
+def _models_enabled() -> bool:
+    # 测试里关掉（conftest），免得每个用到 /model 的用例都真去跑一次 qodercli
+    return os.getenv("CC_LARK_QODER_LIVE_MODELS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _fetch_qoder_models(
+    qoder_bin: Optional[str], config_dir: Optional[str], api_key: Optional[str], timeout: float,
+) -> tuple[str, ...]:
+    cmd = [resolve_qoder_bin(qoder_bin), "--list-models"]
+    if config_dir:
+        cmd += ["--config-dir", os.path.expanduser(config_dir)]
+    env = dict(os.environ, CC_LARK_MIRROR_OFF="1", NO_COLOR="1")
+    if api_key:
+        env["QODER_PERSONAL_ACCESS_TOKEN"] = api_key
+    try:
+        os.makedirs(QODER_USAGE_CWD, exist_ok=True)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+            cwd=QODER_USAGE_CWD, env=env, start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[qoder_models] --list-models 失败: {type(exc).__name__}: {exc}", flush=True)
+        return ()
+    if proc.returncode != 0:
+        print(f"[qoder_models] --list-models rc={proc.returncode}: {(proc.stderr or '')[:200]!r}", flush=True)
+        return ()
+    return tuple(parse_qoder_model_list(proc.stdout))
+
+
+def _refresh_models(key: tuple, qoder_bin, config_dir, api_key, timeout: float) -> tuple[str, ...]:
+    global _last_models
+    try:
+        names = _fetch_qoder_models(qoder_bin, config_dir, api_key, timeout)
+    finally:
+        with _models_lock:
+            _models_refreshing.discard(key)
+    if names:
+        with _models_lock:
+            _models_cache[key] = (time.time(), names)
+            _last_models = names
+    return names
+
+
+def qoder_models(
+    qoder_bin: Optional[str] = None,
+    config_dir: Optional[str] = None,
+    api_key: Optional[str] = None,
+    *,
+    wait: bool = True,
+    timeout: float = 20.0,
+) -> tuple[str, ...]:
+    """qodercli 现在能用的模型名（CLI 的顺序）；拉不到就是空表。
+
+    缓存 QODER_MODELS_TTL 秒。过期了先回旧表、后台线程再拉；一张都没有时 wait=True 当场拉
+    （/model 卡片，约 3 秒），wait=False 只在后台拉、立刻回空表（跑任务的路径，别让一轮多等）。
+    """
+    if not _models_enabled():
+        return ()
+    key = (qoder_bin or "", config_dir or "", bool(api_key))
+    with _models_lock:
+        hit = _models_cache.get(key)
+        if hit and time.time() - hit[0] < QODER_MODELS_TTL:
+            return hit[1]
+        background = bool(hit) or not wait
+        if background and key in _models_refreshing:
+            return hit[1] if hit else ()
+        _models_refreshing.add(key)
+    if background:
+        threading.Thread(
+            target=_refresh_models, args=(key, qoder_bin, config_dir, api_key, timeout),
+            name="qoder-list-models", daemon=True,
+        ).start()
+        return hit[1] if hit else ()
+    return _refresh_models(key, qoder_bin, config_dir, api_key, timeout)
+
+
+def _expire_models() -> None:
+    """CLI 说某个模型没了：下次取表时重拉。"""
+    with _models_lock:
+        for k, (_, names) in list(_models_cache.items()):
+            _models_cache[k] = (0.0, names)
+
+
+def known_qoder_models() -> tuple[str, ...]:
+    """最近一次拉到的模型表，不触发拉取；空表 = 还不知道（判兼容时退回静态规则）。"""
+    return _last_models if _models_enabled() else ()
+
+
+def canonical_qoder_model(name: str, available) -> Optional[str]:
+    """大小写不敏感地在 available 里找 name，返回 CLI 的原样写法；找不到 None。"""
+    low = (name or "").strip().lower()
+    return next((m for m in available or () if m.lower() == low), None)
+
+
+def qoder_model_label(name: str) -> str:
+    """/model 按钮上的字：名字 + 倍率，夜间打折的再带个 ◑。"""
+    low = name.lower()
+    rate = QODER_MODEL_RATES.get(low)
+    label = f"{name} {rate}" if rate else name
+    return f"{label} ◑" if low in QODER_OFF_PEAK_MODELS else label
+
+
+# 1.1.67：Model "Kimi-K3" is not available right now; using "auto" instead. Use /model to …
+_MODEL_FALLBACK_RE = re.compile(
+    r'Model\s+"([^"]+)"\s+is\s+not\s+available[^\n]*?using\s+"([^"]+)"\s+instead', re.IGNORECASE,
+)
+
+
+def _model_fallback_notice(stderr_text: str) -> str:
+    m = _MODEL_FALLBACK_RE.search(stderr_text or "")
+    if not m:
+        return ""
+    return (
+        f"⚠️ Qoder 已经没有模型 `{m.group(1)}` 了，这一轮实际用的是 `{m.group(2)}`。"
+        "发 /model 重新选一个。"
+    )
 
 
 def _normalize_permission_mode(mode: Optional[str], dangerous_skip: bool) -> str:
@@ -297,8 +470,9 @@ def fetch_qoder_plan_usage(
     return result
 
 
-# 各模型的上下文窗口（交互界面 /model 面板里的 ▦ 那一列，1.1.65）。qoder 只回占比、
-# 不回 token 数，footer 的「已用 / 窗口」靠「占比 × 窗口」换算。没列的都是 200K；
+# 各模型的上下文窗口（交互界面 /model 面板里的 ▦ 那一列）。qoder 只回占比、
+# 不回 token 数，footer 的「已用 / 窗口」靠「占比 × 窗口」换算。没列的都是 200K
+# （1.1.67 全表都是 200K；272K 的 Performance 已下架，留着给老会话的 footer）；
 # 用 /context-window 改过窗口的，用 QODER_CONTEXT_WINDOW 覆盖。
 _DEFAULT_CONTEXT_WINDOW = 200_000
 _MODEL_CONTEXT_WINDOWS = {"performance": 272_000}
@@ -389,6 +563,10 @@ async def run_qoder(
         permission_mode, dangerously_skip_permissions
     )
     idle_limit = idle_timeout_sec if idle_timeout_sec > 0 else IDLE_TIMEOUT
+    # 顺手在后台把模型表拉好（/model 卡片秒开、判兼容有据可依）；表里有就换成 CLI 的原样写法
+    available = qoder_models(qoder_bin, config_dir, api_key, wait=False)
+    if model and available:
+        model = canonical_qoder_model(model, available) or model
     mcp_cfg = cc_lark_mcp_config(extra_env, log_tag="run_qoder")
     system_prompt = _with_claude_context(append_system_prompt, cwd, config_dir)
 
@@ -663,4 +841,8 @@ async def run_qoder(
             exc.cc_retryable_resume = True
         raise exc
 
+    notice = _model_fallback_notice(stderr_text)
+    if notice:
+        _expire_models()
+        final_text = f"{final_text}\n\n{notice}" if final_text else notice
     return final_text, new_session_id, used_fresh_session_fallback

@@ -122,9 +122,10 @@ AGY_ONLY_MODELS = frozenset({
 })
 
 
-# qoder 的模型名（qodercli --list-models，1.1.65）：四个档位 + 托管的具体模型。
-# 具体模型按家族前缀放行（新版本出 Qwen3.9 之类不用跟着改）。
-QODER_TIER_MODELS = frozenset({"auto", "ultimate", "performance", "efficient", "sonus", "cantus"})
+# qoder 的模型名：权威是 `qodercli --list-models` 的实时表（qoder_runner.qoder_models，
+# 拉到过就按它判）。还没拉到时按下面的静态规则：档位 + 具体模型的家族前缀
+# （新版本出 Qwen4.1 之类不用跟着改）。Performance 11 月已下架，不再放行。
+QODER_TIER_MODELS = frozenset({"auto", "ultimate", "efficient", "sonus", "cantus"})
 QODER_MODEL_PREFIXES = ("qwen", "kimi-", "glm-", "deepseek-v", "deepseek-flash", "minimax-", "qoder")
 
 # 所有 runner 名（profile 的 RUNNER、会话的 runner 都只能是这几个）。新后端加这里，
@@ -210,8 +211,15 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
         return low.startswith("wow-") or low.startswith("grok")
 
     if runner == "qoder":
-        # qoder: Auto/Ultimate/Performance/Efficient 档位 + 它托管的具体模型（大小写不敏感），
-        # 或 qoder-* 别名。全表随账号变（qodercli --list-models），这里只放已知的家族前缀。
+        # qoder: CLI 实时表里有的才算（大小写不敏感）——下架的名字 CLI 不报错、悄悄退回
+        # auto，会话里存着的旧名字在这里被判掉、回落默认模型。还没拉到表时退回静态规则。
+        try:
+            from qoder_runner import known_qoder_models
+            known = known_qoder_models()
+        except Exception:  # noqa: BLE001 — 取不到实时表就按静态规则
+            known = ()
+        if known:
+            return low in {m.lower() for m in known}
         return (
             low in QODER_TIER_MODELS
             or low.startswith(QODER_MODEL_PREFIXES)

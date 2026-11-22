@@ -486,3 +486,110 @@ def test_session_file_lookup_includes_qoder_projects(tmp_path, monkeypatch):
     monkeypatch.setattr(session_store, "QODER_PROJECTS_DIR", str(tmp_path / "qoder_projects"))
     assert session_store._find_session_file(SID) == str(qoder / f"{SID}.jsonl")
     assert session_store._find_session_file("nope") is None
+
+
+# ── 模型表 ──────────────────────────────────────────────────────
+
+LIST_MODELS_OUT = """MODEL
+Auto
+Ultimate
+Efficient
+Qwen4-Max
+Kimi-K3.1-Pro
+\x1b[2mMiniMax-M3.1-Flash\x1b[0m
+
+"""
+
+
+def test_parse_model_list_keeps_cli_order():
+    assert qoder_runner.parse_qoder_model_list(LIST_MODELS_OUT) == [
+        "Auto", "Ultimate", "Efficient", "Qwen4-Max", "Kimi-K3.1-Pro", "MiniMax-M3.1-Flash",
+    ]
+    # 表头之前的杂行不算；多出来的列只取第一列
+    noisy = "Loading models...\nMODEL   RATE\nAuto    0.3x\nSonus   8x\n"
+    assert qoder_runner.parse_qoder_model_list(noisy) == ["Auto", "Sonus"]
+    assert qoder_runner.parse_qoder_model_list("") == []
+
+
+def test_model_label_shows_rate_and_off_peak():
+    assert qoder_runner.qoder_model_label("Auto") == "Auto 0.3x"
+    assert qoder_runner.qoder_model_label("Ultimate") == "Ultimate 2x ◑"
+    assert qoder_runner.qoder_model_label("Brand-New-9") == "Brand-New-9"
+
+
+@pytest.fixture
+def live(monkeypatch):
+    calls = []
+
+    def fake_fetch(qoder_bin, config_dir, api_key, timeout):
+        calls.append((qoder_bin, config_dir, api_key))
+        return ("Auto", "Qwen4-Max", "Kimi-K3.1-Pro")
+
+    class SyncThread:  # 后台刷新当场跑完，测试好断言
+        def __init__(self, target, args=(), **kwargs):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setenv("CC_LARK_QODER_LIVE_MODELS", "1")
+    monkeypatch.setattr(qoder_runner, "_fetch_qoder_models", fake_fetch)
+    monkeypatch.setattr(qoder_runner.threading, "Thread", SyncThread)
+    monkeypatch.setattr(qoder_runner, "_models_cache", {})
+    monkeypatch.setattr(qoder_runner, "_models_refreshing", set())
+    monkeypatch.setattr(qoder_runner, "_last_models", ())
+    return calls
+
+
+def test_qoder_models_cache_and_background_refresh(live):
+    # 跑任务的路径不等：没表就回空、后台去拉
+    assert qoder_runner.qoder_models("/q", wait=False) == ()
+    assert len(live) == 1
+    assert qoder_runner.known_qoder_models() == ("Auto", "Qwen4-Max", "Kimi-K3.1-Pro")
+    # 缓存期内不再跑 CLI
+    assert qoder_runner.qoder_models("/q") == ("Auto", "Qwen4-Max", "Kimi-K3.1-Pro")
+    assert len(live) == 1
+    # 过期：先回旧表，后台重拉
+    qoder_runner._expire_models()
+    assert qoder_runner.qoder_models("/q") == ("Auto", "Qwen4-Max", "Kimi-K3.1-Pro")
+    assert len(live) == 2
+    # 换了 qodercli（另一个 profile）各拉各的
+    qoder_runner.qoder_models("/other")
+    assert live[-1][0] == "/other"
+
+
+def test_qoder_models_off_switch(monkeypatch):
+    monkeypatch.setenv("CC_LARK_QODER_LIVE_MODELS", "0")
+    monkeypatch.setattr(qoder_runner, "_fetch_qoder_models", lambda *a: pytest.fail("不该跑 CLI"))
+    assert qoder_runner.qoder_models() == ()
+    assert qoder_runner.known_qoder_models() == ()
+
+
+def test_fetch_qoder_models_failure_is_empty(monkeypatch):
+    monkeypatch.setattr(qoder_runner, "QODER_USAGE_CWD", "/tmp")
+    assert qoder_runner._fetch_qoder_models("/nonexistent/qodercli", None, None, 5) == ()
+
+
+def test_run_qoder_uses_cli_spelling_of_model(monkeypatch, live):
+    qoder_runner.qoder_models()
+    captured = {}
+    _patch_exec(monkeypatch, [FakeProc(STREAM_LINES)], captured)
+    asyncio.run(run_qoder(message="hi", model="qwen4-max", cwd="/tmp"))
+    assert _flag(captured["cmd"], "-m") == "Qwen4-Max"
+
+
+def test_run_qoder_flags_retired_model_fallback(monkeypatch):
+    stderr = (b'Model "Kimi-K3" is not available right now; using "auto" instead. '
+              b'Use /model to choose another model.\n')
+    captured = {}
+    _patch_exec(monkeypatch, [FakeProc(STREAM_LINES, stderr=stderr)], captured)
+    text, _, _ = asyncio.run(run_qoder(message="hi", model="Kimi-K3", cwd="/tmp"))
+    assert text.startswith("hello\n\n⚠️ Qoder 已经没有模型 `Kimi-K3` 了，这一轮实际用的是 `auto`")
+    assert "/model" in text
+
+
+def test_run_qoder_without_fallback_has_no_notice(monkeypatch):
+    captured = {}
+    _patch_exec(monkeypatch, [FakeProc(STREAM_LINES, stderr=b"some other warning\n")], captured)
+    text, _, _ = asyncio.run(run_qoder(message="hi", model="Auto", cwd="/tmp"))
+    assert text == "hello"

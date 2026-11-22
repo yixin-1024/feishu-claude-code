@@ -42,6 +42,8 @@ def _isolate_sessions(tmp_path, monkeypatch):
     # qoder 每轮会往 ~/.qoder/skills 建软链、读 ~/.claude 的规则和记忆；测试里一律关掉，
     # 要测这条路的用例自己打开并把目录指到 tmp（见 test_claude_context.py）。
     monkeypatch.setenv("CC_LARK_QODER_CLAUDE_CONTEXT", "0")
+    # qoder 的模型实时表要真跑 `qodercli --list-models`；测试里关掉，要测的用例自己打开并打桩
+    monkeypatch.setenv("CC_LARK_QODER_LIVE_MODELS", "0")
     monkeypatch.setenv("CC_LARK_KIRO_CLAUDE_CONTEXT", "0")
     monkeypatch.setenv("CC_LARK_PI_CLAUDE_CONTEXT", "0")
     # codex / agy 的同一份简报由 agent_runner 拼（CC_LARK_CLAUDE_CONTEXT / <PREFIX>_CLAUDE_CONTEXT）

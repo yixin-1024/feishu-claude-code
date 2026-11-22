@@ -146,18 +146,25 @@ MODEL_ALIASES = {
     "agy-opus": "claude-opus-4-6-thinking",
     "agy-sonnet": "claude-sonnet-4-6",
     "agy-gpt": "gpt-oss-120b-medium",
-    # Qoder CLI（qodercli）：四个档位 + 它托管的具体模型，名字照 `qodercli --list-models`
+    # Qoder CLI（qodercli）：档位 + 它托管的具体模型，名字照 `qodercli --list-models`
+    # （1.1.67 / 11-22）。/model 卡片的按钮直接用 CLI 实时表里的原名，这些只是好敲的简称；
+    # 上新下架后简称指向的名字没了，/model 会拒绝并列出现有的。
     "qoder": "Auto",
     "qoder-auto": "Auto",
     "qoder-ultimate": "Ultimate",
-    "qoder-performance": "Performance",
     "qoder-efficient": "Efficient",
-    "qoder-qwen": "Qwen3.8-Max",
+    "qoder-sonus": "Sonus",
+    "qoder-cantus": "Cantus",
+    "qoder-qwen": "Qwen4-Max",
+    "qoder-qwen38": "Qwen3.8-Max",
     "qoder-qwen-flash": "Qwen3.8-Flash",
-    "qoder-kimi": "Kimi-K3",
+    "qoder-kimi": "Kimi-K3.1-Pro",
+    "qoder-kimi-k28": "Kimi-K2.8-Preview",
     "qoder-glm": "GLM-5.3",
+    "qoder-glm-flash": "GLM-5.3-Flash",
     "qoder-deepseek": "DeepSeek-V4-Pro",
-    "qoder-minimax": "MiniMax-M3",
+    "qoder-deepseek-flash": "DeepSeek-Flash",
+    "qoder-minimax": "MiniMax-M3.1-Flash",
     # Kiro CLI（kiro-cli）：名字照 `kiro-cli chat --list-models`，Claude 那批是点号写法
     "kiro": "auto",
     "kiro-auto": "auto",
@@ -328,6 +335,18 @@ def _codex_model_buttons() -> list[Tuple[str, str]]:
 
     picked = sorted((item for _, item in newest.values()), key=_priority)
     return [(item["slug"], str(item.get("display_name") or item["slug"])) for item in picked]
+
+
+async def _qoder_live_models(bot) -> tuple[str, ...]:
+    """这个 bot 的 qodercli 现在能用的模型（实时表，缓存半小时）；拉不到是空表。"""
+    from qoder_runner import qoder_models
+    profile = getattr(bot, "profile", None)
+    return await asyncio.to_thread(
+        qoder_models,
+        getattr(profile, "qoder_bin", "") or None,
+        getattr(profile, "qoder_config_dir", "") or None,
+        getattr(profile, "qoder_api_key", "") or None,
+    )
 
 
 def _codex_effort_levels(model: str) -> tuple[str, ...]:
@@ -3101,16 +3120,11 @@ async def handle_command(
                         {"text": "GPT-OSS 120B", "value": {"action": "run_cmd", "cmd": "/model agy-gpt", "cid": chat_id}},
                     ]
             elif runner == "qoder":
+                # 按钮跟着 `qodercli --list-models` 的实时表走（上下架很勤），拉不到才用内置表
+                from qoder_runner import QODER_FALLBACK_MODELS, qoder_model_label
                 buttons = [
-                    {"text": "🆓 Qwen3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model qoder-qwen-flash", "cid": chat_id}},
-                    {"text": "🧭 Auto", "value": {"action": "run_cmd", "cmd": "/model qoder-auto", "cid": chat_id}},
-                    {"text": "💎 Ultimate", "value": {"action": "run_cmd", "cmd": "/model qoder-ultimate", "cid": chat_id}},
-                    {"text": "🚀 Performance", "value": {"action": "run_cmd", "cmd": "/model qoder-performance", "cid": chat_id}},
-                    {"text": "⚡ Efficient", "value": {"action": "run_cmd", "cmd": "/model qoder-efficient", "cid": chat_id}},
-                    {"text": "🇨🇳 Qwen3.8 Max", "value": {"action": "run_cmd", "cmd": "/model qoder-qwen", "cid": chat_id}},
-                    {"text": "🌙 Kimi K3", "value": {"action": "run_cmd", "cmd": "/model qoder-kimi", "cid": chat_id}},
-                    {"text": "GLM-5.3", "value": {"action": "run_cmd", "cmd": "/model qoder-glm", "cid": chat_id}},
-                    {"text": "🐋 DeepSeek V4 Pro", "value": {"action": "run_cmd", "cmd": "/model qoder-deepseek", "cid": chat_id}},
+                    {"text": qoder_model_label(name), "value": {"action": "run_cmd", "cmd": f"/model {name}", "cid": chat_id}}
+                    for name in (await _qoder_live_models(bot) or QODER_FALLBACK_MODELS)
                 ]
             elif runner == "kiro":
                 buttons = [
@@ -3153,11 +3167,15 @@ async def handle_command(
                 if followed == store.default_model
                 else f"本群默认：**{followed}**（profile 默认 {store.default_model}）"
             )
+            hint = (
+                "\n按钮上是每轮 credits 倍率；◑ 每天 22:00–8:00 打折"
+                if runner == "qoder" else ""
+            )
             return {
                 "text": (
                     f"当前 runner：**{runner}**\n"
                     f"当前模型：**{cur.model}** {status}\n"
-                    f"{default_line}"
+                    f"{default_line}{hint}"
                 ),
                 "buttons": buttons,
             }
@@ -3170,6 +3188,18 @@ async def handle_command(
             return f"✅ 已清除模型覆盖，跟随{scope} `{followed}`。已开始新 session。"
         cur = await store.get_current(user_id, chat_id)
         model = resolve_model_alias(args, cur.runner)
+        if (cur.runner or "").lower() == "qoder":
+            # 下架的名字 qodercli 不报错、悄悄退回 auto，所以拿实时表先对一遍（顺便纠正大小写）
+            from qoder_runner import canonical_qoder_model
+            available = await _qoder_live_models(bot)
+            if available:
+                found = canonical_qoder_model(model, available)
+                if not found:
+                    return (
+                        f"❌ Qoder 现在没有模型 `{model}`。\n"
+                        f"可选：{'、'.join(f'`{m}`' for m in available)}（发 `/model` 出按钮）"
+                    )
+                model = found
         from bot_config import is_model_compatible_with_runner
         if not is_model_compatible_with_runner(model, cur.runner):
             return (

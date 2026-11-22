@@ -18,6 +18,7 @@ from commands import _format_context_line, handle_command
 from dispatcher import _format_usage_footer
 from lark_prompts import render_lark_prompt
 from session_store import SessionStore
+import qoder_runner
 
 
 def _profile(runner="qoder"):
@@ -93,8 +94,11 @@ def test_load_profile_accepts_qoder_runner(monkeypatch):
 
 @pytest.mark.parametrize("model,ok", [
     ("Auto", True), ("auto", True), ("Ultimate", True), ("Efficient", True),
-    ("Qwen3.8-Max", True), ("Kimi-K3", True), ("GLM-5.3", True),
-    ("DeepSeek-V4-Pro", True), ("MiniMax-M3", True), ("qoder-qwen", True),
+    ("Sonus", True), ("Cantus", True), ("Qwen4-Max", True), ("Qwen3.8-Max", True),
+    ("Kimi-K3.1-Pro", True), ("GLM-5.3-Flash", True), ("DeepSeek-V4-Pro", True),
+    ("DeepSeek-Flash", True), ("MiniMax-M3.1-Flash", True), ("qoder-qwen", True),
+    # 还没拉到实时表时按静态规则：已下架的档位不放行，具体模型按家族前缀放行
+    ("Performance", False),
     ("opus", False), ("claude-sonnet-4-6", False), ("gpt-5.5", False),
     ("gemini-3.8-flash", False),
 ])
@@ -107,7 +111,7 @@ def test_qoder_models_do_not_leak_into_claude():
     assert is_model_compatible_with_runner("Qwen3.8-Max", "claude") is False
     # Claude 模型派给 qoder bot 时回落到 qoder 的默认
     assert normalize_model_for_runner("opus", "qoder", "Auto") == "Auto"
-    assert normalize_model_for_runner("qoder-kimi", "qoder", "Auto") == "Kimi-K3"
+    assert normalize_model_for_runner("qoder-kimi", "qoder", "Auto") == "Kimi-K3.1-Pro"
 
 
 def test_agent_alias_knows_qoder():
@@ -173,17 +177,88 @@ async def test_runner_command_switches_to_qoder(tmp_path, monkeypatch):
 async def test_model_picker_and_alias_for_qoder(store):
     picker = await handle_command("model", "", "u", "oc_1", store, bot=_bot())
     labels = [b["text"] for b in picker["buttons"]]
-    assert labels[0] == "🆓 Qwen3.8 Flash"
-    assert "🧭 Auto" in labels and "🇨🇳 Qwen3.8 Max" in labels
+    # 拉不到实时表（测试里关了）→ 内置表，带倍率
+    assert labels[0] == "Auto 0.3x"
+    assert "Qwen4-Max 0.4x" in labels and "Ultimate 2x ◑" in labels
+    assert not any("Performance" in label or label.startswith("Kimi-K3 ") for label in labels)
     assert all("Opus" not in label and "Sonnet" not in label for label in labels)
 
     reply = await handle_command("model", "qoder-kimi", "u", "oc_1", store, bot=_bot())
     cur = await store.get_current("u", "oc_1")
-    assert "Kimi-K3" in reply
-    assert cur.model == "Kimi-K3"
+    assert "Kimi-K3.1-Pro" in reply
+    assert cur.model == "Kimi-K3.1-Pro"
 
     bad = await handle_command("model", "opus", "u", "oc_1", store, bot=_bot())
     assert "不兼容" in bad
+
+
+# 2026-11-22 qodercli 1.1.67 的实时表（裁剪）：Kimi-K3 / Performance 已下架，GLM-5.3 这里故意不放
+LIVE = ("Auto", "Ultimate", "Efficient", "Qwen4-Max", "Qwen3.8-Flash", "Kimi-K3.1-Pro", "GLM-5.3-Flash")
+
+
+@pytest.fixture
+def live_models(monkeypatch):
+    calls = []
+
+    def fake_fetch(qoder_bin, config_dir, api_key, timeout):
+        calls.append(qoder_bin)
+        return LIVE
+
+    monkeypatch.setenv("CC_LARK_QODER_LIVE_MODELS", "1")
+    monkeypatch.setattr(qoder_runner, "_fetch_qoder_models", fake_fetch)
+    monkeypatch.setattr(qoder_runner, "_models_cache", {})
+    monkeypatch.setattr(qoder_runner, "_models_refreshing", set())
+    monkeypatch.setattr(qoder_runner, "_last_models", ())
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_model_picker_follows_live_list(store, live_models):
+    picker = await handle_command("model", "", "u", "oc_1", store, bot=_bot())
+    buttons = [b for b in picker["buttons"] if b["value"]["cmd"] != "/model default"]
+    assert [b["value"]["cmd"] for b in buttons] == [f"/model {m}" for m in LIVE]
+    assert [b["text"] for b in buttons][:3] == ["Auto 0.3x", "Ultimate 2x ◑", "Efficient 0.1x"]
+    assert "credits 倍率" in picker["text"]
+    # 半小时内再开不再跑 CLI
+    await handle_command("model", "", "u", "oc_1", store, bot=_bot())
+    assert len(live_models) == 1
+
+
+@pytest.mark.asyncio
+async def test_model_command_checks_live_list(store, live_models):
+    # 下架的名字：qodercli 会悄悄退回 auto，这里直接拒绝并列出现有的
+    bad = await handle_command("model", "Kimi-K3", "u", "oc_1", store, bot=_bot())
+    assert bad.startswith("❌ Qoder 现在没有模型 `Kimi-K3`")
+    assert "`Kimi-K3.1-Pro`" in bad
+    assert (await store.get_current("u", "oc_1")).model == "Auto"
+    # 简称指向的模型不在表里也拒绝
+    assert "没有模型 `GLM-5.3`" in await handle_command("model", "qoder-glm", "u", "oc_1", store, bot=_bot())
+
+    # 大小写照 CLI 的原样写法存
+    await handle_command("model", "qwen4-max", "u", "oc_1", store, bot=_bot())
+    assert (await store.get_current("u", "oc_1")).model == "Qwen4-Max"
+    # 不带前缀的简称：kimi → qoder-kimi → Kimi-K3.1-Pro
+    await handle_command("model", "kimi", "u", "oc_1", store, bot=_bot())
+    assert (await store.get_current("u", "oc_1")).model == "Kimi-K3.1-Pro"
+
+
+def test_compat_follows_live_list_once_known(live_models):
+    # 没拉到表：静态规则，Kimi-K3 按家族前缀放行
+    assert is_model_compatible_with_runner("Kimi-K3", "qoder") is True
+    assert qoder_runner.qoder_models() == LIVE
+    assert is_model_compatible_with_runner("Kimi-K3", "qoder") is False
+    assert is_model_compatible_with_runner("kimi-k3.1-pro", "qoder") is True
+    assert is_model_compatible_with_runner("qoder-kimi", "qoder") is True
+    assert is_model_compatible_with_runner("opus", "qoder") is False
+
+
+@pytest.mark.asyncio
+async def test_retired_override_in_session_falls_back_to_default(store, live_models):
+    # 10 月存下的 Kimi-K3（当时还在）：拿到实时表后会话自愈回默认，不再每轮悄悄跑 auto
+    await store.set_model("u", "oc_1", "Kimi-K3")
+    assert (await store.get_current("u", "oc_1")).model == "Kimi-K3"
+    qoder_runner.qoder_models()
+    assert (await store.get_current("u", "oc_1")).model == "Auto"
 
 
 @pytest.mark.asyncio
