@@ -12,6 +12,7 @@ Lark 会话的父进程，不能为了网页需求重启它。本模块只 impor
     POST /v1/runs/{id}/cancel         杀进程组
     GET  /v1/health
     GET  /v1/apps/{app}/runs?limit=N  运维只读：在跑 / 排队 / 最近完成的 run（不含正文）
+    GET  /v1/apps/{app}/agent         只读：agent 规则版本号（CLAUDE.md + bin/ 的哈希）与文件清单
 
 安全边界：
   · cwd / 模型白名单 / 工具白名单 / 权限模式只来自配置（env 文件），请求改不了。
@@ -109,6 +110,10 @@ _LIST_USAGE_KEYS = (
     "input_tokens", "output_tokens", "cache_read_input_tokens",
     "cache_creation_input_tokens", "total_cost_usd", "num_turns",
 )
+
+# agent 规则版本号：只哈希 system prompt 文件 + PATH_PREPEND 目录里的常规文件（不递归）
+_AGENT_MAX_FILES = 200
+_AGENT_MAX_FILE_BYTES = 8 * 1024 * 1024
 
 
 # ── 配置 ──────────────────────────────────────────────────────
@@ -393,7 +398,7 @@ class Run:
     _META_FIELDS = (
         "run_id", "app", "conversation_id", "status", "session_id", "resume_session_id",
         "session_reset", "text", "usage", "error", "model", "effort", "created_at",
-        "started_at", "ended_at", "pid", "prompt_chars", "idempotency_key",
+        "started_at", "ended_at", "pid", "prompt_chars", "idempotency_key", "agent_version",
     )
 
     def __init__(self, gw: "Gateway", run_id: str, app: str, conversation_id: str):
@@ -416,6 +421,7 @@ class Run:
         self.pid: Optional[int] = None
         self.prompt_chars = 0
         self.idempotency_key = ""
+        self.agent_version: Optional[str] = None  # 起 Claude 进程那一刻的 agent 规则版本
         self.events: list[dict] = []
         self.cond = asyncio.Condition()
         self.cancel_requested = False
@@ -464,6 +470,7 @@ class Run:
             "started_at": _iso(self.started_at),
             "ended_at": _iso(self.ended_at),
             "last_seq": self.last_seq,
+            "agent_version": self.agent_version,
         }
 
     async def emit(self, etype: str, data: dict) -> dict:
@@ -600,6 +607,9 @@ class Gateway:
         # 只在工作线程里读写，_list_lock 串行化（同一时刻只有一次扫盘）。
         self._list_cache: dict[str, tuple[tuple[int, int, int], Optional[dict]]] = {}
         self._list_lock = threading.Lock()
+        # agent 规则版本：app → (文件 stat 签名, info)；版本变了才重算哈希、才改 since
+        self._agent_cache: dict[str, tuple[tuple, dict]] = {}
+        self.agent_versions: dict = _read_json(self.agent_versions_path, {})
 
     # 路径
     @property
@@ -617,6 +627,10 @@ class Gateway:
     @property
     def idem_path(self) -> str:
         return os.path.join(self.cfg.state_dir, "idempotency.json")
+
+    @property
+    def agent_versions_path(self) -> str:
+        return os.path.join(self.cfg.state_dir, "agent_versions.json")
 
     @staticmethod
     def _conv_key(app: str, conv: str) -> str:
@@ -710,6 +724,84 @@ class Gateway:
                                          "created_at": now}
             _atomic_write_json(self.sessions_path, self.sessions)
 
+    # ── agent 规则版本 ──
+    @staticmethod
+    def _agent_files(app: AppConfig) -> list[tuple[str, str]]:
+        """(展示名, 绝对路径)：system prompt 文件 + PATH_PREPEND 目录里的常规文件（不递归、跳过隐藏）。"""
+        def label(path: str) -> str:
+            rel = os.path.relpath(path, app.cwd)
+            return path if rel.startswith("..") else rel
+
+        sp_file = app.system_prompt_file or os.path.join(app.cwd, "CLAUDE.md")
+        out = [(label(sp_file), sp_file)]
+        for d in app.path_prepend:
+            try:
+                entries = sorted(os.scandir(d), key=lambda e: e.name)
+            except OSError:
+                continue
+            for e in entries:
+                if e.name.startswith(".") or not e.is_file(follow_symlinks=True):
+                    continue
+                out.append((label(e.path), e.path))
+                if len(out) >= _AGENT_MAX_FILES:
+                    return out
+        return out
+
+    def agent_info(self, app: AppConfig) -> dict:
+        """agent 规则版本号 = CLAUDE.md + bin/ 内容的哈希（不看 mtime）。
+
+        rg-next 用它判断「规则变了，老话题要开新 session」：Claude 把 system prompt 定格在会话
+        第一轮，CLAUDE.md 改了老会话吃不到。since = 网关第一次看到这个版本的时间（落盘，重启不变；
+        第一次运行时取文件最新 mtime）。
+        """
+        files = self._agent_files(app)
+        sig = []
+        for name, path in files:
+            try:
+                st = os.stat(path)
+                sig.append((name, st.st_ino, st.st_mtime_ns, st.st_size))
+            except OSError:
+                sig.append((name, None, None, None))
+        sig_t = tuple(sig)
+        cached = self._agent_cache.get(app.name)
+        if cached and cached[0] == sig_t:
+            return cached[1]
+        h = hashlib.sha256(b"cc-web-agent-v1\n")
+        listing, newest = [], 0.0
+        for (name, path), (_, ino, mtime_ns, size) in zip(files, sig):
+            if ino is None:
+                digest = "missing"
+            elif size > _AGENT_MAX_FILE_BYTES:
+                digest = f"too-large:{size}"
+            else:
+                try:
+                    with open(path, "rb") as f:
+                        digest = hashlib.sha256(f.read()).hexdigest()
+                except OSError:
+                    digest = "unreadable"
+                newest = max(newest, mtime_ns / 1e9)
+            h.update(f"{name}\0{digest}\n".encode())
+            listing.append({"path": name, "sha256": digest, "size": size})
+        version = h.hexdigest()[:16]
+        rec = self.agent_versions.get(app.name) or {}
+        if rec.get("version") != version:
+            since = _now() if rec.get("version") else (newest or _now())
+            rec = {"version": version, "since": since}
+            self.agent_versions[app.name] = rec
+            try:
+                _atomic_write_json(self.agent_versions_path, self.agent_versions)
+            except OSError:
+                pass
+            if cached:
+                log(PROFILE_TAG, "gateway", "info", f"app {app.name} agent rules → {version}")
+        info = {"version": version, "since": _iso(float(rec["since"])), "files": listing}
+        self._agent_cache[app.name] = (sig_t, info)
+        return info
+
+    def agent_brief(self, app: AppConfig) -> dict:
+        info = self.agent_info(app)
+        return {"version": info["version"], "since": info["since"], "files": len(info["files"])}
+
     # ── HTTP 入口（非 SSE）──
     def authorized(self, headers: dict) -> tuple[bool, int, dict]:
         if not self.cfg.token_ok:
@@ -748,6 +840,14 @@ class Gateway:
             if method != "GET":
                 return 405, _err("method_not_allowed", "use GET")
             return 200, run.public()
+        m = re.match(r"^/v1/apps/([^/]+)/agent$", path)
+        if m:
+            if method != "GET":
+                return 405, _err("method_not_allowed", "use GET")
+            app = self.cfg.apps.get(m.group(1))
+            if app is None:
+                return 404, _err("app_not_found", "app is not configured on this gateway")
+            return 200, {"app": app.name, **self.agent_info(app)}
         m = re.match(r"^/v1/apps/([^/]+)/runs$", path)
         if m:
             if method != "GET":
@@ -765,6 +865,8 @@ class Gateway:
             "max_concurrent": self.cfg.max_concurrent,
             "apps": sorted(self.cfg.apps),
             "claude_cli": os.path.basename(self.cfg.claude_cli),
+            # 新增（只加字段）：每个 app 的 agent 规则版本号，见 agent_info()
+            "agents": {name: self.agent_brief(a) for name, a in sorted(self.cfg.apps.items())},
         }
 
     # ── 运维只读列表 ──
@@ -956,7 +1058,8 @@ class Gateway:
             f"resume={'yes' if resume_sid else 'no'} prompt_chars={len(prompt)} "
             f"ctx_chars={len(ctx or '')} env_keys={sorted(env_in)}")
         return 202, {"run_id": run.run_id, "status": run.status, "conversation_id": conv,
-                     "resume_session_id": resume_sid}
+                     "resume_session_id": resume_sid,
+                     "agent_version": self.agent_brief(app)["version"]}
 
     async def cancel_run(self, run: Run) -> tuple[int, dict]:
         if run.finished:
@@ -1122,6 +1225,10 @@ class Gateway:
                           resume_sid: Optional[str]
                           ) -> tuple[Optional[str], str, Optional[dict]]:
         cmd = self.build_cmd(app, run.model, run.effort, resume_sid)
+        try:
+            run.agent_version = self.agent_brief(app)["version"]
+        except Exception:  # noqa: BLE001 — 版本号只是给调用方的提示，不能挡住 run
+            run.agent_version = None
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -1215,7 +1322,8 @@ class Gateway:
                         self._remember_session(run, sid)
                         if data.get("subtype") == "init":
                             await run.emit("status", {"state": "session", "session_id": sid,
-                                                      "model": data.get("model")})
+                                                      "model": data.get("model"),
+                                                      "agent_version": run.agent_version})
                 elif et == "stream_event":
                     evt = data.get("event") or {}
                     if evt.get("type") == "content_block_delta":
