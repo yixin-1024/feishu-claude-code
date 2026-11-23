@@ -373,6 +373,7 @@ class SessionStore:
         profile: str = "default",
         default_cwd: Optional[str] = None,
         chat_default_cwd: Optional[dict[str, str]] = None,
+        user_default_cwd: Optional[dict[str, str]] = None,
         default_runner: Optional[str] = None,
         default_model: Optional[str] = None,
         shared_thread_sessions: Optional[bool] = None,
@@ -401,6 +402,10 @@ class SessionStore:
         # /group add 和外部 API 的 /api/v1/chats 都是实时往 profile.chat_default_cwd 里加映射，
         # 换了对象这里就永远看不到，新群的话题会落回 default_cwd。
         self._chat_default_cwd = chat_default_cwd if chat_default_cwd is not None else {}
+        # 按人隔离：open_id -> cwd（<PREFIX>_USER_CWD_<open_id>）。优先级高于 chat_default_cwd。
+        # 只在会话按发送人分桶时生效（私聊 / 非话题群）；话题群共享桶（哨兵 uid）匹配不到，
+        # 自动回退到 chat_default_cwd / default_cwd。实时持有 profile 的 dict，和上面同理。
+        self._user_default_cwd = user_default_cwd if user_default_cwd is not None else {}
         # 群级默认模型（<PREFIX>_CHAT_MODEL_<chat_id>），同样持有 profile 的那个 dict。
         self._chat_default_model = chat_default_model if chat_default_model is not None else {}
         # 群级默认推理强度（<PREFIX>_CHAT_EFFORT_<chat_id>），同上持有 profile 的 dict。
@@ -517,15 +522,24 @@ class SessionStore:
                 ).update(picked)
         return adopted
 
-    def _default_current(self, chat_key: Optional[str] = None) -> dict:
-        # chat_key 在话题群里是 "oc_xxx:omt_yyy" 复合形式，env 里配置的 CHAT_CWD_<id>
-        # 用的是裸 chat_id，所以先按完整 key 查，未命中再剥掉 thread 后缀查一次。
-        cwd = self._default_cwd
-        if chat_key:
-            cwd = self._chat_default_cwd.get(chat_key)
-            if cwd is None:
-                raw_chat_id = chat_key.split(":", 1)[0]
-                cwd = self._chat_default_cwd.get(raw_chat_id, self._default_cwd)
+    def _default_current(
+        self, chat_key: Optional[str] = None, user_id: Optional[str] = None
+    ) -> dict:
+        # cwd 优先级：按人（USER_CWD）> 按群（CHAT_CWD）> default_cwd。
+        # 按人隔离（user_id 命中 _user_default_cwd）优先：私聊 / 非话题群里 user_id 是真实
+        # 发送人，命中就落到此人专属目录；话题群共享桶传进来的是哨兵 uid，匹配不到，继续往下。
+        cwd = None
+        if user_id:
+            cwd = self._user_default_cwd.get(user_id)
+        if cwd is None:
+            # chat_key 在话题群里是 "oc_xxx:omt_yyy" 复合形式，env 里配置的 CHAT_CWD_<id>
+            # 用的是裸 chat_id，所以先按完整 key 查，未命中再剥掉 thread 后缀查一次。
+            cwd = self._default_cwd
+            if chat_key:
+                cwd = self._chat_default_cwd.get(chat_key)
+                if cwd is None:
+                    raw_chat_id = chat_key.split(":", 1)[0]
+                    cwd = self._chat_default_cwd.get(raw_chat_id, self._default_cwd)
         return {
             "session_id": None,
             "runner": self._default_runner,
@@ -549,9 +563,11 @@ class SessionStore:
     def _normalize_chat_key(self, user_id: str, chat_id: str) -> str:
         return "private" if chat_id == user_id else chat_id
 
-    def _ensure_current_defaults(self, current: dict, chat_key: Optional[str] = None) -> bool:
+    def _ensure_current_defaults(
+        self, current: dict, chat_key: Optional[str] = None, user_id: Optional[str] = None
+    ) -> bool:
         changed = False
-        defaults = self._default_current(chat_key=chat_key)
+        defaults = self._default_current(chat_key=chat_key, user_id=user_id)
         stored_runner = current.get("runner")
         # /runner 显式切过的话题（runner_pinned）不动：那是用户选的，不是配置漂移。
         # 以前没有这个标记，/runner 切完下一条消息就被这里打回 profile runner，等于没切。
@@ -606,15 +622,18 @@ class SessionStore:
                     if user_id == SHARED_THREAD_UID else None
                 )
                 user[chat_key] = adopted or {
-                    "current": self._default_current(chat_key=chat_key),
+                    "current": self._default_current(chat_key=chat_key, user_id=user_id),
                     "history": [],
                 }
             changed = True
 
         chat_data = user[chat_key]
         if self._ensure_current_defaults(
-            chat_data.setdefault("current", self._default_current(chat_key=chat_key)),
+            chat_data.setdefault(
+                "current", self._default_current(chat_key=chat_key, user_id=user_id)
+            ),
             chat_key=chat_key,
+            user_id=user_id,
         ):
             changed = True
         if "history" not in chat_data:
@@ -908,7 +927,7 @@ class SessionStore:
                 asyncio.create_task(self._bg_generate_summary(user_id, old_id))
 
         chat_key = self._normalize_chat_key(user_id, chat_id)
-        chat_data["current"] = self._default_current(chat_key=chat_key)
+        chat_data["current"] = self._default_current(chat_key=chat_key, user_id=user_id)
         await self._save_async()
         return old_title
 

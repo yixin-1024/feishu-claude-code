@@ -417,6 +417,13 @@ class Profile:
     # 可选：chat_id -> 推理强度。同上，来自 <PREFIX>_CHAT_EFFORT_<chat_id>，取用时实时查；
     # 只对 claude runner 生效（档位是 Claude 的 low~max）。
     chat_default_effort: dict[str, str] = field(default_factory=dict)
+    # 可选：open_id -> cwd。给个别用户钉一个不同于 default_cwd 的初始工作目录，用来做
+    # 「按人隔离」：不同人跟同一个 bot 说话各自落在各自的目录里，默认看不到对方的文件。
+    # 来自 <PREFIX>_USER_CWD_<open_id>。优先级 USER_CWD > CHAT_CWD > default_cwd。
+    # ⚠️ 只在「会话按发送人分桶」时生效：私聊和非话题群按人分桶（生效）；话题群共享模式
+    # 下一个话题全员共享一个 session（THREAD_SHARED_SESSION=1），落到哨兵桶、匹配不到
+    # 任何 open_id，于是回退到 CHAT_CWD / default_cwd（即话题群仍是共享工作区）。
+    user_default_cwd: dict[str, str] = field(default_factory=dict)
     allowed_open_ids: set[str] = field(default_factory=set)
     allowed_group_chat_ids: set[str] = field(default_factory=set)
     # ── 操作者白名单（判定和 /acl 命令都在 user_acl.py）──────────
@@ -762,6 +769,16 @@ def _load_profile(name: str) -> Profile:
             if chat_id:
                 chat_default_effort[chat_id] = env_val.strip().lower()
 
+    # 扫描 <PREFIX>_USER_CWD_<open_id>：给个别用户钉一个独立的初始工作目录（按人隔离）。
+    # open_id 大小写原样（飞书 open_id 是小写 ou_...，环境变量名区分大小写，不会被改写）。
+    user_cwd_prefix = f"{prefix}_USER_CWD_"
+    user_default_cwd: dict[str, str] = {}
+    for env_key, env_val in os.environ.items():
+        if env_key.startswith(user_cwd_prefix) and env_val.strip():
+            open_id = env_key[len(user_cwd_prefix):]
+            if open_id:
+                user_default_cwd[open_id] = os.path.expanduser(env_val.strip())
+
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
     if runner not in RUNNERS:
@@ -868,6 +885,7 @@ def _load_profile(name: str) -> Profile:
         chat_default_cwd=chat_default_cwd,
         chat_default_model=chat_default_model,
         chat_default_effort=chat_default_effort,
+        user_default_cwd=user_default_cwd,
         **_acl_from_env(name, platform, os.environ),
         verification_token=env("VERIFICATION_TOKEN").strip(),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),

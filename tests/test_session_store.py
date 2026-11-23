@@ -338,6 +338,60 @@ async def test_chat_default_cwd_private_uses_global_default():
 
 
 @pytest.mark.asyncio
+async def test_user_default_cwd_isolates_per_person():
+    """<PREFIX>_USER_CWD_<open_id> gives a person their own starting dir in p2p,
+    and outranks both chat_default_cwd and default_cwd for that user."""
+    fd, path = tempfile.mkstemp(suffix='.json')
+    os.close(fd)
+    try:
+        store = SessionStore(
+            default_cwd="/mnt/data/wufeng",
+            chat_default_cwd={"oc_team": "/mnt/data/team"},
+            user_default_cwd={"ou_charlie": "/mnt/data/wufeng-charlie"},
+        )
+        store._sessions_file = path
+        store._data = {}
+        store._save()
+
+        # Charlie p2p → his own dir (user_cwd wins over default)
+        assert (await store.get_current("ou_charlie", "ou_charlie")).cwd == "/mnt/data/wufeng-charlie"
+        # yixin p2p → no user_cwd → falls back to default
+        assert (await store.get_current("ou_yixin", "ou_yixin")).cwd == "/mnt/data/wufeng"
+        # Charlie in a non-topic group → still per-sender bucket → user_cwd wins over chat_cwd
+        assert (await store.get_current("ou_charlie", "oc_team")).cwd == "/mnt/data/wufeng-charlie"
+        # /new keeps Charlie isolated
+        await store.reset_current_to_defaults("ou_charlie", "ou_charlie")
+        assert (await store.get_current("ou_charlie", "ou_charlie")).cwd == "/mnt/data/wufeng-charlie"
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+@pytest.mark.asyncio
+async def test_user_default_cwd_shared_topic_thread_falls_back():
+    """In a shared topic thread the session is bucketed under the sentinel uid, so a
+    per-open_id cwd cannot match — it must fall back to chat/default cwd (shared workspace)."""
+    fd, path = tempfile.mkstemp(suffix='.json')
+    os.close(fd)
+    try:
+        store = SessionStore(
+            default_cwd="/mnt/data/wufeng",
+            user_default_cwd={"ou_charlie": "/mnt/data/wufeng-charlie"},
+            shared_thread_sessions=True,
+        )
+        store._sessions_file = path
+        store._data = {}
+        store._save()
+
+        # Topic thread "oc_g:omt_t1" → effective uid is the shared sentinel → no user match
+        session = await store.get_current("ou_charlie", "oc_g:omt_t1")
+        assert session.cwd == "/mnt/data/wufeng"
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+@pytest.mark.asyncio
 async def test_list_sessions_with_chat_id(temp_store):
     user_id = "user_123"
     chat_id = "group_456"

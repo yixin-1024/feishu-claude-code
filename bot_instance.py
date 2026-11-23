@@ -72,6 +72,7 @@ class BotInstance:
             profile=profile.name,
             default_cwd=profile.default_cwd,
             chat_default_cwd=profile.chat_default_cwd,
+            user_default_cwd=profile.user_default_cwd,
             chat_default_model=profile.chat_default_model,
             chat_default_effort=profile.chat_default_effort,
             default_runner=profile.runner,
