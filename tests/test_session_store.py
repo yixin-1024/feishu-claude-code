@@ -368,6 +368,50 @@ async def test_user_default_cwd_isolates_per_person():
 
 
 @pytest.mark.asyncio
+async def test_user_default_cwd_migrates_pre_existing_session():
+    """A session created before USER_CWD was configured (still on default_cwd) is
+    archived and replaced on next access — same effect as the user sending /new."""
+    fd, path = tempfile.mkstemp(suffix='.json')
+    os.close(fd)
+    try:
+        # Before: no mapping. Charlie's p2p session lives on the shared default dir.
+        store1 = SessionStore(default_cwd="/mnt/data/wufeng")
+        store1._sessions_file = path
+        store1._data = {}
+        store1._save()
+        await store1.get_current("ou_charlie", "ou_charlie")
+        await store1.on_agent_response("ou_charlie", "ou_charlie", "old-sess-1", "hi")
+        # Charlie also moved one group chat to a custom dir via /ws — must be left alone.
+        await store1.set_cwd("ou_charlie", "oc_team", "/custom/dir")
+
+        # After: mapping added + restart (new store loads persisted data).
+        store2 = SessionStore(
+            default_cwd="/mnt/data/wufeng",
+            user_default_cwd={"ou_charlie": "/mnt/data/wufeng-charlie"},
+        )
+        store2._sessions_file = path
+        store2._data = json.load(open(path))
+
+        s = await store2.get_current("ou_charlie", "ou_charlie")
+        assert s.cwd == "/mnt/data/wufeng-charlie"
+        assert s.session_id is None  # fresh session, like /new
+        hist = store2._data["ou_charlie"]["private"]["history"]
+        assert any(h["session_id"] == "old-sess-1" for h in hist)  # /resume can find it
+        # persisted, and a second access doesn't re-migrate
+        await store2.on_agent_response("ou_charlie", "ou_charlie", "new-sess-2", "hi again")
+        s = await store2.get_current("ou_charlie", "ou_charlie")
+        assert s.session_id == "new-sess-2"
+        # explicitly customised cwd is untouched
+        assert (await store2.get_current("ou_charlie", "oc_team")).cwd == "/custom/dir"
+        # users without USER_CWD are untouched
+        await store2.get_current("ou_yixin", "ou_yixin")
+        assert (await store2.get_current("ou_yixin", "ou_yixin")).cwd == "/mnt/data/wufeng"
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+@pytest.mark.asyncio
 async def test_user_default_cwd_shared_topic_thread_falls_back():
     """In a shared topic thread the session is bucketed under the sentinel uid, so a
     per-open_id cwd cannot match — it must fall back to chat/default cwd (shared workspace)."""

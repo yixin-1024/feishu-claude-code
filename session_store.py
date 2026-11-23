@@ -602,6 +602,48 @@ class SessionStore:
                 changed = True
         return changed
 
+    def _migrate_to_user_cwd(self, user_id: str, chat_key: str, chat_data: dict) -> bool:
+        """USER_CWD 配上之前就有的老会话：等同于替此人发一次 /new。
+
+        触发条件：此人配了 USER_CWD，且当前会话还停在 profile 的 default_cwd 上（即建于
+        配置之前、也没被 /ws 换到别处）。做法和 reset_current_to_defaults 一样：旧会话进
+        history（/resume 能找回），current 换成新会话、cwd 落到此人目录。不然老会话会一直
+        带着共享目录和旧上下文，隔离形同虚设，又没法从外面替他重置（运行中改 sessions
+        json 会被内存整份写回覆盖）。话题群共享桶的 user_id 是哨兵，匹配不到，不受影响。
+        """
+        user_cwd = self._user_default_cwd.get(user_id) if user_id else None
+        cur = chat_data.get("current")
+        if not user_cwd or not isinstance(cur, dict):
+            return False
+        if cur.get("cwd") != self._default_cwd or user_cwd == self._default_cwd:
+            return False
+        old_id = cur.get("session_id")
+        if old_id:
+            history = [h for h in chat_data.get("history", []) if h.get("session_id") != old_id]
+            history.append({
+                "session_id": old_id,
+                "runner": cur.get("runner", self._default_runner),
+                "started_at": cur.get("started_at", ""),
+                "preview": cur.get("preview", ""),
+            })
+            chat_data["history"] = history[-20:]
+            if not self._data.get(user_id, {}).get("summaries", {}).get(old_id):
+                try:
+                    asyncio.get_running_loop().create_task(
+                        self._bg_generate_summary(user_id, old_id)
+                    )
+                except RuntimeError:
+                    pass  # 没有事件循环（同步调用/测试）：摘要以后由批量补摘要兜底
+        chat_data["current"] = self._default_current(chat_key=chat_key, user_id=user_id)
+        try:
+            from log_util import log
+            log(self.profile, "session", "info",
+                f"USER_CWD 迁移 user={user_id[:12]} chat={chat_key[:24]} "
+                f"old_session={str(old_id)[:13]} cwd {self._default_cwd} -> {user_cwd}")
+        except Exception:
+            pass
+        return True
+
     async def _ensure_chat_data(self, user_id: str, chat_id: str) -> dict:
         user_id = self._effective_uid(user_id, chat_id)
         user = self._user(user_id)
@@ -635,6 +677,8 @@ class SessionStore:
             chat_key=chat_key,
             user_id=user_id,
         ):
+            changed = True
+        if self._migrate_to_user_cwd(user_id, chat_key, chat_data):
             changed = True
         if "history" not in chat_data:
             chat_data["history"] = []
