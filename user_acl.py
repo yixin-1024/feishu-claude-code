@@ -11,6 +11,11 @@
 
 没权限的人一律静默忽略（dispatcher 里不回话，不暴露 bot 的存在）。
 
+名单改了不用重启：每次判定前 `refresh` 看一眼 .env 有没有变（只是一次 stat），
+变了就把这个 profile 的管理员 / 全局名单 / 群白名单 / 本群名单 / 私聊设置重读进内存
+（实现在 bot_config.reload_acl_from_env，启动时注册进来）。所以直接改 .env 的那几行
+也是下一条消息就生效。
+
 管理员没配时 `is_admin` 对所有人返回 True —— 保持老行为（过了白名单的人都能
 `/group`、`/restart`），升级后不会突然谁都重启不了。
 
@@ -22,7 +27,7 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Callable, Iterable, Optional, Sequence, Tuple
 
 import group_allowlist
 
@@ -30,6 +35,26 @@ OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9]{1,64}$")
 
 
 # ── 判定 ─────────────────────────────────────────────────────────
+
+
+_ENV_RELOADER: Optional[Callable[[object], bool]] = None
+
+
+def set_env_reloader(fn: Optional[Callable[[object], bool]]) -> None:
+    """bot_config 加载完 profile 后注册（避免互相 import）。"""
+    global _ENV_RELOADER
+    _ENV_RELOADER = fn
+
+
+def refresh(profile) -> None:
+    """.env 改过就把名单重读进内存。没注册 / 这个 profile 不参与热重读时什么都不做。"""
+    fn = _ENV_RELOADER
+    if fn is None or profile is None or not getattr(profile, "acl_env_sig", None):
+        return
+    try:
+        fn(profile)
+    except Exception as e:  # noqa: BLE001 — 重读失败就沿用旧名单，不能挡住收消息
+        print(f"[acl] 重读 .env 名单失败，沿用旧名单: {e}", flush=True)
 
 
 def _ids(profile, attr: str) -> set[str]:
@@ -42,6 +67,7 @@ def admin_ids(profile) -> set[str]:
 
 def is_admin(profile, user_id: str) -> bool:
     """能不能用 /acl /group /restart。没配管理员 = 过了白名单的人都算（老行为）。"""
+    refresh(profile)
     admins = admin_ids(profile)
     if not admins:
         return True
@@ -62,6 +88,7 @@ def p2p_enabled(profile) -> bool:
 
 def user_allowed(profile, user_id: str, *, is_group: bool, raw_chat_id: str = "") -> bool:
     """这个人能不能在这里触发 bot（群白名单由调用方先判）。"""
+    refresh(profile)
     if not user_id:
         return False
     if user_id in admin_ids(profile):

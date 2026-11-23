@@ -42,11 +42,13 @@ import json
 import os
 import re
 import shutil
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
 from dotenv import dotenv_values, load_dotenv
 
+import group_allowlist
 import user_acl
 
 # override=True：让 .env 文件成为唯一事实源。
@@ -55,6 +57,9 @@ import user_acl
 # os.environ。若用默认 override=False，下次重启时这些"上一代灌进来的旧值"会粘住，
 # 改了 .env 也读不到（实测 <PROFILE>_CLAUDE_ENV_FILE 跨重启一直卡在旧文件）。
 # override=True 强制每次启动都以磁盘上的 .env 为准，根治这个跨重启粘滞。
+# 灌 .env 之前的进程环境：热重读名单时以它为底、再叠 .env（和启动时 override=True 同一语义），
+# 这样从 .env 删掉的名单行，热重读后也会回到"没配"，而不是粘着启动时灌进来的旧值。
+_BASE_ENVIRON: dict[str, str] = dict(os.environ)
 load_dotenv(override=not bool(os.getenv("PYTEST_CURRENT_TEST")))
 
 # cc-lark 代码目录——用于解析相对路径的 claude env 覆盖文件
@@ -424,6 +429,10 @@ class Profile:
     allow_p2p: bool = True
     # 私聊名单（<PREFIX>_P2P_USERS）：非空时只有这些人能私聊；空 = 沿用全局。
     p2p_allowed_open_ids: set[str] = field(default_factory=set)
+    # 名单热重读（reload_acl_from_env）：启动时从哪份 .env 读的、读的时候它长什么样
+    # （mtime_ns, size, inode）。为空 = 这个 profile 不参与热重读（测试里手搓的 Profile）。
+    acl_env_file: str = field(default="", repr=False, compare=False)
+    acl_env_sig: tuple = field(default=(), repr=False, compare=False)
     # Webhook callback source verification. Long-connection callbacks are already
     # authenticated by the SDK; HTTP callbacks should also set this per profile.
     verification_token: str = ""
@@ -596,6 +605,101 @@ class Profile:
         }.get(role, "")
 
 
+def _acl_from_env(name: str, platform: str, environ) -> dict:
+    """群白名单 + 操作者名单这几项（启动加载和热重读共用，唯一解析入口）。"""
+    prefix = name.upper()
+
+    def env(suffix: str) -> str:
+        return environ.get(f"{prefix}_{suffix}", "") or ""
+
+    # 扫描 <PREFIX>_CHAT_USERS_<chat_id>：本群操作者名单（值为空 = 只有管理员，* = 不单独限制）。
+    chat_users_prefix = f"{prefix}_CHAT_USERS_"
+    chat_allowed_open_ids: dict[str, set[str]] = {}
+    for env_key, env_val in environ.items():
+        if env_key.startswith(chat_users_prefix):
+            chat_id = env_key[len(chat_users_prefix):]
+            users = user_acl.parse_chat_users(env_val)
+            if chat_id and users is not None:
+                chat_allowed_open_ids[chat_id] = users
+
+    return dict(
+        # 白名单 = .env 里配的 ∪ 自助授权落盘的（见 tg_allowlist）
+        allowed_open_ids=(
+            _split_csv(env("ALLOWED_OPEN_IDS"))
+            | (_load_tg_allowlist(name) if platform == "telegram" else set())
+        ),
+        allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
+        admin_open_ids=_split_csv(env("ADMIN_OPEN_IDS")),
+        chat_allowed_open_ids=chat_allowed_open_ids,
+        allow_p2p=_env_flag(env("ALLOW_P2P"), True),
+        p2p_allowed_open_ids=_split_csv(env("P2P_USERS")),
+    )
+
+
+def _env_file_sig(path: str) -> tuple:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ()
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+_ACL_RELOAD_LOCK = threading.Lock()
+
+
+def reload_acl_from_env(profile: "Profile") -> bool:
+    """.env 改过（mtime/大小/inode 变了）就把这个 profile 的名单重读进内存，不用重启。
+
+    每次判定权限前调一次（user_acl.refresh），没变时只多一次 stat。重读的是
+    `_acl_from_env` 那几项：管理员、全局名单、群白名单、本群名单、私聊开关与名单。
+    set/dict 原地改，别的模块手里拿着的引用（如 ALLOWED_OPEN_IDS）跟着变。
+    .env 读坏了（半截文件之类）就保留旧名单、下次再试。返回这次有没有重读。
+    """
+    path = getattr(profile, "acl_env_file", "") or ""
+    old_sig = getattr(profile, "acl_env_sig", ()) or ()
+    if not path or not old_sig:
+        return False
+    sig = _env_file_sig(path)
+    if not sig or sig == old_sig:
+        return False
+    with _ACL_RELOAD_LOCK:
+        if sig == profile.acl_env_sig:
+            return False
+        try:
+            file_vals = {k: v for k, v in dotenv_values(path).items() if v is not None}
+            acl = _acl_from_env(profile.name, profile.platform,
+                                {**_BASE_ENVIRON, **file_vals})
+        except Exception as e:  # noqa: BLE001 — 读坏了就用旧名单，不能让收消息挂掉
+            print(f"[acl] {profile.name} 重读 .env 名单失败，沿用旧名单: {e}", flush=True)
+            return False
+        before = (set(profile.admin_open_ids), set(profile.allowed_open_ids),
+                  set(profile.allowed_group_chat_ids),
+                  {k: set(v) for k, v in profile.chat_allowed_open_ids.items()},
+                  profile.allow_p2p, set(profile.p2p_allowed_open_ids))
+        for attr in ("admin_open_ids", "allowed_open_ids", "allowed_group_chat_ids",
+                     "p2p_allowed_open_ids"):
+            cur = getattr(profile, attr)
+            cur.clear()
+            cur.update(acl[attr])
+        profile.chat_allowed_open_ids.clear()
+        profile.chat_allowed_open_ids.update(acl["chat_allowed_open_ids"])
+        profile.allow_p2p = acl["allow_p2p"]
+        profile.acl_env_sig = sig
+        after = (set(profile.admin_open_ids), set(profile.allowed_open_ids),
+                 set(profile.allowed_group_chat_ids),
+                 {k: set(v) for k, v in profile.chat_allowed_open_ids.items()},
+                 profile.allow_p2p, set(profile.p2p_allowed_open_ids))
+    if before != after:
+        print(
+            f"[acl] {profile.name} .env 改了，名单已热重读："
+            f"管理员 {len(after[0])}、全局 {len(after[1]) or '不限'}、"
+            f"群白名单 {len(after[2])}、单独设名单的群 {len(after[3])}、"
+            f"私聊 {'开' if after[4] else '关'}",
+            flush=True,
+        )
+    return True
+
+
 def _load_profile(name: str) -> Profile:
     prefix = name.upper()
 
@@ -657,16 +761,6 @@ def _load_profile(name: str) -> Profile:
             chat_id = env_key[len(chat_effort_prefix):]
             if chat_id:
                 chat_default_effort[chat_id] = env_val.strip().lower()
-
-    # 扫描 <PREFIX>_CHAT_USERS_<chat_id>：本群操作者名单（值为空 = 只有管理员，* = 不单独限制）。
-    chat_users_prefix = f"{prefix}_CHAT_USERS_"
-    chat_allowed_open_ids: dict[str, set[str]] = {}
-    for env_key, env_val in os.environ.items():
-        if env_key.startswith(chat_users_prefix):
-            chat_id = env_key[len(chat_users_prefix):]
-            users = user_acl.parse_chat_users(env_val)
-            if chat_id and users is not None:
-                chat_allowed_open_ids[chat_id] = users
 
     role = env("ROLE").strip().lower()
     runner = env("RUNNER", "claude").strip().lower()
@@ -774,16 +868,7 @@ def _load_profile(name: str) -> Profile:
         chat_default_cwd=chat_default_cwd,
         chat_default_model=chat_default_model,
         chat_default_effort=chat_default_effort,
-        # 白名单 = .env 里配的 ∪ 自助授权落盘的（见 tg_allowlist）
-        allowed_open_ids=(
-            _split_csv(env("ALLOWED_OPEN_IDS"))
-            | (_load_tg_allowlist(name) if platform == "telegram" else set())
-        ),
-        allowed_group_chat_ids=_split_csv(env("ALLOWED_GROUP_CHAT_IDS")),
-        admin_open_ids=_split_csv(env("ADMIN_OPEN_IDS")),
-        chat_allowed_open_ids=chat_allowed_open_ids,
-        allow_p2p=_env_flag(env("ALLOW_P2P"), True),
-        p2p_allowed_open_ids=_split_csv(env("P2P_USERS")),
+        **_acl_from_env(name, platform, os.environ),
         verification_token=env("VERIFICATION_TOKEN").strip(),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),
         bot_token=bot_token,
@@ -1048,6 +1133,24 @@ def _load_profiles() -> list[Profile]:
 
 
 PROFILES: list[Profile] = _load_profiles()
+
+
+def _arm_acl_reload(profiles: list[Profile]) -> None:
+    """给从 .env 加载的 profile 记下 .env 的样子，之后它一改名单就热重读。
+    旧版单实例配置（没设 PROFILES，键不带前缀）不参与。"""
+    if not os.getenv("PROFILES", "").strip():
+        return
+    path = group_allowlist.default_env_path()
+    sig = _env_file_sig(path)
+    if not sig:
+        return
+    for p in profiles:
+        p.acl_env_file = path
+        p.acl_env_sig = sig
+
+
+_arm_acl_reload(PROFILES)
+user_acl.set_env_reloader(reload_acl_from_env)
 
 # 名字 → profile 索引，供 callback 路由使用
 PROFILES_BY_NAME: dict[str, Profile] = {p.name: p for p in PROFILES}

@@ -131,6 +131,7 @@ def card_action_allowed(profile, user_id: str, chat_id: str) -> bool:
         return False
     raw_chat_id = chat_id.split(":", 1)[0]
     is_group = raw_chat_id.startswith("oc_")
+    user_acl.refresh(profile)  # .env 改了名单就重读，不用重启
     if is_group:
         allowed_groups = set(getattr(profile, "allowed_group_chat_ids", set()) or set())
         if "*" not in allowed_groups and raw_chat_id not in allowed_groups:

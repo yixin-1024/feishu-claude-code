@@ -1281,6 +1281,7 @@ async def handle_message_async(bot: BotInstance, event: P2ImMessageReceiveV1):
 
     # 访问控制：群聊白名单 + 用户 allowlist（静默忽略，避免泄露 bot 存在）
     if not bot.profile.is_trinity:
+        user_acl.refresh(bot.profile)  # .env 改了名单就重读，不用重启
         if (
             is_group
             and "*" not in bot.profile.allowed_group_chat_ids

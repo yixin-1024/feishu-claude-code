@@ -348,3 +348,117 @@ async def test_group_command_requires_admin():
     out = await commands.handle_command("group", "add oc_new", ALICE, G1, MagicMock(), bot=bot)
     assert out.startswith("⛔")
     assert "oc_new" not in bot.profile.allowed_group_chat_ids
+
+
+# ── 名单热重读：改 .env 不用重启 ─────────────────────────────────
+
+def _armed_profile(path, monkeypatch, base_env=None) -> Profile:
+    """像 bot_config 启动时那样：从 .env 读名单并记下 .env 的样子（参与热重读）。"""
+    monkeypatch.setattr(bot_config, "_BASE_ENVIRON", dict(base_env or {}))
+    # 别的测试会重新 import bot_config，注册进 user_acl 的可能是另一份模块的函数；
+    # 钉成本文件这份，monkeypatch 的 _BASE_ENVIRON 才作用得上。
+    monkeypatch.setattr(user_acl, "_ENV_RELOADER", bot_config.reload_acl_from_env)
+    from dotenv import dotenv_values
+    vals = {k: v for k, v in dotenv_values(str(path)).items() if v is not None}
+    acl = bot_config._acl_from_env("test", "lark", {**(base_env or {}), **vals})
+    p = _profile(**acl)
+    p.acl_env_file = str(path)
+    p.acl_env_sig = bot_config._env_file_sig(str(path))
+    return p
+
+
+def _rewrite(path, text):
+    """改写 .env 并把 mtime 往后拨，避免同一时钟刻度内改两次被当成没变。"""
+    st = os.stat(path)
+    path.write_text(text, encoding="utf-8")
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+
+def test_reloader_registered_by_bot_config():
+    fn = user_acl._ENV_RELOADER
+    assert fn is not None and fn.__name__ == "reload_acl_from_env"
+    assert fn.__module__ == "bot_config"
+
+
+def test_global_list_edit_takes_effect_without_restart(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text(f"TEST_ADMIN_OPEN_IDS={ADMIN}\nTEST_ALLOWED_OPEN_IDS={ADMIN}\n",
+                   encoding="utf-8")
+    p = _armed_profile(env, monkeypatch)
+    glob_ref = p.allowed_open_ids
+    assert not user_acl.user_allowed(p, ALICE, is_group=False)
+
+    _rewrite(env, f"TEST_ADMIN_OPEN_IDS={ADMIN}\nTEST_ALLOWED_OPEN_IDS={ADMIN},{ALICE}\n")
+    assert user_acl.user_allowed(p, ALICE, is_group=False)       # 下一条消息就放行
+    assert user_acl.user_allowed(p, ALICE, is_group=True, raw_chat_id=G1)
+    assert not user_acl.is_admin(p, ALICE)
+    assert p.allowed_open_ids is glob_ref                         # 原地改，别处的引用跟着变
+
+    _rewrite(env, f"TEST_ADMIN_OPEN_IDS={ADMIN}\nTEST_ALLOWED_OPEN_IDS={ADMIN}\n")
+    assert not user_acl.user_allowed(p, ALICE, is_group=False)   # 删人也立刻生效
+
+
+def test_reload_covers_admin_chat_list_p2p_and_groups(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("TEST_ALLOWED_GROUP_CHAT_IDS=oc_g1\n", encoding="utf-8")
+    p = _armed_profile(env, monkeypatch)
+    assert p.allowed_group_chat_ids == {G1}
+    assert user_acl.is_admin(p, ALICE)  # 没配管理员 = 老行为
+
+    _rewrite(env, "\n".join([
+        f"TEST_ADMIN_OPEN_IDS={ADMIN}",
+        f"TEST_ALLOWED_GROUP_CHAT_IDS={G1},{G2}",
+        f"TEST_CHAT_USERS_{G2}={BOB}",
+        "TEST_ALLOW_P2P=0",
+    ]) + "\n")
+    user_acl.refresh(p)
+    assert p.allowed_group_chat_ids == {G1, G2}
+    assert not user_acl.is_admin(p, ALICE)
+    assert user_acl.user_allowed(p, BOB, is_group=True, raw_chat_id=G2)
+    assert not user_acl.user_allowed(p, ALICE, is_group=True, raw_chat_id=G2)
+    assert not user_acl.user_allowed(p, ALICE, is_group=False)   # 私聊关了
+    assert user_acl.user_allowed(p, ADMIN, is_group=False)
+
+
+def test_acl_command_write_then_reload_keeps_list(env_file, monkeypatch):
+    """/acl add 自己写的 .env 被热重读回来，名单不变（不会自己把自己冲掉）。"""
+    p = _armed_profile(env_file, monkeypatch)
+    user_acl.set_chat_users(p, G1, {ALICE, BOB})
+    assert bot_config.reload_acl_from_env(p)                      # .env 变了，重读一次
+    assert p.chat_allowed_open_ids == {G1: {ALICE, BOB}}
+    assert not bot_config.reload_acl_from_env(p)                  # 没再变就不重读
+
+
+def test_deleted_line_falls_back_to_base_env_not_sticky(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text(f"TEST_ALLOWED_OPEN_IDS={ADMIN}\n", encoding="utf-8")
+    p = _armed_profile(env, monkeypatch, base_env={})
+    assert not user_acl.user_allowed(p, ALICE, is_group=False)
+    _rewrite(env, "# 名单那行删了\n")
+    assert user_acl.user_allowed(p, ALICE, is_group=False)       # 回到"不限人"，不粘旧值
+
+
+def test_unarmed_profile_is_never_reloaded(tmp_path, monkeypatch):
+    """测试里手搓的 / 旧版单实例 profile 没记 .env，不参与热重读。"""
+    p = _profile(allowed_open_ids={ADMIN})
+    assert not bot_config.reload_acl_from_env(p)
+    user_acl.refresh(p)
+    assert p.allowed_open_ids == {ADMIN}
+
+
+def test_missing_env_file_keeps_old_lists(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text(f"TEST_ALLOWED_OPEN_IDS={ADMIN}\n", encoding="utf-8")
+    p = _armed_profile(env, monkeypatch)
+    env.unlink()
+    assert not bot_config.reload_acl_from_env(p)
+    assert p.allowed_open_ids == {ADMIN}
+
+
+def test_card_click_sees_reloaded_group_list(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("TEST_ALLOWED_GROUP_CHAT_IDS=oc_g1\n", encoding="utf-8")
+    p = _armed_profile(env, monkeypatch)
+    assert not card_security.card_action_allowed(p, ALICE, f"{G2}:omt_x")
+    _rewrite(env, f"TEST_ALLOWED_GROUP_CHAT_IDS={G1},{G2}\n")
+    assert card_security.card_action_allowed(p, ALICE, f"{G2}:omt_x")

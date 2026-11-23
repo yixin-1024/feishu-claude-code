@@ -40,6 +40,7 @@ from typing import Callable, Optional
 from bot_instance import BotInstance
 from log_util import log
 from telegram_client import TelegramApiError, make_key, new_thread_id, split_key
+import user_acl
 
 # 启动时 Telegram 可能还压着一堆离线期间的 update。比这个时间更老的一律丢掉
 # （只推进 offset），否则 /restart 之后会把几小时前的老消息当新任务重跑一遍。
@@ -423,6 +424,7 @@ def build_event(bot: BotInstance, msg: dict) -> Optional[TgEvent]:
 
 def group_reject(profile, chat_id: str) -> str:
     """这个群是否被允许（空串=放行）。决定"这个房间里的话能不能进上下文缓冲"。"""
+    user_acl.refresh(profile)  # .env 改了名单就重读，不用重启
     if not set(getattr(profile, "allowed_open_ids", set()) or set()):
         return "白名单为空（Telegram 不允许默认放开）"
     groups = set(getattr(profile, "allowed_group_chat_ids", set()) or set())
@@ -433,6 +435,7 @@ def group_reject(profile, chat_id: str) -> str:
 
 def user_reject(profile, user_id: str) -> str:
     """这个人能不能触发 agent（空串=放行）。"""
+    user_acl.refresh(profile)
     allowed_users = set(getattr(profile, "allowed_open_ids", set()) or set())
     if not allowed_users:
         return "白名单为空（Telegram 不允许默认放开）"
