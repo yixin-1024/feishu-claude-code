@@ -651,3 +651,71 @@ def test_gemini_buttons_can_be_hidden_when_local_models_exist(two_providers, mon
     for k in ("PI_LOCAL_MODELS", "PI_LOCAL_VENICE_MODELS"):
         monkeypatch.delenv(k)
     assert pi_runner.model_buttons() == pi_runner.PI_MODEL_BUTTONS
+
+
+def _thinking_end(text):
+    return _j({"type": "message_update", "usage": {},
+               "assistantMessageEvent": {"type": "thinking_end", "contentIndex": 0, "content": text}})
+
+
+# DeepSeek 式：叙述全在思考里、工具之间没有正文，正文只在最后一条消息
+THINKING_STREAM = [
+    STREAM[0],
+    _j({"type": "message_start", "message": {"role": "assistant", "content": [], "stopReason": "pending"}}),
+    _thinking_end("Let me look at\nthe workspace first."),
+    _j({"type": "message_end", "message": {
+        "role": "assistant", "stopReason": "toolUse", "usage": _usage(100, 10),
+        "content": [{"type": "thinking", "thinking": "Let me look at\nthe workspace first."},
+                    {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "ls"}}]}}),
+    _j({"type": "tool_execution_start", "toolCallId": "c1", "toolName": "bash", "args": {"command": "ls"}}),
+    _j({"type": "tool_execution_end", "toolCallId": "c1", "toolName": "bash", "isError": False,
+        "result": {"structuredContent": {"exit_code": 0}}}),
+    _j({"type": "message_start", "message": {"role": "assistant", "content": [], "stopReason": "pending"}}),
+    _thinking_end("Found it, now answer."),
+    _delta("搞定"),
+    _j({"type": "message_end", "message": {
+        "role": "assistant", "stopReason": "stop", "usage": _usage(100, 10),
+        "content": [{"type": "thinking", "thinking": "Found it, now answer."},
+                    {"type": "text", "text": "搞定"}]}}),
+    STREAM[-2], STREAM[-1],
+]
+
+
+def test_thinking_shown_on_card_but_not_in_result(monkeypatch, sessions):
+    chunks = []
+    _patch_exec(monkeypatch, [FakeProc(THINKING_STREAM)], {})
+    text, _, _ = _run(sessions, on_text_chunk=chunks.append)
+    assert text == "搞定"
+    shown = "".join(chunks)
+    assert shown == "💭 Let me look at the workspace first.\n\n💭 Found it, now answer.\n\n搞定"
+    # 收尾卡片能拆出「过程」= 两行思考、「结论」= 正文
+    from dispatcher import _split_process_and_result
+    assert _split_process_and_result(shown, text) == (
+        "💭 Let me look at the workspace first.\n\n💭 Found it, now answer.", "搞定")
+
+
+def test_thinking_after_text_gets_blank_line(monkeypatch, sessions):
+    stream = [STREAM[0], STREAM[3], _delta("先看看"), _thinking_end("hmm"), _delta("好"), STREAM[-2], STREAM[-1]]
+    chunks = []
+    _patch_exec(monkeypatch, [FakeProc(stream)], {})
+    _run(sessions, on_text_chunk=chunks.append)
+    assert "".join(chunks) == "先看看\n\n💭 hmm\n\n好"
+
+
+def test_thinking_hidden_when_disabled(monkeypatch, sessions):
+    monkeypatch.setenv("CC_LARK_PI_SHOW_THINKING", "0")
+    chunks = []
+    _patch_exec(monkeypatch, [FakeProc(THINKING_STREAM)], {})
+    _run(sessions, on_text_chunk=chunks.append)
+    assert "".join(chunks) == "搞定"
+
+
+def test_thinking_line_truncates_and_balances_markdown():
+    from pi_runner import THINKING_PREVIEW_CHARS, _thinking_line
+    assert _thinking_line("") == "" and _thinking_line("  \n ") == ""
+    long = "x" * 10 + " `lark-cli docs +fetch " + "y" * 400 + "`"
+    line = _thinking_line(long)
+    assert line.startswith("💭 ") and line.count("`") % 2 == 0
+    assert len(line) <= len("💭 ") + THINKING_PREVIEW_CHARS + 2
+    assert _thinking_line("a **bold") == "💭 a **bold**"
+    assert _thinking_line("2 * 3") == "💭 2  3"

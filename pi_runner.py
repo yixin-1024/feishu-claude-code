@@ -58,6 +58,12 @@ Claude Code 的规则 / 记忆 / skill：pi 自己会沿 cwd 往上加载 AGENTS
 ~/.claude/CLAUDE.md 和记忆索引拼进系统提示（见 claude_context.py）。
 CC_LARK_PI_CLAUDE_CONTEXT=0 关掉。
 
+思考过程上卡片（11-24 加）：DeepSeek 这类模型把「我下一步要干嘛」全写在思考（reasoning）里，
+正文只在最后一条消息出现（实测一轮 62 次工具调用、34 段思考、正文只有 2 段）。Claude / Codex
+会在工具之间写叙述，卡片和收尾的「🔍 过程」靠的就是它；pi 这边以前不转思考，于是跑完只剩结论。
+现在每段思考结束（thinking_end）时压成一行「💭 …」（最多 THINKING_PREVIEW_CHARS 字）走
+on_text_chunk 上卡片，不进返回的正文。CC_LARK_PI_SHOW_THINKING=0 关掉。
+
 计费：走 Gemini API key。每条 assistant 消息自带 usage + cost（美元，pi 按
 PI_GEMINI_MODELS 里的价目表算，Gemini 4 的价格没有官方页可查，是估算），footer 显示
 上下文占用 + 本轮花费。
@@ -137,6 +143,9 @@ PI_MODEL_BUTTONS: list[tuple[str, str]] = [
 
 # pi 工具名 → 卡片认识的名字（dispatcher._format_tool 按名字挑图标和主参数）
 _TOOL_DISPLAY = {"find": "glob", "ls": "list_dir"}
+
+# 每段思考在卡片上最多显示多少字（11-24 实测 DeepSeek 一段思考中位数约 390 字、p90 约 1600 字）
+THINKING_PREVIEW_CHARS = 200
 
 
 def resolve_pi_bin(configured: Optional[str] = None) -> str:
@@ -592,6 +601,29 @@ def _message_text(message: dict) -> str:
     return "".join(parts)
 
 
+def _show_thinking() -> bool:
+    return os.getenv("CC_LARK_PI_SHOW_THINKING", "1") != "0"
+
+
+def _thinking_line(content) -> str:
+    """一段思考 → 卡片上的一行「💭 …」：压掉换行、截到 THINKING_PREVIEW_CHARS，
+    截断后落单的 ` / ** 补齐，免得把后面整张卡片渲染成代码或粗体。"""
+    if isinstance(content, dict):
+        content = content.get("thinking") or content.get("text") or ""
+    text = re.sub(r"\s+", " ", str(content or "")).strip()
+    if not text:
+        return ""
+    if len(text) > THINKING_PREVIEW_CHARS:
+        text = text[:THINKING_PREVIEW_CHARS].rstrip() + "…"
+    if text.count("**") % 2:
+        text += "**"
+    if text.replace("**", "").count("*") % 2:
+        text = text.replace("*", "")
+    if text.count("`") % 2:
+        text += "`"
+    return f"💭 {text}"
+
+
 def _tool_name(name: str) -> str:
     return _TOOL_DISPLAY.get(name, name)
 
@@ -740,6 +772,9 @@ async def run_pi(
         last_text = ""
         new_session_id: Optional[str] = None
         text_started_in_message = False
+        show_thinking = _show_thinking()
+        # 上一次推给卡片的是「💭」行（已自带结尾空行）：紧跟的正文别再补空行
+        thought_shown_last = False
         tool_args: dict[str, tuple[str, dict]] = {}
         last_started_tool = ""
         last_usage: dict = {}
@@ -805,7 +840,17 @@ async def run_pi(
                             chunk = "\n\n" + chunk
                         text_started_in_message = True
                         full_text += chunk
+                        if thought_shown_last:
+                            chunk = chunk.lstrip("\n")
+                            thought_shown_last = False
                         await _fire_callback(on_text_chunk, chunk)
+                    elif ev.get("type") == "thinking_end" and show_thinking:
+                        line = _thinking_line(ev.get("content"))
+                        if line:
+                            # 只上卡片（成为收尾「🔍 过程」的一部分），不进返回的正文
+                            prefix = "\n\n" if (full_text and not thought_shown_last) else ""
+                            thought_shown_last = True
+                            await _fire_callback(on_text_chunk, prefix + line + "\n\n")
 
                 elif etype == "message_end":
                     msg = data.get("message") or {}
