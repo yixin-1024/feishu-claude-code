@@ -7,7 +7,7 @@ import ssl
 import urllib.request
 import urllib.error
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from bot_config import (
     SESSIONS_DIR, DEFAULT_MODEL, DEFAULT_CWD, PERMISSION_MODE, DEFAULT_RUNNER,
@@ -379,9 +379,12 @@ class SessionStore:
         shared_thread_sessions: Optional[bool] = None,
         chat_default_model: Optional[dict[str, str]] = None,
         chat_default_effort: Optional[dict[str, str]] = None,
+        env_refresh: Optional[Callable[[], None]] = None,
     ):
         """
         每个 profile 独占一个 SessionStore 实例和一份 json 文件。
+        env_refresh：取默认模型 / 强度前先调它，让 .env 里改的模型配置不用重启就生效
+        （BotInstance 传 user_acl.refresh(profile)；没变时只是一次 stat）。
         default_cwd 给新用户的初始 cwd（覆盖全局 DEFAULT_CWD）。
         chat_default_cwd 给指定 chat_id 的初始 cwd（仅在新建 chat 数据时生效，
         不会覆盖 sessions.json 里已有的 chat）。键用 normalized chat_key：
@@ -410,6 +413,7 @@ class SessionStore:
         self._chat_default_model = chat_default_model if chat_default_model is not None else {}
         # 群级默认推理强度（<PREFIX>_CHAT_EFFORT_<chat_id>），同上持有 profile 的 dict。
         self._chat_default_effort = chat_default_effort if chat_default_effort is not None else {}
+        self._env_refresh = env_refresh
         self._sessions_file = _sessions_file_for(profile)
         self._save_lock = asyncio.Lock()  # 保护 _save() 的全局锁
         self._data: dict = self._load()
@@ -758,9 +762,19 @@ class SessionStore:
         user.setdefault("summaries", {}).update(summaries)
         await self._save_async()
 
+    def _refresh_env(self) -> None:
+        fn = self._env_refresh
+        if fn is None:
+            return
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 — 重读失败就用旧配置，不能挡住取模型
+            print(f"[env] {self.profile} 重读 .env 失败，沿用旧配置: {e}", flush=True)
+
     @property
     def default_model(self) -> str:
-        """profile 当前默认模型（启动时来自 config；/all 改全局默认时运行时更新）"""
+        """profile 当前默认模型（启动时来自 config；.env 改了热重读 / /all 改全局默认时运行时更新）"""
+        self._refresh_env()
         return self._default_model
 
     def set_default_model(self, model: str) -> None:
@@ -781,6 +795,7 @@ class SessionStore:
         群级默认只在它属于该会话的 runner 时才用——话题被 /runner 切到别的后端后，
         不能把 opus 塞给 codex。
         """
+        self._refresh_env()
         if chat_id:
             model = self._chat_value(self._chat_default_model, chat_id)
             if model:
@@ -809,6 +824,7 @@ class SessionStore:
         档位是 Claude 的 low~max，所以只对 claude runner 生效——话题被 /runner 切到
         别的后端后不能把 max 塞给它。
         """
+        self._refresh_env()
         if (runner or self._default_runner).lower() != "claude":
             return None
         value = (self._chat_value(self._chat_default_effort, chat_id) or "").strip().lower()

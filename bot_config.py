@@ -440,6 +440,8 @@ class Profile:
     # （mtime_ns, size, inode）。为空 = 这个 profile 不参与热重读（测试里手搓的 Profile）。
     acl_env_file: str = field(default="", repr=False, compare=False)
     acl_env_sig: tuple = field(default=(), repr=False, compare=False)
+    # 热重读改了模型那几项之后要通知的回调（BotInstance 注册：把新默认模型同步进 SessionStore）。
+    env_reload_hooks: list = field(default_factory=list, repr=False, compare=False)
     # Webhook callback source verification. Long-connection callbacks are already
     # authenticated by the SDK; HTTP callbacks should also set this per profile.
     verification_token: str = ""
@@ -643,6 +645,47 @@ def _acl_from_env(name: str, platform: str, environ) -> dict:
     )
 
 
+def _models_from_env(name: str, environ) -> dict:
+    """选模型那几项（启动加载和热重读共用，唯一解析入口）：默认模型、派活模型、
+    群级模型 / 推理强度，以及 agy 走订阅还是 API key（决定哪些模型能用）。
+    语义同老代码：<PREFIX>_X 有这一行（哪怕值为空）就用它，没有才落到全局 X。"""
+    prefix = name.upper()
+
+    def env(suffix: str, default: str = "") -> str:
+        key = f"{prefix}_{suffix}"
+        if key in environ:
+            return environ.get(key) or ""
+        return environ.get(suffix, default) or ""
+
+    def scan(suffix: str, lower: bool = False) -> dict[str, str]:
+        head = f"{prefix}_{suffix}_"
+        out: dict[str, str] = {}
+        for env_key, env_val in environ.items():
+            if env_key.startswith(head) and (env_val or "").strip():
+                chat_id = env_key[len(head):]
+                if chat_id:
+                    val = env_val.strip()
+                    out[chat_id] = val.lower() if lower else val
+        return out
+
+    return dict(
+        default_model=env("DEFAULT_MODEL"),
+        dispatch_model=env("DISPATCH_MODEL").strip(),
+        # <PREFIX>_CHAT_MODEL_<chat_id>：给个别群钉一个不同于 profile 默认的模型。
+        chat_default_model=scan("CHAT_MODEL"),
+        # <PREFIX>_CHAT_EFFORT_<chat_id>：给个别群钉一个默认推理强度。
+        chat_default_effort=scan("CHAT_EFFORT", lower=True),
+        agy_model_provider=env("AGY_MODEL_PROVIDER", "gemini").strip(),
+        agy_api_key=env("AGY_API_KEY", environ.get("GEMINI_API_KEY", "") or "").strip(),
+        agy_api_key_env=env("AGY_API_KEY_ENV", "GEMINI_API_KEY").strip() or "GEMINI_API_KEY",
+    )
+
+
+# 不在 Profile 上、而是 runner 每次现读 os.environ 的模型配置（pi 的默认模型）。
+# 热重读时把 .env 里的新值同步进进程环境，它们也就不用重启了。
+_LIVE_ENV_MODEL_KEYS = ("{prefix}_PI_MODEL", "PI_MODEL")
+
+
 def _env_file_sig(path: str) -> tuple:
     try:
         st = os.stat(path)
@@ -655,12 +698,14 @@ _ACL_RELOAD_LOCK = threading.Lock()
 
 
 def reload_acl_from_env(profile: "Profile") -> bool:
-    """.env 改过（mtime/大小/inode 变了）就把这个 profile 的名单重读进内存，不用重启。
+    """.env 改过（mtime/大小/inode 变了）就把这个 profile 的名单和模型配置重读进内存，不用重启。
 
-    每次判定权限前调一次（user_acl.refresh），没变时只多一次 stat。重读的是
-    `_acl_from_env` 那几项：管理员、全局名单、群白名单、本群名单、私聊开关与名单。
-    set/dict 原地改，别的模块手里拿着的引用（如 ALLOWED_OPEN_IDS）跟着变。
-    .env 读坏了（半截文件之类）就保留旧名单、下次再试。返回这次有没有重读。
+    每次判定权限前（user_acl.refresh）、每次取会话模型前（SessionStore）、派活前都调一次，
+    没变时只多一次 stat。重读的是 `_acl_from_env`（管理员、全局名单、群白名单、本群名单、
+    私聊开关与名单）和 `_models_from_env`（默认模型、派活模型、群级模型 / 强度、agy 走订阅
+    还是 API key）。set/dict 原地改，别的模块手里拿着的引用（如 ALLOWED_OPEN_IDS、
+    SessionStore 的群级模型表）跟着变；默认模型改了再调 env_reload_hooks 同步进 SessionStore。
+    .env 读坏了（半截文件之类）就保留旧配置、下次再试。返回这次有没有重读。
     """
     path = getattr(profile, "acl_env_file", "") or ""
     old_sig = getattr(profile, "acl_env_sig", ()) or ()
@@ -674,10 +719,11 @@ def reload_acl_from_env(profile: "Profile") -> bool:
             return False
         try:
             file_vals = {k: v for k, v in dotenv_values(path).items() if v is not None}
-            acl = _acl_from_env(profile.name, profile.platform,
-                                {**_BASE_ENVIRON, **file_vals})
-        except Exception as e:  # noqa: BLE001 — 读坏了就用旧名单，不能让收消息挂掉
-            print(f"[acl] {profile.name} 重读 .env 名单失败，沿用旧名单: {e}", flush=True)
+            merged = {**_BASE_ENVIRON, **file_vals}
+            acl = _acl_from_env(profile.name, profile.platform, merged)
+            models = _models_from_env(profile.name, merged)
+        except Exception as e:  # noqa: BLE001 — 读坏了就用旧配置，不能让收消息挂掉
+            print(f"[acl] {profile.name} 重读 .env 失败，沿用旧配置: {e}", flush=True)
             return False
         before = (set(profile.admin_open_ids), set(profile.allowed_open_ids),
                   set(profile.allowed_group_chat_ids),
@@ -691,11 +737,13 @@ def reload_acl_from_env(profile: "Profile") -> bool:
         profile.chat_allowed_open_ids.clear()
         profile.chat_allowed_open_ids.update(acl["chat_allowed_open_ids"])
         profile.allow_p2p = acl["allow_p2p"]
-        profile.acl_env_sig = sig
         after = (set(profile.admin_open_ids), set(profile.allowed_open_ids),
                  set(profile.allowed_group_chat_ids),
                  {k: set(v) for k, v in profile.chat_allowed_open_ids.items()},
                  profile.allow_p2p, set(profile.p2p_allowed_open_ids))
+        model_changes = _apply_models(profile, models)
+        _sync_live_env_models(profile.name, merged)
+        profile.acl_env_sig = sig
     if before != after:
         print(
             f"[acl] {profile.name} .env 改了，名单已热重读："
@@ -704,7 +752,46 @@ def reload_acl_from_env(profile: "Profile") -> bool:
             f"私聊 {'开' if after[4] else '关'}",
             flush=True,
         )
+    if model_changes:
+        print(f"[env] {profile.name} .env 改了，模型配置已热重读：{'；'.join(model_changes)}",
+              flush=True)
+        for hook in list(getattr(profile, "env_reload_hooks", ()) or ()):
+            try:
+                hook(profile)
+            except Exception as e:  # noqa: BLE001
+                print(f"[env] {profile.name} 模型热重读回调失败: {e}", flush=True)
     return True
+
+
+def _apply_models(profile: "Profile", models: dict) -> list[str]:
+    """把重读出来的模型配置写回 profile，返回改了哪些（给日志看；密钥只说变没变）。"""
+    changes: list[str] = []
+    for attr in ("default_model", "dispatch_model", "agy_model_provider", "agy_api_key_env"):
+        old, new = getattr(profile, attr, ""), models[attr]
+        if old != new:
+            setattr(profile, attr, new)
+            changes.append(f"{attr} {old or '(空)'} → {new or '(空)'}")
+    if profile.agy_api_key != models["agy_api_key"]:
+        profile.agy_api_key = models["agy_api_key"]
+        changes.append("agy_api_key 已换" if models["agy_api_key"] else "agy_api_key 已清空")
+    for attr in ("chat_default_model", "chat_default_effort"):
+        cur = getattr(profile, attr)
+        if cur != models[attr]:
+            cur.clear()
+            cur.update(models[attr])  # 原地改：SessionStore 持有的是同一个 dict
+            changes.append(f"{attr} {len(models[attr])} 个群")
+    return changes
+
+
+def _sync_live_env_models(name: str, merged: dict) -> None:
+    """pi 这类每次现读 os.environ 的模型配置：.env 里的新值同步进进程环境。
+    行被删了就退回启动前的进程环境（_BASE_ENVIRON），不粘旧值。"""
+    for tmpl in _LIVE_ENV_MODEL_KEYS:
+        key = tmpl.format(prefix=name.upper())
+        if key in merged:
+            os.environ[key] = merged[key]
+        else:
+            os.environ.pop(key, None)
 
 
 def _load_profile(name: str) -> Profile:
@@ -750,24 +837,6 @@ def _load_profile(name: str) -> Profile:
             chat_id = env_key[len(chat_cwd_prefix):]
             if chat_id:
                 chat_default_cwd[chat_id] = os.path.expanduser(env_val)
-
-    # 扫描 <PREFIX>_CHAT_MODEL_<chat_id>：给个别群钉一个不同于 profile 默认的模型。
-    chat_model_prefix = f"{prefix}_CHAT_MODEL_"
-    chat_default_model: dict[str, str] = {}
-    for env_key, env_val in os.environ.items():
-        if env_key.startswith(chat_model_prefix) and env_val.strip():
-            chat_id = env_key[len(chat_model_prefix):]
-            if chat_id:
-                chat_default_model[chat_id] = env_val.strip()
-
-    # 扫描 <PREFIX>_CHAT_EFFORT_<chat_id>：给个别群钉一个默认推理强度。
-    chat_effort_prefix = f"{prefix}_CHAT_EFFORT_"
-    chat_default_effort: dict[str, str] = {}
-    for env_key, env_val in os.environ.items():
-        if env_key.startswith(chat_effort_prefix) and env_val.strip():
-            chat_id = env_key[len(chat_effort_prefix):]
-            if chat_id:
-                chat_default_effort[chat_id] = env_val.strip().lower()
 
     # 扫描 <PREFIX>_USER_CWD_<open_id>：给个别用户钉一个独立的初始工作目录（按人隔离）。
     # open_id 大小写原样（飞书 open_id 是小写 ou_...，环境变量名区分大小写，不会被改写）。
@@ -880,13 +949,10 @@ def _load_profile(name: str) -> Profile:
         domain=_DOMAIN_MAP[platform],
         default_cwd=default_cwd,
         runner=runner,
-        default_model=env("DEFAULT_MODEL", os.getenv("DEFAULT_MODEL", "")),
-        dispatch_model=env("DISPATCH_MODEL", os.getenv("DISPATCH_MODEL", "")).strip(),
         chat_default_cwd=chat_default_cwd,
-        chat_default_model=chat_default_model,
-        chat_default_effort=chat_default_effort,
         user_default_cwd=user_default_cwd,
         **_acl_from_env(name, platform, os.environ),
+        **_models_from_env(name, os.environ),
         verification_token=env("VERIFICATION_TOKEN").strip(),
         lark_cli_profile=env("LARK_CLI_PROFILE", name),
         bot_token=bot_token,
@@ -933,9 +999,6 @@ def _load_profile(name: str) -> Profile:
         maka_dangerous_skip=max(0, min(1, maka_skip)),
         maka_idle_timeout_sec=max(0, maka_idle),
         agy_bin=env("AGY_BIN", os.getenv("AGY_BIN", "")).strip(),
-        agy_model_provider=env("AGY_MODEL_PROVIDER", os.getenv("AGY_MODEL_PROVIDER", "gemini")).strip(),
-        agy_api_key=env("AGY_API_KEY", os.getenv("AGY_API_KEY", os.getenv("GEMINI_API_KEY", ""))).strip(),
-        agy_api_key_env=env("AGY_API_KEY_ENV", os.getenv("AGY_API_KEY_ENV", "GEMINI_API_KEY")).strip() or "GEMINI_API_KEY",
         agy_proxy=env("AGY_PROXY", os.getenv("AGY_PROXY", "http://127.0.0.1:7899")).strip(),
         agy_print_timeout=env("AGY_PRINT_TIMEOUT", os.getenv("AGY_PRINT_TIMEOUT", "24h")).strip() or "24h",
         agy_dangerous_skip=max(0, min(1, agy_skip)),

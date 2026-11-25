@@ -19,6 +19,7 @@ import os
 
 import lark_oapi as lark
 
+import user_acl
 from bot_config import Profile
 from feishu_client import FeishuClient
 from run_control import ActiveRunRegistry
@@ -77,10 +78,18 @@ class BotInstance:
             chat_default_effort=profile.chat_default_effort,
             default_runner=profile.runner,
             default_model=profile.default_model,
+            # .env 里改了默认模型 / 群级模型 / agy 通道，下次取模型就生效，不用 /restart
+            env_refresh=lambda: user_acl.refresh(profile),
         )
+        profile.env_reload_hooks.append(self._on_env_models_reloaded)
         self.active_runs = ActiveRunRegistry()
         # per-chat 消息队列锁：同一 chat 串行，跨 chat 并行
         self.chat_locks: dict[str, asyncio.Lock] = {}
+
+    def _on_env_models_reloaded(self, profile: Profile) -> None:
+        """.env 里的默认模型被热重读了：同步进 SessionStore（没 /model 覆盖的会话下一条就用它）。"""
+        import session_store
+        self.store.set_default_model(profile.default_model or session_store.DEFAULT_MODEL)
 
     def _ensure_chat_lock(self, chat_id: str) -> asyncio.Lock:
         if chat_id not in self.chat_locks:

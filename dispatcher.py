@@ -4203,6 +4203,7 @@ async def handle_spawn(
                 await bot.store.set_runner(user_id, chat_id, runner)
             if model:
                 child_runner = runner or bot.profile.runner
+                user_acl.refresh(bot.profile)  # 兜底模型读 profile，先吃进 .env 的改动
                 if not is_model_compatible_with_runner(model, child_runner):
                     # profile 的默认模型属于 profile 的 runner；换了后端就让那个后端用它自己的默认
                     profile_fallback = "" if runner else (
@@ -4646,6 +4647,8 @@ async def dispatch_task(
 
     # runner：子话题换个后端跑（agent 点名的后端本机没有专门的 bot，由同一个 bot 代跑）
     child_runner = runner or child_bot.profile.runner
+    # 下面直接读子 bot 的 DISPATCH_MODEL / DEFAULT_MODEL：先看一眼 .env 改没改（不用重启）
+    user_acl.refresh(child_bot.profile)
     if model:
         if not is_model_compatible_with_runner(model, child_runner):
             fallback_target = "" if runner else (
