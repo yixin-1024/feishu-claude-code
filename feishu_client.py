@@ -1003,8 +1003,17 @@ class FeishuClient:
 
         return await asyncio.to_thread(_http)
 
-    async def list_thread_messages(self, thread_id: str, limit: int = 200) -> list:
-        """列出话题里的消息，按创建时间升序。返回 Message 对象列表。"""
+    async def list_thread_messages(
+        self, thread_id: str, limit: int = 200, tail: bool = False, stop_at: str = "",
+    ) -> list:
+        """列出话题里的消息，返回 Message 对象列表，按创建时间升序。
+
+        tail=False：取最早的 limit 条（拿话题根消息、读子会话从头开始的脉络）。
+        tail=True：取最新的 limit 条——话题上下文要的是「上次处理之后」的消息，
+        长话题（超过 limit 条）只取开头的话，最近的消息根本拉不到。
+        stop_at：tail 模式下从新往旧翻，翻到这条就不再翻下一页（它本身仍在结果里），
+        省掉长话题每条消息都翻满 limit 条的开销。
+        """
         messages: list = []
         page_token = ""
         while len(messages) < limit:
@@ -1012,7 +1021,7 @@ class FeishuClient:
                 ListMessageRequest.builder()
                 .container_id_type("thread")
                 .container_id(thread_id)
-                .sort_type("ByCreateTimeAsc")
+                .sort_type("ByCreateTimeDesc" if tail else "ByCreateTimeAsc")
                 .page_size(min(50, limit - len(messages)))
             )
             if page_token:
@@ -1023,10 +1032,14 @@ class FeishuClient:
                 raise RuntimeError(f"list thread messages 失败: {resp.code} {resp.msg}")
             items = (resp.data.items or []) if resp.data else []
             messages.extend(items)
+            if tail and stop_at and any((m.message_id or "") == stop_at for m in items):
+                break
             has_more = bool(resp.data and resp.data.has_more)
             page_token = (resp.data.page_token or "") if resp.data else ""
             if not has_more or not page_token:
                 break
+        if tail:
+            messages.reverse()
         return messages
 
     async def list_chat_messages(self, chat_id: str, start_time: int, limit: int = 15) -> list:

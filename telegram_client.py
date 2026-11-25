@@ -976,7 +976,10 @@ class TelegramClient:
         chat_id, mid = split_key(message_id)
         return new_thread_id(chat_id, mid) if mid else ""
 
-    async def list_thread_messages(self, thread_id: str, limit: int = 200) -> list:
+    async def list_thread_messages(
+        self, thread_id: str, limit: int = 200, tail: bool = False, stop_at: str = "",
+    ) -> list:
+        # 缓冲里本来就只留每条 thread 最近的消息、按时间升序，tail / stop_at 不用另外处理。
         return self.buffer.thread_messages(thread_id, limit=limit)
 
     async def is_bot_in_chat(self, chat_id: str) -> tuple[bool, str]:

@@ -456,6 +456,12 @@ async def _render_messages(
     return lines, all_paths
 
 
+# 话题上下文每次最多从话题末尾往回拉多少条；last_seen 不在这段里时只带最近
+# THREAD_FALLBACK_TAIL 条。
+THREAD_FETCH_LIMIT = 200
+THREAD_FALLBACK_TAIL = 30
+
+
 async def build_thread_context(
     feishu: FeishuClient,
     thread_id: str,
@@ -477,8 +483,13 @@ async def build_thread_context(
                话题历史失败的原因（如缺权限），调用方据此区分"真没历史"与
                "读不到历史"，避免静默把缺权限当成没内容。
     """
+    # 取话题最新的一段（不是最早的一段）：超过 THREAD_FETCH_LIMIT 条的长话题以前只拉
+    # 开头那些，last_seen 落在拉取范围之外，于是「上次之后的消息」一条都认不出来——
+    # 先发几条再单独 @ 的那一下就只剩空正文，回「读不到前面的消息」。
     try:
-        msgs = await feishu.list_thread_messages(thread_id)
+        msgs = await feishu.list_thread_messages(
+            thread_id, limit=THREAD_FETCH_LIMIT, tail=True, stop_at=last_seen_message_id,
+        )
     except Exception as e:
         print(f"[thread] 拉取话题消息失败 thread={thread_id[:12]}...: {e}", flush=True)
         return "", [], str(e)
@@ -486,31 +497,40 @@ async def build_thread_context(
     if not msgs:
         return "", [], None
 
-    # 筛选未处理过的消息：跳过当前消息、bot 自己的消息、last_seen 及之前的消息
-    unseen = []
-    hit_last_seen = not bool(last_seen_message_id)  # 空 last_seen → 全量从头
-    for m in msgs:
-        mid = m.message_id or ""
-        if mid == current_message_id:
-            continue
-        if not hit_last_seen:
-            if mid == last_seen_message_id:
-                hit_last_seen = True
-            continue
-        # 注意：保留 bot (sender_type=="app") 自己的卡片消息，便于 /new 后让新 session
-        # 能看到 bot 之前的回复脉络。loading 占位卡和无正文的卡片会在 _extract 里被过滤。
-        unseen.append(m)
+    # 注意：保留 bot (sender_type=="app") 自己的卡片消息，便于 /new 后让新 session
+    # 能看到 bot 之前的回复脉络。loading 占位卡和无正文的卡片会在 _extract 里被过滤。
+    # last_seen 要在含当前这条的完整列表里找：定时唤醒 / 续跑锚定的消息常常就是
+    # 上次处理到的那条（last_seen == current），那是「没有新消息」，不是「找不到」。
+    ids = [m.message_id or "" for m in msgs]
+    pool = [m for m in msgs if (m.message_id or "") != current_message_id]
+    if not last_seen_message_id:
+        # 第一次在这个话题里处理消息 → 带上整段（最近 THREAD_FETCH_LIMIT 条）
+        unseen = pool
+        note = "按时间顺序"
+        if len(msgs) >= THREAD_FETCH_LIMIT:
+            note += f"；话题较长，只取最近 {THREAD_FETCH_LIMIT} 条"
+        head = "话题历史"
+    elif last_seen_message_id in ids:
+        after = msgs[ids.index(last_seen_message_id) + 1:]
+        unseen = [m for m in after if (m.message_id or "") != current_message_id]
+        head, note = "话题新增", "距上次处理后"
+    else:
+        # 上次处理的那条不在最近这段里（这期间又来了很多消息，或那条被撤回了）：
+        # 只带最近 THREAD_FALLBACK_TAIL 条，不把整段重灌一遍，也不静默什么都不给。
+        unseen = pool[-THREAD_FALLBACK_TAIL:]
+        head, note = "话题最近", "上次处理的位置已不在可读范围，只带最近这些"
+        print(
+            f"[thread] last_seen 不在最近 {len(msgs)} 条里 thread={thread_id[:12]}...，"
+            f"退回最近 {len(unseen)} 条",
+            flush=True,
+        )
 
     if not unseen:
         return "", [], None
 
     lines, all_paths = await _render_messages(feishu, unseen, cli_profile)
 
-    prefix = (
-        f"【话题历史 · {len(unseen)} 条（按时间顺序）】"
-        if not last_seen_message_id
-        else f"【话题新增 · {len(unseen)} 条（距上次处理后）】"
-    )
+    prefix = f"【{head} · {len(unseen)} 条（{note}）】"
     context = prefix + "\n" + "\n".join(lines)
     return context, all_paths, None
 

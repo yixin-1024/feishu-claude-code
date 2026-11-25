@@ -436,7 +436,7 @@ class _StubClient:
         self._app_id = app_id
         self.downloads: list[tuple] = []
 
-    async def list_thread_messages(self, thread_id, limit=200):
+    async def list_thread_messages(self, thread_id, limit=200, tail=False, stop_at=""):
         return self.buffer.thread_messages(thread_id, limit=limit)
 
     async def batch_resolve_names(self, open_ids):
@@ -504,15 +504,17 @@ def test_thread_context_timestamps_come_from_ms_string():
     assert thread_context._fmt_time(msg.create_time) in ctx
 
 
-def test_evicted_last_seen_yields_silent_empty_context(monkeypatch):
-    """last_seen 被裁掉/被压实删掉 → 上下文静默为空且 error=None，
-    调用方分不清"真没历史"和"历史被自己扔了"。"""
+def test_evicted_last_seen_falls_back_to_recent_messages(monkeypatch):
+    """last_seen 被裁掉/被压实删掉：以前上下文静默为空，调用方分不清"真没历史"和
+    "历史被自己扔了"；2026-11-25 起退回最近几条并标明「话题最近」。"""
     monkeypatch.setattr(tg_context, "MAX_PER_THREAD", 3)
     buf = TgBuffer("tc3")
     for i in range(6):
         _rec(buf, f"-100:{i}", f"m{i}")
     _, ctx, paths, err = _build(buf, "-100:0", "-100:5")      # -100:0 已被裁掉
-    assert ctx == "" and paths == [] and err is None
+    assert err is None and paths == []
+    assert ctx.startswith("【话题最近 · 2 条")
+    assert "m3" in ctx and "m4" in ctx and "m5" not in ctx
 
 
 def test_bot_label_needs_app_id_match():
