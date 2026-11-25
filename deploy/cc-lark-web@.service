@@ -1,0 +1,36 @@
+# cc-lark web gateway — one instance per RG Next tenant (cc-lark-web@prod, cc-lark-web@<tenant>…).
+# 和 cc-lark-web.service（RG 测试租户，历史单实例名）同一份代码，进程 / 端口 / 状态 / Claude 会话 / 凭证全部分开：
+#   配置   /home/yixin/.config/cc-lark-web-%i.env（600；端口、状态目录、CC_WEB_CLAUDE_CONFIG_DIR、app cwd、token 都在这里）
+#   日志   journalctl -u cc-lark-web@%i
+# 独立于主 bot（cc-lark.service）——重启实例不影响任何 Lark 会话，也不影响别的实例。
+# 安装：sudo cp deploy/cc-lark-web@.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#       && sudo systemctl enable --now cc-lark-web@<tenant>
+# 运维手册：rg-next 仓 docs/ai/AGENT-HOST.md、docs/ops/TENANTS.md
+[Unit]
+Description=cc-lark web gateway instance %i (Claude Code sessions for RG Next tenant %i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=yixin
+Group=yixin
+WorkingDirectory=/home/yixin/feishu-claude-code
+Environment=HOME=/home/yixin
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/yixin/.local/bin
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/yixin/.config/cc-lark-web-%i.env
+ExecStart=/home/yixin/feishu-claude-code/.venv/bin/python cc_web_gateway.py
+Restart=always
+RestartSec=5
+# 停服务时连同在跑的 claude 进程组一起收掉（网关会先把它们记成 interrupted）
+KillMode=control-group
+TimeoutStopSec=20
+NoNewPrivileges=yes
+UMask=0077
+MemoryMax=6G
+
+[Install]
+WantedBy=multi-user.target

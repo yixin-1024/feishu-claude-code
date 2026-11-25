@@ -831,6 +831,29 @@ async def test_isolated_cwd_old_dirs_pruned_on_restart(make_gw, tmp_path):
     assert not d.exists()
 
 
+async def test_claude_config_dir_is_opt_in_and_private(make_gw, tmp_path):
+    # 默认：不带 CLAUDE_CONFIG_DIR（claude 用 ~/.claude，测试实例照旧）
+    gw, client, cwd = await make_gw()
+    rid = await _start(client, conv="cfg0", prompt="x")
+    await client.events(rid)
+    assert "CLAUDE_CONFIG_DIR" not in _calls(cwd)[-1]["env"]
+    # 配了：每个子进程都带，目录 700
+    home = tmp_path / "prod-claude"
+    gw2, client2, cwd2 = await make_gw(CC_WEB_CLAUDE_CONFIG_DIR=str(home),
+                                       CC_WEB_STATE_DIR=str(tmp_path / "state2"))
+    assert home.is_dir() and (home.stat().st_mode & 0o777) == 0o700
+    rid = await _start(client2, conv="cfg1", prompt="x")
+    await client2.events(rid)
+    env = _calls(cwd2)[-1]["env"]
+    assert env["CLAUDE_CONFIG_DIR"] == str(home)
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "fake-cred"
+
+
+def test_claude_config_dir_must_be_absolute(tmp_path):
+    with pytest.raises(gwmod.ConfigError):
+        gwmod.load_config(_env(tmp_path, CC_WEB_CLAUDE_CONFIG_DIR="relative/dir"))
+
+
 def test_isolate_cwd_config_default_on_and_can_be_disabled(tmp_path):
     env = _env(tmp_path)
     env.pop("CC_WEB_APP_RG_NEXT_ISOLATE_CWD")

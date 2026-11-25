@@ -196,6 +196,10 @@ class GatewayConfig:
     retention_days: float
     heartbeat_sec: float
     apps: dict[str, AppConfig] = field(default_factory=dict)
+    # 空 = claude 用默认的 ~/.claude（和主 bot 同一个）。配了 → 每个 claude 子进程带
+    # CLAUDE_CONFIG_DIR=<这里>，会话记录（projects/…jsonl）只落这个目录：同机多个网关实例
+    # （例：RG 测试 / 生产租户）的会话彼此、也和主 bot 分开。凭证仍走 env 注入（claude_credential_env）。
+    claude_config_dir: str = ""
 
     @property
     def token_ok(self) -> bool:
@@ -232,7 +236,10 @@ def load_config(env: Optional[dict] = None) -> GatewayConfig:
         max_env_value_chars=_env_int(env, "CC_WEB_MAX_ENV_VALUE_CHARS", 4096),
         retention_days=_env_float(env, "CC_WEB_RETENTION_DAYS", 14.0),
         heartbeat_sec=max(0.2, _env_float(env, "CC_WEB_HEARTBEAT_SEC", 15.0)),
+        claude_config_dir=os.path.expanduser((env.get("CC_WEB_CLAUDE_CONFIG_DIR") or "").strip()),
     )
+    if cfg.claude_config_dir and not os.path.isabs(cfg.claude_config_dir):
+        raise ConfigError("CC_WEB_CLAUDE_CONFIG_DIR 必须是绝对路径")
     for name in _csv(env.get("CC_WEB_APPS") or ""):
         if not _APP_NAME_RE.match(name):
             raise ConfigError(f"app 名不合法：{name!r}")
@@ -600,6 +607,9 @@ class Gateway:
             os.chmod(cfg.state_dir, 0o700)
         except OSError:
             pass
+        if cfg.claude_config_dir:
+            os.makedirs(cfg.claude_config_dir, mode=0o700, exist_ok=True)
+            os.chmod(cfg.claude_config_dir, 0o700)
         self.conversations: dict = _read_json(self.conv_path, {})
         self.sessions: dict = _read_json(self.sessions_path, {})
         self.idempotency: dict = _read_json(self.idem_path, {})
@@ -1172,6 +1182,8 @@ class Gateway:
         env["PATH"] = ":".join([*app.path_prepend, _BASE_PATH,
                                 os.path.expanduser("~/.local/bin")])
         env.update(claude_credential_env())
+        if self.cfg.claude_config_dir:
+            env["CLAUDE_CONFIG_DIR"] = self.cfg.claude_config_dir
         env["CC_LARK_MIRROR_OFF"] = "1"  # session-mirror hook 自我排除（restricted 下本就不跑 hook）
         env["DISABLE_AUTOUPDATER"] = "1"
         if effort:
