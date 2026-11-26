@@ -519,6 +519,74 @@ async def test_env_whitelist_and_isolation(make_gw, monkeypatch):
     assert env["CC_LARK_MIRROR_OFF"] == "1"
 
 
+def _write_claude_env(path: Path, mode: int = 0o600, **env) -> None:
+    path.write_text(json.dumps({"env": env}))
+    os.chmod(path, mode)
+
+
+_RELAY = {
+    "ANTHROPIC_BASE_URL": "https://relay.example.invalid",
+    "ANTHROPIC_AUTH_TOKEN": "relay-token-aaaaaaaa",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "o-model",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "s-model",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "h-model",
+}
+
+
+async def test_claude_env_file_replaces_subscription_credentials(make_gw, tmp_path):
+    f = tmp_path / "claude-env.json"
+    # Keys outside the allow-list (PATH, a subscription token) must never reach the child.
+    _write_claude_env(f, **_RELAY, PATH="/evil", CLAUDE_CODE_OAUTH_TOKEN="sub-token", HTTPS_PROXY="http://evil")
+    gw, client, cwd = await make_gw(CC_WEB_CLAUDE_ENV_FILE=str(f))
+    rid = await _start(client, conv="relay", prompt="x")
+    assert (await _wait_done(client, rid))["status"] == "succeeded"
+    env = _calls(cwd)[-1]["env"]
+    for k, v in _RELAY.items():
+        assert env[k] == v
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env          # the fixture's subscription credential is not used
+    assert "HTTPS_PROXY" not in env and "/evil" not in env["PATH"]
+    # Token change: picked up by the next run, no restart.
+    _write_claude_env(f, **{**_RELAY, "ANTHROPIC_AUTH_TOKEN": "relay-token-bbbbbbbb"})
+    rid = await _start(client, conv="relay2", prompt="x")
+    await _wait_done(client, rid)
+    assert _calls(cwd)[-1]["env"]["ANTHROPIC_AUTH_TOKEN"] == "relay-token-bbbbbbbb"
+
+
+@pytest.mark.parametrize("case", ["missing", "world_readable", "no_token", "not_json", "multiline"])
+async def test_claude_env_file_fails_closed(make_gw, tmp_path, case):
+    f = tmp_path / "claude-env.json"
+    if case == "world_readable":
+        _write_claude_env(f, mode=0o644, **_RELAY)
+    elif case == "no_token":
+        _write_claude_env(f, ANTHROPIC_BASE_URL="https://relay.example.invalid")
+    elif case == "not_json":
+        f.write_text("ANTHROPIC_AUTH_TOKEN=x")
+        os.chmod(f, 0o600)
+    elif case == "multiline":
+        _write_claude_env(f, **{**_RELAY, "ANTHROPIC_BASE_URL": "https://a\nX-Evil: 1"})
+    gw, client, cwd = await make_gw(CC_WEB_CLAUDE_ENV_FILE=str(f))
+    rid = await _start(client, conv="relay-bad", prompt="x")
+    body = await _wait_done(client, rid)
+    assert body["status"] == "failed" and body["error"]["code"] == "claude_env_unavailable", body
+    assert _calls(cwd) == []                              # claude was never started (no fallback)
+
+
+async def test_claude_env_file_must_be_absolute(tmp_path):
+    with pytest.raises(gwmod.ConfigError):
+        gwmod.load_config(_env(tmp_path, CC_WEB_CLAUDE_ENV_FILE="relative/claude-env.json"))
+
+
+async def test_relay_token_redacted_from_events(make_gw, tmp_path):
+    f = tmp_path / "claude-env.json"
+    _write_claude_env(f, **_RELAY)
+    gw, client, cwd = await make_gw(CC_WEB_CLAUDE_ENV_FILE=str(f))
+    rid = await _start(client, conv="relay-red", prompt="MODE:echorelay")   # a model reciting its env
+    evts = await client.events(rid)
+    assert _RELAY["ANTHROPIC_AUTH_TOKEN"] not in json.dumps(evts) and "relay is ***" in evts[-1]["data"]["text"]
+    st, body = await client.req("GET", f"/v1/runs/{rid}")
+    assert _RELAY["ANTHROPIC_AUTH_TOKEN"] not in json.dumps(body)
+
+
 async def test_injected_secret_values_are_redacted_from_events(make_gw):
     gw, client, cwd = await make_gw()
     rid = await _start(client, conv="red", prompt="MODE:echoenv",

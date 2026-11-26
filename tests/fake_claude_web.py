@@ -8,6 +8,7 @@
     MODE:tools  → 一次 Bash(rg-tool) 工具调用 + 结果，再回文本
     MODE:recall → 回 "PREV=<上一轮 prompt>"（测 resume）
     MODE:echoenv→ 回 RG_RUN_TOKEN 的值（测脱敏）
+    MODE:echorelay→ 回 ANTHROPIC_AUTH_TOKEN 的值（测中转站 token 脱敏）
     MODE:apierror → result is_error（API 500）
 会话存在 <cwd>/.fake_sessions/<sid>.jsonl；--resume 不存在的 sid → 和真 CLI 一样报
 "No conversation found with session ID"。每次调用把 argv / env / prompt 追加到
@@ -94,6 +95,11 @@ def main():
         return
     if "MODE:recall" in prompt:
         msg = "PREV=" + (prev[-1] if prev else "<none>")
+        text_delta(msg)
+        result(msg, sid)
+        return
+    if "MODE:echorelay" in prompt:
+        msg = "relay is " + os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
         text_delta(msg)
         result(msg, sid)
         return

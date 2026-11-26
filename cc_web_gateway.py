@@ -67,6 +67,14 @@ _FORBIDDEN_TOOLS = frozenset({
 _FORBIDDEN_PERMISSION_MODES = frozenset({"bypassPermissions", "acceptEdits", "auto"})
 
 _DEFAULT_TOOLS = "Bash(rg-tool:*),Read,Grep,Glob,WebSearch,WebFetch"
+
+# CC_WEB_CLAUDE_ENV_FILE 里只认这些键（中转站 / API key 的凭证和模型映射）。别的键一律丢掉，
+# 所以这个文件改不了 PATH、HOME、代理之类，也带不进订阅 token。
+_CLAUDE_ENV_FILE_KEYS = frozenset({
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+})
+_CLAUDE_ENV_SECRET_KEYS = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")
 _DEFAULT_ENV_KEYS = "RG_RUN_TOKEN,RG_API_BASE,RG_LOCALE"
 
 _CONV_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -200,6 +208,11 @@ class GatewayConfig:
     # CLAUDE_CONFIG_DIR=<这里>，会话记录（projects/…jsonl）只落这个目录：同机多个网关实例
     # （例：RG 测试 / 生产租户）的会话彼此、也和主 bot 分开。凭证仍走 env 注入（claude_credential_env）。
     claude_config_dir: str = ""
+    # 空 = 凭证走 claude_credential_env()（主 bot 选中的订阅 token）。配了 → 每次起 claude 前重读这个
+    # JSON（{"env": {...}} 或扁平 {...}），只取 _CLAUDE_ENV_FILE_KEYS 里的键注入子进程，**不再**注入订阅
+    # 凭证；读不到 / 不合法 / 权限太宽 → 这一轮以 claude_env_unavailable 失败（fail-closed，不回落订阅）。
+    # 换 token 只改文件，不用重启。用于 RG agent 独立机器走中转站。
+    claude_env_file: str = ""
 
     @property
     def token_ok(self) -> bool:
@@ -237,7 +250,10 @@ def load_config(env: Optional[dict] = None) -> GatewayConfig:
         retention_days=_env_float(env, "CC_WEB_RETENTION_DAYS", 14.0),
         heartbeat_sec=max(0.2, _env_float(env, "CC_WEB_HEARTBEAT_SEC", 15.0)),
         claude_config_dir=os.path.expanduser((env.get("CC_WEB_CLAUDE_CONFIG_DIR") or "").strip()),
+        claude_env_file=os.path.expanduser((env.get("CC_WEB_CLAUDE_ENV_FILE") or "").strip()),
     )
+    if cfg.claude_env_file and not os.path.isabs(cfg.claude_env_file):
+        raise ConfigError("CC_WEB_CLAUDE_ENV_FILE 必须是绝对路径")
     if cfg.claude_config_dir and not os.path.isabs(cfg.claude_config_dir):
         raise ConfigError("CC_WEB_CLAUDE_CONFIG_DIR 必须是绝对路径")
     for name in _csv(env.get("CC_WEB_APPS") or ""):
@@ -309,6 +325,35 @@ def claude_credential_env() -> dict[str, str]:
     except Exception as exc:  # noqa: BLE001
         log(PROFILE_TAG, "gateway", "warn", f"读凭证失败：{type(exc).__name__}")
     return {}
+
+
+def load_claude_env_file(path: str) -> dict[str, str]:
+    """CC_WEB_CLAUDE_ENV_FILE → 白名单内的 env。任何问题都抛 RunFailure（这一轮失败，不回落订阅凭证）。"""
+    try:
+        st = os.stat(path)
+        if st.st_mode & 0o077:
+            raise RunFailure("claude_env_unavailable", "claude env file must not be group/world accessible")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except RunFailure:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RunFailure("claude_env_unavailable", f"claude env file unreadable ({type(exc).__name__})")
+    if isinstance(data, dict) and isinstance(data.get("env"), dict):
+        data = data["env"]
+    if not isinstance(data, dict):
+        raise RunFailure("claude_env_unavailable", "claude env file must be a JSON object")
+    out: dict[str, str] = {}
+    for k, v in data.items():
+        if k not in _CLAUDE_ENV_FILE_KEYS:
+            continue
+        if not isinstance(v, str) or not v.strip() or "\n" in v or "\r" in v:
+            raise RunFailure("claude_env_unavailable", f"claude env file: bad value for {k}")
+        out[k] = v.strip()
+    if not any(out.get(k) for k in _CLAUDE_ENV_SECRET_KEYS):
+        raise RunFailure("claude_env_unavailable",
+                         "claude env file has no ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY")
+    return out
 
 
 # ── 摘要 / 脱敏 ───────────────────────────────────────────────
@@ -1052,7 +1097,7 @@ class Gateway:
         run.resume_session_id = resume_sid
         run.prompt_chars = len(prompt)
         run.idempotency_key = idem
-        run.redact = Redactor([v for k, v in env_in.items()])
+        run.redact = Redactor([v for k, v in env_in.items()] + self._claude_env_secret_values())
         self.runs[run.run_id] = run
         self.active_by_conv[ckey] = run.run_id
         run.save_meta()
@@ -1175,13 +1220,27 @@ class Gateway:
             cmd += ["--resume", resume_sid]
         return cmd
 
+    def _claude_env_secret_values(self) -> list[str]:
+        """中转站 token 也要从对外事件里抹掉（模型偶尔会把环境变量念出来）。读不到就算了：起 run 时会报错。"""
+        if not self.cfg.claude_env_file:
+            return []
+        try:
+            got = load_claude_env_file(self.cfg.claude_env_file)
+        except RunFailure:
+            return []
+        return [got[k] for k in _CLAUDE_ENV_SECRET_KEYS if got.get(k)]
+
     def build_env(self, app: AppConfig, env_in: dict, effort: str) -> dict:
         env = {k: os.environ[k] for k in _INHERIT_ENV_KEYS if os.environ.get(k)}
         env.setdefault("HOME", os.path.expanduser("~"))
         env.setdefault("LANG", "C.UTF-8")
         env["PATH"] = ":".join([*app.path_prepend, _BASE_PATH,
                                 os.path.expanduser("~/.local/bin")])
-        env.update(claude_credential_env())
+        if self.cfg.claude_env_file:
+            # 中转站 / API key：只用这个文件里的白名单键，订阅凭证不进子进程
+            env.update(load_claude_env_file(self.cfg.claude_env_file))
+        else:
+            env.update(claude_credential_env())
         if self.cfg.claude_config_dir:
             env["CLAUDE_CONFIG_DIR"] = self.cfg.claude_config_dir
         env["CC_LARK_MIRROR_OFF"] = "1"  # session-mirror hook 自我排除（restricted 下本就不跑 hook）
