@@ -67,6 +67,8 @@ _FORBIDDEN_TOOLS = frozenset({
 _FORBIDDEN_PERMISSION_MODES = frozenset({"bypassPermissions", "acceptEdits", "auto"})
 
 _DEFAULT_TOOLS = "Bash(rg-tool:*),Read,Grep,Glob,WebSearch,WebFetch"
+# 一条拒绝规则：工具名，或 工具名(规则内容)；不许空白、嵌套括号混进 argv。
+_DENY_SPEC_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\([^()\s]{1,200}\))?$")
 
 # CC_WEB_CLAUDE_ENV_FILE 里只认这些键（中转站 / API key 的凭证和模型映射）。别的键一律丢掉，
 # 所以这个文件改不了 PATH、HOME、代理之类，也带不进订阅 token。
@@ -174,6 +176,10 @@ class AppConfig:
     # （--restricted 锁在 cwd）和 rg-tool 落地的客户原件（./.files）因此按话题隔离——
     # 共用 app.cwd 时，别的用户的话题能 Glob/Read 到这里的原件（D4 安全审查实测）。
     isolate_cwd: bool = True
+    # 拒绝规则（--disallowedTools，优先于白名单）。用途：Claude Code 自带一份「只读命令」名单
+    # （ls / echo / pwd / id / cat …），这些在 dontAsk 下不经白名单也放行，还能和 rg-tool 用
+    # ; && | 串成一条（RG R0 审计 §B.2）。逐条 Bash(<cmd>:*) 拒掉；复合命令里任一段命中整条拒。
+    disallowed_tools: list[str] = field(default_factory=list)
 
     @property
     def builtin_tools(self) -> list[str]:
@@ -270,6 +276,10 @@ def load_config(env: Optional[dict] = None) -> GatewayConfig:
         bad = [t for t in tools if _tool_base(t) in _FORBIDDEN_TOOLS]
         if bad:
             raise ConfigError(f"{p}ALLOWED_TOOLS 含禁用工具：{bad}")
+        disallowed = _csv(env.get(p + "DISALLOWED_TOOLS") or "")
+        bad = [t for t in disallowed if not _DENY_SPEC_RE.match(t)]
+        if bad:
+            raise ConfigError(f"{p}DISALLOWED_TOOLS 含非法规则：{bad[:3]}")
         perm = (env.get(p + "PERMISSION_MODE") or "dontAsk").strip()
         if perm in _FORBIDDEN_PERMISSION_MODES:
             raise ConfigError(f"{p}PERMISSION_MODE 不允许 {perm}")
@@ -285,6 +295,7 @@ def load_config(env: Optional[dict] = None) -> GatewayConfig:
         cfg.apps[name] = AppConfig(
             name=name, cwd=cwd, model=model, effort=effort, models=models,
             allowed_tools=tools, permission_mode=perm, env_keys=env_keys,
+            disallowed_tools=disallowed,
             path_prepend=path_prepend,
             system_prompt_file=(env.get(p + "SYSTEM_PROMPT_FILE") or "").strip(),
             isolate_cwd=(env.get(p + "ISOLATE_CWD") or "1").strip().lower()
@@ -1207,6 +1218,10 @@ class Gateway:
             "--strict-mcp-config",
             "--tools", ",".join(app.builtin_tools),
             "--allowedTools", *app.allowed_tools,
+        ]
+        if app.disallowed_tools:
+            cmd += ["--disallowedTools", *app.disallowed_tools]
+        cmd += [
             "--permission-mode", app.permission_mode,
             "--model", model,
         ]

@@ -240,6 +240,26 @@ async def test_cli_flags_restricted_toolset(make_gw):
     assert "bypassPermissions" not in argv and "--dangerously-skip-permissions" not in argv
 
 
+async def test_cli_flags_disallowed_tools(make_gw):
+    """RG R0 审计 §B.2：自带只读命令（ls / echo …）要靠拒绝规则挡；没配就不带这个参数。"""
+    gw, client, cwd = await make_gw(CC_WEB_APP_RG_NEXT_DISALLOWED_TOOLS="Bash(ls:*),Bash(echo:*),Bash([:*)")
+    rid = await _start(client)
+    await client.events(rid)
+    argv = _calls(cwd)[-1]["argv"]
+    i = argv.index("--disallowedTools")
+    assert argv[i + 1:i + 4] == ["Bash(ls:*)", "Bash(echo:*)", "Bash([:*)"]
+    # 白名单照旧，拒绝规则不混进 --tools
+    assert argv[argv.index("--tools") + 1] == "Bash,Read,Grep,Glob,WebSearch,WebFetch"
+    assert argv[i + 4] == "--permission-mode"
+
+
+async def test_cli_flags_no_disallowed_tools_by_default(make_gw):
+    gw, client, cwd = await make_gw()
+    rid = await _start(client)
+    await client.events(rid)
+    assert "--disallowedTools" not in _calls(cwd)[-1]["argv"]
+
+
 async def test_model_override_only_from_allowlist(make_gw):
     gw, client, cwd = await make_gw()
     st, body = await client.req("POST", "/v1/runs", {"app": "rg-next", "conversation_id": "m",
@@ -638,6 +658,10 @@ def test_config_refuses_unsafe_settings(tmp_path):
         gwmod.load_config({**base, "CC_WEB_APP_RG_NEXT_ALLOWED_TOOLS": "Read,Write(./x)"})
     with pytest.raises(gwmod.ConfigError):
         gwmod.load_config({**base, "CC_WEB_APP_RG_NEXT_PERMISSION_MODE": "bypassPermissions"})
+    # 拒绝规则不许夹空白 / 括号嵌套（会被拆成别的 argv）
+    for bad in ("Bash(ls :*)", "Bash(ls:*) --dangerously-skip-permissions", "Bash((ls))", "-x"):
+        with pytest.raises(gwmod.ConfigError):
+            gwmod.load_config({**base, "CC_WEB_APP_RG_NEXT_DISALLOWED_TOOLS": bad})
     with pytest.raises(gwmod.ConfigError):
         gwmod.load_config({**base, "CC_WEB_GATEWAY_HOST": "0.0.0.0"})
     with pytest.raises(gwmod.ConfigError):
