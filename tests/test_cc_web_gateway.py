@@ -260,6 +260,36 @@ async def test_cli_flags_no_disallowed_tools_by_default(make_gw):
     assert "--disallowedTools" not in _calls(cwd)[-1]["argv"]
 
 
+async def test_cli_flags_system_prompt_replace_mode(make_gw):
+    """RG fix-r3 B-01：中转站 opus 通道会换掉 Claude Code 默认提示那一段，接在后面的规则跟着丢；
+    replace 模式用 --system-prompt-file，规则独立成段。默认仍是 append（行为不变）。"""
+    gw, client, cwd = await make_gw(CC_WEB_APP_RG_NEXT_SYSTEM_PROMPT_MODE="replace")
+    (cwd / "CLAUDE.md").write_text("# agent\n")
+    rid = await _start(client)
+    await client.events(rid)
+    argv = _calls(cwd)[-1]["argv"]
+    assert argv[argv.index("--system-prompt-file") + 1] == str(cwd / "CLAUDE.md")
+    assert "--append-system-prompt-file" not in argv
+    # 三档模型都走同一个参数
+    for m in ("opus", "haiku"):
+        st, body = await client.req("POST", "/v1/runs", {"app": "rg-next", "conversation_id": "sp-" + m,
+                                                         "prompt": "hi", "model": m})
+        assert st == 202, body
+        await client.events(body["run_id"])
+        argv = _calls(cwd)[-1]["argv"]
+        assert argv[argv.index("--model") + 1] == m
+        assert "--system-prompt-file" in argv and "--append-system-prompt-file" not in argv
+
+
+async def test_cli_flags_system_prompt_append_by_default(make_gw):
+    gw, client, cwd = await make_gw()
+    (cwd / "CLAUDE.md").write_text("# agent\n")
+    rid = await _start(client)
+    await client.events(rid)
+    argv = _calls(cwd)[-1]["argv"]
+    assert "--append-system-prompt-file" in argv and "--system-prompt-file" not in argv
+
+
 async def test_model_override_only_from_allowlist(make_gw):
     gw, client, cwd = await make_gw()
     st, body = await client.req("POST", "/v1/runs", {"app": "rg-next", "conversation_id": "m",
@@ -662,6 +692,9 @@ def test_config_refuses_unsafe_settings(tmp_path):
     for bad in ("Bash(ls :*)", "Bash(ls:*) --dangerously-skip-permissions", "Bash((ls))", "-x"):
         with pytest.raises(gwmod.ConfigError):
             gwmod.load_config({**base, "CC_WEB_APP_RG_NEXT_DISALLOWED_TOOLS": bad})
+    for bad in ("prepend", "--dangerously-skip-permissions", "replace;x"):
+        with pytest.raises(gwmod.ConfigError):
+            gwmod.load_config({**base, "CC_WEB_APP_RG_NEXT_SYSTEM_PROMPT_MODE": bad})
     with pytest.raises(gwmod.ConfigError):
         gwmod.load_config({**base, "CC_WEB_GATEWAY_HOST": "0.0.0.0"})
     with pytest.raises(gwmod.ConfigError):

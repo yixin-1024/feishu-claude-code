@@ -69,6 +69,8 @@ _FORBIDDEN_PERMISSION_MODES = frozenset({"bypassPermissions", "acceptEdits", "au
 _DEFAULT_TOOLS = "Bash(rg-tool:*),Read,Grep,Glob,WebSearch,WebFetch"
 # 一条拒绝规则：工具名，或 工具名(规则内容)；不许空白、嵌套括号混进 argv。
 _DENY_SPEC_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\([^()\s]{1,200}\))?$")
+# CC_WEB_APP_<X>_SYSTEM_PROMPT_MODE → 挂 system prompt 文件用的 claude 参数
+_SYSTEM_PROMPT_MODES = {"append": "--append-system-prompt-file", "replace": "--system-prompt-file"}
 
 # CC_WEB_CLAUDE_ENV_FILE 里只认这些键（中转站 / API key 的凭证和模型映射）。别的键一律丢掉，
 # 所以这个文件改不了 PATH、HOME、代理之类，也带不进订阅 token。
@@ -180,6 +182,11 @@ class AppConfig:
     # （ls / echo / pwd / id / cat …），这些在 dontAsk 下不经白名单也放行，还能和 rg-tool 用
     # ; && | 串成一条（RG R0 审计 §B.2）。逐条 Bash(<cmd>:*) 拒掉；复合命令里任一段命中整条拒。
     disallowed_tools: list[str] = field(default_factory=list)
+    # system prompt 文件怎么挂：append（默认）= --append-system-prompt-file，接在 Claude Code 自带的
+    # 默认提示后面；replace = --system-prompt-file，整段替换默认提示。RG 走中转站时，中转站的 opus
+    # 通道会把「Claude Code 默认提示」那一段整段换成它自己的，接在后面的规则跟着丢（RG fix-r3 B-01：
+    # 深入档不知道 rg-tool），replace 模式下规则是独立一段，不受影响。
+    system_prompt_mode: str = "append"
 
     @property
     def builtin_tools(self) -> list[str]:
@@ -292,12 +299,16 @@ def load_config(env: Optional[dict] = None) -> GatewayConfig:
             if not _ENV_KEY_RE.match(k):
                 raise ConfigError(f"{p}ENV_KEYS 含非法键 {k!r}")
         path_prepend = _csv(env.get(p + "PATH_PREPEND") or os.path.join(cwd, "bin"))
+        sp_mode = (env.get(p + "SYSTEM_PROMPT_MODE") or "append").strip().lower()
+        if sp_mode not in _SYSTEM_PROMPT_MODES:
+            raise ConfigError(f"{p}SYSTEM_PROMPT_MODE={sp_mode!r} 不在 {_SYSTEM_PROMPT_MODES}")
         cfg.apps[name] = AppConfig(
             name=name, cwd=cwd, model=model, effort=effort, models=models,
             allowed_tools=tools, permission_mode=perm, env_keys=env_keys,
             disallowed_tools=disallowed,
             path_prepend=path_prepend,
             system_prompt_file=(env.get(p + "SYSTEM_PROMPT_FILE") or "").strip(),
+            system_prompt_mode=sp_mode,
             isolate_cwd=(env.get(p + "ISOLATE_CWD") or "1").strip().lower()
             not in ("0", "false", "no", "off"),
         )
@@ -1228,9 +1239,9 @@ class Gateway:
         if effort:
             cmd += ["--effort", effort]
         sp_file = app.system_prompt_file or os.path.join(app.cwd, "CLAUDE.md")
-        # --restricted 下 CLAUDE.md 不会自动加载，显式挂进 system prompt
+        # --restricted 下 CLAUDE.md 不会自动加载，显式挂进 system prompt（append / replace 见 AppConfig）
         if os.path.isfile(sp_file):
-            cmd += ["--append-system-prompt-file", sp_file]
+            cmd += [_SYSTEM_PROMPT_MODES[app.system_prompt_mode], sp_file]
         if resume_sid:
             cmd += ["--resume", resume_sid]
         return cmd
