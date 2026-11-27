@@ -44,6 +44,8 @@ def _isolate_sessions(tmp_path, monkeypatch):
     monkeypatch.setenv("CC_LARK_QODER_CLAUDE_CONTEXT", "0")
     # qoder 的模型实时表要真跑 `qodercli --list-models`；测试里关掉，要测的用例自己打开并打桩
     monkeypatch.setenv("CC_LARK_QODER_LIVE_MODELS", "0")
+    # agy 订阅通道的 /model 菜单同理（真跑 `agy models`，还会用到本机登录的号）
+    monkeypatch.setenv("CC_LARK_AGY_LIVE_MODELS", "0")
     monkeypatch.setenv("CC_LARK_KIRO_CLAUDE_CONTEXT", "0")
     monkeypatch.setenv("CC_LARK_PI_CLAUDE_CONTEXT", "0")
     # codex / agy 的同一份简报由 agent_runner 拼（CC_LARK_CLAUDE_CONTEXT / <PREFIX>_CLAUDE_CONTEXT）

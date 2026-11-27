@@ -349,6 +349,49 @@ async def _qoder_live_models(bot) -> tuple[str, ...]:
     )
 
 
+_AGY_MODEL_EMOJI = {
+    "gemini-4-neon": "✴️",
+    "gemini-4-hydrogen": "💧",
+    "gemini-4-carbon": "🪨",
+    "gemini-4-argon": "🔆",
+    "gemini-3.8-flash": "🚀",
+    "gemini-3.1-pro": "💎",
+    "claude-opus-4-6-thinking": "🧠",
+    "claude-sonnet-4-6": "⚡",
+    "claude-opus-5-5": "🧠",
+    "claude-sonnet-5-5": "⚡",
+}
+
+
+async def _agy_live_models(bot) -> tuple[tuple[str, str], ...]:
+    """这个 bot 的 agy（用它自己的 HOME 登录）现在能用的模型；没 profile 或拉不到是空。"""
+    profile = getattr(bot, "profile", None)
+    if profile is None or os.getenv("CC_LARK_AGY_LIVE_MODELS", "1").strip() == "0":
+        return ()
+    from agy_runner import agy_model_choices
+    return await asyncio.to_thread(
+        agy_model_choices,
+        getattr(profile, "agy_bin", "") or None,
+        getattr(profile, "agy_home", "") or None,
+        getattr(profile, "agy_proxy", "") or None,
+    )
+
+
+def _agy_model_cmd(model_id: str) -> str:
+    """模型 id → `/model` 后面写什么：有别名用别名（neon / flash / agy-opus），否则用 id。
+
+    Gemini 用短名（要能解析回同一个模型）；Claude / GPT-OSS 这些第三方模型照旧留 agy- 前缀，
+    跟兜底菜单一致（裸 opus 是 Claude Code 的模型）。
+    """
+    for key, val in MODEL_ALIASES.items():
+        if key.startswith("agy-") and val == model_id:
+            short = key[len("agy-"):]
+            if model_id.startswith("gemini-") and resolve_model_alias(short, "agy") == model_id:
+                return short
+            return key
+    return model_id
+
+
 def _codex_effort_levels(model: str) -> tuple[str, ...]:
     """Use Codex's local model catalog when available; fall back to the stable UI set."""
     for item in _codex_catalog():
@@ -3096,7 +3139,8 @@ async def handle_command(
             elif runner == "agy":
                 # 两条鉴权通道的模型表不重叠（agy 1.5.9 `agy models` 实测）：
                 #   API key：Gemini 4 四款 + 3.8/3.7/3.6 Flash + 3.1 Pro，没有 Claude/GPT；
-                #   OAuth 订阅：只有 3.8 Flash + Claude 4.6 两款 + GPT-OSS，没有 Gemini 4。
+                #   OAuth 订阅：按号的档位不同（免费/赠送号只有 3.8 Flash + Claude 4.6 + GPT-OSS，
+                #   付费 Pro 有 Gemini 4），所以按这个 bot 的 `agy models` 实时出，拉不到才用兜底表。
                 # 点了另一边的模型 agy 会直接报 not recognized，所以只列本 bot 那条通道的。
                 # 拿不到 profile 时按 bot_config 的默认（agy_model_provider="gemini"）算 API key。
                 agy_profile = getattr(bot, "profile", None)
@@ -3112,7 +3156,17 @@ async def handle_command(
                         {"text": "Gemini 3.6 Flash", "value": {"action": "run_cmd", "cmd": "/model 36", "cid": chat_id}},
                         {"text": "💎 Gemini 3.1 Pro", "value": {"action": "run_cmd", "cmd": "/model pro", "cid": chat_id}},
                     ]
+                elif live_models := await _agy_live_models(bot):
+                    # 订阅号的模型表因档而异（付费 Pro 有 Gemini 4），按 `agy models` 实时出
+                    buttons = [
+                        {
+                            "text": f"{_AGY_MODEL_EMOJI.get(mid, '')} {label}".strip(),
+                            "value": {"action": "run_cmd", "cmd": f"/model {_agy_model_cmd(mid)}", "cid": chat_id},
+                        }
+                        for mid, label in live_models
+                    ]
                 else:
+                    # 拉不到实时表时的兜底（免费/赠送号的那几款）。
                     # 第三方模型保留 agy- 前缀：裸 opus / sonnet 是 Claude 的通用别名
                     buttons = [
                         {"text": "🚀 Gemini 3.8 Flash", "value": {"action": "run_cmd", "cmd": "/model flash", "cid": chat_id}},

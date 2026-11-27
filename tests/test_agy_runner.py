@@ -1833,3 +1833,19 @@ def test_effort_levels_for_agy_hydrogen():
 
     assert _effort_levels_for("agy", "gemini-4-hydrogen")[0] == ("low", "medium", "high", "xhigh")
     assert _effort_levels_for("agy", "agy-argon")[0] == ("low", "medium", "high")
+
+
+def test_account_verification_hint_surfaces_google_verify_link():
+    """新地方首次用 agy 时 Google 要求验证本人：给人话 + 验证链接，别当上游抖动去重试。"""
+    stderr = (
+        "error: Eligibility check failed: Your current account is not eligible for Antigravity. "
+        "Verify your account to continue.\n\nPlease verify your account in your browser to continue:\n"
+        "https://accounts.google.com/v3/signin/continue?plt=AKgn_x-1&continue=https://developers.google.com/"
+        "gemini-code-assist/auth/auth_success_gemini&sarp=1&authuser\n"
+    )
+    hint = agy_runner.account_verification_hint(stderr)
+    assert "验证" in hint
+    assert "https://accounts.google.com/v3/signin/continue?plt=AKgn_x-1&continue=" in hint
+    assert hint.rstrip("。验证完再发一次就好，").find("authuser") > 0
+    assert agy_runner.account_verification_hint("PERMISSION_DENIED (code 403): Verify your account to continue.")
+    assert agy_runner.account_verification_hint("Error 503 (UNAVAILABLE): overloaded") == ""

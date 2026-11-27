@@ -297,10 +297,14 @@ async def test_agy_model_card_buttons_use_unprefixed_names(tmp_path):
         assert reply.startswith("✅"), (c, reply)
 
 
-async def test_agy_oauth_model_card_buttons_all_switch(tmp_path):
-    """OAuth 订阅通道：3.8 Flash 不带前缀；第三方模型保留 agy- 前缀（裸 opus 是 Claude 的）。"""
+async def test_agy_oauth_model_card_buttons_all_switch(tmp_path, monkeypatch):
+    """OAuth 订阅通道拉不到实时表时的兜底：3.8 Flash 不带前缀；第三方模型保留 agy- 前缀（裸 opus 是 Claude 的）。"""
     from types import SimpleNamespace
 
+    async def no_live(bot):
+        return ()
+
+    monkeypatch.setattr(commands, "_agy_live_models", no_live)
     store = _store(tmp_path, runner="agy")
     bot = SimpleNamespace(profile=SimpleNamespace(agy_model_provider="", runner="agy", name="agybot"))
 
@@ -311,3 +315,163 @@ async def test_agy_oauth_model_card_buttons_all_switch(tmp_path):
     for c in cmds:
         reply = await commands.handle_command("model", c.split(" ", 1)[1], "ou_u", "oc_c", store, bot=None)
         assert reply.startswith("✅"), (c, reply)
+
+
+AGY_MODELS_PAID = """Fetching available models...
+gemini-4-neon-high\tGemini 4 Neon (High)
+gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)
+gemini-4-neon-low\tGemini 4 Neon (Low)
+gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)
+gemini-4-argon-medium\tGemini 4 Argon (Medium)
+gemini-3.8-flash-high\tGemini 3.8 Flash (High)
+gemini-3.8-flash-low\tGemini 3.8 Flash (Low)
+claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)
+gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
+"""
+
+
+def test_parse_agy_models_folds_gemini_levels_keeps_fixed_ones():
+    import agy_runner
+
+    got = agy_runner.parse_agy_models(AGY_MODELS_PAID)
+    assert got == (
+        ("gemini-4-neon", "Gemini 4 Neon"),
+        ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+        ("gemini-4-argon", "Gemini 4 Argon"),
+        ("gemini-3.8-flash", "Gemini 3.8 Flash"),
+        ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+        ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+    )
+    assert agy_runner.parse_agy_models("") == ()
+    assert agy_runner.parse_agy_models("Please sign in\n") == ()
+
+
+def test_agy_model_choices_uses_bot_home_and_caches(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    import agy_runner
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw["env"].get("HOME"), "BASH_ENV" in kw["env"]))
+        return SimpleNamespace(returncode=0, stdout=AGY_MODELS_PAID)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(agy_runner, "_AGY_MODELS_CACHE", {})
+    monkeypatch.setenv("BASH_ENV", "/x/restore.sh")
+    first = agy_runner.agy_model_choices("/x/agy", "/x/bot-home")
+    second = agy_runner.agy_model_choices("/x/agy", "/x/bot-home")
+    assert first == second and first[0][0] == "gemini-4-neon"
+    assert calls == [(["/x/agy", "models"], "/x/bot-home", False)]
+
+
+def test_agy_model_choices_failure_is_empty(monkeypatch):
+    import subprocess
+    import agy_runner
+
+    def boom(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 20)
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(agy_runner, "_AGY_MODELS_CACHE", {})
+    assert agy_runner.agy_model_choices("/x/agy", "/x/h") == ()
+
+
+async def test_agy_oauth_model_card_follows_live_models(tmp_path, monkeypatch):
+    """付费订阅号：菜单按 `agy models` 出，Gemini 4 用短名，每个按钮都能切成功。"""
+    from types import SimpleNamespace
+    import agy_runner
+
+    async def live(bot):
+        return agy_runner.parse_agy_models(AGY_MODELS_PAID)
+
+    monkeypatch.setattr(commands, "_agy_live_models", live)
+    store = _store(tmp_path, runner="agy")
+    bot = SimpleNamespace(profile=SimpleNamespace(agy_model_provider="", runner="agy", name="agybot"))
+
+    card = await commands.handle_command("model", "", "ou_u", "oc_c", store, bot=bot)
+
+    cmds = [b["value"]["cmd"] for b in card["buttons"]]
+    assert cmds == [
+        "/model neon", "/model hydrogen", "/model argon", "/model flash",
+        "/model agy-opus", "/model agy-gpt",
+    ]
+    assert card["buttons"][0]["text"] == "✴️ Gemini 4 Neon"
+    for c in cmds:
+        reply = await commands.handle_command("model", c.split(" ", 1)[1], "ou_u", "oc_c", store, bot=None)
+        assert reply.startswith("✅"), (c, reply)
+
+
+# 2026-11-28 Google AI Ultra 号（agy 1.5.18）`agy models` 的原样输出
+AGY_MODELS_ULTRA = """Fetching available models...
+gemini-4-neon-high\tGemini 4 Neon (High)
+gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)
+gemini-4-neon-medium\tGemini 4 Neon (Medium)
+gemini-4-neon-low\tGemini 4 Neon (Low)
+gemini-4-carbon-medium\tGemini 4 Carbon (Medium)
+gemini-4-carbon-high\tGemini 4 Carbon (High)
+gemini-4-carbon-low\tGemini 4 Carbon (Low)
+gemini-4-argon-medium\tGemini 4 Argon (Medium)
+gemini-4-argon-high\tGemini 4 Argon (High)
+gemini-4-argon-low\tGemini 4 Argon (Low)
+gemini-4-hydrogen-high\tGemini 4 Hydrogen (High)
+gemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)
+gemini-4-hydrogen-medium\tGemini 4 Hydrogen (Medium)
+gemini-4-hydrogen-low\tGemini 4 Hydrogen (Low)
+gemini-pro-orchestrator-neon\tOrchestrator (Neon)
+gemini-pro-orchestrator\tOrchestrator (Carbon)
+gemini-pro-orchestrator-argon\tOrchestrator (Argon)
+gemini-3.8-flash-high\tGemini 3.8 Flash (High)
+gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)
+gemini-3.8-flash-low\tGemini 3.8 Flash (Low)
+claude-opus-5-5-low\tClaude Opus 5.5 (Low)
+claude-opus-5-5-medium\tClaude Opus 5.5 (Medium)
+claude-opus-5-5-high\tClaude Opus 5.5 (High)
+claude-sonnet-5-5-low\tClaude Sonnet 5.5 (Low)
+claude-sonnet-5-5-medium\tClaude Sonnet 5.5 (Medium)
+claude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)
+gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
+"""
+
+
+async def test_agy_ultra_model_card_every_button_switches(tmp_path, monkeypatch):
+    """Ultra 号：Gemini 4 四款 + Orchestrator + Claude 5.5（多档并成一条）+ GPT-OSS，每个按钮都能切。"""
+    from types import SimpleNamespace
+    import agy_runner
+
+    choices = agy_runner.parse_agy_models(AGY_MODELS_ULTRA)
+    assert [m for m, _ in choices] == [
+        "gemini-4-neon", "gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen",
+        "gemini-pro-orchestrator-neon", "gemini-pro-orchestrator", "gemini-pro-orchestrator-argon",
+        "gemini-3.8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b-medium",
+    ]
+    assert dict(choices)["claude-opus-5-5"] == "Claude Opus 5.5"
+    assert dict(choices)["gemini-pro-orchestrator"] == "Orchestrator (Carbon)"
+
+    async def live(bot):
+        return choices
+
+    monkeypatch.setattr(commands, "_agy_live_models", live)
+    store = _store(tmp_path, runner="agy")
+    bot = SimpleNamespace(profile=SimpleNamespace(agy_model_provider="", runner="agy", name="agybot"))
+    card = await commands.handle_command("model", "", "ou_u", "oc_c", store, bot=bot)
+    cmds = [b["value"]["cmd"] for b in card["buttons"]]
+    assert cmds[:4] == ["/model neon", "/model carbon", "/model argon", "/model hydrogen"]
+    assert "/model claude-opus-5-5" in cmds and "/model agy-gpt" in cmds
+    for c in cmds:
+        reply = await commands.handle_command("model", c.split(" ", 1)[1], "ou_u", "oc_c", store, bot=None)
+        assert reply.startswith("✅"), (c, reply)
+
+
+def test_agy_accepts_subscription_claude_5_with_effort():
+    import agy_runner
+    from bot_config import is_model_compatible_with_runner
+
+    assert is_model_compatible_with_runner("claude-opus-5-5", "agy")
+    assert is_model_compatible_with_runner("claude-sonnet-5-5-high", "agy")
+    # 仍是 Claude Code 自己的合法模型名
+    assert is_model_compatible_with_runner("claude-opus-5-5", "claude")
+    # 档位走 --effort，不被当成「不收 effort」的第三方模型
+    assert not agy_runner.model_ignores_effort("claude-opus-5-5")
+    assert agy_runner._resolve_model_effort("claude-opus-5-5", "xhigh") == ("claude-opus-5-5", "high")

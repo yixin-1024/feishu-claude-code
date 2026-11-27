@@ -121,6 +121,8 @@ AGY_THIRD_PARTY_MODELS = frozenset({
 # 两个后端各有一个同名模型，都合法。早先把它一起排除，导致 Claude 会话里
 # `/model claude-sonnet-4-6` 被判不兼容、静默回退成默认模型
 # （tests/test_session_store.py 三个用例当场抓到）。
+AGY_SUBSCRIPTION_CLAUDE_RE = re.compile(r"^claude-(opus|sonnet|haiku)-\d+-\d+(-(low|medium|high))?$")
+
 AGY_ONLY_MODELS = frozenset({
     "claude-opus-4-6-thinking",
     "gpt-oss-120b-medium",
@@ -263,6 +265,10 @@ def is_model_compatible_with_runner(model: str, runner: str) -> bool:
         if low.startswith("google/"):
             low = low[len("google/"):]
         if low in AGY_THIRD_PARTY_MODELS:
+            return True
+        # 高档订阅（Ultra / 付费 Pro）里的 Claude 5.x：claude-opus-5-5[-low|-medium|-high]，
+        # 档位走 --effort（2026-11-28 实测 agy 1.5.18 接受 `--model claude-opus-5-5 --effort high`）
+        if AGY_SUBSCRIPTION_CLAUDE_RE.match(low):
             return True
         return low.startswith("gemini-") or low.startswith("agy")
 

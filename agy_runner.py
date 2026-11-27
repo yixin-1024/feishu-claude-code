@@ -257,6 +257,92 @@ def resolve_agy_bin(configured: Optional[str] = None) -> str:
     return "agy"
 
 
+# `agy models` 的结果按 (agy 二进制, HOME) 缓存：拉一次要联网 1~3 秒，而模型表一天
+# 也变不了几次。拉失败（没登录、超时）只记一分钟，免得每次点 /model 都干等。
+_AGY_MODELS_TTL = 1800.0
+_AGY_MODELS_FAIL_TTL = 60.0
+_AGY_MODELS_CACHE: dict[tuple[str, str], tuple[float, tuple[tuple[str, str], ...]]] = {}
+_AGY_ID_LEVEL_RE = re.compile(r"-(low|medium|high|xhigh)$")
+_AGY_LABEL_LEVEL_RE = re.compile(r"\s*\((low|medium|high|xhigh)\)\s*$", re.IGNORECASE)
+
+
+def parse_agy_models(text: str) -> tuple[tuple[str, str], ...]:
+    """`agy models` 的输出（每行 `id<TAB>显示名`）→ ((模型 id, 显示名), …)，保持原顺序。
+
+    各档位并成一条：id 去掉 -low/-medium/-high/-xhigh，显示名去掉「(High)」，档位交给
+    /effort（Gemini 一律并；Ultra 里的 claude-opus-5-5-low/-medium/-high 这种多档的也并）。
+    只有一个档位、档位写死在 id 里的（gpt-oss-120b-medium）原样保留，它不接受 --effort。
+    """
+    rows: list[tuple[str, str]] = []
+    for line in (text or "").splitlines():
+        if "\t" not in line:
+            continue
+        mid, label = (part.strip() for part in line.split("\t", 1))
+        if mid and " " not in mid:
+            rows.append((mid, label))
+    # 同一个底名下有 ≥2 个档位（claude-opus-5-5-low/-medium/-high）才并；只有一个档位
+    # 的（gpt-oss-120b-medium）那个后缀就是 id 的一部分，去掉反而成了不存在的模型
+    variants: dict[str, int] = {}
+    for mid, _ in rows:
+        base = _AGY_ID_LEVEL_RE.sub("", mid)
+        variants[base] = variants.get(base, 0) + 1
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for mid, label in rows:
+        base = _AGY_ID_LEVEL_RE.sub("", mid)
+        if base != mid and (mid.lower().startswith("gemini-") or variants.get(base, 0) >= 2):
+            mid = base
+            label = _AGY_LABEL_LEVEL_RE.sub("", label)
+        if mid in seen:
+            continue
+        seen.add(mid)
+        out.append((mid, label or mid))
+    return tuple(out)
+
+
+def agy_model_choices(
+    agy_bin: Optional[str] = None,
+    home: Optional[str] = None,
+    proxy: Optional[str] = None,
+    *,
+    timeout: float = 20.0,
+) -> tuple[tuple[str, str], ...]:
+    """这个 agy（及其登录所在的 HOME）现在能用的模型；拉不到返回空。
+
+    订阅号的模型表因档而异（免费号只有 3.8 Flash 一类，付费 Pro 有 Gemini 4），
+    /model 菜单按它出按钮。
+    """
+    key = (agy_bin or "", home or "")
+    now = time.monotonic()
+    hit = _AGY_MODELS_CACHE.get(key)
+    if hit:
+        ttl = _AGY_MODELS_TTL if hit[1] else _AGY_MODELS_FAIL_TTL
+        if now - hit[0] < ttl:
+            return hit[1]
+    env = dict(os.environ)
+    env.pop("BASH_ENV", None)
+    if home:
+        env["HOME"] = home
+    if proxy:
+        for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            env[k] = proxy
+    choices: tuple[tuple[str, str], ...] = ()
+    try:
+        import subprocess
+
+        r = subprocess.run(
+            [resolve_agy_bin(agy_bin), "models"],
+            capture_output=True, text=True, timeout=timeout, env=env,
+            stdin=subprocess.DEVNULL, cwd=home or None,
+        )
+        if r.returncode == 0:
+            choices = parse_agy_models(r.stdout)
+    except Exception as e:  # 没装 / 超时 / 没登录卡在提示上
+        print(f"[agy] agy models 拉取失败: {type(e).__name__}: {str(e)[:120]}", flush=True)
+    _AGY_MODELS_CACHE[key] = (now, choices)
+    return choices
+
+
 def ensure_bot_home() -> bool:
     """幂等地把 bot 专用 HOME 备好（目录 + skills 软链）。返回是否发生写入。
 
@@ -516,6 +602,30 @@ _AGY_STARTUP_NOISE = (
     "failed to get load code assist response",
     "admin controls not applicable",
 )
+
+
+# Google 账号在新地方首次用 agy（比如登到服务器上）会被要求先在浏览器里验证本人：
+# stderr「Eligibility check failed: … Verify your account to continue.」，日志里是
+# 403 PERMISSION_DENIED + validation_url。重试多少次都一样，得让人去点链接。
+_AGY_VERIFY_PATTERNS = (
+    "verify your account",
+    "not eligible for antigravity",
+    "eligibility check failed",
+)
+_AGY_VERIFY_URL_RE = re.compile(r"https://accounts\.google\.com/v3/signin/continue\?[^\s\"'<>]+")
+
+
+def account_verification_hint(text: str) -> str:
+    """agy 报「这个 Google 号要先验证」时，给卡片上的一句人话（带验证链接）；否则空串。"""
+    low = (text or "").lower()
+    if not any(p in low for p in _AGY_VERIFY_PATTERNS):
+        return ""
+    m = _AGY_VERIFY_URL_RE.search(text or "")
+    where = f"打开：{m.group(0)}" if m else "按 agy 给的链接操作（在服务器上跑一次 `agy -p hi` 能看到）"
+    return (
+        "👉 这个 Google 账号要先在浏览器里验证本人才能用 agy（新地方首次登录常见），"
+        f"用登着这个号的浏览器{where}，验证完再发一次就好。"
+    )
 
 
 def _is_agy_startup_noise(line: str) -> bool:
@@ -1252,9 +1362,13 @@ async def _run_agy_once(
         elif "stream was interrupted" in str(error_detail).lower() and not raw_error:
             error_detail = f"{error_detail} (上游连接流式中断，常见于网络抖动、模型服务端超时或会话历史过长)"
 
+        verify_hint = account_verification_hint(f"{error_detail}\n{stderr_text}")
+        if verify_hint:
+            error_detail = f"{error_detail}\n{verify_hint}"
+
         exc = RuntimeError(f"agy 执行出错：{error_detail}")
         exc.cc_session_id = new_session_id
-        exc.cc_retryable_resume = not is_fatal_error_text(str(error_detail))
+        exc.cc_retryable_resume = not verify_hint and not is_fatal_error_text(str(error_detail))
         if run_log_file and os.path.exists(run_log_file):
             print(f"[run_agy] 出错日志已保留: {run_log_file}", flush=True)
         raise exc
