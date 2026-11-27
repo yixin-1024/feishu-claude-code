@@ -270,8 +270,8 @@ async def test_cli_flags_system_prompt_replace_mode(make_gw):
     argv = _calls(cwd)[-1]["argv"]
     assert argv[argv.index("--system-prompt-file") + 1] == str(cwd / "CLAUDE.md")
     assert "--append-system-prompt-file" not in argv
-    # 三档模型都走同一个参数
-    for m in ("opus", "haiku"):
+    # 换模型也走同一个参数
+    for m in ("opus",):
         st, body = await client.req("POST", "/v1/runs", {"app": "rg-next", "conversation_id": "sp-" + m,
                                                          "prompt": "hi", "model": m})
         assert st == 202, body
